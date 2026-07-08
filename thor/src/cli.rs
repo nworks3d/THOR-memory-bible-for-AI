@@ -232,6 +232,11 @@ enum Commands {
     /// automatically (detached) by the courier when needed; can also be launched
     /// at SessionStart to be warm before the first prompt.
     EmbedDaemon,
+    /// Pre-warm the recall embedder (feature `semantic`): if no live daemon is
+    /// answering, spawn one detached, then return immediately. Idempotent and
+    /// non-blocking - safe to run at SessionStart so the first prompt is already
+    /// warm. A no-op on a bm25-only build.
+    Warm,
 }
 
 /// Render the authoritative answer for one entity: its full head-set. A
@@ -535,6 +540,23 @@ pub fn run() -> Result<()> {
             #[cfg(not(feature = "semantic"))]
             {
                 eprintln!("thor was built WITHOUT the `semantic` feature: there is no embed daemon.");
+            }
+        }
+        Commands::Warm => {
+            #[cfg(feature = "semantic")]
+            {
+                // A live daemon answers a trivial probe in well under the client
+                // budget; only spawn (detached) when nothing is up. client_embed
+                // self-heals a stale portfile on failure, so the spawn targets a
+                // clean slate.
+                if crate::embed_daemon::client_embed(&db, "warm").is_none() {
+                    crate::embed_daemon::ensure_daemon(&db);
+                }
+            }
+            #[cfg(not(feature = "semantic"))]
+            {
+                // bm25-only build has no resident embedder; warming is a no-op so
+                // the same SessionStart hook is harmless on any build.
             }
         }
     }

@@ -4,6 +4,8 @@ A blind, judged comparison of THOR's recall against [mimir](https://github.com/M
 on the same machine over the same knowledge, measuring **answer quality**: does a
 system's top-5 actually contain a correct answer to the question?
 
+![THOR vs mimir - recall quality](assets/benchmark.svg)
+
 ## Method
 
 - **52 real questions across 6 categories** (code-structure, code-behavior,

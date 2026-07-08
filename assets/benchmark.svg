@@ -1,0 +1,56 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 840 522" font-family="Segoe UI, Helvetica Neue, Arial, sans-serif">
+<rect x="0" y="0" width="840" height="522" rx="10" fill="#0d1117"/>
+<text x="20" y="40" fill="#e6edf3" font-size="22" font-weight="800">THOR vs mimir - recall quality</text>
+<text x="20" y="62" fill="#8b949e" font-size="12.5">Same machine, same knowledge . higher is better . blind-judged answer-presence over 52 questions</text>
+<text x="20" y="87" fill="#e6edf3" font-size="14" font-weight="700">Code structure</text>
+<text x="116" y="107" fill="#3fb950" font-size="11" font-weight="700" text-anchor="end">THOR</text>
+<rect x="132" y="96" width="373" height="14" rx="7" fill="#3fb950"/>
+<text x="513" y="107" fill="#e6edf3" font-size="11.5" font-weight="700">89%</text>
+<text x="116" y="127" fill="#8b949e" font-size="11" text-anchor="end">mimir</text>
+<rect x="132" y="116" width="140" height="14" rx="7" fill="#484f58"/>
+<text x="280" y="127" fill="#8b949e" font-size="11.5">33%</text>
+<text x="816" y="118" fill="#3fb950" font-size="15" font-weight="800" text-anchor="end">2.7x</text>
+<text x="20" y="151" fill="#e6edf3" font-size="14" font-weight="700">Code behavior</text>
+<text x="116" y="171" fill="#3fb950" font-size="11" font-weight="700" text-anchor="end">THOR</text>
+<rect x="132" y="160" width="262" height="14" rx="7" fill="#3fb950"/>
+<text x="402" y="171" fill="#e6edf3" font-size="11.5" font-weight="700">62%</text>
+<text x="116" y="191" fill="#8b949e" font-size="11" text-anchor="end">mimir</text>
+<rect x="132" y="180" width="262" height="14" rx="7" fill="#484f58"/>
+<text x="402" y="191" fill="#8b949e" font-size="11.5">62%</text>
+<text x="816" y="182" fill="#8b949e" font-size="13" font-weight="600" text-anchor="end">tie</text>
+<text x="20" y="215" fill="#e6edf3" font-size="14" font-weight="700">Doc reference</text>
+<text x="116" y="235" fill="#3fb950" font-size="11" font-weight="700" text-anchor="end">THOR</text>
+<rect x="132" y="224" width="373" height="14" rx="7" fill="#3fb950"/>
+<text x="513" y="235" fill="#e6edf3" font-size="11.5" font-weight="700">89%</text>
+<text x="116" y="255" fill="#8b949e" font-size="11" text-anchor="end">mimir</text>
+<rect x="132" y="244" width="350" height="14" rx="7" fill="#484f58"/>
+<text x="490" y="255" fill="#8b949e" font-size="11.5">83%</text>
+<text x="816" y="246" fill="#8b949e" font-size="13" font-weight="600" text-anchor="end">tie</text>
+<text x="20" y="279" fill="#e6edf3" font-size="14" font-weight="700">Config how-to</text>
+<text x="116" y="299" fill="#3fb950" font-size="11" font-weight="700" text-anchor="end">THOR</text>
+<rect x="132" y="288" width="327" height="14" rx="7" fill="#3fb950"/>
+<text x="467" y="299" fill="#e6edf3" font-size="11.5" font-weight="700">78%</text>
+<text x="116" y="319" fill="#8b949e" font-size="11" text-anchor="end">mimir</text>
+<rect x="132" y="308" width="303" height="14" rx="7" fill="#484f58"/>
+<text x="443" y="319" fill="#8b949e" font-size="11.5">72%</text>
+<text x="816" y="310" fill="#8b949e" font-size="13" font-weight="600" text-anchor="end">tie</text>
+<text x="20" y="343" fill="#e6edf3" font-size="14" font-weight="700">Gotcha</text>
+<text x="116" y="363" fill="#3fb950" font-size="11" font-weight="700" text-anchor="end">THOR</text>
+<rect x="132" y="352" width="420" height="14" rx="7" fill="#3fb950"/>
+<text x="560" y="363" fill="#e6edf3" font-size="11.5" font-weight="700">100%</text>
+<text x="116" y="383" fill="#8b949e" font-size="11" text-anchor="end">mimir</text>
+<rect x="132" y="372" width="420" height="14" rx="7" fill="#484f58"/>
+<text x="560" y="383" fill="#8b949e" font-size="11.5">100%</text>
+<text x="816" y="374" fill="#8b949e" font-size="13" font-weight="600" text-anchor="end">tie</text>
+<text x="20" y="407" fill="#e6edf3" font-size="14" font-weight="700">Decision</text>
+<text x="116" y="427" fill="#3fb950" font-size="11" font-weight="700" text-anchor="end">THOR</text>
+<rect x="132" y="416" width="394" height="14" rx="7" fill="#3fb950"/>
+<text x="534" y="427" fill="#e6edf3" font-size="11.5" font-weight="700">94%</text>
+<text x="116" y="447" fill="#8b949e" font-size="11" text-anchor="end">mimir</text>
+<rect x="132" y="436" width="394" height="14" rx="7" fill="#484f58"/>
+<text x="534" y="447" fill="#8b949e" font-size="11.5">94%</text>
+<text x="816" y="438" fill="#8b949e" font-size="13" font-weight="600" text-anchor="end">tie</text>
+<line x1="20" y1="490" x2="820" y2="490" stroke="#21262d" stroke-width="1"/>
+<text x="20" y="511" fill="#e6edf3" font-size="13.5" font-weight="700">Overall  <tspan fill="#3fb950">THOR 85.6%</tspan>  vs  <tspan fill="#8b949e">mimir 74.0%</tspan></text>
+<text x="820" y="511" fill="#8b949e" font-size="12" text-anchor="end">wins or ties every category . loses none</text>
+</svg>

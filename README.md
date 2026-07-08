@@ -29,6 +29,8 @@ git required, and it never loses a write.
 
 ## Benchmarks
 
+![THOR vs mimir - recall quality](assets/benchmark.svg)
+
 A blind, judged recall head-to-head against [mimir](https://github.com/MakerViking/mimir):
 THOR wins or ties every category (**85.6% vs 74.0%** answer-presence), and the semantic
 layer closed the paraphrase gap mimir used to lead. Full method + honest weaknesses in

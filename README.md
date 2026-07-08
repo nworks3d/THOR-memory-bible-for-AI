@@ -8,6 +8,8 @@ them back **automatically at the right moment**, so a session does not have to
 start from zero every time. It is a single Rust binary: no external services, no
 git required, and it never loses a write.
 
+![THOR vs mimir - recall quality: THOR wins or ties every category](assets/benchmark.svg)
+
 ## What it does
 
 - **Lossless append-only store.** Every fact is an event in a hash-chained,
@@ -28,8 +30,6 @@ git required, and it never loses a write.
   behind an auth gate.
 
 ## Benchmarks
-
-![THOR vs mimir - recall quality](assets/benchmark.svg)
 
 A blind, judged recall head-to-head against [mimir](https://github.com/MakerViking/mimir):
 THOR wins or ties every category (**85.6% vs 74.0%** answer-presence), and the semantic

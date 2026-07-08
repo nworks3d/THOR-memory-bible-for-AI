@@ -1,0 +1,23 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 840 270" font-family="Segoe UI, Helvetica Neue, Arial, sans-serif">
+<rect x="0" y="0" width="840" height="270" rx="10" fill="#0d1117"/>
+<text x="20" y="40" fill="#e6edf3" font-size="22" font-weight="800">Recall speed - THOR vs mimir</text>
+<text x="20" y="62" fill="#8b949e" font-size="12.5">Same machine, same query, full per-prompt cost (process start + recall) . lower is better</text>
+<text x="20" y="91" fill="#e6edf3" font-size="14" font-weight="700">Recall latency (warm)</text>
+<text x="134" y="111" fill="#8b949e" font-size="11" text-anchor="end">mimir</text>
+<rect x="150" y="100" width="401" height="14" rx="7" fill="#484f58"/>
+<text x="559" y="111" fill="#8b949e" font-size="11.5">280 ms</text>
+<text x="134" y="131" fill="#22d3ee" font-size="11" font-weight="700" text-anchor="end">THOR</text>
+<rect x="150" y="120" width="140" height="14" rx="7" fill="#22d3ee"/>
+<text x="298" y="131" fill="#e6edf3" font-size="11.5" font-weight="700">98 ms</text>
+<text x="816" y="122" fill="#22d3ee" font-size="16" font-weight="800" text-anchor="end">2.8x faster</text>
+<text x="20" y="159" fill="#e6edf3" font-size="14" font-weight="700">Recall latency (cold, bm25)</text>
+<text x="134" y="179" fill="#8b949e" font-size="11" text-anchor="end">mimir</text>
+<rect x="150" y="168" width="401" height="14" rx="7" fill="#484f58"/>
+<text x="559" y="179" fill="#8b949e" font-size="11.5">280 ms</text>
+<text x="134" y="199" fill="#22d3ee" font-size="11" font-weight="700" text-anchor="end">THOR</text>
+<rect x="150" y="188" width="158" height="14" rx="7" fill="#22d3ee"/>
+<text x="316" y="199" fill="#e6edf3" font-size="11.5" font-weight="700">110 ms</text>
+<text x="816" y="190" fill="#22d3ee" font-size="16" font-weight="800" text-anchor="end">2.5x faster</text>
+<line x1="20" y1="240" x2="820" y2="240" stroke="#21262d" stroke-width="1"/>
+<text x="20" y="260" fill="#8b949e" font-size="11.5">Token burn is comparable (~240 vs ~218 tokens injected/prompt). Warm semantic daemon holds ~570 MB; mimir keeps ~700 MB resident.</text>
+</svg>

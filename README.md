@@ -1,17 +1,49 @@
 ![The AI Memory Bible](assets/banner.png)
 
-# THOR - a central, lossless memory for AI coding agents
+# THOR - one lossless, local memory for AI coding agents
 
 THOR is a from-scratch persistent memory for AI coding agents (such as Claude
-Code). It remembers decisions, gotchas and context across your projects and gives
-them back **automatically at the right moment**, so a session does not have to
-start from zero every time. It is a single Rust binary: no external services, no
-git required, and it never loses a write.
+Code). It ingests your **repositories, docs and decisions** into a single local
+index and gives the relevant pieces back **automatically, at the right moment** -
+so a session never starts from zero, even right after a compaction. It is a single
+Rust binary: no external services, no git required, and it never loses a write.
 
-![THOR vs mimir - recall quality: THOR wins or ties every category](assets/benchmark.svg)
+![THOR vs mimir - coverage, quality, drift and speed](assets/benchmark.svg)
+
+## Why THOR
+
+THOR's thesis is to replace *both* the repo knowledge *and* the memory tool with
+one thing the agent can search automatically. Measured against
+[mimir](https://github.com/MakerViking/mimir) on the same machine
+([full method + weaknesses](BENCHMARKS.md)):
+
+- **It has the answer, automatically.** THOR chunks your source, docs and memories
+  into one index that auto-recall searches every prompt - so a code question is
+  answered without the agent doing anything. As deployed, **86% vs 27%** on 500
+  real questions.
+- **It ranks better even on equal footing.** On facts both systems have, THOR still
+  leads **91% vs 75%** - a dense score-fusion layer catches paraphrases that
+  keyword search misses.
+- **It compensates for session drift.** After a compaction the agent starts blank;
+  THOR puts the governing gotcha/decision back in front of it **1.6x more often**
+  than mimir (75% vs 46%). This is what the tool is *for*.
+- **It is faster and lighter.** ~**3.1x** lower per-prompt latency (83 ms vs
+  254 ms) as a single native binary; the default mode holds no resident process.
+- **It never loses a write.** Every fact is an event in a hash-chained append-only
+  log; a conflicting edit *branches* (both heads kept) instead of overwriting, and
+  `fsck` recomputes the chain so tampering is detectable.
+- **It degrades cleanly.** Semantic off, model missing, sidecar deleted, daemon
+  down - each path falls back to bm25 and can never make recall worse.
+
+The one thing mimir does that THOR deliberately does not: a **code-symbol graph**
+for "which functions call X". THOR chunks source into recall instead. See
+[BENCHMARKS.md](BENCHMARKS.md) for the honest trade-offs.
 
 ## What it does
 
+- **Unified local ingest.** `thor` chunks your repositories (source + docs) and
+  your remembered facts into one append-only store, so auto-recall can answer
+  questions about the code itself - not just about saved notes.
 - **Lossless append-only store.** Every fact is an event in a hash-chained,
   append-only SQLite log. A concurrent conflicting edit *branches* (both heads are
   kept and surfaced) instead of silently overwriting - nothing is ever lost. A
@@ -31,10 +63,12 @@ git required, and it never loses a write.
 
 ## Benchmarks
 
-A blind, judged recall head-to-head against [mimir](https://github.com/MakerViking/mimir):
-THOR wins or ties every category (**85.6% vs 74.0%** answer-presence), and the semantic
-layer closed the paraphrase gap mimir used to lead. Full method + honest weaknesses in
-[BENCHMARKS.md](BENCHMARKS.md).
+A blind, judged head-to-head against [mimir](https://github.com/MakerViking/mimir),
+reported as two separate fair tests: **as-deployed coverage** (86% vs 27% on 500
+questions, because THOR indexes repo code mimir's recall does not) and
+**same-knowledge quality** (91% vs 75% on facts both have). Plus session-drift
+compensation (75% vs 46%) and ~3.1x lower latency. Full method, per-category
+tables and honest weaknesses in [BENCHMARKS.md](BENCHMARKS.md).
 
 ## Quick start
 
@@ -85,8 +119,9 @@ cargo build --release --features semantic
   ```
 - Recall now fuses lexical and dense candidates: `fused = bm_norm + LAMBDA*cos`,
   with the bm25 leg min-max normalized per query. The per-prompt courier never
-  pays the model load cost - a warm `thor embed-daemon` holds the model and the
-  courier falls back to bm25 (and warms the daemon) if it is not up.
+  pays the model load cost - a warm `thor embed-daemon` holds the model, and
+  `thor warm` (safe to run at SessionStart) brings it up idempotently. The courier
+  falls back to bm25 (and warms the daemon) if it is not up.
 - `thor vectors sync` embeds only new facts (index maintenance).
 
 The dense sidecar (`thor-vectors.db`) is derived and deletable: remove it and
@@ -122,6 +157,7 @@ file for your own network and route.
 |---|---|
 | `thor remember` / `recall` / `get` / `history` | write / search / read facts |
 | `thor courier` | per-prompt recall hook (reads hook JSON on stdin) |
+| `thor warm` | pre-warm the semantic embedder (idempotent; for SessionStart) |
 | `thor guard` / `thor stop-guard` | moment-of-action / response advisories |
 | `thor install` | write the hooks into settings.json |
 | `thor vectors build \| sync \| status` | semantic sidecar (feature `semantic`) |

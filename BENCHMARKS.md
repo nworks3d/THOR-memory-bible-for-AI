@@ -6,9 +6,9 @@ horsepower, but quality, speed, cost per turn, and the structural properties.
 Every number below is measured or verifiable; nothing is invented, and the
 weaknesses are listed in full.
 
-## 1. Recall quality (blind-judged)
+![THOR vs mimir - recall quality and speed](assets/benchmark.svg)
 
-![THOR vs mimir - recall quality](assets/benchmark.svg)
+## 1. Recall quality (blind-judged)
 
 - **52 real questions across 6 categories.** Each ships with a written *"what a
   correct answer must contain"* ground truth. The corpus references private
@@ -25,8 +25,6 @@ weaknesses are listed in full.
   67% to 73%.
 
 ## 2. Recall speed
-
-![Recall speed - THOR vs mimir](assets/speed.svg)
 
 Full per-prompt cost (process start + recall), median of several runs, same query:
 

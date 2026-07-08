@@ -1,3 +1,5 @@
+![The AI Memory Bible](assets/banner.png)
+
 # THOR - a central, lossless memory for AI coding agents
 
 THOR is a from-scratch persistent memory for AI coding agents (such as Claude

@@ -1,7 +1,7 @@
-<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 840 662" font-family="Segoe UI, Helvetica Neue, Arial, sans-serif">
-<rect x="0" y="0" width="840" height="662" rx="10" fill="#0d1117"/>
-<text x="20" y="40" fill="#e6edf3" font-size="23" font-weight="800">THOR vs mimir</text>
-<text x="20" y="62" fill="#8b949e" font-size="12.5">Same machine, same knowledge, blind-judged . 52 questions . +% = THOR margin</text>
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 840 826" font-family="Segoe UI, Helvetica Neue, Arial, sans-serif">
+<rect x="0" y="0" width="840" height="826" rx="10" fill="#0d1117"/>
+<text x="20" y="40" fill="#e6edf3" font-size="23" font-weight="800">THOR vs mimir - the honest picture</text>
+<text x="20" y="62" fill="#8b949e" font-size="12.5">Same machine, same knowledge, blind-judged . 52 questions . +% = THOR margin . measured, nothing invented</text>
 <text x="20" y="82" fill="#c9d1d9" font-size="12" font-weight="700" letter-spacing="0.5">RECALL QUALITY  <tspan fill="#8b949e" font-weight="400">- answer-presence, higher is better</tspan></text>
 <text x="20" y="103" fill="#e6edf3" font-size="14" font-weight="700">Code structure</text>
 <text x="116" y="123" fill="#22d3ee" font-size="11" font-weight="700" text-anchor="end">THOR</text>
@@ -51,23 +51,36 @@
 <rect x="132" y="432" width="394" height="14" rx="7" fill="#484f58"/>
 <text x="534" y="443" fill="#8b949e" font-size="11.5">94%</text>
 <text x="816" y="434" fill="#8b949e" font-size="15" font-weight="800" text-anchor="end">+0%</text>
-<text x="20" y="472" fill="#c9d1d9" font-size="12" font-weight="700" letter-spacing="0.5">RECALL SPEED  <tspan fill="#8b949e" font-weight="400">- per-prompt latency, lower is better</tspan></text>
-<text x="20" y="493" fill="#e6edf3" font-size="14" font-weight="700">Latency (warm)</text>
-<text x="116" y="513" fill="#22d3ee" font-size="11" font-weight="700" text-anchor="end">THOR</text>
-<rect x="132" y="502" width="137" height="14" rx="7" fill="#22d3ee"/>
-<text x="277" y="513" fill="#e6edf3" font-size="11.5" font-weight="700">98 ms</text>
-<text x="116" y="533" fill="#8b949e" font-size="11" text-anchor="end">mimir</text>
-<rect x="132" y="522" width="392" height="14" rx="7" fill="#484f58"/>
-<text x="532" y="533" fill="#8b949e" font-size="11.5">280 ms</text>
-<text x="816" y="524" fill="#22d3ee" font-size="15" font-weight="800" text-anchor="end">2.8x faster</text>
-<text x="20" y="553" fill="#e6edf3" font-size="14" font-weight="700">Latency (cold, bm25)</text>
-<text x="116" y="573" fill="#22d3ee" font-size="11" font-weight="700" text-anchor="end">THOR</text>
-<rect x="132" y="562" width="154" height="14" rx="7" fill="#22d3ee"/>
-<text x="294" y="573" fill="#e6edf3" font-size="11.5" font-weight="700">110 ms</text>
-<text x="116" y="593" fill="#8b949e" font-size="11" text-anchor="end">mimir</text>
-<rect x="132" y="582" width="392" height="14" rx="7" fill="#484f58"/>
-<text x="532" y="593" fill="#8b949e" font-size="11.5">280 ms</text>
-<text x="816" y="584" fill="#22d3ee" font-size="15" font-weight="800" text-anchor="end">2.5x faster</text>
-<line x1="20" y1="632" x2="820" y2="632" stroke="#21262d" stroke-width="1"/>
-<text x="20" y="652" fill="#e6edf3" font-size="13.5" font-weight="700">Overall quality  <tspan fill="#22d3ee">THOR 85.6%</tspan>  vs  <tspan fill="#8b949e">mimir 74.0%</tspan>  <tspan fill="#8b949e" font-weight="400" font-size="12">. token burn comparable . wins or ties every category</tspan></text>
+<text x="20" y="470" fill="#c9d1d9" font-size="12" font-weight="700" letter-spacing="0.5">RECALL SPEED  <tspan fill="#8b949e" font-weight="400">- per-prompt latency, lower is better</tspan></text>
+<text x="20" y="491" fill="#e6edf3" font-size="14" font-weight="700">Latency (warm)</text>
+<text x="116" y="511" fill="#22d3ee" font-size="11" font-weight="700" text-anchor="end">THOR</text>
+<rect x="132" y="500" width="137" height="14" rx="7" fill="#22d3ee"/>
+<text x="277" y="511" fill="#e6edf3" font-size="11.5" font-weight="700">98 ms</text>
+<text x="116" y="531" fill="#8b949e" font-size="11" text-anchor="end">mimir</text>
+<rect x="132" y="520" width="392" height="14" rx="7" fill="#484f58"/>
+<text x="532" y="531" fill="#8b949e" font-size="11.5">280 ms</text>
+<text x="816" y="522" fill="#22d3ee" font-size="15" font-weight="800" text-anchor="end">2.8x faster</text>
+<text x="20" y="551" fill="#e6edf3" font-size="14" font-weight="700">Latency (cold, bm25)</text>
+<text x="116" y="571" fill="#22d3ee" font-size="11" font-weight="700" text-anchor="end">THOR</text>
+<rect x="132" y="560" width="154" height="14" rx="7" fill="#22d3ee"/>
+<text x="294" y="571" fill="#e6edf3" font-size="11.5" font-weight="700">110 ms</text>
+<text x="116" y="591" fill="#8b949e" font-size="11" text-anchor="end">mimir</text>
+<rect x="132" y="580" width="392" height="14" rx="7" fill="#484f58"/>
+<text x="532" y="591" fill="#8b949e" font-size="11.5">280 ms</text>
+<text x="816" y="582" fill="#22d3ee" font-size="15" font-weight="800" text-anchor="end">2.5x faster</text>
+<text x="20" y="618" fill="#c9d1d9" font-size="12" font-weight="700" letter-spacing="0.5">HONEST DOWNSIDES  <tspan fill="#8b949e" font-weight="400">- where THOR does not win, and the caveats</tspan></text>
+<circle cx="26" cy="644" r="3" fill="#e3b341"/>
+<text x="38" y="648" fill="#e6edf3" font-size="12">Code-behavior is a tie - pure paraphrase is hard for both (~40% left on the table)</text>
+<circle cx="26" cy="668" r="3" fill="#e3b341"/>
+<text x="38" y="672" fill="#e6edf3" font-size="12">The overall lead leans on code-structure; strip it and it is 84.9% vs 82.6%</text>
+<circle cx="26" cy="692" r="3" fill="#e3b341"/>
+<text x="38" y="696" fill="#e6edf3" font-size="12">No code-graph - for 'which functions call X' mimir has a symbol graph, THOR does not</text>
+<circle cx="26" cy="716" r="3" fill="#e3b341"/>
+<text x="38" y="720" fill="#e6edf3" font-size="12">Newer and far less battle-tested than mimir's daily use</text>
+<circle cx="26" cy="740" r="3" fill="#e3b341"/>
+<text x="38" y="744" fill="#e6edf3" font-size="12">Semantic mode needs a ~235 MB model + a ~570 MB warm daemon (off by default)</text>
+<circle cx="26" cy="764" r="3" fill="#e3b341"/>
+<text x="38" y="768" fill="#e6edf3" font-size="12">One machine, one 52-question set, single judge, private corpus - not reproducible here</text>
+<line x1="20" y1="796" x2="820" y2="796" stroke="#21262d" stroke-width="1"/>
+<text x="20" y="816" fill="#e6edf3" font-size="13.5" font-weight="700">Overall quality  <tspan fill="#22d3ee">THOR 85.6%</tspan>  vs  <tspan fill="#8b949e">mimir 74.0%</tspan>  <tspan fill="#8b949e" font-weight="400" font-size="12">. token burn + RAM comparable</tspan></text>
 </svg>

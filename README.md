@@ -27,6 +27,13 @@ git required, and it never loses a write.
 - **Runs anywhere.** Local CLI + hooks, or a remote MCP server (Streamable-HTTP)
   behind an auth gate.
 
+## Benchmarks
+
+A blind, judged recall head-to-head against [mimir](https://github.com/MakerViking/mimir):
+THOR wins or ties every category (**85.6% vs 74.0%** answer-presence), and the semantic
+layer closed the paraphrase gap mimir used to lead. Full method + honest weaknesses in
+[BENCHMARKS.md](BENCHMARKS.md).
+
 ## Quick start
 
 ```sh

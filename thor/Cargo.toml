@@ -1,0 +1,50 @@
+[package]
+name = "thor"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+rusqlite = { version = "0.31", features = ["bundled", "chrono"] }
+sha2 = "0.10"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+uuid = { version = "1.6", features = ["v4", "serde"] }
+chrono = "0.4"
+clap = { version = "4", features = ["derive"] }
+anyhow = "1.0"
+thiserror = "1.0"
+# Remote MCP (mimir's proven recipe): Streamable-HTTP MCP so THOR can run as a
+# standalone remote connector on the NAS (its own server, port, DB - independent
+# of mimir). rmcp gives the protocol + transports; axum/tokio serve the HTTP.
+rmcp = { version = "1.7", features = ["server", "transport-io", "transport-streamable-http-server"] }
+axum = "0.8"
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "net"] }
+schemars = "1"
+# HTTP client for the log-shipping sender (thor ship). Blocking keeps the CLI
+# path simple. No TLS backend: shipping runs machine-to-machine over LAN/tailnet
+# (the bearer token authenticates); public exposure goes through the Cloudflare
+# tunnel/Access that already fronts the MCP endpoint, so no in-process TLS is
+# needed and the build stays free of a C/asm crypto backend on every platform.
+reqwest = { version = "0.12", default-features = false, features = ["blocking", "json"] }
+# Optional semantic-recall layer (score-fusion + precomputed dense vectors). OFF
+# by default: the store, sync and NAS/remote-MCP builds stay pure bm25 and never
+# pull the ONNX runtime. Enabled only on the CLIENT where the recall courier runs
+# (`--features semantic`). fastembed brings ort/onnxruntime (download-binaries) +
+# the tokenizer; we load our own local model so THOR stays independent of any
+# external cache. See embed.rs / vectors.rs / recall::recall_fused.
+fastembed = { version = "5.17", optional = true }
+
+[features]
+# Turn on the dense score-fusion recall path (client-only). Degrades to bm25
+# whenever the sidecar or model is absent, so enabling it can never break recall.
+semantic = ["dep:fastembed"]
+
+[dev-dependencies]
+tempfile = "3"
+
+# The recall eval harness pulls in the semantic modules, so it only builds when
+# that feature is on (otherwise a plain `cargo build` / `cargo test` would fail to
+# compile it against a bm25-only library).
+[[example]]
+name = "recall_eval"
+required-features = ["semantic"]

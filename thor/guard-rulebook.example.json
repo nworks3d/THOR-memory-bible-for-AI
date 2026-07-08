@@ -1,0 +1,37 @@
+[
+  {
+    "id": "force-recreate-prod",
+    "tools": ["Bash", "PowerShell"],
+    "all_of": ["--force-recreate"],
+    "none_of": ["-dev", "_dev"],
+    "reminder": "Do not --force-recreate the prod stack; use your one deploy route instead. Manual recreate drifts and skips the version bump + changelog."
+  },
+  {
+    "id": "hot-patch-is-not-a-deploy",
+    "tools": ["Bash", "PowerShell"],
+    "all_of": ["docker cp"],
+    "none_of": ["-dev:", "_dev:"],
+    "reminder": "docker cp into a live container is NOT a deploy: it hot-patches, drifts, and is lost on the next rebuild. Deploy through the real pipeline. (Anchor the dev exclusion to the container-ref colon '-dev:' so a file path that merely contains 'dev' - e.g. ./dev/ or fix-dev-bug.js - cannot silence a real prod hot-patch.)"
+  },
+  {
+    "id": "no-skip-precommit-hook",
+    "tools": ["Bash", "PowerShell"],
+    "all_of": ["git commit"],
+    "any_of": ["--no-verify", " -n"],
+    "reminder": "Do not skip the precommit hook (--no-verify / -n): fix the underlying issue instead of bypassing the gate."
+  },
+  {
+    "id": "print-secret",
+    "tools": ["Bash", "PowerShell"],
+    "any_of": ["your_secret_env_name", ".env"],
+    "none_of": ["grep -q", "grep -c", "[ -n", "test -n", ".env.example", "restore --staged"],
+    "reminder": "Do not print or dump secret values. Check presence with grep -q / test -n / [ -n ], never cat/echo the value into the transcript, a log, or a file. (Tool-scope to Bash/PowerShell so this never fires on your own chat text that merely mentions a secret name.)"
+  },
+  {
+    "id": "reuse-before-write",
+    "tools": ["Write", "Edit", "MultiEdit", "NotebookEdit"],
+    "any_of": ["your-new-duplicate-helper-name"],
+    "none_of": ["your-existing-helper-name"],
+    "reminder": "A helper for this already exists - reuse it instead of writing a new one (write less code, avoid divergence)."
+  }
+]

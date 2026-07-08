@@ -1,0 +1,19 @@
+[
+  {
+    "id": "ask-user-to-commit-push",
+    "any_of": ["naar welke branch", "welke branch", "which branch", "zal ik pushen", "kun je pushen", "kun je committen", "committen + "],
+    "none_of": ["pull request", "merge request"],
+    "reminder": "You can commit and push yourself (passwordless git). Pick the branch per the repo's deploy rules and do it - do not ask the user which branch or to push for you."
+  },
+  {
+    "id": "claim-no-access-without-checking",
+    "any_of": ["kan ik van hieruit niet", "geen tailnet", "geen nas-toegang", "geen toegang", "ik heb geen toegang", "i can't reach", "i don't have access", "no access to the nas"],
+    "none_of": ["read-only", "alleen-lezen"],
+    "reminder": "Verify before claiming you cannot: you likely have passwordless git + SSH/SMB to the NAS. Check what you actually reach (facts first) and read the repo's deploy/procedure tips instead of assuming."
+  },
+  {
+    "id": "ask-user-to-check-or-fetch",
+    "any_of": ["kun je checken", "kun je kijken", "could you check", "can you check", "can you pull up", "paste me", "would you mind pulling", "let me know what it says"],
+    "reminder": "You likely have the tools/access to check this yourself (SSH/SMB, or by reading the repo) - do it directly rather than asking the user."
+  }
+]

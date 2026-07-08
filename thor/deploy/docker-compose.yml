@@ -1,0 +1,36 @@
+# THOR remote MCP - its own container, port (8078), and data volume. Fully
+# independent of mimir: killing mimir's container never touches this one.
+#
+# The Cloudflare tunnel (cloudflared) reaches this container by name over the
+# shared docker network, exactly like mimir-mcp. THOR does NOT publish 8078 to
+# the host/LAN - the transport has no auth; Cloudflare Access is the only gate.
+services:
+  thor-mcp:
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile
+    container_name: thor-mcp
+    restart: always
+    environment:
+      # Live replication to a PC replica (see deploy/SYNC-DEPLOY.md). Set BOTH to
+      # turn it on: the container then also runs `thor ship --watch` to the replica.
+      # Leave THOR_REPLICA_URL empty for MCP-only (the ship loop does not start).
+      # Put the REAL token on the NAS only - NEVER commit it (this repo file keeps
+      # placeholders).
+      THOR_TOKEN: "<shared-token>"
+      THOR_REPLICA_URL: ""   # e.g. http://<pc-lan-ip>:5555
+    volumes:
+      # holds thor.db; drop the backup export here (events.jsonl) for first-run restore
+      - ./data:/data
+    expose:
+      - "8078"
+    networks:
+      - cloudflared_net
+
+networks:
+  # the external network cloudflared lives on (same one mimir-mcp joins). This
+  # is shared tunnel infra, NOT mimir - remove mimir and THOR keeps working.
+  cloudflared_net:
+    external: true
+    # set to the docker network cloudflared runs on (`docker network ls`)
+    name: your-cloudflared-network

@@ -1,0 +1,12 @@
+# Private memory snapshots exported from mimir hold real memories - never commit.
+*.jsonl
+# Local THOR stores (should live outside the repo, but guard against strays).
+*.db
+*.db-wal
+*.db-shm
+# Python tooling
+__pycache__/
+# Build/upload artifacts (e.g. the NAS source bundle)
+*.zip
+# Local MCP connector config (machine-specific absolute path)
+.mcp.json

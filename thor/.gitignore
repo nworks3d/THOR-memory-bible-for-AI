@@ -1,0 +1,13 @@
+/target
+*.db
+*.db-wal
+*.db-shm
+# private memory snapshots must never be committed (they hold real memories)
+*.jsonl
+tools/__pycache__/
+# the real Guard rulebook holds machine/business internals (NAS IP, hosts,
+# container names) - keep it local; a redacted .example is tracked instead.
+guard-rulebook.json
+
+# response Guard rulebook (Stop-hook, capability-amnesia) - keep local, .example is tracked
+guard-response-rulebook.json

@@ -29,12 +29,13 @@ pub struct RecallHit {
 
 /// A one-line preview of a fact body for display: whitespace collapsed to single
 /// spaces, capped at `max` chars. When the body is longer than `max`, the window
-/// is CENTERED on the first query term that occurs past what a head-truncation
-/// would show (with leading/trailing "..."), so a long imported chunk whose match
-/// sits deep in the body surfaces the matched region instead of an unrelated
-/// preamble. Falls back to head-truncation when no query term is found (or the
-/// match is already near the start). Fixes sim pain points P2 + the "right hit,
-/// useless snippet" bucket. `query` may be empty (pure head-truncation).
+/// is chosen for MAXIMUM DISTINCT query-term coverage (not merely the first
+/// match): the measured drift-miss mode was "right hit injected, actionable
+/// details cut" - the details often sit past the first matching term. Wide caps
+/// (>= 500, the courier's slot 1) may spend their budget on TWO disjoint
+/// windows when a second region covers query terms the first one misses.
+/// Falls back to head-truncation when no query term is found (or the best
+/// window is already the head). `query` may be empty (pure head-truncation).
 pub fn snippet(body: &str, max: usize, query: &str) -> String {
     let collapsed = body.split_whitespace().collect::<Vec<_>>().join(" ");
     let chars: Vec<char> = collapsed.chars().collect();
@@ -42,45 +43,107 @@ pub fn snippet(body: &str, max: usize, query: &str) -> String {
     if total <= max {
         return collapsed;
     }
-    // Earliest char-index where any (non-stopword) query term occurs.
     let lower = collapsed.to_lowercase();
-    let hit = query
-        .split(|c: char| !c.is_alphanumeric())
-        .filter(|t| t.chars().count() >= 2)
-        .map(|t| t.to_lowercase())
-        .filter(|t| !STOPWORDS.contains(&t.as_str()))
-        .filter_map(|t| lower.find(&t))
-        .map(|byte| lower[..byte].chars().count())
-        .min();
+    // All char-index occurrences per distinct (non-stopword) query term. Byte
+    // offsets are mapped to char indexes of `lower`, then clamped into the
+    // `chars` domain below (lowercasing can expand a codepoint, so the two
+    // strings may differ in length - a mismatch must never panic the hook path).
+    let terms: Vec<String> = {
+        let mut seen = HashSet::new();
+        query
+            .split(|c: char| !c.is_alphanumeric())
+            .filter(|t| t.chars().count() >= 2)
+            .map(|t| t.to_lowercase())
+            .filter(|t| !STOPWORDS.contains(&t.as_str()))
+            .filter(|t| seen.insert(t.clone()))
+            .collect()
+    };
+    let positions: Vec<Vec<usize>> = terms
+        .iter()
+        .map(|t| {
+            lower
+                .match_indices(t.as_str())
+                .take(16)
+                .map(|(byte, _)| lower[..byte].chars().count().min(total))
+                .collect()
+        })
+        .collect();
+
     let lead = max / 5;
-    let (start, prefix) = match hit {
-        // window only when the match sits past what a head-truncation shows
-        Some(pos) if pos > max.saturating_sub(lead) => {
-            let s = pos.saturating_sub(lead);
-            (s, s > 0)
+    // Candidate window starts: the head, plus one window anchored before each
+    // term occurrence. Score = how many DISTINCT terms fall inside.
+    let window = |width: usize, start: usize, exclude: Option<(usize, usize)>| -> usize {
+        let end = start + width;
+        positions
+            .iter()
+            .filter(|occ| {
+                occ.iter().any(|&p| {
+                    p >= start
+                        && p < end
+                        && exclude.map_or(true, |(xs, xe)| p < xs || p >= xe)
+                })
+            })
+            .count()
+    };
+    let candidates = |width: usize| -> Vec<usize> {
+        let mut c: Vec<usize> = positions
+            .iter()
+            .flatten()
+            .map(|&p| p.saturating_sub(lead).min(total.saturating_sub(width)))
+            .collect();
+        c.push(0);
+        c.sort_unstable();
+        c.dedup();
+        c
+    };
+    let best = |width: usize, exclude: Option<(usize, usize)>| -> (usize, usize) {
+        candidates(width)
+            .into_iter()
+            .map(|s| (window(width, s, exclude), s))
+            .max_by(|a, b| a.0.cmp(&b.0).then(b.1.cmp(&a.1))) // ties -> earliest
+            .map(|(score, s)| (s, score))
+            .unwrap_or((0, 0))
+    };
+
+    let cut = |start: usize, width: usize| -> String {
+        let start = start.min(total);
+        let end = (start + width).min(total);
+        let mut mid: String = chars[start..end].iter().collect();
+        let pre = if start > 0 {
+            mid = mid.trim_start().to_string();
+            "..."
+        } else {
+            ""
+        };
+        let suf = if end < total {
+            mid = mid.trim_end().to_string();
+            "..."
+        } else {
+            ""
+        };
+        format!("{}{}{}", pre, mid, suf)
+    };
+
+    let (start1, score1) = best(max, None);
+    if score1 == 0 {
+        return cut(0, max); // no term found anywhere: head-truncation
+    }
+    // Wide budget: try splitting into two disjoint half-windows when a second
+    // region contributes terms the first misses. Only when it genuinely adds
+    // coverage - otherwise one contiguous window reads better.
+    if max >= 500 {
+        let half = max / 2 - 4; // room for the " ... " joint
+        let (h1, s1) = best(half, None);
+        let (h2, s2) = best(half, Some((h1, h1 + half)));
+        if s2 > 0 && s1 + s2 > score1 {
+            let (first, second) = if h1 <= h2 { (h1, h2) } else { (h2, h1) };
+            let a = cut(first, half);
+            let b = cut(second, half);
+            let b = b.strip_prefix("...").unwrap_or(&b).trim_start().to_string();
+            return format!("{} ... {}", a.trim_end_matches("...").trim_end(), b);
         }
-        _ => (0, false),
-    };
-    // `pos` (hence `start`) is a char index into `lower`, the lowercased copy,
-    // which can be LONGER than `chars` when lowercasing expands a codepoint (e.g.
-    // 'I' with a dot above -> 'i' + combining dot). Clamp so the slice below can
-    // never have start > end, which would panic on the courier hook path.
-    let start = start.min(total);
-    let end = (start + max).min(total);
-    let mut mid: String = chars[start..end].iter().collect();
-    let pre = if prefix {
-        mid = mid.trim_start().to_string();
-        "..."
-    } else {
-        ""
-    };
-    let suf = if end < total {
-        mid = mid.trim_end().to_string();
-        "..."
-    } else {
-        ""
-    };
-    format!("{}{}{}", pre, mid, suf)
+    }
+    cut(start1, max)
 }
 
 /// Once the best head is found, stop taking hits whose bm25 rank is much weaker
@@ -1015,6 +1078,37 @@ mod tests {
         let h = snippet(&body, 60, "zzz");
         assert!(!h.starts_with("..."), "no match -> head truncation: {}", h);
         assert!(h.starts_with("filler"));
+    }
+
+    #[test]
+    fn test_snippet_picks_densest_window_and_splits_wide_caps() {
+        // Two term clusters far apart: "alpha" early, "alpha beta gamma" deep.
+        // A first-match window would show the early lone "alpha" and miss the
+        // dense cluster - the measured "right hit, details cut" drift mode.
+        let body = format!(
+            "alpha intro text {} the alpha beta gamma details live here {}",
+            "filler ".repeat(80),
+            "tail ".repeat(40)
+        );
+        let s = snippet(&body, 120, "alpha beta gamma");
+        assert!(
+            s.contains("beta gamma"),
+            "the DENSEST window wins, not the first match: {}",
+            s
+        );
+        // Wide cap + two disjoint clusters ("alpha beta" early, "gamma delta"
+        // deep, too far apart for one window) -> two joined windows.
+        let body2 = format!(
+            "the alpha beta decision was made {} while gamma delta carries the limit values",
+            "filler ".repeat(200)
+        );
+        let w = snippet(&body2, 600, "alpha beta gamma delta");
+        assert!(
+            w.contains("alpha beta") && w.contains("gamma delta"),
+            "a wide cap spends its budget on BOTH clusters: {}",
+            w
+        );
+        assert!(w.contains(" ... "), "disjoint windows are visibly joined: {}", w);
     }
 
     #[test]

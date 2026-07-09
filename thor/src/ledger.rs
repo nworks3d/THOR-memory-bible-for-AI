@@ -189,6 +189,48 @@ pub fn insert_once(db: &Path, ns: &str, key: &str, value: &serde_json::Value) ->
     }
 }
 
+/// Atomically increment a counter entry (created at 1). Used for the access
+/// namespace: reads (MCP get, recall serves) are a RANKING/decay signal, never
+/// facts - they live here in the local ledger and must never bloat the synced
+/// hash-chained log. Fail-open like every ledger op.
+pub fn increment(db: &Path, ns: &str, key: &str) {
+    let now = crate::review::now_secs();
+    if let Some(c) = conn(db) {
+        let _ = c.execute(
+            "INSERT INTO kv (ns, k, v, ts) VALUES (?, ?, '1', ?)
+             ON CONFLICT (ns, k) DO UPDATE SET
+               v = CAST(COALESCE(CAST(kv.v AS INTEGER), 0) + 1 AS TEXT),
+               ts = excluded.ts",
+            rusqlite::params![ns, key, now as i64],
+        );
+    }
+}
+
+/// Read a counter written by increment(). 0 = absent or any error.
+pub fn counter(db: &Path, ns: &str, key: &str) -> u64 {
+    get(db, ns, key).and_then(|v| v.as_u64()).unwrap_or(0)
+}
+
+/// All counters in a namespace (for consolidate's decay scan). Empty on error.
+pub fn counters(db: &Path, ns: &str) -> HashMap<String, u64> {
+    let Some(c) = conn(db) else { return HashMap::new() };
+    let mut out = HashMap::new();
+    let Ok(mut stmt) = c.prepare("SELECT k, v FROM kv WHERE ns = ?") else {
+        return out;
+    };
+    let rows = stmt.query_map([ns], |r| {
+        Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
+    });
+    if let Ok(rows) = rows {
+        for (k, v) in rows.flatten() {
+            if let Ok(n) = v.parse::<u64>() {
+                out.insert(k, n);
+            }
+        }
+    }
+    out
+}
+
 /// Remove one entry (absent = no-op).
 pub fn remove(db: &Path, ns: &str, key: &str) {
     if let Some(c) = conn(db) {

@@ -1,5 +1,23 @@
 # AI-Boost Roadmap — making THOR measurably better for the agent
 
+> **Implementation status (2026-07-09).** After a second audit round the priorities
+> were reshuffled (capture → feedback → moment-of-action → re-orientation →
+> freshness) and the first tranche is **shipped and lab-verified** on this branch:
+> Stop-hook **capture nudge** (keyword-gated, once/session, loop-safe); **mark**
+> tool + echo prior in the courier; **file-touch guard** (first Edit of a file →
+> memories that name it, never chunks); **pin + post-compaction `<thor-brief>`**
+> (standing rules guaranteed back after a compaction — the measured "gotcha ranked
+> 7th" NAS scenario is now covered by construction); **per-session injection
+> ledger** (no repeated blocks, rotation, cleared on compact); **silence gate**
+> (the measured "ga verder met de sync refactor" noise injection is now silent);
+> **live-file freshness** (`[refreshed]`/`[stale?]`); the full **MCP stewardship
+> toolset** (revise/retract/resolve/history/mark/pin/unpin/reproject/brief,
+> `kind:"memory"` recall, duplicate-refusing typed remember, CAS-checked writes);
+> and the **dense-leg head-filter bugfix** (compile-verified here; run
+> `cargo test --features semantic` locally to execute its regression test).
+> Phase 1's ranking work (source-class prior, term-coverage rerank) and the
+> reproducible drift eval remain open — see below.
+
 An improvement trajectory derived from a full code walk (all of `thor/src`),
 the published benchmarks, and **empirical verification**: the binary was built
 and exercised against a seeded store (this repo ingested + hand-written

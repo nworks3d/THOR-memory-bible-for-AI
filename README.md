@@ -63,6 +63,22 @@ for "which functions call X". THOR chunks source into recall instead. See
   current prompt and injects the top hits, so the agent starts each turn with the
   relevant context. Lexical bm25 (FTS5) by default; an optional semantic
   score-fusion layer improves recall on paraphrased questions (see below).
+  The courier never repeats itself (a per-session ledger suppresses recently-shown
+  hits and rotates deeper ones in), stays silent instead of injecting weak
+  one-word coincidences, and re-reads a chunk's file live so changed code is
+  injected `[refreshed]` (or flagged `[stale?]`) instead of as a stale snapshot.
+- **Drift hooks.** Pin standing rules (`thor pin`) and SessionStart re-injects
+  their full body at every start - including right after a compaction, when
+  prompt-recall has nothing to match against. The first time a session touches a
+  file, the guard surfaces stored memories that *name* that file (memories only,
+  never code chunks). A Stop-hook capture nudge fires (once per session) when a
+  reply contains an unstored decision/gotcha, so durable facts stop depending on
+  the model remembering to remember.
+- **Agent stewardship.** Over MCP the agent can maintain the memory, not just
+  fill it: `revise`/`retract` with real CAS (a stale parent returns the fresh
+  head-set instead of minting a silent branch), `resolve` for DIVERGED facts,
+  `mark` ("this helped" - feeds the ranking prior), duplicate-refusing typed
+  `remember`, `reproject`, and a `brief` overview of what THOR knows here.
 - **Guard.** A moment-of-action hook (`PreToolUse`) that emits an advisory when a
   tool call matches a risk rulebook (fail-open, never blocks).
 - **Cross-machine sync.** Log-shipping (`thor ship` / `thor recv`) replicates the
@@ -207,16 +223,18 @@ file for your own network and route.
 | `thor reproject <id> --project <key> \| --global` | reassign a fact's project scope (sync-safe) |
 | `thor backfill-projects [--apply]` | attribute legacy memories from their import footer |
 | `thor review-scope [--mark]` | list no-signal global memories to review (SessionStart nudges once/day) |
-| `thor courier` / `thor session-start` | per-prompt recall hook / SessionStart refresh + setup cue |
+| `thor courier` / `thor session-start` | per-prompt recall hook (session-dedup, noise gate, live-file freshness) / SessionStart refresh + pinned `<thor-brief>` + setup cue |
+| `thor pin <id> \| --list` / `thor unpin <id>` | pin standing rules: their full body re-injects at every session start and right after a compaction |
+| `thor mark <id>` | record that a fact actually helped (feeds the courier's ranking prior) |
 | `thor warm` | pre-warm the semantic embedder (idempotent; for SessionStart) |
-| `thor guard` / `thor stop-guard` | moment-of-action / response advisories |
+| `thor guard` / `thor stop-guard` | moment-of-action advisories (risk rulebook + first-touch file memories) / response advisories + a once-per-session capture nudge for unstored decisions/gotchas |
 | `thor install` | write the hooks into settings.json |
 | `thor vectors build \| sync \| status` | semantic sidecar (feature `semantic`) |
 | `thor embed-daemon` | warm embedder for the courier (feature `semantic`) |
 | `thor export` / `restore` / `backup` | JSONL backup + verified restore |
 | `thor ship` / `recv` / `status` | cross-machine log-shipping sync |
 | `thor fsck` | verify chain integrity + FTS projection |
-| `thor mcp [--http <bind>]` | run as an MCP server (stdio or Streamable-HTTP) |
+| `thor mcp [--http <bind>]` | run as an MCP server (stdio or Streamable-HTTP) exposing the full stewardship toolset: recall (`kind:"memory"` filter) / get / history / remember (typed, duplicate-refusing) / revise / retract / resolve / mark / pin / unpin / reproject / brief |
 
 ## Build features
 

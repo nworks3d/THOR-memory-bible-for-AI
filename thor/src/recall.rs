@@ -17,6 +17,14 @@ pub struct RecallHit {
     /// The fact's effective project (`None` = the global tier). Lets the courier /
     /// CLI label a hit `[global]` or `[proj:<key>]` so the agent knows its scope.
     pub project: Option<String>,
+    /// The constraint class of a typed hand-written fact (gotcha / decision /
+    /// preference), parsed from its body. None for chunks and untyped notes.
+    pub fact_type: Option<crate::repo::FactType>,
+    /// True when this hit came from the strict AND pass (every content term of
+    /// the query matched) - or from the fused path, which has its own evidence.
+    /// False = an OR-fallback hit; the courier applies a coverage gate to those
+    /// so a one-word coincidence is never injected as if it were an answer.
+    pub matched_and: bool,
 }
 
 /// A one-line preview of a fact body for display: whitespace collapsed to single
@@ -132,6 +140,26 @@ fn content_tokens(text: &str) -> Vec<String> {
     chosen
 }
 
+/// Coverage gate for OR-fallback hits: does `body` literally contain (word-
+/// boundary, case-insensitive, the FTS tokenization rule) at least
+/// min(2, #query-content-terms) DISTINCT content terms of `query`? A hit that
+/// matches only one word of a multi-word question is a coincidence, not an
+/// answer - the courier stays silent instead of injecting it confidently.
+pub fn covers_query(body: &str, query: &str) -> bool {
+    let qterms: HashSet<String> =
+        content_tokens(query).iter().map(|t| t.to_lowercase()).collect();
+    if qterms.is_empty() {
+        return false;
+    }
+    let required = 2.min(qterms.len());
+    let body_tokens: HashSet<String> = body
+        .split(|c: char| !c.is_alphanumeric())
+        .filter(|t| t.chars().count() >= 2)
+        .map(|t| t.to_lowercase())
+        .collect();
+    qterms.iter().filter(|t| body_tokens.contains(*t)).count() >= required
+}
+
 /// Build a safe FTS5 MATCH query (content tokens OR-ed, each double-quoted so
 /// FTS5 can never read one as an operator/column/prefix). Returns None when
 /// there is nothing searchable, so the caller skips recall entirely instead of
@@ -238,6 +266,8 @@ fn collect_heads(
             is_diverged: head_set.is_diverged,
             rank,
             project: filter.projects.get(&ev.entity_id).cloned().flatten(),
+            fact_type: crate::repo::fact_type(&ev.body),
+            matched_and: false, // stamped true by the caller for the strict pass
         });
         if hits.len() >= limit {
             break;
@@ -273,7 +303,7 @@ impl RecallScope {
         RecallScope { project: key, all_projects: false }
     }
     /// Whether a fact with the given EFFECTIVE project (None = global) is in scope.
-    fn allows(&self, effective: Option<&str>) -> bool {
+    pub fn allows(&self, effective: Option<&str>) -> bool {
         if self.all_projects {
             return true;
         }
@@ -289,16 +319,23 @@ impl RecallScope {
 
 /// Bundles the per-entity effective-project map with the scope, plus the "a
 /// retracted head is not live" rule, so every candidate path filters identically
-/// with a single `keep(ev)` check.
+/// with a single `keep(ev)` check. `memories_only` additionally drops repo
+/// chunks, for callers (the file-touch guard) where a code chunk is by
+/// construction noise - the empirically-verified failure of raw tool-call
+/// recall is chunks crowding out the one governing memory.
 struct ScopeFilter<'a> {
     projects: &'a HashMap<String, Option<String>>,
     scope: &'a RecallScope,
+    memories_only: bool,
 }
 
 impl ScopeFilter<'_> {
     fn keep(&self, ev: &Event) -> bool {
         if matches!(ev.kind, EventKind::FactRetracted) {
             return false; // a retracted head is not live: never surface it
+        }
+        if self.memories_only && crate::repo::is_chunk_id(&ev.entity_id) {
+            return false; // chunks never spend a slot in a memories-only recall
         }
         let effective = self.projects.get(&ev.entity_id).and_then(|o| o.as_deref());
         self.scope.allows(effective)
@@ -312,6 +349,28 @@ pub fn recall_scoped(
     query: &str,
     limit: usize,
     scope: &RecallScope,
+) -> anyhow::Result<Vec<RecallHit>> {
+    recall_scoped_inner(store, query, limit, scope, false)
+}
+
+/// Memories-only bm25 recall: identical to `recall_scoped` but repo chunks never
+/// occupy a slot. For the file-touch guard, where only hand-written memories
+/// (gotchas/decisions about the file) are signal and chunks are always noise.
+pub fn recall_memories_scoped(
+    store: &EventStore,
+    query: &str,
+    limit: usize,
+    scope: &RecallScope,
+) -> anyhow::Result<Vec<RecallHit>> {
+    recall_scoped_inner(store, query, limit, scope, true)
+}
+
+fn recall_scoped_inner(
+    store: &EventStore,
+    query: &str,
+    limit: usize,
+    scope: &RecallScope,
+    memories_only: bool,
 ) -> anyhow::Result<Vec<RecallHit>> {
     if limit == 0 {
         return Ok(vec![]);
@@ -330,14 +389,17 @@ pub fn recall_scoped(
     let by_seq: HashMap<i64, &Event> = events.iter().map(|e| (e.seq, e)).collect();
     let heads = compute_head_sets(&events);
     let projects = crate::cas::compute_projects(&events);
-    let filter = ScopeFilter { projects: &projects, scope };
+    let filter = ScopeFilter { projects: &projects, scope, memories_only };
 
     // AND-first: prefer memories that match the WHOLE question over a single-word
     // coincidence; fall back to the OR query only when the strict pass finds no
     // head. collect_heads applies the relevance floor + near-duplicate collapse.
     if let Some(aq) = and_query {
-        let strict = collect_heads(store, &aq, &by_seq, &heads, &filter, limit);
+        let mut strict = collect_heads(store, &aq, &by_seq, &heads, &filter, limit);
         if !strict.is_empty() {
+            for h in &mut strict {
+                h.matched_and = true; // every content term matched: strong evidence
+            }
             return Ok(strict);
         }
     }
@@ -506,6 +568,10 @@ fn finalize_heads(
             is_diverged: head_set.is_diverged,
             rank,
             project: filter.projects.get(&ev.entity_id).cloned().flatten(),
+            fact_type: crate::repo::fact_type(&ev.body),
+            // The fused path carries its own (semantic) evidence; the OR-fallback
+            // coverage gate is a pure-bm25 concern and never applies here.
+            matched_and: true,
         });
         if hits.len() >= limit {
             break;
@@ -547,7 +613,7 @@ pub fn recall_fused_scoped(
     let by_seq: HashMap<i64, &Event> = events.iter().map(|e| (e.seq, e)).collect();
     let heads = compute_head_sets(&events);
     let projects = crate::cas::compute_projects(&events);
-    let filter = ScopeFilter { projects: &projects, scope };
+    let filter = ScopeFilter { projects: &projects, scope, memories_only: false };
 
     // Lexical leg: current-head candidates in bm25 rank order (streaming head-walk,
     // NO fixed raw-row window - see lexical_head_pool). Empty if the query has no
@@ -563,11 +629,22 @@ pub fn recall_fused_scoped(
     // no lexical overlap is reachable. An empty/absent sidecar leaves this empty.
     let all = vecs.all_vectors().unwrap_or_default();
     let cos_by_seq: HashMap<i64, f64> = all.iter().map(|(s, v)| (*s, dot(qvec, v))).collect();
-    // Keep only in-scope dense candidates, so out-of-project vectors never consume a
-    // DENSE_TOPM slot from an in-scope paraphrase gold.
+    // Keep only in-scope CURRENT-HEAD dense candidates. The head check mirrors
+    // lexical_head_pool's guard: without it, the near-identical vectors of a
+    // frequently-revised entity's superseded revs cluster at the top of the
+    // cosine order, eat DENSE_TOPM slots, and are then discarded in
+    // finalize_heads - starving the paraphrase reach this leg exists for as a
+    // store ages (the same starvation the lexical leg is hardened against).
     let mut dense: Vec<(i64, f64)> = cos_by_seq
         .iter()
-        .filter(|(s, _)| by_seq.get(s).map(|ev| filter.keep(ev)).unwrap_or(false))
+        .filter(|(s, _)| {
+            by_seq.get(s).map_or(false, |ev| {
+                filter.keep(ev)
+                    && heads
+                        .get(&ev.entity_id)
+                        .map_or(false, |h| h.heads.contains(&ev.this_hash))
+            })
+        })
         .map(|(s, c)| (*s, *c))
         .collect();
     dense.sort_by(|a, b| b.1.total_cmp(&a.1).then(a.0.cmp(&b.0)));
@@ -780,6 +857,55 @@ mod tests {
     }
 
     #[test]
+    fn test_covers_query_gate() {
+        // multi-word query: >= 2 distinct terms must literally appear
+        assert!(covers_query("the sync refactor plan", "ga verder met de sync refactor"));
+        assert!(
+            !covers_query("something about sync only", "ga verder met de sync refactor"),
+            "one matching word of a multi-word query is a coincidence, not an answer"
+        );
+        // single-content-term query: that one term suffices (no self-silencing)
+        assert!(covers_query("the deploy watcher gotcha", "deploy"));
+        assert!(!covers_query("unrelated text", "deploy"));
+        // stopword-only query -> no content terms -> never covers
+        assert!(!covers_query("anything", "de het een"));
+    }
+
+    #[test]
+    fn test_memories_only_recall_excludes_chunks() {
+        let mut store = EventStore::in_memory().unwrap();
+        // a code chunk and a memory, both matching "widget"
+        store
+            .append_event("s", "l", "a", EventKind::FactCreated, "Proj:src/widget.rs#0", None, "widget widget widget code")
+            .unwrap();
+        store
+            .append_event("s", "l", "a", EventKind::FactCreated, "Proj:mem-1", None, "GOTCHA: the widget must never be blue")
+            .unwrap();
+        let scope = RecallScope::current(Some("Proj".to_string()));
+        let all = recall_scoped(&store, "widget", 5, &scope).unwrap();
+        assert_eq!(all.len(), 2, "normal recall sees both");
+        let mems = recall_memories_scoped(&store, "widget", 5, &scope).unwrap();
+        assert_eq!(mems.len(), 1, "memories-only recall drops the chunk");
+        assert_eq!(mems[0].entity_id, "Proj:mem-1");
+        assert_eq!(mems[0].fact_type, Some(crate::repo::FactType::Gotcha), "typed fact is classified");
+    }
+
+    #[test]
+    fn test_matched_and_flag_strict_vs_fallback() {
+        let mut store = EventStore::in_memory().unwrap();
+        store
+            .append_event("s", "l", "a", EventKind::FactCreated, "e1", None, "deploy watcher restarts the app")
+            .unwrap();
+        // both terms present -> strict AND pass -> matched_and = true
+        let strict = recall(&store, "deploy watcher", 3).unwrap();
+        assert!(strict[0].matched_and, "a whole-question match is strong evidence");
+        // only one term matches -> OR fallback -> matched_and = false
+        let weak = recall(&store, "deploy zeppelin unrelated", 3).unwrap();
+        assert!(!weak.is_empty());
+        assert!(!weak[0].matched_and, "an OR-fallback hit is flagged as weak evidence");
+    }
+
+    #[test]
     fn test_recall_empty_query_and_no_match() {
         let mut store = EventStore::in_memory().unwrap();
         store
@@ -916,6 +1042,51 @@ mod fused_tests {
         assert_eq!(hits.len(), 1, "the current head must not be starved by superseded revs");
         assert_eq!(hits[0].rev, parent, "the surviving hit is the current head");
         assert!(hits[0].body.contains(&format!("v{}", FUSION_POOL + 10)));
+    }
+
+    #[test]
+    fn test_dense_leg_head_filter_prevents_slot_starvation() {
+        // Regression (dense-leg head-filter bugfix): the dense candidate filter
+        // checked scope but NOT head-membership, so the near-identical vectors of
+        // a frequently-revised entity's superseded revs filled all DENSE_TOPM
+        // slots and were then discarded in finalize_heads - evicting a
+        // zero-lexical-overlap gold the dense leg exists to surface.
+        let mut store = EventStore::in_memory().unwrap();
+        let mut rows: Vec<(i64, Vec<f32>)> = Vec::new();
+        let mut parent = {
+            let ev = store
+                .append_event("s", "l", "a", EventKind::FactCreated, "e1", None, "keyword v0")
+                .unwrap();
+            rows.push((ev.seq, axis(1.0))); // cosine 1.0 with the query
+            ev.this_hash
+        };
+        for i in 1..=(DENSE_TOPM + 10) {
+            let ev = store
+                .append_event("s", "l", "a", EventKind::FactRevised, "e1", Some(&parent), &format!("keyword v{}", i))
+                .unwrap();
+            rows.push((ev.seq, axis(1.0)));
+            parent = ev.this_hash;
+        }
+        // the gold: shares NO token with the query, slightly weaker cosine, so it
+        // only surfaces if superseded revs do not eat the dense slots.
+        let gold = store
+            .append_event("s", "l", "a", EventKind::FactCreated, "e2", None, "resident model stays warm")
+            .unwrap();
+        let mut gv = vec![0.0f32; DIM];
+        gv[0] = 0.9;
+        rows.push((gold.seq, gv));
+
+        let dir = tempfile::tempdir().unwrap();
+        let mut vecs = VectorStore::open(&dir.path().join("v.db")).unwrap();
+        vecs.upsert_batch(&rows).unwrap();
+
+        // "zzz" matches nothing lexically: candidates come from the dense leg only.
+        let hits = recall_fused(&store, "zzz unmatched", &axis(1.0), &vecs, 5, 1.5).unwrap();
+        assert!(
+            hits.iter().any(|h| h.entity_id == "e2"),
+            "the gold must not be starved out of the dense top-M by superseded revs: {:?}",
+            hits.iter().map(|h| &h.entity_id).collect::<Vec<_>>()
+        );
     }
 
     #[test]

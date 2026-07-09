@@ -191,6 +191,18 @@ pub struct ResolveConflict {
     pub current_heads: Vec<String>,
 }
 
+/// A checked revise/retract was rejected: the entity is unknown, diverged with
+/// no parent cited, or the cited parent_rev is not a current head. Carries the
+/// fresh head-set so the caller can retry citing exactly what is current -
+/// the MCP write path returns this instead of ever minting a silent branch.
+#[derive(Debug, thiserror::Error)]
+#[error("mutate rejected for entity {entity_id}: {reason}; current head-set: {current_heads:?}")]
+pub struct MutateConflict {
+    pub entity_id: String,
+    pub reason: String,
+    pub current_heads: Vec<String>,
+}
+
 /// Result of ingesting a shipped batch into a replica (log shipping receiver).
 #[derive(Debug)]
 pub enum IngestOutcome {
@@ -548,6 +560,70 @@ impl EventStore {
             None,
             &body,
         )?;
+        tx.commit()?;
+        Ok(event)
+    }
+
+    /// Append a revise/retract as a CHECKED mutation: the head-set is recomputed
+    /// under the immediate write lock, and the event is only written when its
+    /// parent is a current head - so a concurrent writer turns the call into a
+    /// typed MutateConflict (carrying the fresh heads) instead of a silent
+    /// DIVERGED branch. `parent_rev = None` auto-fills the single head; a
+    /// diverged entity then rejects with "resolve first". This is the safe write
+    /// path for agents (MCP): plain `append_event` stays the raw, branch-capable
+    /// primitive.
+    pub fn append_mutate_checked(
+        &mut self,
+        session_id: &str,
+        lineage_id: &str,
+        actor: &str,
+        kind: EventKind,
+        entity_id: &str,
+        parent_rev: Option<&str>,
+        body: &str,
+    ) -> anyhow::Result<Event> {
+        let tx = self
+            .conn
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+
+        let events = query_all_events(&tx)?;
+        let current: HashSet<String> = crate::cas::compute_head_sets(&events)
+            .get(entity_id)
+            .map(|head_set| head_set.heads.clone())
+            .unwrap_or_default();
+        let mut current_sorted: Vec<String> = current.iter().cloned().collect();
+        current_sorted.sort();
+        let conflict = |reason: &str| MutateConflict {
+            entity_id: entity_id.to_string(),
+            reason: reason.to_string(),
+            current_heads: current_sorted.clone(),
+        };
+
+        if current.is_empty() {
+            return Err(conflict("unknown entity (no live head); store a new fact instead").into());
+        }
+        let parent = match parent_rev.filter(|p| !p.is_empty()) {
+            Some(p) => {
+                if !current.contains(p) {
+                    return Err(conflict(
+                        "parent_rev is not a current head (the fact changed since you read it)",
+                    )
+                    .into());
+                }
+                p.to_string()
+            }
+            None => {
+                if current.len() > 1 {
+                    return Err(conflict(
+                        "entity is DIVERGED: resolve it first, or cite the exact parent_rev to mutate",
+                    )
+                    .into());
+                }
+                current_sorted[0].clone()
+            }
+        };
+
+        let event = insert_event(&tx, session_id, lineage_id, actor, kind, entity_id, Some(&parent), body)?;
         tx.commit()?;
         Ok(event)
     }
@@ -998,6 +1074,54 @@ mod tests {
         let retrieved = store.get_event_by_uuid(&event.event_uuid).unwrap();
         assert!(retrieved.is_some());
         assert_eq!(retrieved.unwrap().seq, 1);
+    }
+
+    #[test]
+    fn test_append_mutate_checked_cas_semantics() {
+        let mut store = EventStore::in_memory().unwrap();
+        let v1 = store
+            .append_event("s", "l", "a", EventKind::FactCreated, "e1", None, "v1")
+            .unwrap();
+
+        // single head + no parent cited -> auto-fills the head (a safe FF revise)
+        let v2 = store
+            .append_mutate_checked("s", "l", "a", EventKind::FactRevised, "e1", None, "v2")
+            .unwrap();
+        assert_eq!(v2.parent_rev.as_deref(), Some(v1.this_hash.as_str()));
+
+        // a STALE parent is rejected with the fresh head-set, and nothing is written
+        let n_before = store.get_all_events().unwrap().len();
+        let err = store
+            .append_mutate_checked("s", "l", "a", EventKind::FactRevised, "e1", Some(&v1.this_hash), "v3")
+            .unwrap_err();
+        let conflict = err.downcast_ref::<MutateConflict>().expect("typed conflict");
+        assert!(conflict.reason.contains("not a current head"));
+        assert_eq!(conflict.current_heads, vec![v2.this_hash.clone()]);
+        assert_eq!(store.get_all_events().unwrap().len(), n_before, "rejected mutate writes nothing");
+
+        // unknown entity -> typed conflict, not a silent create
+        assert!(store
+            .append_mutate_checked("s", "l", "a", EventKind::FactRevised, "nope", None, "x")
+            .unwrap_err()
+            .downcast_ref::<MutateConflict>()
+            .is_some());
+
+        // force a divergence via the raw primitive; a parentless mutate then rejects
+        store
+            .append_event("s", "l", "a", EventKind::FactRevised, "e1", Some("stale-parent"), "branch")
+            .unwrap();
+        let err = store
+            .append_mutate_checked("s", "l", "a", EventKind::FactRetracted, "e1", None, "")
+            .unwrap_err();
+        let conflict = err.downcast_ref::<MutateConflict>().expect("typed conflict");
+        assert!(conflict.reason.contains("DIVERGED"));
+        assert_eq!(conflict.current_heads.len(), 2, "the fresh head-set is returned for the retry");
+
+        // ...but citing one exact contested head is allowed (an explicit choice)
+        let keep = conflict.current_heads[0].clone();
+        store
+            .append_mutate_checked("s", "l", "a", EventKind::FactRevised, "e1", Some(&keep), "explicit")
+            .unwrap();
     }
 
     // ---- log shipping (sync receiver) ----

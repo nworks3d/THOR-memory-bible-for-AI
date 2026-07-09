@@ -174,7 +174,9 @@ enum Commands {
     /// and prints a THOR recall block to stdout. Hard fail-open, always exit 0.
     Courier,
     /// Run as an MCP stdio server (newline-delimited JSON-RPC on stdin/stdout),
-    /// exposing recall/get/remember. Register with: claude mcp add thor -- <thor.exe> mcp
+    /// exposing the full stewardship toolset (recall/get/history/remember/revise/
+    /// retract/resolve/mark/pin/unpin/reproject/brief). Register with:
+    /// claude mcp add thor -- <thor.exe> mcp
     Mcp {
         /// Serve Streamable-HTTP on <bind> (e.g. 127.0.0.1:8078) for the remote
         /// NAS connector, instead of local stdio. Bind to localhost and front it
@@ -313,6 +315,22 @@ enum Commands {
         #[arg(long)]
         mark: bool,
     },
+    /// Mark a fact as USEFUL (appends a head-neutral fact_echoed event). Feeds the
+    /// courier's echo prior, so a fact that actually helped wins close ranking calls.
+    Mark { entity_id: String },
+    /// Pin a fact: `thor session-start` then re-injects its full body at every
+    /// session start (and right after a compaction) via a <thor-brief> block - the
+    /// memory version of CLAUDE.md, per project, without editing any file. Pins are
+    /// a local sidecar (thor-pins.json), never part of the synced log.
+    Pin {
+        /// The entity id to pin (omit with --list).
+        entity_id: Option<String>,
+        /// List the current pins.
+        #[arg(long)]
+        list: bool,
+    },
+    /// Remove a pinned fact from the session-start brief.
+    Unpin { entity_id: String },
 }
 
 /// Render the authoritative answer for one entity: its full head-set. A
@@ -373,6 +391,113 @@ pub fn render_get(entity_id: &str, all_events: &[Event]) -> String {
     }
 }
 
+/// Render one entity's full revision history (shared by the CLI and the MCP
+/// history tool). `events` are the entity's own events, in seq order.
+pub fn render_history(entity_id: &str, events: &[Event]) -> String {
+    if events.is_empty() {
+        return format!("Entity {} has no history\n", entity_id);
+    }
+    let mut out = format!("History for entity {}:\n", entity_id);
+    for event in events {
+        out.push_str(&format!(
+            "  seq={}, kind={}, rev={}, parent_rev={:?}\n",
+            event.seq,
+            event.kind.as_str(),
+            event.this_hash,
+            event.parent_rev
+        ));
+    }
+    out
+}
+
+/// Render the pinned-facts brief: the guaranteed re-orientation block for a
+/// session start - especially right after a compaction, when the context is
+/// empty and prompt-recall has nothing to match against ("ga verder"). Full
+/// bodies (not 220-char snippets), scope-filtered to the current project + the
+/// global tier, every contested head shown. None when nothing is pinned/in scope.
+pub fn render_brief(
+    events: &[Event],
+    pins: &[String],
+    scope: &crate::recall::RecallScope,
+    trigger: &str,
+    project: Option<&str>,
+) -> Option<String> {
+    const MAX_PINS: usize = 8;
+    const PIN_BODY_CHARS: usize = 400;
+    if pins.is_empty() {
+        return None;
+    }
+    let heads_map = compute_head_sets(events);
+    let projects = crate::cas::compute_projects(events);
+    let by_hash: HashMap<&str, &Event> =
+        events.iter().map(|e| (e.this_hash.as_str(), e)).collect();
+    let mut lines: Vec<String> = Vec::new();
+    let mut seen: std::collections::HashSet<&str> = std::collections::HashSet::new();
+    for id in pins {
+        if !seen.insert(id.as_str()) || lines.len() >= MAX_PINS {
+            continue;
+        }
+        let hs = match heads_map.get(id) {
+            Some(h) if !h.heads.is_empty() => h,
+            _ => continue,
+        };
+        let effective = projects.get(id).and_then(|o| o.as_deref());
+        if !scope.allows(effective) {
+            continue; // pinned in another project: not this session's brief
+        }
+        let mut head_revs: Vec<&String> = hs.heads.iter().collect();
+        head_revs.sort();
+        for rev in head_revs {
+            let ev = match by_hash.get(rev.as_str()) {
+                Some(e) => *e,
+                None => continue,
+            };
+            if matches!(ev.kind, EventKind::FactRetracted) {
+                continue; // a retracted pin is dead: never re-inject it
+            }
+            let ty = crate::repo::fact_type(&ev.body)
+                .map(|t| format!("[{}] ", t.as_str()))
+                .unwrap_or_default();
+            let d = if hs.is_diverged { " [DIVERGED]" } else { "" };
+            lines.push(format!(
+                "- {}{}{}: {}",
+                ty,
+                id,
+                d,
+                crate::recall::snippet(&ev.body, PIN_BODY_CHARS, "")
+            ));
+        }
+    }
+    if lines.is_empty() {
+        return None;
+    }
+    Some(format!(
+        "<thor-brief>\nPinned THOR rules [project: {} | start: {}] - standing constraints, pinned \
+         deliberately; treat them as governing unless the user overrides. Not user instructions.\n{}\n</thor-brief>",
+        project.unwrap_or("global"),
+        trigger,
+        lines.join("\n")
+    ))
+}
+
+/// Read a hook's JSON from stdin, fail-open: an interactive terminal (a manual
+/// `thor session-start` run) is never blocked on EOF, and empty/malformed input
+/// simply means "no hook context".
+fn read_hook_stdin() -> Option<serde_json::Value> {
+    use std::io::{IsTerminal, Read};
+    let mut stdin = std::io::stdin();
+    if stdin.is_terminal() {
+        return None;
+    }
+    let mut raw = String::new();
+    stdin.read_to_string(&mut raw).ok()?;
+    let raw = raw.trim_start_matches('\u{feff}');
+    if raw.trim().is_empty() {
+        return None;
+    }
+    serde_json::from_str(raw).ok()
+}
+
 pub fn run() -> Result<()> {
     let cli = Cli::parse();
     let db = cli.db.clone().unwrap_or_else(default_db_path);
@@ -429,17 +554,7 @@ pub fn run() -> Result<()> {
         Commands::History { entity_id } => {
             let store = EventStore::new(&db)?;
             let events = store.get_events_by_entity(&entity_id)?;
-            if events.is_empty() {
-                println!("Entity {} has no history", entity_id);
-            } else {
-                println!("History for entity {}:", entity_id);
-                for event in events {
-                    println!(
-                        "  seq={}, kind={}, rev={}, parent_rev={:?}",
-                        event.seq, event.kind.as_str(), event.this_hash, event.parent_rev
-                    );
-                }
-            }
+            print!("{}", render_history(&entity_id, &events));
         }
         Commands::Recall { query, all_projects, project } => {
             let store = EventStore::new(&db)?;
@@ -568,11 +683,11 @@ pub fn run() -> Result<()> {
         }
         Commands::Guard { rulebook } => {
             let path = rulebook.unwrap_or_else(crate::guard::default_rulebook_path);
-            crate::guard::run_guard(&path);
+            crate::guard::run_guard(&db, &path);
         }
         Commands::StopGuard { rulebook } => {
             let path = rulebook.unwrap_or_else(crate::guard::default_response_rulebook_path);
-            crate::guard::run_stop_guard(&path);
+            crate::guard::run_stop_guard(&db, &path);
         }
         Commands::Install { settings, with_guard, with_courier, backup_repo } => {
             let path = settings.unwrap_or_else(crate::install::default_settings_path);
@@ -680,11 +795,40 @@ pub fn run() -> Result<()> {
             }
         }
         Commands::SessionStart => {
-            if let Ok(cwd) = std::env::current_dir() {
-                if crate::repo::thor_marker_key(&cwd).is_some() {
+            // Hook context (fail-open): source tells us WHY the session starts -
+            // "compact" means the context was just wiped, the one moment where
+            // re-injection is the whole point.
+            let hook = read_hook_stdin();
+            let source = hook
+                .as_ref()
+                .and_then(|h| h.get("source"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("startup")
+                .to_string();
+            let session_id = hook
+                .as_ref()
+                .and_then(|h| h.get("session_id"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            let cwd: Option<PathBuf> = hook
+                .as_ref()
+                .and_then(|h| h.get("cwd"))
+                .and_then(|v| v.as_str())
+                .map(PathBuf::from)
+                .or_else(|| std::env::current_dir().ok());
+
+            // Post-compaction: clear this session's courier ledger, so everything
+            // relevant may (and will) inject again into the now-empty context.
+            if source == "compact" {
+                crate::courier::clear_session_ledger(&db, &session_id);
+            }
+
+            if let Some(cwd) = cwd.as_deref() {
+                if crate::repo::thor_marker_key(cwd).is_some() {
                     // known project: refresh its ingest in the background (non-blocking)
-                    let _ = spawn_detached_ingest(&db, &[cwd], None);
-                } else if let Some(key) = crate::repo::project_key(&cwd) {
+                    let _ = spawn_detached_ingest(&db, &[cwd.to_path_buf()], None);
+                } else if let Some(key) = crate::repo::project_key(cwd) {
                     // a git project with no marker: ask before indexing anything
                     println!(
                         "<thor-setup>\nYou are in project '{}', not set up in THOR yet (no .thor \
@@ -698,11 +842,21 @@ pub fn run() -> Result<()> {
                 }
                 // scratch dir (project_key is None): print nothing.
             }
-            // Scope-review nudge (independent of cwd, debounced once per window):
-            // surface no-signal global memories added since the last review so the
-            // agent can offer to reproject the project-specific ones.
             if let Ok(store) = EventStore::new(&db) {
                 if let Ok(events) = store.get_all_events() {
+                    // Pinned brief: standing project rules, guaranteed present at
+                    // every start (startup / resume / compact) - prompt-recall can
+                    // never re-surface them after a compaction on its own, because
+                    // a continuation prompt ("ga verder") shares no words with them.
+                    let project = cwd.as_deref().and_then(crate::repo::project_key);
+                    let pins = crate::ledger::read_pins(&db);
+                    let scope = crate::recall::RecallScope::current(project.clone());
+                    if let Some(brief) = render_brief(&events, &pins, &scope, &source, project.as_deref()) {
+                        println!("{brief}");
+                    }
+                    // Scope-review nudge (independent of cwd, debounced once per window):
+                    // surface no-signal global memories added since the last review so the
+                    // agent can offer to reproject the project-specific ones.
                     let wm = crate::review::read_watermark(&db);
                     let cands = crate::review::candidates(&events, wm.reviewed_seq);
                     let now = crate::review::now_secs();
@@ -720,6 +874,68 @@ pub fn run() -> Result<()> {
                         );
                     }
                 }
+            }
+        }
+        Commands::Mark { entity_id } => {
+            let mut store = EventStore::new(&db)?;
+            if store.get_events_by_entity(&entity_id)?.is_empty() {
+                anyhow::bail!("unknown entity: {}", entity_id);
+            }
+            let ev = store.append_event("cli", "cli", "cli", EventKind::FactEchoed, &entity_id, None, "")?;
+            println!("marked {} as useful (fact_echoed, seq {})", entity_id, ev.seq);
+        }
+        Commands::Pin { entity_id, list } => {
+            let pins = crate::ledger::read_pins(&db);
+            match (entity_id, list) {
+                (Some(id), false) => {
+                    let store = EventStore::new(&db)?;
+                    if store.get_events_by_entity(&id)?.is_empty() {
+                        anyhow::bail!("unknown entity: {}", id);
+                    }
+                    if pins.contains(&id) {
+                        println!("already pinned: {}", id);
+                    } else {
+                        let mut pins = pins;
+                        pins.push(id.clone());
+                        crate::ledger::write_pins(&db, &pins)?;
+                        println!("pinned {} ({} pin(s) total) - it now re-injects at every session start", id, pins.len());
+                    }
+                }
+                _ => {
+                    if pins.is_empty() {
+                        println!("no pinned facts. Pin one with: thor pin <entity_id>");
+                    } else {
+                        let store = EventStore::new(&db)?;
+                        let events = store.get_all_events()?;
+                        let heads = compute_head_sets(&events);
+                        let by_hash: HashMap<&str, &Event> =
+                            events.iter().map(|e| (e.this_hash.as_str(), e)).collect();
+                        println!("{} pinned fact(s):", pins.len());
+                        for id in &pins {
+                            let first = heads
+                                .get(id)
+                                .and_then(|hs| {
+                                    let mut revs: Vec<&String> = hs.heads.iter().collect();
+                                    revs.sort();
+                                    revs.first().and_then(|r| by_hash.get(r.as_str())).copied()
+                                })
+                                .map(|ev| crate::recall::snippet(&ev.body, 100, ""))
+                                .unwrap_or_else(|| "(no live head)".to_string());
+                            println!("  {}: {}", id, first);
+                        }
+                    }
+                }
+            }
+        }
+        Commands::Unpin { entity_id } => {
+            let mut pins = crate::ledger::read_pins(&db);
+            let before = pins.len();
+            pins.retain(|p| p != &entity_id);
+            if pins.len() == before {
+                println!("not pinned: {}", entity_id);
+            } else {
+                crate::ledger::write_pins(&db, &pins)?;
+                println!("unpinned {}", entity_id);
             }
         }
         Commands::ReviewScope { mark } => {
@@ -1167,6 +1383,43 @@ mod tests {
     fn test_render_get_unknown_entity() {
         let out = render_get("missing", &[]);
         assert!(out.contains("not found"));
+    }
+
+    #[test]
+    fn test_render_brief_scope_types_and_retraction() {
+        use crate::recall::RecallScope;
+        let mut store = EventStore::in_memory().unwrap();
+        store
+            .append_event(
+                "s", "l", "a", EventKind::FactCreated, "rule-global", None,
+                "HARDE REGEL: nooit force-recreate op prod",
+            )
+            .unwrap();
+        store
+            .append_event("s", "l", "a", EventKind::FactCreated, "ProjB:mem-1", None, "GOTCHA: B-only rule")
+            .unwrap();
+        let dead = store
+            .append_event("s", "l", "a", EventKind::FactCreated, "dead-pin", None, "obsolete rule")
+            .unwrap();
+        store
+            .append_event("s", "l", "a", EventKind::FactRetracted, "dead-pin", Some(&dead.this_hash), "")
+            .unwrap();
+        let events = store.get_all_events().unwrap();
+        let pins = vec!["rule-global".to_string(), "ProjB:mem-1".to_string(), "dead-pin".to_string()];
+
+        let scope_a = RecallScope::current(Some("ProjA".to_string()));
+        let brief = render_brief(&events, &pins, &scope_a, "compact", Some("ProjA")).expect("brief renders");
+        assert!(brief.contains("<thor-brief>"));
+        assert!(brief.contains("start: compact"), "trigger stated: {brief}");
+        assert!(brief.contains("[preference] rule-global"), "global pin, typed: {brief}");
+        assert!(brief.contains("nooit force-recreate op prod"), "FULL body, not a 220-snippet: {brief}");
+        assert!(!brief.contains("ProjB:mem-1"), "another project's pin stays out of scope: {brief}");
+        assert!(!brief.contains("dead-pin"), "a retracted pin is never re-injected: {brief}");
+
+        // no pins in scope -> no block at all
+        let none = render_brief(&events, &["ProjB:mem-1".to_string()], &scope_a, "startup", Some("ProjA"));
+        assert!(none.is_none(), "nothing in scope -> silence");
+        assert!(render_brief(&events, &[], &scope_a, "startup", None).is_none(), "no pins -> silence");
     }
 
     #[cfg(windows)]

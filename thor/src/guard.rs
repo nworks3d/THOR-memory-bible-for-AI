@@ -132,15 +132,16 @@ pub fn evaluate(rules: &[Rule], tool: &str, haystack_lower: &str) -> Vec<String>
     fired
 }
 
-/// Run as a PreToolUse guard: read the hook JSON on stdin, and if any rule
-/// fires, emit a hookSpecificOutput with additionalContext (advisory-only,
-/// permissionDecision "allow" so the tool proceeds). HARD fail-open: any error
-/// prints nothing and exits 0 - the guard must never block a tool call.
-pub fn run_guard(rulebook: &Path) {
-    let _ = try_guard(rulebook);
+/// Run as a PreToolUse guard: read the hook JSON on stdin, and if any rulebook
+/// rule fires OR a stored memory names the file being touched, emit a
+/// hookSpecificOutput with additionalContext (advisory-only, permissionDecision
+/// "allow" so the tool proceeds). HARD fail-open: any error prints nothing and
+/// exits 0 - the guard must never block a tool call.
+pub fn run_guard(db: &Path, rulebook: &Path) {
+    let _ = try_guard(db, rulebook);
 }
 
-fn try_guard(rulebook: &Path) -> anyhow::Result<()> {
+fn try_guard(db: &Path, rulebook: &Path) -> anyhow::Result<()> {
     let mut raw = String::new();
     std::io::stdin().read_to_string(&mut raw)?;
     let raw = raw.trim_start_matches('\u{feff}');
@@ -152,16 +153,23 @@ fn try_guard(rulebook: &Path) -> anyhow::Result<()> {
     let input = hook.get("tool_input").cloned().unwrap_or(Value::Null);
     let haystack = tool_input_text(&input);
 
-    let rules = match std::fs::read_to_string(rulebook) {
-        Ok(text) => parse_rules(&text),
-        Err(_) => return Ok(()), // no rulebook -> silent, never block
-    };
-    let fired = evaluate(&rules, tool, &haystack);
-    if fired.is_empty() {
+    // Static rulebook advisories (a missing rulebook is silent, never an error -
+    // and must not skip the memory advisory below).
+    let rules = std::fs::read_to_string(rulebook).map(|t| parse_rules(&t)).unwrap_or_default();
+    let mut parts = evaluate(&rules, tool, &haystack);
+
+    // Memory advisory: the first time this session touches a file, surface the
+    // stored memories that NAME it (memories only - never code chunks). Drift is
+    // decided at the moment of action; the prompt often has zero overlap with a
+    // gotcha written in code language, but the file path does.
+    if let Some(mem) = file_memory_advisory(db, &hook) {
+        parts.push(mem);
+    }
+    if parts.is_empty() {
         return Ok(());
     }
 
-    let context = format!("[THOR guard] {}", fired.join("  ||  "));
+    let context = format!("[THOR guard] {}", parts.join("  ||  "));
     let out = serde_json::json!({
         "hookSpecificOutput": {
             "hookEventName": "PreToolUse",
@@ -177,6 +185,88 @@ fn try_guard(rulebook: &Path) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// How many file-naming memories to surface per (session, file).
+const FILE_MEMORY_HITS: usize = 2;
+
+/// The memory-backed half of the guard: for a tool call carrying a file_path,
+/// recall MEMORIES (never chunks) that literally name the file, at most once per
+/// (session, file) via the fail-open guard-seen ledger. Returns None to stay
+/// silent. Rationale is measured, not assumed: recall over the raw tool call
+/// returns 8/8 code chunks and 0 memories, so the candidate set must exclude
+/// chunks up front, and a hit must name the file to count as "about" it.
+fn file_memory_advisory(db: &Path, hook: &Value) -> Option<String> {
+    let file_path = hook.get("tool_input")?.get("file_path")?.as_str()?.trim();
+    if file_path.is_empty() {
+        return None;
+    }
+    let session_id = hook.get("session_id").and_then(|v| v.as_str()).unwrap_or("");
+    let ledger_path = crate::ledger::guard_seen_path(db);
+    let key = format!("{}|{}", session_id, file_path);
+    let mut seen = crate::ledger::read_map(&ledger_path);
+    if seen.contains_key(&key) {
+        return None; // already advised for this file this session
+    }
+
+    let p = Path::new(file_path);
+    let name = p.file_name()?.to_str()?;
+    let stem = p.file_stem().and_then(|s| s.to_str()).unwrap_or(name);
+    // Query = the file's name + its nearest two directory names, so bm25 can
+    // reach a memory that mentions any of them; precision comes from the
+    // name-check below, not from ranking.
+    let mut terms: Vec<&str> = vec![name];
+    if stem != name {
+        terms.push(stem);
+    }
+    for anc in p.ancestors().skip(1).take(2) {
+        if let Some(d) = anc.file_name().and_then(|d| d.to_str()) {
+            terms.push(d);
+        }
+    }
+    let query = terms.join(" ");
+
+    let project = hook
+        .get("cwd")
+        .and_then(|v| v.as_str())
+        .and_then(|c| crate::repo::project_key(Path::new(c)));
+    let scope = crate::recall::RecallScope::current(project);
+    let store = crate::event_store::EventStore::new(db).ok()?;
+    let hits = crate::recall::recall_memories_scoped(&store, &query, 6, &scope).ok()?;
+
+    // Keep only memories that literally NAME the file (full name, or a stem of
+    // >= 3 chars) - "mentions the directory" is not "about this file".
+    let name_l = name.to_lowercase();
+    let stem_l = stem.to_lowercase();
+    let named: Vec<_> = hits
+        .into_iter()
+        .filter(|h| {
+            let b = h.body.to_lowercase();
+            b.contains(&name_l) || (stem_l.chars().count() >= 3 && b.contains(&stem_l))
+        })
+        .take(FILE_MEMORY_HITS)
+        .collect();
+    if named.is_empty() {
+        return None; // no ledger write: a memory stored later this session still surfaces
+    }
+
+    let lines: Vec<String> = named
+        .iter()
+        .map(|h| {
+            let ty = h.fact_type.map(|t| format!("[{}] ", t.as_str())).unwrap_or_default();
+            format!("{}{}: {}", ty, h.entity_id, crate::recall::snippet(&h.body, 200, &query))
+        })
+        .collect();
+
+    let now = crate::review::now_secs();
+    seen.insert(key, serde_json::json!(now));
+    crate::ledger::prune_old(&mut seen, now, |v| v.as_u64());
+    crate::ledger::write_map(&ledger_path, &seen);
+
+    Some(format!(
+        "stored memory about this file (verify before relying): {}",
+        lines.join("  ||  ")
+    ))
+}
+
 /// Response-rulebook for the Stop guard (the capability-amnesia / ssh-amnesia
 /// class), separate from the PreToolUse command rulebook.
 pub fn default_response_rulebook_path() -> PathBuf {
@@ -188,15 +278,39 @@ pub fn default_response_rulebook_path() -> PathBuf {
 
 /// Run as a Stop guard: read the Stop-hook JSON on stdin and, if the assistant's
 /// final message matches a response rule (e.g. it asked the user to do something
-/// it could do itself), emit `{"decision":"block","reason":...}` so the model
+/// it could do itself) OR looks like it contains an unstored durable fact (the
+/// capture nudge), emit `{"decision":"block","reason":...}` so the model
 /// reconsiders BEFORE it yields. Unlike the advisory PreToolUse guard this DOES
 /// block the stop - that is the point for this class. HARD fail-open: any error
 /// (or the loop-guard) prints nothing and exits 0, so a stop is never wrongly held.
-pub fn run_stop_guard(rulebook: &Path) {
-    let _ = try_stop_guard(rulebook);
+pub fn run_stop_guard(db: &Path, rulebook: &Path) {
+    let _ = try_stop_guard(db, rulebook);
 }
 
-fn try_stop_guard(rulebook: &Path) -> anyhow::Result<()> {
+/// Hard capture triggers (EN + NL), per the user's own capture rule: a new
+/// project, a move/relocation of code or data, a major decision or direction
+/// change, a confirmed gotcha. Deliberately conservative substrings - a false
+/// positive costs one nudge per session, a false negative costs a lost fact.
+const CAPTURE_TRIGGERS: &[&str] = &[
+    "besloten",
+    "beslissing",
+    "besluit:",
+    "afgesproken",
+    "harde regel",
+    "voortaan",
+    "decision:",
+    "we decided",
+    "decided to",
+    "from now on",
+    "gotcha",
+    "verplaatst naar",
+    "gemigreerd naar",
+    "migrated to",
+    "nieuw project",
+    "new project",
+];
+
+fn try_stop_guard(db: &Path, rulebook: &Path) -> anyhow::Result<()> {
     let mut raw = String::new();
     std::io::stdin().read_to_string(&mut raw)?;
     let raw = raw.trim_start_matches('\u{feff}');
@@ -218,22 +332,57 @@ fn try_stop_guard(rulebook: &Path) -> anyhow::Result<()> {
         return Ok(());
     }
     // Reuse the command matcher over the assistant's message as the haystack.
+    // A missing rulebook leaves the response rules empty but must NOT skip the
+    // capture nudge below.
     let haystack = tool_input_text(&Value::String(msg.to_string()));
-    let rules = match std::fs::read_to_string(rulebook) {
-        Ok(text) => parse_rules(&text),
-        Err(_) => return Ok(()), // no rulebook -> never block
-    };
+    let rules = std::fs::read_to_string(rulebook).map(|t| parse_rules(&t)).unwrap_or_default();
     let fired = evaluate(&rules, "response", &haystack);
-    if fired.is_empty() {
+
+    let reason = if !fired.is_empty() {
+        format!("[THOR] {}", fired.join("  ||  "))
+    } else if let Some(r) = capture_nudge(db, &hook, &haystack) {
+        r
+    } else {
         return Ok(());
-    }
-    let reason = format!("[THOR] {}", fired.join("  ||  "));
+    };
     let out = serde_json::json!({ "decision": "block", "reason": reason });
     use std::io::Write;
     let mut stdout = std::io::stdout();
     let _ = writeln!(stdout, "{}", out);
     let _ = stdout.flush();
     Ok(())
+}
+
+/// The capture safety net: when the final reply contains a hard trigger
+/// (decision / gotcha / migration / new-project language), block the stop ONCE
+/// per session with a "store it or say it's stored" reason. Keyword-gated and
+/// loop-safe (the stop_hook_active check above catches the retry), so model
+/// proactivity is no longer the only thing standing between a durable fact and
+/// oblivion. Fail-open at every step.
+fn capture_nudge(db: &Path, hook: &Value, haystack_lower: &str) -> Option<String> {
+    let session_id = hook.get("session_id").and_then(|v| v.as_str()).unwrap_or("");
+    if session_id.is_empty() {
+        return None; // no session identity -> cannot debounce -> stay silent
+    }
+    if !CAPTURE_TRIGGERS.iter().any(|t| haystack_lower.contains(t)) {
+        return None;
+    }
+    let path = crate::ledger::capture_ledger_path(db);
+    let mut seen = crate::ledger::read_map(&path);
+    if seen.contains_key(session_id) {
+        return None; // at most one nudge per session
+    }
+    let now = crate::review::now_secs();
+    seen.insert(session_id.to_string(), serde_json::json!(now));
+    crate::ledger::prune_old(&mut seen, now, |v| v.as_u64());
+    crate::ledger::write_map(&path, &seen);
+    Some(
+        "[THOR capture] This reply looks like it contains a durable decision, gotcha, or \
+         milestone (project start, code/data move, direction change). If it is durable and \
+         not yet stored: store it in THOR now (remember - concise and self-contained). If it \
+         is already stored or not durable, just finish. This nudge fires at most once per session."
+            .to_string(),
+    )
 }
 
 #[cfg(test)]
@@ -340,6 +489,82 @@ mod tests {
         let hay = tool_input_text(&json!({"command": "DOCKER COMPOSE UP --FORCE-RECREATE"}));
         assert_eq!(evaluate(&rules, "bash", &hay).len(), 1);
         assert!(evaluate(&[], "Bash", &hay).is_empty(), "no rules -> no fire");
+    }
+
+    #[test]
+    fn test_capture_nudge_fires_once_per_session_and_is_keyword_gated() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("thor.db");
+        let hook = |sid: &str| json!({ "session_id": sid, "last_assistant_message": "x" });
+
+        // a durable-decision reply fires...
+        let hay = tool_input_text(&json!("We hebben besloten de NAS-sync via ship/recv te doen."));
+        assert!(capture_nudge(&db, &hook("s1"), &hay).is_some(), "decision language fires");
+        // ...but only once per session
+        assert!(capture_nudge(&db, &hook("s1"), &hay).is_none(), "second stop in s1 is silent");
+        // a new session gets its own nudge
+        assert!(capture_nudge(&db, &hook("s2"), &hay).is_some(), "a fresh session nudges again");
+        // plain status text never fires
+        let plain = tool_input_text(&json!("Tests are green, pushed to main."));
+        assert!(capture_nudge(&db, &hook("s3"), &plain).is_none(), "no trigger -> no nudge");
+        // no session id -> cannot debounce -> silent
+        assert!(capture_nudge(&db, &json!({}), &hay).is_none(), "sessionless stop stays silent");
+    }
+
+    #[test]
+    fn test_file_memory_advisory_memories_only_once_per_session() {
+        use crate::event_store::{EventKind, EventStore};
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("thor.db");
+        {
+            let mut store = EventStore::new(&db).unwrap();
+            // a code chunk AND a gotcha memory both naming courier.rs
+            store
+                .append_event(
+                    "s", "l", "a", EventKind::FactCreated, "Proj:src/courier.rs#0", None,
+                    "fn courier() {} // courier.rs code chunk",
+                )
+                .unwrap();
+            store
+                .append_event(
+                    "s", "l", "a", EventKind::FactCreated, "Proj:mem-1", None,
+                    "GOTCHA: courier.rs must stay hard fail-open - never add a path that can error a prompt",
+                )
+                .unwrap();
+        }
+        let proj = dir.path().join("Proj");
+        std::fs::create_dir_all(proj.join(".git")).unwrap();
+        let hook = json!({
+            "session_id": "s1",
+            "cwd": proj.to_string_lossy(),
+            "tool_name": "Edit",
+            "tool_input": { "file_path": proj.join("src/courier.rs").to_string_lossy() }
+        });
+
+        let adv = file_memory_advisory(&db, &hook).expect("first touch must advise");
+        assert!(adv.contains("Proj:mem-1"), "the gotcha memory surfaces: {adv}");
+        assert!(adv.contains("[gotcha]"), "typed tag rendered: {adv}");
+        assert!(adv.contains("fail-open"), "snippet carries the constraint: {adv}");
+        assert!(!adv.contains("courier.rs#0"), "code chunks NEVER appear in the advisory: {adv}");
+
+        // second touch of the same file in the same session: silent
+        assert!(file_memory_advisory(&db, &hook).is_none(), "once per (session, file)");
+        // a different session advises again
+        let hook2 = json!({
+            "session_id": "s2",
+            "cwd": proj.to_string_lossy(),
+            "tool_name": "Edit",
+            "tool_input": { "file_path": proj.join("src/courier.rs").to_string_lossy() }
+        });
+        assert!(file_memory_advisory(&db, &hook2).is_some());
+        // a file no memory names: silent, and no ledger entry is burned
+        let other = json!({
+            "session_id": "s1",
+            "cwd": proj.to_string_lossy(),
+            "tool_name": "Edit",
+            "tool_input": { "file_path": proj.join("src/other.rs").to_string_lossy() }
+        });
+        assert!(file_memory_advisory(&db, &other).is_none());
     }
 
     #[test]

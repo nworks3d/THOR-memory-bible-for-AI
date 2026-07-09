@@ -281,6 +281,84 @@ pub fn is_chunk_id(entity_id: &str) -> bool {
     }
 }
 
+/// The constraint class of a hand-written fact, so the courier / guard / brief
+/// can label (and later prioritize) the facts that prevent drift. Only these
+/// three classes get a tag; anything else (note, insight, plain text) is None.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FactType {
+    Gotcha,
+    Decision,
+    Preference,
+}
+
+impl FactType {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            FactType::Gotcha => "gotcha",
+            FactType::Decision => "decision",
+            FactType::Preference => "preference",
+        }
+    }
+}
+
+/// Leading first-line markers that convention already uses in hand-written
+/// bodies. Case-sensitive uppercase on purpose: prose ("the decision was...")
+/// must not classify, a deliberate "DECISION: ..." must. EN + NL.
+const TYPE_MARKERS: &[(&str, FactType)] = &[
+    ("GOTCHA", FactType::Gotcha),
+    ("DECISION", FactType::Decision),
+    ("BESLISSING", FactType::Decision),
+    ("BESLUIT", FactType::Decision),
+    ("PREFERENCE", FactType::Preference),
+    ("VOORKEUR", FactType::Preference),
+    ("WERKVOORKEUR", FactType::Preference),
+    ("WERKWIJZE-VOORKEUR", FactType::Preference),
+    ("HARDE REGEL", FactType::Preference),
+    ("REGEL:", FactType::Preference),
+    ("AFSPRAAK", FactType::Preference),
+];
+
+/// Classify a fact body: the `[memory/<type> ...]` footer (the exact format the
+/// mimir import already writes) wins, else a leading uppercase marker on the
+/// first non-empty line. None for chunks, notes, and everything untyped.
+pub fn fact_type(body: &str) -> Option<FactType> {
+    // Footer: the LAST line that starts with '[' and carries "memory/<type>".
+    for line in body.lines().rev() {
+        let line = line.trim();
+        if !line.starts_with('[') {
+            continue;
+        }
+        if let Some(rest) = line.strip_prefix("[memory/") {
+            let ty: String = rest.chars().take_while(|c| c.is_ascii_alphabetic() || *c == '-').collect();
+            return match ty.as_str() {
+                "gotcha" => Some(FactType::Gotcha),
+                "decision" => Some(FactType::Decision),
+                "preference" => Some(FactType::Preference),
+                _ => None, // a typed footer of another class (note, insight, ...) is authoritative
+            };
+        }
+    }
+    // Leading marker on the first non-empty line.
+    let first = body.lines().find(|l| !l.trim().is_empty())?.trim_start();
+    TYPE_MARKERS
+        .iter()
+        .find(|(marker, _)| first.starts_with(marker))
+        .map(|(_, ty)| *ty)
+}
+
+/// The project ROOT directory for a working dir: the nearest ancestor holding a
+/// `.thor` marker or a `.git` entry. This is the base repo-chunk `rel` paths
+/// resolve against (the courier's freshness check re-reads files from here).
+pub fn project_root(start: &Path) -> Option<PathBuf> {
+    let mut dir: &Path = start;
+    loop {
+        if dir.join(".thor").exists() || dir.join(".git").exists() {
+            return Some(dir.to_path_buf());
+        }
+        dir = dir.parent()?;
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -399,6 +477,46 @@ mod tests {
             "walk keeps normal files (fwd-slash), drops dotfiles/dot-dirs/heavy dirs/nested repos"
         );
         assert!(complete, "a fully-readable tree reports complete");
+    }
+
+    #[test]
+    fn fact_type_from_footer_and_markers() {
+        // mimir footer wins (the exact live format)
+        assert_eq!(
+            fact_type("never open the db over SMB\n\n[memory/gotcha | tags: db wal | project: P | mimir:01K]"),
+            Some(FactType::Gotcha)
+        );
+        assert_eq!(
+            fact_type("body\n\n[memory/decision | tags: x | project: global | mimir:01K]"),
+            Some(FactType::Decision)
+        );
+        // a typed footer of another class stays untyped (authoritative footer)
+        assert_eq!(fact_type("body\n\n[memory/note | tags: x | project: P | mimir:01K]"), None);
+        // leading uppercase markers (EN + NL)
+        assert_eq!(fact_type("GOTCHA: never do X when Y"), Some(FactType::Gotcha));
+        assert_eq!(fact_type("DECISION: budget stays top-3"), Some(FactType::Decision));
+        assert_eq!(fact_type("BESLISSING (2026): we kiezen A"), Some(FactType::Decision));
+        assert_eq!(fact_type("HARDE REGEL: geheugenstore is bron van waarheid"), Some(FactType::Preference));
+        assert_eq!(fact_type("WERKWIJZE-VOORKEUR bij analyse"), Some(FactType::Preference));
+        // prose does NOT classify (case-sensitive markers)
+        assert_eq!(fact_type("the decision was made to defer"), None);
+        assert_eq!(fact_type("plain chunk text fn main() {}"), None);
+        assert_eq!(fact_type(""), None);
+    }
+
+    #[test]
+    fn project_root_finds_marker_or_git() {
+        let tmp = tempfile::tempdir().unwrap();
+        let a = tmp.path().join("A");
+        std::fs::create_dir_all(a.join("src")).unwrap();
+        std::fs::write(a.join(".thor"), "A\n").unwrap();
+        assert_eq!(project_root(&a.join("src")), Some(a.clone()));
+        let b = tmp.path().join("B");
+        std::fs::create_dir_all(b.join(".git")).unwrap();
+        assert_eq!(project_root(&b), Some(b.clone()));
+        let scratch = tmp.path().join("scratch");
+        std::fs::create_dir_all(&scratch).unwrap();
+        assert_eq!(project_root(&scratch), None);
     }
 
     #[test]

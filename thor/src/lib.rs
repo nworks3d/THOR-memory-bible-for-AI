@@ -4,6 +4,7 @@ pub mod auditor;
 pub mod recall;
 pub mod repo;
 pub mod ingest;
+pub mod ledger;
 pub mod review;
 #[cfg(feature = "semantic")]
 pub mod embed;

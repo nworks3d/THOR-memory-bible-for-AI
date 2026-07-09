@@ -1,31 +1,40 @@
-//! THOR MCP server. Serves recall/get/remember over MCP, either on stdio
-//! (`thor mcp`, the local connector) or Streamable-HTTP (`thor mcp --http
-//! <bind>`, the remote connector deployed on the NAS - THOR's own server, port
-//! and DB, fully independent of mimir). Built on rmcp (mimir's proven recipe).
+//! THOR MCP server: the agent's full stewardship surface - read (recall / get /
+//! history / brief), write (remember with duplicate refusal + typed footers),
+//! repair (revise / retract / resolve, all CAS-checked so a stale write returns
+//! the fresh head-set instead of minting a silent branch), and curate (mark /
+//! pin / unpin / reproject). Served on stdio (`thor mcp`, the local connector)
+//! or Streamable-HTTP (`thor mcp --http <bind>`, the remote connector deployed
+//! on the NAS - THOR's own server, port and DB, fully independent of mimir).
+//! Built on rmcp (mimir's proven recipe).
 //!
 //! The store is sync (rusqlite); every tool hops through spawn_blocking so the
 //! async transport is never blocked. One shared store behind a Mutex serves all
 //! HTTP sessions (WAL + the Mutex handle concurrency).
 
-use crate::cli::render_get;
-use crate::event_store::{EventKind, EventStore};
-use crate::recall::{recall_scoped, RecallScope};
+use crate::cli::{render_get, render_history};
+use crate::event_store::{EventKind, EventStore, MutateConflict, ResolveConflict};
+use crate::recall::{recall_memories_scoped, recall_scoped, RecallScope};
 use rmcp::handler::server::router::tool::ToolRouter;
 use rmcp::handler::server::wrapper::Parameters;
 use rmcp::model::{ServerCapabilities, ServerInfo};
 use rmcp::{schemars, tool, tool_handler, tool_router, ServerHandler, ServiceExt};
 use serde::Deserialize;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use uuid::Uuid;
 
-const INSTRUCTIONS: &str = "THOR is the user's lossless memory. recall searches the current-head \
-facts (read-only), SCOPED to the current project + the global tier - pass all_projects:true to \
-search every project, or project:\"<key>\" for a specific one. get shows one entity's head(s); \
-remember stores a NEW fact (scoped to the current project by default; pass project:\"global\" for \
-a cross-project fact). When a fact you already stored CHANGES, do not remember a second copy: \
-revise it (replace its current head) or retract it (stop serving it) by entity_id, so recall never \
-serves a stale version. Recall before remembering to avoid duplicates.";
+const INSTRUCTIONS: &str = "THOR is the user's lossless memory - and YOURS to maintain, not just \
+to fill. recall searches the current-head facts (scoped to the current project + the global tier; \
+all_projects:true for everything, project:\"<key>\" for one, kind:\"memory\" to exclude code \
+chunks when you want notes/decisions). get shows one entity's full head(s); history its revision \
+log. remember stores a NEW fact (recall first - near-duplicates are refused) and accepts \
+fact_type (gotcha|decision|preference) + tags. When a fact you see is outdated or wrong: revise \
+it (auto-fills parent_rev when single-headed) or retract it - do NOT remember a duplicate. When \
+you meet a [DIVERGED] fact: resolve it (keep_rev wins) as soon as you know the right head. When \
+an injected/recalled fact actually helped you: mark it (improves future ranking). pin/unpin \
+manage the standing rules re-injected at every session start; brief shows what THOR knows about \
+the current project (counts, recent facts, pins, diverged). reproject moves a mis-scoped fact to \
+another project or global.";
 
 /// The current project for a stdio server, from its launch cwd (Claude Code starts
 /// the connector in the project dir). `None` for the HTTP server (no cwd).
@@ -39,6 +48,9 @@ pub struct ThorServer {
     /// Project the server was launched in (`None` = unscoped / HTTP). Recall
     /// defaults to this; remember tags new facts with it.
     project: Option<String>,
+    /// Store path, for the sidecars that live NEXT to the db (pins). An empty
+    /// path (in-memory test store) keeps pin/unpin working in a temp cwd.
+    db: PathBuf,
     #[allow(dead_code)] // read only inside the #[tool_handler] macro expansion
     tool_router: ToolRouter<Self>,
 }
@@ -57,6 +69,10 @@ pub struct RecallArgs {
     /// server's current project.
     #[serde(default)]
     pub project: Option<String>,
+    /// "memory" = only hand-written facts (notes/gotchas/decisions), never repo
+    /// code chunks. Omit for everything.
+    #[serde(default)]
+    pub kind: Option<String>,
 }
 
 #[derive(Deserialize, schemars::JsonSchema)]
@@ -76,30 +92,95 @@ pub struct RememberArgs {
     /// cross-project fact. Omitted = the server's current project.
     #[serde(default)]
     pub project: Option<String>,
+    /// Constraint class: "gotcha", "decision", or "preference". Typed facts get
+    /// a footer, a tag in recall/injection, and (guard/brief) priority.
+    #[serde(default)]
+    pub fact_type: Option<String>,
+    /// Free-form tags, stored in the footer for later search.
+    #[serde(default)]
+    pub tags: Option<Vec<String>>,
 }
 
 #[derive(Deserialize, schemars::JsonSchema)]
 pub struct ReviseArgs {
-    /// The entity id whose current head to replace with a corrected version.
+    /// The entity id to update.
     pub entity_id: String,
-    /// The corrected fact body (replaces the current head).
+    /// The corrected, full replacement body.
     pub body: String,
+    /// The head rev this update is based on. Omit when the entity has a single
+    /// head (auto-filled); required when it is DIVERGED. A stale value is
+    /// rejected with the fresh head-set instead of creating a silent branch.
+    #[serde(default)]
+    pub parent_rev: Option<String>,
 }
 
 #[derive(Deserialize, schemars::JsonSchema)]
 pub struct RetractArgs {
-    /// The entity id to retract (its current head stops being served by recall).
+    /// The entity id to retract (recall stops surfacing it; history is kept).
     pub entity_id: String,
+    /// The head rev being retracted (omit when single-headed).
+    #[serde(default)]
+    pub parent_rev: Option<String>,
+    /// Why it is retracted (kept in the log).
+    #[serde(default)]
+    pub reason: Option<String>,
+}
+
+#[derive(Deserialize, schemars::JsonSchema)]
+pub struct ResolveArgs {
+    /// The DIVERGED entity to settle.
+    pub entity_id: String,
+    /// The head rev that wins; every other contested head is discarded.
+    pub keep_rev: String,
+}
+
+#[derive(Deserialize, schemars::JsonSchema)]
+pub struct EntityArgs {
+    /// The entity id.
+    pub entity_id: String,
+}
+
+#[derive(Deserialize, schemars::JsonSchema)]
+pub struct ReprojectArgs {
+    /// The entity id to move (memories only, never repo chunks).
+    pub entity_id: String,
+    /// Target project key, or "global" for the cross-project tier.
+    pub project: String,
+}
+
+#[derive(Deserialize, schemars::JsonSchema)]
+pub struct BriefArgs {
+    /// Project key to brief on. Omitted = the server's current project.
+    #[serde(default)]
+    pub project: Option<String>,
+}
+
+/// Normalized body prefix for the near-duplicate check (same normalization as
+/// recall's near-duplicate collapse: whitespace-collapsed, lowercased, 120 chars).
+fn dup_prefix(body: &str) -> String {
+    body.split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .to_lowercase()
+        .chars()
+        .take(120)
+        .collect()
+}
+
+/// Strip characters that would corrupt the `[memory/... | tags: ... | ...]`
+/// footer's field structure.
+fn footer_safe(s: &str) -> String {
+    s.chars().filter(|c| !matches!(c, '|' | '[' | ']')).collect::<String>().trim().to_string()
 }
 
 #[tool_router]
 impl ThorServer {
-    pub fn new(store: EventStore) -> Self {
-        Self::from_shared(Arc::new(Mutex::new(store)), None)
+    pub fn new(store: EventStore, db: PathBuf) -> Self {
+        Self::from_shared(Arc::new(Mutex::new(store)), None, db)
     }
 
-    pub fn from_shared(store: Arc<Mutex<EventStore>>, project: Option<String>) -> Self {
-        ThorServer { store, project, tool_router: Self::tool_router() }
+    pub fn from_shared(store: Arc<Mutex<EventStore>>, project: Option<String>, db: PathBuf) -> Self {
+        ThorServer { store, project, db, tool_router: Self::tool_router() }
     }
 
     /// Run a sync store closure off the async runtime; its Ok/Err String is the
@@ -119,7 +200,7 @@ impl ThorServer {
         }
     }
 
-    #[tool(description = "Search THOR memory and return the best-matching CURRENT-HEAD facts, ranked. Read-only.")]
+    #[tool(description = "Search THOR memory and return the best-matching CURRENT-HEAD facts, ranked. Read-only. kind:\"memory\" excludes repo code chunks.")]
     async fn recall(&self, Parameters(args): Parameters<RecallArgs>) -> String {
         let server_project = self.project.clone();
         self.blocking(move |s| {
@@ -131,8 +212,14 @@ impl ThorServer {
             } else {
                 RecallScope::current(server_project.clone())
             };
-            let hits = recall_scoped(s, &args.query, args.limit.unwrap_or(8), &scope)
-                .map_err(|e| format!("error: {e}"))?;
+            let limit = args.limit.unwrap_or(8);
+            let memories_only = args.kind.as_deref().is_some_and(|k| k.eq_ignore_ascii_case("memory"));
+            let hits = if memories_only {
+                recall_memories_scoped(s, &args.query, limit, &scope)
+            } else {
+                recall_scoped(s, &args.query, limit, &scope)
+            }
+            .map_err(|e| format!("error: {e}"))?;
             if hits.is_empty() {
                 return Ok(format!("No THOR hits for: {}", args.query));
             }
@@ -141,13 +228,15 @@ impl ThorServer {
                 let short = &hit.rev[..hit.rev.len().min(8)];
                 let snip = crate::recall::snippet(&hit.body, 220, &args.query);
                 let diverged = if hit.is_diverged { " [DIVERGED]" } else { "" };
+                let ty = hit.fact_type.map(|t| format!(" [{}]", t.as_str())).unwrap_or_default();
                 let tag = if crate::repo::is_global(hit.project.as_deref()) {
                     "[global]".to_string()
                 } else {
                     format!("[proj:{}]", hit.project.as_deref().unwrap_or("?"))
                 };
-                out.push_str(&format!("{} {} ({}{}): {}\n", tag, hit.entity_id, short, diverged, snip));
+                out.push_str(&format!("{}{} {} ({}{}): {}\n", tag, ty, hit.entity_id, short, diverged, snip));
             }
+            out.push_str("(full body: get <entity_id>; helped you? mark <entity_id>)\n");
             Ok(out)
         })
         .await
@@ -162,7 +251,16 @@ impl ThorServer {
         .await
     }
 
-    #[tool(description = "Store a new fact in THOR as a fact_created. Returns the entity id and rev.")]
+    #[tool(description = "Show one entity's full revision history (seq, kind, rev, parent per event).")]
+    async fn history(&self, Parameters(args): Parameters<EntityArgs>) -> String {
+        self.blocking(move |s| {
+            let events = s.get_events_by_entity(&args.entity_id).map_err(|e| format!("error: {e}"))?;
+            Ok(render_history(&args.entity_id, &events))
+        })
+        .await
+    }
+
+    #[tool(description = "Store a NEW fact (fact_created). Recall first; a near-duplicate of a live fact is refused with a pointer to it. Accepts fact_type (gotcha|decision|preference) and tags.")]
     async fn remember(&self, Parameters(args): Parameters<RememberArgs>) -> String {
         let server_project = self.project.clone();
         self.blocking(move |s| {
@@ -170,81 +268,323 @@ impl ThorServer {
             if body.is_empty() {
                 return Err("a non-empty 'body' is required".to_string());
             }
+            // Near-duplicate refusal: the store's hygiene must not depend on the
+            // model remembering to recall first. Same normalization as recall's
+            // near-duplicate collapse, checked across every project (a duplicate
+            // is a duplicate wherever it lives).
+            let dups = recall_scoped(s, body, 3, &RecallScope::everything()).unwrap_or_default();
+            if let Some(dup) = dups.iter().find(|h| dup_prefix(&h.body) == dup_prefix(body)) {
+                return Err(format!(
+                    "NOT stored: near-duplicate of {} (rev {}). Use revise(entity_id:\"{}\") to \
+                     update it, mark(entity_id:\"{}\") if it just proved useful, or reword if it is \
+                     genuinely a different fact.",
+                    dup.entity_id,
+                    &dup.rev[..dup.rev.len().min(8)],
+                    dup.entity_id,
+                    dup.entity_id
+                ));
+            }
+            let mint = match args.project {
+                Some(p) if p.eq_ignore_ascii_case("global") => None,
+                Some(p) => Some(p),
+                None => server_project,
+            };
             let entity_id = match args.entity_id.filter(|s| !s.is_empty()) {
                 // A caller-supplied id is used verbatim (its prefix defines scope).
                 Some(id) => id,
-                None => {
-                    // Mint scope: explicit arg ("global" -> global) else the server's
-                    // project. A scoped memory is `<key>:mem-<uuid>`, global `mcp-<uuid>`.
-                    let mint = match args.project {
-                        Some(p) if p.eq_ignore_ascii_case("global") => None,
-                        Some(p) => Some(p),
-                        None => server_project,
-                    };
-                    crate::repo::memory_entity_id(mint.as_deref(), &Uuid::new_v4().to_string())
-                }
+                // A scoped memory is `<key>:mem-<uuid>`, global `mcp-<uuid>`.
+                None => crate::repo::memory_entity_id(mint.as_deref(), &Uuid::new_v4().to_string()),
             };
+            // Typed footer (the mimir-compatible format fact_type parsing reads
+            // back), only when the caller passed a type or tags.
+            let mut body = body.to_string();
+            if args.fact_type.is_some() || args.tags.as_deref().is_some_and(|t| !t.is_empty()) {
+                let ty = footer_safe(&args.fact_type.unwrap_or_else(|| "note".into())).to_lowercase();
+                let ty = if ty.is_empty() { "note".to_string() } else { ty };
+                let tags = args
+                    .tags
+                    .unwrap_or_default()
+                    .iter()
+                    .map(|t| footer_safe(t))
+                    .filter(|t| !t.is_empty())
+                    .collect::<Vec<_>>()
+                    .join(" ");
+                let scope_label = crate::repo::owner_project(&entity_id)
+                    .map(str::to_string)
+                    .unwrap_or_else(|| "global".into());
+                body.push_str(&format!("\n\n[memory/{} | tags: {} | project: {}]", ty, tags, scope_label));
+            }
             let ev = s
-                .append_event("mcp", "mcp-session", "mcp", EventKind::FactCreated, &entity_id, None, body)
+                .append_event("mcp", "mcp-session", "mcp", EventKind::FactCreated, &entity_id, None, &body)
                 .map_err(|e| format!("error: {e}"))?;
             Ok(format!("stored entity {} rev {}", entity_id, ev.this_hash))
         })
         .await
     }
 
-    #[tool(
-        description = "Correct an existing fact: replace its current head with a new body (a fact_revised), so recall stops serving the old version. Use when a decision/fact you stored earlier CHANGED. Resolves the current head itself; errors if the entity is diverged (multiple contested heads)."
-    )]
+    #[tool(description = "Update an existing fact with a corrected body (fact_revised). Single-headed facts auto-fill parent_rev; a stale parent_rev is rejected with the fresh head-set (no silent branch). Prefer this over remember for a fact that CHANGED.")]
     async fn revise(&self, Parameters(args): Parameters<ReviseArgs>) -> String {
         self.blocking(move |s| {
             let body = args.body.trim();
             if body.is_empty() {
                 return Err("a non-empty 'body' is required".to_string());
             }
-            let parent = current_head(s, &args.entity_id)?;
-            let ev = s
-                .append_event(
-                    "mcp", "mcp-session", "mcp", EventKind::FactRevised, &args.entity_id, Some(&parent), body,
-                )
-                .map_err(|e| format!("error: {e}"))?;
-            Ok(format!("revised entity {} -> rev {}", args.entity_id, ev.this_hash))
+            match s.append_mutate_checked(
+                "mcp",
+                "mcp-session",
+                "mcp",
+                EventKind::FactRevised,
+                &args.entity_id,
+                args.parent_rev.as_deref(),
+                body,
+            ) {
+                Ok(ev) => Ok(format!("revised {} -> rev {}", args.entity_id, ev.this_hash)),
+                Err(e) => Err(render_mutate_err(e)),
+            }
         })
         .await
     }
 
-    #[tool(
-        description = "Retract a fact: mark its current head as no longer true so recall stops serving it (a fact_retracted; nothing is deleted - the history stays). Resolves the current head itself; errors if diverged."
-    )]
+    #[tool(description = "Retract a wrong or obsolete fact (fact_retracted): recall stops surfacing it, the log keeps its history. Same CAS rules as revise.")]
     async fn retract(&self, Parameters(args): Parameters<RetractArgs>) -> String {
         self.blocking(move |s| {
-            let parent = current_head(s, &args.entity_id)?;
-            let ev = s
-                .append_event(
-                    "mcp", "mcp-session", "mcp", EventKind::FactRetracted, &args.entity_id, Some(&parent),
-                    "[retracted via mcp]",
-                )
+            let body = args.reason.unwrap_or_default();
+            match s.append_mutate_checked(
+                "mcp",
+                "mcp-session",
+                "mcp",
+                EventKind::FactRetracted,
+                &args.entity_id,
+                args.parent_rev.as_deref(),
+                &body,
+            ) {
+                Ok(ev) => Ok(format!("retracted {} (rev {})", args.entity_id, ev.this_hash)),
+                Err(e) => Err(render_mutate_err(e)),
+            }
+        })
+        .await
+    }
+
+    #[tool(description = "Settle a DIVERGED entity: keep_rev becomes the single head, every other contested head is discarded. Run when get/recall shows [DIVERGED] and you know which head is right.")]
+    async fn resolve(&self, Parameters(args): Parameters<ResolveArgs>) -> String {
+        self.blocking(move |s| {
+            // Derive the discard set from the current heads; append_resolve
+            // re-verifies the citation under the write lock, so a concurrent
+            // change comes back as a conflict instead of a wrong resolve.
+            let events = s.get_all_events().map_err(|e| format!("error: {e}"))?;
+            let heads = crate::cas::compute_head_sets(&events);
+            let current = heads
+                .get(&args.entity_id)
+                .map(|h| h.heads.clone())
+                .unwrap_or_default();
+            if current.is_empty() {
+                return Err(format!("unknown entity: {}", args.entity_id));
+            }
+            let discarded: Vec<String> =
+                current.iter().filter(|r| **r != args.keep_rev).cloned().collect();
+            match s.append_resolve("mcp", "mcp-session", "mcp", &args.entity_id, &args.keep_rev, &discarded) {
+                Ok(_) => Ok(format!("resolved {}: kept rev {}", args.entity_id, args.keep_rev)),
+                Err(e) => match e.downcast_ref::<ResolveConflict>() {
+                    Some(c) => Err(format!(
+                        "resolve rejected: {}. Current head-set: {:?} - re-run citing exactly these.",
+                        c.reason, c.current_heads
+                    )),
+                    None => Err(format!("error: {e}")),
+                },
+            }
+        })
+        .await
+    }
+
+    #[tool(description = "Mark a fact as USEFUL (it actually answered your question / prevented a mistake). Head-neutral, sync-safe; feeds the ranking prior, so marking honestly improves your own future recall.")]
+    async fn mark(&self, Parameters(args): Parameters<EntityArgs>) -> String {
+        self.blocking(move |s| {
+            if s.get_events_by_entity(&args.entity_id).map_err(|e| format!("error: {e}"))?.is_empty() {
+                return Err(format!("unknown entity: {}", args.entity_id));
+            }
+            s.append_event("mcp", "mcp-session", "mcp", EventKind::FactEchoed, &args.entity_id, None, "")
                 .map_err(|e| format!("error: {e}"))?;
-            Ok(format!("retracted entity {} -> rev {}", args.entity_id, ev.this_hash))
+            Ok(format!("marked {} as useful", args.entity_id))
+        })
+        .await
+    }
+
+    #[tool(description = "Pin a fact: its full body is then re-injected at EVERY session start and right after a compaction (<thor-brief>). Use for standing rules the user states (\"never X on prod\").")]
+    async fn pin(&self, Parameters(args): Parameters<EntityArgs>) -> String {
+        let db = self.db.clone();
+        self.blocking(move |s| {
+            if s.get_events_by_entity(&args.entity_id).map_err(|e| format!("error: {e}"))?.is_empty() {
+                return Err(format!("unknown entity: {}", args.entity_id));
+            }
+            let mut pins = crate::ledger::read_pins(&db);
+            if pins.contains(&args.entity_id) {
+                return Ok(format!("already pinned: {}", args.entity_id));
+            }
+            pins.push(args.entity_id.clone());
+            crate::ledger::write_pins(&db, &pins).map_err(|e| format!("error: {e}"))?;
+            Ok(format!("pinned {} ({} pin(s) total)", args.entity_id, pins.len()))
+        })
+        .await
+    }
+
+    #[tool(description = "Remove a fact from the pinned session-start brief.")]
+    async fn unpin(&self, Parameters(args): Parameters<EntityArgs>) -> String {
+        let db = self.db.clone();
+        self.blocking(move |_s| {
+            let mut pins = crate::ledger::read_pins(&db);
+            let before = pins.len();
+            pins.retain(|p| p != &args.entity_id);
+            if pins.len() == before {
+                return Ok(format!("not pinned: {}", args.entity_id));
+            }
+            crate::ledger::write_pins(&db, &pins).map_err(|e| format!("error: {e}"))?;
+            Ok(format!("unpinned {}", args.entity_id))
+        })
+        .await
+    }
+
+    #[tool(description = "Move a mis-scoped fact to another project or to \"global\" (sync-safe fact_reprojected event). Memories only - repo chunks are managed by ingest.")]
+    async fn reproject(&self, Parameters(args): Parameters<ReprojectArgs>) -> String {
+        self.blocking(move |s| {
+            if crate::repo::is_chunk_id(&args.entity_id) {
+                return Err(format!(
+                    "{} is a repo chunk (managed by ingest); reproject applies to memories",
+                    args.entity_id
+                ));
+            }
+            if s.get_events_by_entity(&args.entity_id).map_err(|e| format!("error: {e}"))?.is_empty() {
+                return Err(format!("unknown entity: {}", args.entity_id));
+            }
+            let (body, target) = if args.project.eq_ignore_ascii_case("global") {
+                (r#"{"project":null}"#.to_string(), "global".to_string())
+            } else {
+                crate::repo::validate_project_key(&args.project)?;
+                (serde_json::json!({ "project": args.project }).to_string(), args.project.clone())
+            };
+            s.append_event("mcp", "mcp-session", "mcp", EventKind::FactReprojected, &args.entity_id, None, &body)
+                .map_err(|e| format!("error: {e}"))?;
+            Ok(format!("reprojected {} -> {}", args.entity_id, target))
+        })
+        .await
+    }
+
+    #[tool(description = "What does THOR know here? Live-fact counts (memories vs code chunks, per type), the most recent memories, the pinned standing rules, and any DIVERGED facts needing a resolve. Start-of-task orientation.")]
+    async fn brief(&self, Parameters(args): Parameters<BriefArgs>) -> String {
+        let server_project = self.project.clone();
+        let db = self.db.clone();
+        self.blocking(move |s| {
+            let project = args.project.or(server_project);
+            let events = s.get_all_events().map_err(|e| format!("error: {e}"))?;
+            Ok(render_overview(&events, &db, project.as_deref()))
         })
         .await
     }
 }
 
-/// Resolve the SINGLE current head of an entity for a revise/retract. Errors when
-/// the entity is unknown (no head) or diverged (more than one contested head) - a
-/// diverged fact must be reconciled explicitly, never auto-picked.
-fn current_head(s: &EventStore, entity_id: &str) -> Result<String, String> {
-    let events = s.get_all_events().map_err(|e| format!("error: {e}"))?;
-    let heads = crate::cas::compute_head_sets(&events);
-    match heads.get(entity_id) {
-        None => Err(format!("error: no such entity '{}'", entity_id)),
-        Some(hs) if hs.heads.len() == 1 => Ok(hs.heads.iter().next().unwrap().clone()),
-        Some(hs) => Err(format!(
-            "error: '{}' is diverged ({} contested heads); reconcile it with `thor resolve` before revising/retracting",
-            entity_id,
-            hs.heads.len()
-        )),
+/// Typed-conflict rendering for revise/retract: the agent gets the fresh
+/// head-set to retry with, instead of an opaque error.
+fn render_mutate_err(e: anyhow::Error) -> String {
+    match e.downcast_ref::<MutateConflict>() {
+        Some(c) => format!(
+            "rejected: {}. Current head-set for {}: {:?}. Re-read the fact (get) and retry with \
+             the right parent_rev, or resolve the divergence first.",
+            c.reason, c.entity_id, c.current_heads
+        ),
+        None => format!("error: {e}"),
     }
+}
+
+/// The brief tool's body: counts, recent memories, pins, diverged - the
+/// orientation an agent needs to decide whether memory is worth interrogating.
+fn render_overview(events: &[crate::event_store::Event], db: &Path, project: Option<&str>) -> String {
+    use std::collections::HashMap;
+    let scope = RecallScope::current(project.map(str::to_string));
+    let heads = crate::cas::compute_head_sets(events);
+    let projects = crate::cas::compute_projects(events);
+    let by_hash: HashMap<&str, &crate::event_store::Event> =
+        events.iter().map(|e| (e.this_hash.as_str(), e)).collect();
+
+    let mut memories = 0usize;
+    let mut chunks = 0usize;
+    let mut typed: HashMap<&'static str, usize> = HashMap::new();
+    let mut diverged: Vec<&str> = Vec::new();
+    // (entity, max head seq, body, type) for the recent-memories list
+    let mut recent: Vec<(&str, i64, &str, Option<crate::repo::FactType>)> = Vec::new();
+
+    for (id, hs) in &heads {
+        let effective = projects.get(id).and_then(|o| o.as_deref());
+        if !scope.allows(effective) {
+            continue;
+        }
+        let mut live_body: Option<(&str, i64)> = None;
+        for rev in &hs.heads {
+            if let Some(ev) = by_hash.get(rev.as_str()) {
+                if !matches!(ev.kind, EventKind::FactRetracted) {
+                    let best = live_body.map(|(_, s)| s).unwrap_or(i64::MIN);
+                    if ev.seq > best {
+                        live_body = Some((ev.body.as_str(), ev.seq));
+                    }
+                }
+            }
+        }
+        let (body, seq) = match live_body {
+            Some(x) => x,
+            None => continue, // fully retracted: not a live fact
+        };
+        if crate::repo::is_chunk_id(id) {
+            chunks += 1;
+            continue;
+        }
+        memories += 1;
+        let ty = crate::repo::fact_type(body);
+        if let Some(t) = ty {
+            *typed.entry(t.as_str()).or_default() += 1;
+        }
+        if hs.is_diverged {
+            diverged.push(id);
+        }
+        recent.push((id, seq, body, ty));
+    }
+
+    recent.sort_by(|a, b| b.1.cmp(&a.1));
+    diverged.sort();
+
+    let mut out = format!(
+        "THOR brief [project: {}]\nlive facts in scope: {} memories + {} code chunks",
+        project.unwrap_or("global"),
+        memories,
+        chunks
+    );
+    if !typed.is_empty() {
+        let mut t: Vec<_> = typed.into_iter().collect();
+        t.sort();
+        out.push_str(&format!(
+            " ({})",
+            t.iter().map(|(k, v)| format!("{}: {}", k, v)).collect::<Vec<_>>().join(", ")
+        ));
+    }
+    out.push('\n');
+    if !recent.is_empty() {
+        out.push_str("recent memories:\n");
+        for (id, _, body, ty) in recent.iter().take(5) {
+            let tag = ty.map(|t| format!("[{}] ", t.as_str())).unwrap_or_default();
+            out.push_str(&format!("  {}{}: {}\n", tag, id, crate::recall::snippet(body, 120, "")));
+        }
+    }
+    let pins = crate::ledger::read_pins(db);
+    if let Some(brief) =
+        crate::cli::render_brief(events, &pins, &scope, "brief", project)
+    {
+        out.push_str(&brief);
+        out.push('\n');
+    }
+    if !diverged.is_empty() {
+        out.push_str(&format!(
+            "DIVERGED (resolve these): {}\n",
+            diverged.iter().take(5).cloned().collect::<Vec<_>>().join(", ")
+        ));
+    }
+    out
 }
 
 #[tool_handler]
@@ -265,13 +605,15 @@ pub fn run_mcp(db: &Path, http: Option<String>) {
 
 fn run(db: &Path, http: Option<String>) -> anyhow::Result<()> {
     let shared = Arc::new(Mutex::new(EventStore::new(db)?));
+    let db = db.to_path_buf();
     let runtime = tokio::runtime::Runtime::new()?;
     runtime.block_on(async {
         match http {
-            Some(bind) => serve_http(shared, &bind).await,
+            Some(bind) => serve_http(shared, db, &bind).await,
             None => {
-                let service =
-                    ThorServer::from_shared(shared, startup_project()).serve(rmcp::transport::stdio()).await?;
+                let service = ThorServer::from_shared(shared, startup_project(), db)
+                    .serve(rmcp::transport::stdio())
+                    .await?;
                 service.waiting().await?;
                 Ok(())
             }
@@ -282,10 +624,10 @@ fn run(db: &Path, http: Option<String>) -> anyhow::Result<()> {
 /// Serve the tools over Streamable-HTTP at /mcp. This transport carries NO auth -
 /// bind to localhost on the NAS and front it with the Cloudflare Access gate,
 /// exactly like mimir's remote MCP.
-async fn serve_http(store: Arc<Mutex<EventStore>>, bind: &str) -> anyhow::Result<()> {
+async fn serve_http(store: Arc<Mutex<EventStore>>, db: PathBuf, bind: &str) -> anyhow::Result<()> {
     // HTTP/remote has no cwd: unscoped by default (a cwd-less remote consumer is
     // cross-project by nature), honoring an explicit `project` arg per call.
-    let app = mcp_http_router(move || Ok(ThorServer::from_shared(store.clone(), None)));
+    let app = mcp_http_router(move || Ok(ThorServer::from_shared(store.clone(), None, db.clone())));
     let listener = tokio::net::TcpListener::bind(bind).await?;
     println!("thor MCP (streamable-http) listening on http://{bind}/mcp");
     axum::serve(listener, app).await?;
@@ -320,67 +662,217 @@ mod tests {
         store
     }
 
+    fn server_with(store: EventStore) -> (ThorServer, tempfile::TempDir) {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("thor.db");
+        (ThorServer::new(store, db), dir)
+    }
+
+    fn recall_args(query: &str) -> RecallArgs {
+        RecallArgs { query: query.into(), limit: None, all_projects: false, project: None, kind: None }
+    }
+
+    fn remember_args(body: &str) -> RememberArgs {
+        RememberArgs { body: body.into(), entity_id: None, project: None, fact_type: None, tags: None }
+    }
+
     #[tokio::test]
     async fn test_recall_tool_returns_hit() {
-        let server = ThorServer::new(seed());
-        let out = server
-            .recall(Parameters(RecallArgs { query: "deploy watcher".into(), limit: None, all_projects: false, project: None }))
-            .await;
+        let (server, _d) = server_with(seed());
+        let out = server.recall(Parameters(recall_args("deploy watcher"))).await;
         assert!(out.contains("e1"), "recall must surface the seeded fact: {out}");
     }
 
     #[tokio::test]
-    async fn test_remember_then_recall_roundtrip() {
-        let server = ThorServer::new(seed());
+    async fn test_recall_kind_memory_excludes_chunks() {
+        let mut store = seed();
+        store
+            .append_event("s", "l", "a", EventKind::FactCreated, "Proj:src/widget.rs#0", None, "widget widget code chunk")
+            .unwrap();
+        store
+            .append_event("s", "l", "a", EventKind::FactCreated, "Proj:mem-1", None, "GOTCHA: widget must stay red")
+            .unwrap();
+        let (server, _d) = server_with(store);
+        let mut args = recall_args("widget");
+        args.all_projects = true;
+        args.kind = Some("memory".into());
+        let out = server.recall(Parameters(args)).await;
+        assert!(out.contains("Proj:mem-1"), "the memory surfaces: {out}");
+        assert!(out.contains("[gotcha]"), "typed tag rendered: {out}");
+        assert!(!out.contains("widget.rs#0"), "kind:memory must exclude chunks: {out}");
+    }
+
+    #[tokio::test]
+    async fn test_remember_then_recall_roundtrip_with_typed_footer() {
+        let (server, _d) = server_with(seed());
         let stored = server
-            .remember(Parameters(RememberArgs { body: "a brand new zephyr fact".into(), entity_id: None, project: None }))
+            .remember(Parameters(RememberArgs {
+                body: "a brand new zephyr fact".into(),
+                entity_id: None,
+                project: None,
+                fact_type: Some("decision".into()),
+                tags: Some(vec!["zephyr".into(), "test".into()]),
+            }))
             .await;
         assert!(stored.starts_with("stored entity mcp-"), "got: {stored}");
-        let rc = server
-            .recall(Parameters(RecallArgs { query: "zephyr".into(), limit: None, all_projects: false, project: None }))
-            .await;
+        let rc = server.recall(Parameters(recall_args("zephyr"))).await;
         assert!(rc.contains("zephyr"), "the new fact must be recallable: {rc}");
+        assert!(rc.contains("[decision]"), "the typed footer classifies the fact: {rc}");
+    }
+
+    #[tokio::test]
+    async fn test_remember_refuses_near_duplicate() {
+        let (server, _d) = server_with(seed());
+        let out = server
+            .remember(Parameters(remember_args("The deploy   watcher GOTCHA")))
+            .await;
+        assert!(out.contains("NOT stored"), "a near-duplicate must be refused: {out}");
+        assert!(out.contains("e1"), "the refusal points at the existing fact: {out}");
+        assert!(out.contains("revise"), "the refusal teaches the repair path: {out}");
+        // a genuinely different fact still stores
+        let ok = server.remember(Parameters(remember_args("an entirely different filament note"))).await;
+        assert!(ok.starts_with("stored entity"), "{ok}");
     }
 
     #[tokio::test]
     async fn test_remember_rejects_empty_body() {
-        let server = ThorServer::new(seed());
-        let out = server
-            .remember(Parameters(RememberArgs { body: "   ".into(), entity_id: None, project: None }))
-            .await;
+        let (server, _d) = server_with(seed());
+        let out = server.remember(Parameters(remember_args("   "))).await;
         assert!(out.contains("non-empty"), "empty body must be rejected: {out}");
     }
 
     #[tokio::test]
-    async fn test_revise_and_retract_update_recall() {
-        let server = ThorServer::new(seed()); // e1 = "the deploy watcher gotcha"
-        // revise replaces the head; recall serves the new body
-        let r = server
+    async fn test_revise_lifecycle_and_stale_parent_conflict() {
+        let (server, _d) = server_with(seed());
+        // revise with auto-filled parent (single head)
+        let out = server
             .revise(Parameters(ReviseArgs {
                 entity_id: "e1".into(),
-                body: "the deploy watcher now runs on the NAS".into(),
+                body: "the deploy watcher gotcha, updated".into(),
+                parent_rev: None,
             }))
             .await;
-        assert!(r.starts_with("revised entity e1"), "got: {r}");
-        let rc = server
-            .recall(Parameters(RecallArgs { query: "deploy watcher NAS".into(), limit: None, all_projects: true, project: None }))
+        assert!(out.starts_with("revised e1"), "{out}");
+        // the old text is no longer a head; the new one recalls
+        let rc = server.recall(Parameters(recall_args("deploy watcher"))).await;
+        assert!(rc.contains("updated"), "{rc}");
+        // a stale parent_rev is rejected with the fresh head-set, never a branch
+        let stale = server
+            .revise(Parameters(ReviseArgs {
+                entity_id: "e1".into(),
+                body: "racing write".into(),
+                parent_rev: Some("0000000000000000000000000000000000000000000000000000000000000000".into()),
+            }))
             .await;
-        assert!(rc.contains("NAS"), "recall serves the revised body: {rc}");
-        // retract stops it surfacing
-        let rt = server.retract(Parameters(RetractArgs { entity_id: "e1".into() })).await;
-        assert!(rt.starts_with("retracted entity e1"), "got: {rt}");
-        let rc2 = server
-            .recall(Parameters(RecallArgs { query: "deploy watcher NAS".into(), limit: None, all_projects: true, project: None }))
-            .await;
-        assert!(!rc2.contains("e1"), "a retracted fact stops surfacing: {rc2}");
+        assert!(stale.contains("rejected"), "stale parent must conflict: {stale}");
+        assert!(stale.contains("head-set"), "the fresh head-set is returned: {stale}");
+        let get = server.get(Parameters(GetArgs { entity_id: "e1".into() })).await;
+        assert!(!get.contains("DIVERGED"), "a rejected revise must not mint a branch: {get}");
         // revising an unknown entity errors (never creates a stray head)
-        let err = server.revise(Parameters(ReviseArgs { entity_id: "nope".into(), body: "x".into() })).await;
-        assert!(err.contains("no such entity"), "got: {err}");
+        let err = server
+            .revise(Parameters(ReviseArgs { entity_id: "nope".into(), body: "x".into(), parent_rev: None }))
+            .await;
+        assert!(err.contains("unknown entity"), "got: {err}");
+    }
+
+    #[tokio::test]
+    async fn test_retract_hides_from_recall_keeps_history() {
+        let (server, _d) = server_with(seed());
+        let out = server
+            .retract(Parameters(RetractArgs { entity_id: "e1".into(), parent_rev: None, reason: Some("obsolete".into()) }))
+            .await;
+        assert!(out.starts_with("retracted e1"), "{out}");
+        let rc = server.recall(Parameters(recall_args("deploy watcher"))).await;
+        assert!(rc.contains("No THOR hits"), "a retracted fact must stop surfacing: {rc}");
+        let hist = server.history(Parameters(EntityArgs { entity_id: "e1".into() })).await;
+        assert!(hist.contains("fact_retracted"), "history keeps the full trail: {hist}");
+        assert!(hist.contains("fact_created"), "{hist}");
+    }
+
+    #[tokio::test]
+    async fn test_resolve_settles_diverged_entity() {
+        let mut store = seed();
+        // force a divergence via the raw primitive
+        store
+            .append_event("s", "l", "a", EventKind::FactRevised, "e1", Some("stale-parent"), "branch B")
+            .unwrap();
+        let heads: Vec<String> = {
+            let events = store.get_all_events().unwrap();
+            let mut h: Vec<String> =
+                crate::cas::compute_head_sets(&events)["e1"].heads.iter().cloned().collect();
+            h.sort();
+            h
+        };
+        assert_eq!(heads.len(), 2, "sanity: diverged");
+        let (server, _d) = server_with(store);
+        let out = server
+            .resolve(Parameters(ResolveArgs { entity_id: "e1".into(), keep_rev: heads[0].clone() }))
+            .await;
+        assert!(out.starts_with("resolved e1"), "{out}");
+        let get = server.get(Parameters(GetArgs { entity_id: "e1".into() })).await;
+        assert!(!get.contains("DIVERGED"), "resolve must settle the entity: {get}");
+    }
+
+    #[tokio::test]
+    async fn test_mark_appends_echo_and_validates_entity() {
+        let (server, _d) = server_with(seed());
+        let out = server.mark(Parameters(EntityArgs { entity_id: "e1".into() })).await;
+        assert!(out.contains("marked e1"), "{out}");
+        let hist = server.history(Parameters(EntityArgs { entity_id: "e1".into() })).await;
+        assert!(hist.contains("fact_echoed"), "the echo lands in the log: {hist}");
+        let bad = server.mark(Parameters(EntityArgs { entity_id: "nope".into() })).await;
+        assert!(bad.contains("unknown entity"), "{bad}");
+    }
+
+    #[tokio::test]
+    async fn test_pin_unpin_and_brief() {
+        let mut store = seed();
+        store
+            .append_event(
+                "s", "l", "a", EventKind::FactCreated, "rule-1", None,
+                "HARDE REGEL: never force-recreate on prod",
+            )
+            .unwrap();
+        let (server, _d) = server_with(store);
+        let out = server.pin(Parameters(EntityArgs { entity_id: "rule-1".into() })).await;
+        assert!(out.starts_with("pinned rule-1"), "{out}");
+        let brief = server.brief(Parameters(BriefArgs { project: None })).await;
+        assert!(brief.contains("2 memories"), "counts live facts: {brief}");
+        assert!(brief.contains("<thor-brief>"), "pinned block present: {brief}");
+        assert!(brief.contains("never force-recreate on prod"), "full pinned body: {brief}");
+        assert!(brief.contains("[preference]"), "typed count/tag: {brief}");
+        let out = server.unpin(Parameters(EntityArgs { entity_id: "rule-1".into() })).await;
+        assert!(out.starts_with("unpinned"), "{out}");
+        let brief = server.brief(Parameters(BriefArgs { project: None })).await;
+        assert!(!brief.contains("<thor-brief>"), "unpinned -> no pinned block: {brief}");
+    }
+
+    #[tokio::test]
+    async fn test_reproject_moves_scope_and_refuses_chunks() {
+        let (server, _d) = server_with(seed());
+        let out = server
+            .reproject(Parameters(ReprojectArgs { entity_id: "e1".into(), project: "ProjA".into() }))
+            .await;
+        assert!(out.contains("e1 -> ProjA"), "{out}");
+        // now scoped: visible in ProjA, hidden in ProjB
+        let mut in_a = recall_args("deploy watcher");
+        in_a.project = Some("ProjA".into());
+        assert!(server.recall(Parameters(in_a)).await.contains("e1"));
+        let mut in_b = recall_args("deploy watcher");
+        in_b.project = Some("ProjB".into());
+        assert!(server.recall(Parameters(in_b)).await.contains("No THOR hits"));
+        // chunks are refused
+        let chunk = server
+            .reproject(Parameters(ReprojectArgs { entity_id: "P:src/a.rs#0".into(), project: "X".into() }))
+            .await;
+        assert!(chunk.contains("chunk"), "{chunk}");
     }
 
     #[tokio::test]
     async fn test_http_router_builds() {
         // the Streamable-HTTP transport wires up without a live socket
-        let _app = mcp_http_router(|| Ok(ThorServer::new(EventStore::in_memory().unwrap())));
+        let _app = mcp_http_router(|| {
+            Ok(ThorServer::new(EventStore::in_memory().unwrap(), PathBuf::from("thor-test.db")))
+        });
     }
 }

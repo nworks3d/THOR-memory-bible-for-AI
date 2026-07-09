@@ -1,10 +1,20 @@
 use crate::event_store::EventStore;
 use crate::recall::{recall_scoped, RecallHit, RecallScope};
+use std::collections::HashMap;
 use std::io::Read;
 use std::path::Path;
 
 /// How many distinct hits to inject (matches the mimir hook's MaxHits).
 const MAX_HITS: usize = 3;
+/// How many hits to recall as the working pool. Deeper than MAX_HITS so the
+/// session ledger can rotate suppressed hits out and the echo prior can promote
+/// a proven-useful fact from below the fold. Recall cost is limit-independent.
+const POOL_HITS: usize = 8;
+/// A rev injected within this many recent prompts is suppressed (not repeated).
+const SUPPRESS_WINDOW: u64 = 5;
+/// Echo-promotion threshold: a below-the-fold fact the agent marked useful may
+/// take slot 3 only when its bm25 strength is within this factor of slot 3's.
+const ECHO_RANK_SLACK: f64 = 1.5;
 /// Skip prompts shorter than this (pure acks like "ok").
 const MIN_CHARS: usize = 4;
 /// Cap the query length fed to recall.
@@ -105,14 +115,55 @@ fn injection_for_hook_json(db: &Path, raw: &str) -> Option<String> {
     // walk-up, no subprocess); the CORE recall then scopes to that project + the
     // always-in-scope global tier. A projectless cwd (scratch dir) -> global-only,
     // so auto-injection never re-imports another project's clutter.
-    let project = data
-        .get("cwd")
-        .and_then(|v| v.as_str())
-        .and_then(|c| crate::repo::project_key(Path::new(c)));
+    let cwd = data.get("cwd").and_then(|v| v.as_str()).map(str::to_string);
+    let session_id = data.get("session_id").and_then(|v| v.as_str()).unwrap_or("");
+    let project = cwd.as_deref().and_then(|c| crate::repo::project_key(Path::new(c)));
     let scope = RecallScope::current(project.clone());
-    let hits = recall_for(db, &store, &query, &scope, MAX_HITS);
-    if hits.is_empty() {
+    let pool = recall_for(db, &store, &query, &scope, POOL_HITS);
+
+    // Silence threshold: an OR-fallback pool (only some query words matched) is
+    // gated on real term coverage, so "best of an all-weak pool" is silence, not
+    // three confident-looking noise lines. Strict-AND and fused hits pass as-is.
+    let pool: Vec<RecallHit> = pool
+        .into_iter()
+        .filter(|h| h.matched_and || crate::recall::covers_query(&h.body, &query))
+        .collect();
+    if pool.is_empty() {
         return None;
+    }
+
+    // Per-session injection ledger: never re-inject a rev shown within the last
+    // SUPPRESS_WINDOW prompts; deeper pool hits rotate into the freed slots.
+    // Sessionless hooks (no session_id) behave statelessly, exactly as before.
+    let mut ledger = SessionLedger::load(db, session_id);
+    let pool_top_rev = pool[0].rev.clone();
+    let survivors: Vec<RecallHit> =
+        pool.into_iter().filter(|h| !ledger.suppressed(h)).collect();
+
+    // Echo prior: if none of the top picks was ever marked useful but a
+    // below-the-fold fact was (and it ranks close enough), give it slot 3.
+    let echo = echo_counts(&store);
+    let selected = select_hits(survivors, &echo);
+
+    // One-line stub when the best match was suppressed: the agent keeps the
+    // pointer without paying the repeated block.
+    let top_suppressed_stub = (ledger.active()
+        && ledger.was_recent(&pool_top_rev)
+        && !selected.iter().any(|h| h.rev == pool_top_rev))
+    .then(|| {
+        format!(
+            "- (top match unchanged, shown {} prompt(s) ago; `get` it if needed)\n",
+            ledger.prompts_since(&pool_top_rev)
+        )
+    });
+
+    // Count this prompt + record what we are about to inject, even when
+    // everything was suppressed (the window must keep sliding).
+    ledger.record(&selected);
+    ledger.save(db);
+
+    if selected.is_empty() {
+        return None; // everything relevant is already in the agent's context
     }
 
     // THOR-PRIMARY.flag flips the phase: THOR becomes the source of truth and
@@ -138,7 +189,7 @@ fn injection_for_hook_json(db: &Path, raw: &str) -> Option<String> {
     // If any hit is on a DIVERGED entity, load the head projection ONCE so we can
     // show the OTHER contested head(s) too - the agent then reconciles a real
     // conflict instead of silently acting on one auto-picked side.
-    let diverged_ctx = if hits.iter().any(|h| h.is_diverged) {
+    let diverged_ctx = if selected.iter().any(|h| h.is_diverged) {
         store.get_all_events().ok().map(|events| {
             let heads = crate::cas::compute_head_sets(&events);
             let by_rev: std::collections::HashMap<String, String> =
@@ -148,13 +199,25 @@ fn injection_for_hook_json(db: &Path, raw: &str) -> Option<String> {
     } else {
         None
     };
-    for hit in &hits {
+    for hit in &selected {
         let short = &hit.rev[..hit.rev.len().min(8)];
         // A memory/decision/gotcha is short and its actionable half must not be cut;
         // a code chunk is long and a preview suffices. So give memories a wider window.
         let cap = if crate::repo::is_chunk_id(&hit.entity_id) { 220 } else { 500 };
-        let snip = crate::recall::snippet(&hit.body, cap, &query);
         let diverged = if hit.is_diverged { " [DIVERGED]" } else { "" };
+        // Freshness: a chunk of the CURRENT project is re-read from disk, so the
+        // agent sees today's code (tagged [refreshed]) - or a warning when the
+        // stored chunk no longer exists ([stale?]). Memories pass through.
+        let (fresh_tag, snip) = match freshness(&hit.entity_id, &hit.body, project.as_deref(), cwd.as_deref()) {
+            Freshness::Current => (String::new(), crate::recall::snippet(&hit.body, cap, &query)),
+            Freshness::Refreshed(live) => {
+                (" [refreshed]".to_string(), crate::recall::snippet(&live, cap, &query))
+            }
+            Freshness::Stale => (" [stale?]".to_string(), crate::recall::snippet(&hit.body, cap, &query)),
+        };
+        // Type tag for hand-written constraints, so a gotcha/decision reads as
+        // one at a glance instead of blending in with chunks.
+        let type_tag = hit.fact_type.map(|t| format!(" [{}]", t.as_str())).unwrap_or_default();
         // Scope tag so the agent knows which project a hit belongs to (esp. memories,
         // whose ids are opaque): [global] for the global tier, else [proj:<key>].
         let scope_tag = if crate::repo::is_global(hit.project.as_deref()) {
@@ -162,7 +225,10 @@ fn injection_for_hook_json(db: &Path, raw: &str) -> Option<String> {
         } else {
             format!("[proj:{}]", hit.project.as_deref().unwrap_or("?"))
         };
-        out.push_str(&format!("- {} {} ({}{}): {}\n", scope_tag, hit.entity_id, short, diverged, snip));
+        out.push_str(&format!(
+            "- {}{} {} ({}{}{}): {}\n",
+            scope_tag, type_tag, hit.entity_id, short, diverged, fresh_tag, snip
+        ));
         // Show the other contested head(s) so the agent reconciles, not guesses.
         if hit.is_diverged {
             if let Some((heads, by_rev)) = &diverged_ctx {
@@ -184,8 +250,250 @@ fn injection_for_hook_json(db: &Path, raw: &str) -> Option<String> {
             }
         }
     }
+    if let Some(stub) = top_suppressed_stub {
+        out.push_str(&stub);
+    }
     out.push_str("</thor-recall>");
     Some(out)
+}
+
+/// FactEchoed count per entity: the "this actually helped me" signal written by
+/// the mark tool. Fail-soft: any query error means an empty map (no prior).
+fn echo_counts(store: &EventStore) -> HashMap<String, i64> {
+    let conn = store.conn();
+    let mut stmt = match conn
+        .prepare("SELECT entity_id, COUNT(*) FROM event WHERE kind = 'fact_echoed' GROUP BY entity_id")
+    {
+        Ok(s) => s,
+        Err(_) => return HashMap::new(),
+    };
+    let rows = match stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?))) {
+        Ok(r) => r,
+        Err(_) => return HashMap::new(),
+    };
+    rows.flatten().collect()
+}
+
+/// Pick MAX_HITS from the (already gated + suppression-filtered) pool, in rank
+/// order - then, if NO pick was ever marked useful but a deeper hit was, and
+/// that hit's bm25 strength is within ECHO_RANK_SLACK of slot 3's, promote it
+/// into slot 3. Conservative by construction: a marked fact never displaces a
+/// clearly stronger match, and slots 1-2 are never touched.
+fn select_hits(pool: Vec<RecallHit>, echo: &HashMap<String, i64>) -> Vec<RecallHit> {
+    let echoed = |h: &RecallHit| echo.get(&h.entity_id).copied().unwrap_or(0) > 0;
+    let mut selected: Vec<RecallHit> = Vec::with_capacity(MAX_HITS);
+    let mut rest: Vec<RecallHit> = Vec::new();
+    for h in pool {
+        if selected.len() < MAX_HITS {
+            selected.push(h);
+        } else {
+            rest.push(h);
+        }
+    }
+    if selected.len() == MAX_HITS && !selected.iter().any(&echoed) {
+        let slot3_rank = selected[MAX_HITS - 1].rank;
+        // bm25 ranks are negative (more negative = stronger); a rank of 0.0 is a
+        // dense-only hit with no lexical evidence - never promote against that.
+        if slot3_rank < 0.0 {
+            if let Some(cand) = rest
+                .into_iter()
+                .find(|h| echoed(h) && h.rank < 0.0 && h.rank <= slot3_rank / ECHO_RANK_SLACK)
+            {
+                selected[MAX_HITS - 1] = cand;
+            }
+        }
+    }
+    selected
+}
+
+// ---- Per-session injection ledger --------------------------------------------
+
+/// Sliding-window suppression state for one session, persisted in the fail-open
+/// `thor-courier-seen.json` sidecar (crate::ledger). Inactive (stateless, the
+/// pre-ledger behavior) when the hook carries no session_id or the file cannot
+/// be read - the courier contract (never block, never error) is preserved.
+struct SessionLedger {
+    session_id: String,
+    /// This prompt's ordinal within the session (1-based; already incremented).
+    count: u64,
+    /// rev|diverged -> the prompt ordinal at which it was last injected.
+    seen: HashMap<String, u64>,
+}
+
+fn ledger_key(rev: &str, diverged: bool) -> String {
+    // Keyed on rev + diverged so a divergence FLIP re-surfaces the same rev with
+    // its new [DIVERGED] marker instead of being suppressed as "already shown".
+    format!("{}|{}", rev, diverged)
+}
+
+impl SessionLedger {
+    fn load(db: &Path, session_id: &str) -> Self {
+        let mut this = SessionLedger { session_id: session_id.to_string(), count: 0, seen: HashMap::new() };
+        if session_id.is_empty() {
+            return this; // inactive
+        }
+        let map = crate::ledger::read_map(&crate::ledger::courier_seen_path(db));
+        if let Some(entry) = map.get(session_id) {
+            this.count = entry.get("count").and_then(|v| v.as_u64()).unwrap_or(0);
+            if let Some(seen) = entry.get("seen").and_then(|v| v.as_object()) {
+                this.seen = seen
+                    .iter()
+                    .filter_map(|(k, v)| v.as_u64().map(|at| (k.clone(), at)))
+                    .collect();
+            }
+        }
+        this.count += 1; // this prompt
+        this
+    }
+
+    fn active(&self) -> bool {
+        !self.session_id.is_empty()
+    }
+
+    fn suppressed(&self, hit: &RecallHit) -> bool {
+        if !self.active() {
+            return false;
+        }
+        match self.seen.get(&ledger_key(&hit.rev, hit.is_diverged)) {
+            Some(at) => self.count.saturating_sub(*at) <= SUPPRESS_WINDOW,
+            None => false,
+        }
+    }
+
+    /// Was this rev (either diverged state) injected within the window?
+    fn was_recent(&self, rev: &str) -> bool {
+        [true, false].iter().any(|d| {
+            self.seen
+                .get(&ledger_key(rev, *d))
+                .map(|at| self.count.saturating_sub(*at) <= SUPPRESS_WINDOW)
+                .unwrap_or(false)
+        })
+    }
+
+    fn prompts_since(&self, rev: &str) -> u64 {
+        [true, false]
+            .iter()
+            .filter_map(|d| self.seen.get(&ledger_key(rev, *d)))
+            .map(|at| self.count.saturating_sub(*at))
+            .min()
+            .unwrap_or(0)
+    }
+
+    fn record(&mut self, injected: &[RecallHit]) {
+        if !self.active() {
+            return;
+        }
+        for h in injected {
+            self.seen.insert(ledger_key(&h.rev, h.is_diverged), self.count);
+        }
+        // entries older than the window are dead weight - drop them here so the
+        // sidecar stays bounded even in a very long session.
+        let count = self.count;
+        self.seen.retain(|_, at| count.saturating_sub(*at) <= SUPPRESS_WINDOW);
+    }
+
+    fn save(&self, db: &Path) {
+        if !self.active() {
+            return;
+        }
+        let path = crate::ledger::courier_seen_path(db);
+        let mut map = crate::ledger::read_map(&path);
+        let now = crate::review::now_secs();
+        let seen: serde_json::Map<String, serde_json::Value> =
+            self.seen.iter().map(|(k, v)| (k.clone(), serde_json::json!(v))).collect();
+        map.insert(
+            self.session_id.clone(),
+            serde_json::json!({ "ts": now, "count": self.count, "seen": seen }),
+        );
+        crate::ledger::prune_old(&mut map, now, |v| v.get("ts").and_then(|t| t.as_u64()));
+        crate::ledger::write_map(&path, &map);
+    }
+}
+
+/// Clear one session's courier ledger (SessionStart on `source:"compact"`): the
+/// context was just wiped, so re-injection is exactly the point again.
+pub fn clear_session_ledger(db: &Path, session_id: &str) {
+    if session_id.is_empty() {
+        return;
+    }
+    let path = crate::ledger::courier_seen_path(db);
+    let mut map = crate::ledger::read_map(&path);
+    if map.remove(session_id).is_some() {
+        crate::ledger::write_map(&path, &map);
+    }
+}
+
+// ---- Freshness ----------------------------------------------------------------
+
+enum Freshness {
+    /// Stored chunk still matches the file on disk (or the hit is not a chunk of
+    /// the current project, or anything errored - fail-open to the stored body).
+    Current,
+    /// The file changed since ingest: inject THIS live chunk text instead.
+    Refreshed(String),
+    /// The file is gone or the chunk index no longer exists: warn the agent.
+    Stale,
+}
+
+/// Ingest is a snapshot; the agent edits all session long. Before injecting a
+/// chunk of the CURRENT project, re-read its file (same truncation + chunking as
+/// ingest) and compare - so THOR never presents outdated code as fresh context.
+/// Bounded: at most MAX_HITS single-file reads per prompt. Hard fail-open.
+fn freshness(entity_id: &str, stored_body: &str, project: Option<&str>, cwd: Option<&str>) -> Freshness {
+    if !crate::repo::is_chunk_id(entity_id) {
+        return Freshness::Current;
+    }
+    let (project, cwd) = match (project, cwd) {
+        (Some(p), Some(c)) => (p, c),
+        _ => return Freshness::Current,
+    };
+    // Only chunks OWNED by the current project resolve against this cwd's root.
+    if crate::repo::owner_project(entity_id) != Some(project) {
+        return Freshness::Current;
+    }
+    let rest = match entity_id.split_once(':') {
+        Some((_, rest)) => rest,
+        None => return Freshness::Current,
+    };
+    let (rel, n) = match rest.rsplit_once('#') {
+        Some((rel, n)) => match n.parse::<usize>() {
+            Ok(n) => (rel, n),
+            Err(_) => return Freshness::Current,
+        },
+        None => return Freshness::Current,
+    };
+    // Path safety: a chunk rel is always a forward-slash relative path; refuse
+    // anything that could escape the project root.
+    if rel.is_empty() || rel.starts_with('/') || rel.contains("..") || rel.contains(':') {
+        return Freshness::Current;
+    }
+    let root = match crate::repo::project_root(Path::new(cwd)) {
+        Some(r) => r,
+        None => return Freshness::Current,
+    };
+    let path = root.join(rel);
+    let mut text = match std::fs::read_to_string(&path) {
+        Ok(t) => t,
+        Err(_) => return Freshness::Stale, // tracked at ingest, unreadable now
+    };
+    if text.chars().count() > crate::repo::MAX_FILE_CHARS {
+        let cut = text
+            .char_indices()
+            .nth(crate::repo::MAX_FILE_CHARS)
+            .map(|(i, _)| i)
+            .unwrap_or(text.len());
+        text.truncate(cut);
+    }
+    let chunks = crate::repo::chunk_text(&text, crate::repo::MAX_CHUNK_CHARS);
+    if n >= chunks.len() {
+        return Freshness::Stale;
+    }
+    let live = crate::repo::chunk_body(&chunks[n], project, rel, n, chunks.len());
+    if live == stored_body {
+        Freshness::Current
+    } else {
+        Freshness::Refreshed(chunks[n].clone())
+    }
 }
 
 /// Recall for the courier: the semantic score-fusion path when the feature is
@@ -345,6 +653,150 @@ mod tests {
         assert!(injection_for_hook_json(&db, "   ").is_none());
         // missing prompt field -> silent
         assert!(injection_for_hook_json(&db, r#"{"cwd":"x"}"#).is_none());
+    }
+
+    #[test]
+    fn test_session_ledger_suppresses_repeats_and_rotates() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("m.db");
+        {
+            let mut store = EventStore::new(&db).unwrap();
+            for i in 0..5 {
+                store
+                    .append_event(
+                        "s", "l", "a", EventKind::FactCreated, &format!("e{i}"), None,
+                        &format!("deploy watcher fact number {i}"),
+                    )
+                    .unwrap();
+            }
+        }
+        let raw = r#"{"prompt":"deploy watcher","cwd":"x","session_id":"sess-1"}"#;
+        let first = injection_for_hook_json(&db, raw).expect("first prompt injects");
+        // top-3 of the pool injected
+        let injected_first: Vec<bool> = (0..5).map(|i| first.contains(&format!("e{i}"))).collect();
+        assert_eq!(injected_first.iter().filter(|b| **b).count(), 3, "3 hits injected: {first}");
+
+        // same prompt again, same session: the shown revs are suppressed and the
+        // DEEPER pool hits rotate in (with a stub for the suppressed top match).
+        let second = injection_for_hook_json(&db, raw).expect("rotation injects the deeper hits");
+        for (i, was_in_first) in injected_first.iter().enumerate() {
+            let id = format!("e{i}");
+            assert_eq!(
+                second.contains(&format!("- [global] {id} ")),
+                !was_in_first,
+                "prompt 2 must inject exactly the NOT-yet-shown hits; offender: {id}\n{second}"
+            );
+        }
+        assert!(second.contains("top match unchanged"), "stub points at the suppressed top: {second}");
+
+        // third time: everything within the window -> full silence
+        assert!(
+            injection_for_hook_json(&db, raw).is_none(),
+            "everything recently shown -> silent, not a repeated block"
+        );
+
+        // a DIFFERENT session is unaffected
+        let other = r#"{"prompt":"deploy watcher","cwd":"x","session_id":"sess-2"}"#;
+        assert!(injection_for_hook_json(&db, other).is_some(), "other sessions keep their own ledger");
+
+        // clearing the ledger (what SessionStart does on compact) re-arms injection
+        clear_session_ledger(&db, "sess-1");
+        assert!(
+            injection_for_hook_json(&db, raw).is_some(),
+            "post-compaction the same facts must inject again"
+        );
+    }
+
+    #[test]
+    fn test_silence_gate_blocks_single_word_coincidence() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("m.db");
+        {
+            let mut store = EventStore::new(&db).unwrap();
+            store
+                .append_event("s", "l", "a", EventKind::FactCreated, "e1", None, "the sync module ships batches")
+                .unwrap();
+        }
+        // multi-word prompt, only "sync" matches -> OR-fallback coincidence -> silent
+        let raw = r#"{"prompt":"ga verder met de sync refactor","cwd":"x"}"#;
+        assert!(
+            injection_for_hook_json(&db, raw).is_none(),
+            "a one-word overlap on a multi-word prompt is noise, not an answer"
+        );
+        // a prompt genuinely covered by the body still injects
+        let raw2 = r#"{"prompt":"sync ships batches how","cwd":"x"}"#;
+        assert!(injection_for_hook_json(&db, raw2).is_some(), "real coverage still injects");
+    }
+
+    #[test]
+    fn test_select_hits_promotes_echoed_fact_into_slot3() {
+        let mk = |id: &str, rank: f64| RecallHit {
+            entity_id: id.to_string(),
+            rev: format!("rev-{id}"),
+            body: "b".to_string(),
+            kind: EventKind::FactCreated,
+            is_diverged: false,
+            rank,
+            project: None,
+            fact_type: None,
+            matched_and: true,
+        };
+        let mut echo = std::collections::HashMap::new();
+        echo.insert("e4".to_string(), 2i64);
+
+        // e4 (echoed) is within 1.5x of slot 3 -> promoted into slot 3
+        let pool = vec![mk("e1", -9.0), mk("e2", -8.0), mk("e3", -6.0), mk("e4", -5.0)];
+        let sel = select_hits(pool, &echo);
+        assert_eq!(sel[2].entity_id, "e4", "close-ranked echoed fact takes slot 3");
+        assert_eq!(sel[0].entity_id, "e1");
+        assert_eq!(sel[1].entity_id, "e2");
+
+        // too far below slot 3 (-6/1.5 = -4 needed; -1 is far weaker) -> no swap
+        let pool = vec![mk("e1", -9.0), mk("e2", -8.0), mk("e3", -6.0), mk("e4", -1.0)];
+        let sel = select_hits(pool, &echo);
+        assert_eq!(sel[2].entity_id, "e3", "a much weaker echoed fact never displaces a strong match");
+
+        // an echoed fact already in the top 3 -> no swap needed
+        let mut echo2 = std::collections::HashMap::new();
+        echo2.insert("e2".to_string(), 1i64);
+        let pool = vec![mk("e1", -9.0), mk("e2", -8.0), mk("e3", -6.0), mk("e4", -5.9)];
+        let sel = select_hits(pool, &echo2);
+        assert_eq!(sel[2].entity_id, "e3", "top already carries an echoed fact");
+    }
+
+    #[test]
+    fn test_freshness_refreshes_changed_chunk_and_flags_deleted_file() {
+        // a NON-git project (walk_files) with a .thor marker
+        let dir = tempfile::tempdir().unwrap();
+        let proj = dir.path().join("Proj");
+        std::fs::create_dir_all(&proj).unwrap();
+        std::fs::write(proj.join(".thor"), "Proj\n").unwrap();
+        std::fs::write(proj.join("notes.md"), "how the widget frobnicator does work: magic pipeline v1\n").unwrap();
+        let db = dir.path().join("m.db");
+        {
+            let mut store = EventStore::new(&db).unwrap();
+            crate::ingest::ingest_repos(&mut store, &[proj.clone()], "test", None).unwrap();
+        }
+        let raw = format!(
+            r#"{{"prompt":"widget frobnicator work","cwd":{}}}"#,
+            serde_json::to_string(&proj.to_string_lossy()).unwrap()
+        );
+        // unchanged file: no freshness tag
+        let out = injection_for_hook_json(&db, &raw).expect("chunk injects");
+        assert!(out.contains("Proj:notes.md#0"), "the chunk is the hit: {out}");
+        assert!(!out.contains("[refreshed]") && !out.contains("[stale?]"), "unchanged -> no tag: {out}");
+
+        // file edited after ingest: the LIVE text is injected, tagged [refreshed]
+        std::fs::write(proj.join("notes.md"), "how the widget frobnicator does work: magic pipeline v2 LIVE\n").unwrap();
+        let out = injection_for_hook_json(&db, &raw).expect("still injects");
+        assert!(out.contains("[refreshed]"), "changed file must be tagged: {out}");
+        assert!(out.contains("v2 LIVE"), "the agent sees today's content, not the snapshot: {out}");
+        assert!(!out.contains("v1"), "the stale snapshot text is not shown: {out}");
+
+        // file deleted: warn instead of presenting dead code as fresh
+        std::fs::remove_file(proj.join("notes.md")).unwrap();
+        let out = injection_for_hook_json(&db, &raw).expect("still injects (stored body)");
+        assert!(out.contains("[stale?]"), "a vanished file must be flagged: {out}");
     }
 
     #[test]

@@ -18,6 +18,48 @@
 > Phase 1's ranking work (source-class prior, term-coverage rerank) and the
 > reproducible drift eval remain open — see below.
 
+## Open points (next round) + expected outcomes
+
+In priority order:
+
+1. **Validate + deploy locally** (first action, owner's machine): run
+   `cargo test --features semantic` (the cloud environment could not download
+   the onnxruntime binaries), install the new binary + hooks, **replace the old
+   live MCP server** (still a create-only, unscoped build — verified live), and
+   pin the standing rules (at minimum the WAL/NAS gotcha and the
+   source-of-truth rule).
+2. **Reproducible drift eval** (`examples/drift_eval.rs` + a committed scenario
+   corpus): makes the 39.7% full-catch falsifiable and is the measurement gate
+   for everything below.
+3. **Ranking track (phase 1)**: source-class prior (memories/docs over code,
+   query-routed) + term-coverage/proximity rerank. Target: dual-written cut
+   82.1% → ~88-90%, Project 1 docs 67% → 80%+.
+4. **One footer module + write-time fact_type** (review finding): three parsers
+   and one inline writer currently share only a convention; stamp the type
+   structurally at write time, keep the body parser as an import shim.
+5. **Later**: fused-recall parity over MCP (semantic server build), a reserved
+   typed courier slot, capture triggers as a rulebook class instead of a const,
+   hook-ledger state in SQLite (race-free), freshness in `get`/MCP-recall/brief.
+
+**Expected outcomes to hold this work against:**
+
+- *By construction, already demonstrated in the lab*: pinned rules ~100%
+  present after a compaction (previously: a measured miss); zero repeated
+  injection blocks within the 5-prompt window; the measured noise-injection
+  scenario now silent; file-naming gotchas surfaced at the moment of action;
+  near-duplicates refused at write time.
+- *To re-verify via the drift eval + a fresh benchmark run*:
+  preventer-surfaced 54.8% → ≥65%; full-catch 39.7% → ≥55% on
+  compaction/file-touch scenarios; injected tokens/prompt in focused sessions
+  ~239 → <100.
+- *Qualitative, over weeks of use*: the agent maintains the store
+  (revise/retract/mark/resolve visible in the log), no banner blindness, and
+  the capture nudge catches missed facts at ≤1 nudge/session without
+  irritating (watch its false-positive rate).
+- *Honest caveat*: the pin/guard channels bypass ranking rather than improve
+  it — the pure ranking win (dual-written cut toward mimir's 89.6%) only
+  arrives with point 3.
+
 An improvement trajectory derived from a full code walk (all of `thor/src`),
 the published benchmarks, and **empirical verification**: the binary was built
 and exercised against a seeded store (this repo ingested + hand-written

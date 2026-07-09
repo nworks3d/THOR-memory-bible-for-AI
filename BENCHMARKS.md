@@ -40,17 +40,17 @@ What the agent actually gets injected, automatically, per prompt.
 
 | category | THOR | mimir |
 |---|---:|---:|
-| code-structure | **79.7%** | 12.7% |
-| code-behavior | **89.0%** | 21.2% |
-| doc-reference | **84.8%** | 29.1% |
-| config how-to | **91.2%** | 44.1% |
-| gotcha | **88.9%** | 47.2% |
-| decision | **90.8%** | 61.8% |
-| **overall** | **86.1%** | **27.5%** |
+| code-structure | **59.7%** | 28.4% |
+| code-behavior | **71.2%** | 37.7% |
+| doc-reference | **67.0%** | 31.3% |
+| config how-to | **70.6%** | 47.1% |
+| gotcha | **70.8%** | 59.7% |
+| decision | **68.4%** | 61.8% |
+| **overall (n=504)** | **67.3%** | **38.1%** |
 
-THOR wins every category. mimir's low code scores are **not a ranking failure** -
-they are coverage: on the business-code questions (386 of the 500) mimir's recall
-scores 13.0% because it does not index source, while THOR scores 84.7%. That is
+THOR wins every category. mimir's lower code scores are **not a ranking failure** -
+they are coverage: on the business-code questions (386 of the 504) mimir's recall
+scores 32.5% because it does not index source, while THOR scores 69.0%. That is
 exactly THOR's "one local index over everything" design showing up as a result.
 
 ## Test 2 - Same knowledge (118 facts both systems have)
@@ -58,22 +58,13 @@ exactly THOR's "one local index over everything" design showing up as a result.
 The fair, apples-to-apples comparison: only questions whose source fact is a
 dual-written memory or a doc chunk **both** stores hold.
 
-| category | THOR | mimir |
-|---|---:|---:|
-| code-structure | **80%** | 70% |
-| code-behavior | **92%** | 59% |
-| doc-reference | **88%** | 85% |
-| config how-to | **96%** | 71% |
-| gotcha | **92%** | 82% |
-| decision | **92%** | 85% |
-| **overall (n=118)** | **90.7%** | **75.0%** |
-
-**Even on an equal corpus, THOR leads by +15.7 points.** On the strictest cut -
-only dual-written memories, where there is zero doubt both stores have the fact
-(n=53) - it is **94.3% vs 80.2%**. This is the semantic score-fusion layer
-catching paraphrases that lexical-only search misses. It is consistent with an
-independent, hand-curated 52-question set built to be answerable by both systems:
-**85.6% vs 74.0%**.
+**Overall (n=118): THOR 61.4% vs mimir 56.4%** - on the broad shared set THOR still
+leads, by +5 points, thanks to the semantic score-fusion layer catching paraphrases
+that lexical-only search misses. **But on the strictest cut - only dual-written
+memories, where there is zero doubt both stores have the fact (n=53) - mimir wins,
+89.6% vs 82.1%.** Pure memory recall over a small, clean set of hand-written notes is
+mimir's home turf, and it shows: THOR's advantage is breadth (it also holds the code
+and docs), not a better memory-recall engine on this cut.
 
 ## Test 3 - Multi-project (three private project repos seeded)
 
@@ -101,7 +92,7 @@ source - ranks code above them. This is the honest complementary strength: a cur
 doc collection can out-retrieve raw source ingest on design questions. Isolation held
 throughout: **0 of 211 THOR retrievals came from a foreign project.**
 
-## Session drift compensation (72 scenarios, 3-way)
+## Session drift compensation (73 scenarios, 3-way)
 
 This is what THOR is *for*: at the start of a fresh session (empty context, just
 after a compaction), does the automatic top-3 injection surface the one fact that
@@ -113,16 +104,16 @@ searching **every** project (`--all`, its best case - not scoped to a wrong proj
 
 | metric | THOR (scoped) | THOR (unscoped) | mimir (--all) |
 |---|---:|---:|---:|
-| preventer surfaced (0-2 avg) | **74.3%** | 72.2% | 59.0% |
-| clear catch (fully surfaced) | **51.4%** | 47.2% | 34.7% |
-| on gotchas | **75.0%** | 75.0% | 61.1% |
-| on decisions | **73.6%** | 69.4% | 56.9% |
+| preventer surfaced (0-2 avg) | **54.8%** | 49.3% | 47.9% |
+| clear catch (fully surfaced) | **39.7%** | 35.6% | 30.1% |
 
-THOR surfaces the drift-preventing fact **~1.25x** more often than mimir at its best,
-and fully catches it **~1.5x** more often - both inject the same top-3 budget, so this
-is better task-to-constraint association, not "more context". Project scoping helps
-here too (74.3% vs 72.2% unscoped): with fewer other-project distractors competing for
-the three slots, the right preventer lands more often.
+THOR surfaces the drift-preventing fact **~1.14x** more often than mimir at its best
+(54.8% vs 47.9%), and fully catches it **~1.32x** more often (39.7% vs 30.1%) - both
+inject the same top-3 budget, so this is better task-to-constraint association, not
+"more context". Project scoping helps (54.8% vs 49.3% unscoped): with fewer
+other-project distractors competing for the three slots, the right preventer lands
+more often. By type (scoped vs mimir): on gotchas the two are near-tied (55.6% vs
+54.2%); THOR's edge is clearer on decisions (54.1% vs 41.9%).
 
 ## Speed and cost
 
@@ -160,11 +151,12 @@ embedder resident.
   for "which functions call X", but it never fires at a session boundary.
 - **It ranks better on equal footing (score-fusion).** THOR fuses lexical bm25 with
   a dense multilingual embedding (`fused = bm_norm + LAMBDA*cos`), so a paraphrased
-  question still finds the right fact. That is the +15.7 points in Test 2, where
-  coverage is held equal.
+  question still finds the right fact. That is the +5 points on the broad shared set
+  in Test 2, where coverage is held equal - though on the strictest dual-written cut
+  mimir edges ahead (its home turf).
 - **It compensates for session drift.** The whole reason the tool exists: after a
   compaction the agent starts blank, and THOR's automatic injection puts the
-  governing gotcha/decision back in front of it 1.6x more often than mimir.
+  governing gotcha/decision back in front of it more often than mimir (54.8% vs 47.9%).
 - **It is faster and lighter to run.** ~3.1x lower per-prompt latency as a single
   binary; the default mode holds no resident process.
 - **It never loses a write.** Every fact is an event in a hash-chained append-only
@@ -176,8 +168,10 @@ embedder resident.
 ## Honest weaknesses
 
 - **Test 1's headline gap is coverage, not pure ranking.** THOR ingests source and
-  mimir's recall does not; strip that and the honest same-knowledge lead is the
-  ~16 points of Test 2, not 59.
+  mimir's recall does not; strip that and the honest same-knowledge picture is a
+  +5-point lead on the broad shared set (Test 2) - and on the strictest dual-written
+  cut mimir actually wins (89.6% vs 82.1%). The big Test 1 gap is coverage, not a
+  better memory engine.
 - **No code-symbol graph.** For "which functions call X" mimir routes to a symbol
   graph; THOR chunks source directly (which is why it wins the code categories
   here) but has no graph queries.

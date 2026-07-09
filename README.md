@@ -19,14 +19,15 @@ one thing the agent can search automatically. Measured against
 
 - **It has the answer, automatically.** THOR chunks your source, docs and memories
   into one index that auto-recall searches every prompt - so a code question is
-  answered without the agent doing anything. As deployed, **86% vs 27%** on 500
+  answered without the agent doing anything. As deployed, **67% vs 38%** on 504
   real questions.
-- **It ranks better even on equal footing.** On facts both systems have, THOR still
-  leads **91% vs 75%** - a dense score-fusion layer catches paraphrases that
-  keyword search misses.
+- **It ranks better on the broad shared set.** On facts both systems have, THOR
+  leads **61% vs 56%** thanks to a dense score-fusion layer that catches paraphrases
+  keyword search misses - though on the strictest dual-written-only cut mimir wins
+  (90% vs 82%), pure memory recall being its home turf.
 - **It compensates for session drift.** After a compaction the agent starts blank;
-  THOR puts the governing gotcha/decision back in front of it **~1.25x more often**
-  than mimir at its best (74% vs 59%). This is what the tool is *for*.
+  THOR puts the governing gotcha/decision back in front of it more often than mimir
+  at its best (**55% vs 48%**). This is what the tool is *for*.
 - **It is faster and lighter.** ~**3.1x** lower per-prompt latency (83 ms vs
   254 ms) as a single native binary; the default mode holds no resident process.
 - **It never loses a write.** Every fact is an event in a hash-chained append-only
@@ -74,13 +75,13 @@ for "which functions call X". THOR chunks source into recall instead. See
 ## Benchmarks
 
 A blind, judged head-to-head against [mimir](https://github.com/MakerViking/mimir),
-reported as two separate fair tests: **as-deployed coverage** (86% vs 27% on 500
+reported as two separate fair tests: **as-deployed coverage** (67% vs 38% on 504
 questions, because THOR indexes repo code mimir's recall does not) and
-**same-knowledge quality** (91% vs 75% on facts both have). Plus **multi-project
-coverage** across three seeded repos (73% vs 53% overall - though mimir's curated
-design docs win one project, 93% vs 67%), session-drift compensation (74% vs 59%), and
-~3.1x lower latency. Full method, per-category tables and honest weaknesses in
-[BENCHMARKS.md](BENCHMARKS.md).
+**same-knowledge quality** (61% vs 56% on the broad shared set; mimir wins the strict
+dual-written cut, 90% vs 82%). Plus **multi-project coverage** across three seeded
+repos (73% vs 53% overall - though mimir's curated design docs win one project, 93% vs
+67%), session-drift compensation (55% vs 48%), and ~3.1x lower latency. Full method,
+per-category tables and honest weaknesses in [BENCHMARKS.md](BENCHMARKS.md).
 
 ## Quick start
 

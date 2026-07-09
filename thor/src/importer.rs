@@ -1,12 +1,30 @@
-use crate::event_store::{EventKind, EventStore};
+use crate::event_store::{Event, EventKind, EventStore};
+use std::collections::HashSet;
 use std::io::BufRead;
 use std::path::Path;
 
 #[derive(Debug, Default, Clone, Copy)]
 pub struct ImportStats {
     pub imported: usize,
+    pub revised: usize,
+    pub retracted: usize,
     pub skipped_existing: usize,
     pub skipped_malformed: usize,
+    pub skipped_diverged: usize,
+}
+
+/// The single current head rev of an entity from its own event chain (a head is a
+/// this_hash that is no other event's parent). `None` when the entity is diverged
+/// (more than one contested head) - the importer then leaves it untouched rather
+/// than guess which head a correction supersedes.
+fn single_head(events: &[Event]) -> Option<String> {
+    let parents: HashSet<&str> = events.iter().filter_map(|e| e.parent_rev.as_deref()).collect();
+    let heads: Vec<&Event> = events.iter().filter(|e| !parents.contains(e.this_hash.as_str())).collect();
+    if heads.len() == 1 {
+        Some(heads[0].this_hash.clone())
+    } else {
+        None
+    }
 }
 
 /// Import facts from a JSONL snapshot (one object per line). THOR never opens
@@ -14,10 +32,13 @@ pub struct ImportStats {
 /// exporter produces the JSONL, so the import is fully decoupled and cannot
 /// touch the source.
 ///
-/// Each line: `{"entity_id": "...", "body": "...", "actor": "..."?}`.
-/// Every record becomes one `fact_created` for `entity_id`. Idempotent: an
-/// entity that already has any event is left untouched, so re-running the
-/// import (or importing an overlapping snapshot) never duplicates a fact.
+/// Each line: `{"entity_id": "...", "body": "...", "actor": "..."?, "status": "..."?}`.
+/// A new entity becomes a `fact_created`. An entity that ALREADY exists is
+/// reconciled so a correction in the source propagates instead of being frozen:
+/// - `status` = superseded/deleted/retracted -> `fact_retracted` (stop serving it);
+/// - the body CHANGED -> `fact_revised` (the old version stops being a head);
+/// - the body is identical -> skipped (idempotent: re-running imports nothing);
+/// - a diverged entity is left untouched (no safe single head to supersede).
 pub fn import_jsonl(store: &mut EventStore, path: &Path) -> anyhow::Result<ImportStats> {
     let file = std::fs::File::open(path)?;
     let reader = std::io::BufReader::new(file);
@@ -58,9 +79,44 @@ pub fn import_jsonl(store: &mut EventStore, path: &Path) -> anyhow::Result<Impor
             .and_then(|v| v.as_str())
             .unwrap_or("mimir-import");
 
-        // Idempotency: skip an entity that already exists in the store.
-        if !store.get_events_by_entity(&entity_id)?.is_empty() {
-            stats.skipped_existing += 1;
+        // Reconcile an entity that already exists so a SOURCE correction propagates
+        // (the old importer froze the first-seen body forever). Diverged entities are
+        // left untouched; identical bodies are skipped (idempotent).
+        let existing = store.get_events_by_entity(&entity_id)?;
+        if !existing.is_empty() {
+            let head = match single_head(&existing) {
+                Some(h) => h,
+                None => {
+                    stats.skipped_diverged += 1;
+                    continue;
+                }
+            };
+            let head_ev = existing.iter().find(|e| e.this_hash == head);
+            let already_retracted =
+                head_ev.map(|e| matches!(e.kind, EventKind::FactRetracted)).unwrap_or(false);
+            let status = value.get("status").and_then(|v| v.as_str()).unwrap_or("").to_ascii_lowercase();
+            if matches!(status.as_str(), "superseded" | "deleted" | "retracted") {
+                if already_retracted {
+                    stats.skipped_existing += 1;
+                    continue;
+                }
+                store.append_event(
+                    "import", "mimir-import", actor, EventKind::FactRetracted, &entity_id, Some(&head),
+                    "[retracted: superseded in source]",
+                )?;
+                stats.retracted += 1;
+                continue;
+            }
+            // Live head with an identical body -> nothing to do (idempotent re-import).
+            if !already_retracted && head_ev.map(|e| e.body == body).unwrap_or(false) {
+                stats.skipped_existing += 1;
+                continue;
+            }
+            // Body changed (or resurrecting a retracted head from the source) -> revise.
+            store.append_event(
+                "import", "mimir-import", actor, EventKind::FactRevised, &entity_id, Some(&head), body,
+            )?;
+            stats.revised += 1;
             continue;
         }
 
@@ -118,6 +174,38 @@ mod tests {
         assert!(store.get_events_by_entity("NUM").unwrap().is_empty());
         assert!(store.get_events_by_entity("EMPTY").unwrap().is_empty());
         assert!(!store.get_events_by_entity("OK").unwrap().is_empty());
+    }
+
+    #[test]
+    fn test_import_propagates_a_corrected_body_then_retracts() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("c.db");
+        let mut store = EventStore::new(&db).unwrap();
+        // first import
+        let v1 = write_jsonl(dir.path(), "v1.jsonl", &[r#"{"entity_id":"DEC1","body":"the db lives on the desktop"}"#]);
+        assert_eq!(import_jsonl(&mut store, &v1).unwrap().imported, 1);
+        // the source corrected the fact: a changed body is REVISED, not skipped
+        let v2 = write_jsonl(dir.path(), "v2.jsonl", &[r#"{"entity_id":"DEC1","body":"the db now lives on the NAS"}"#]);
+        let s2 = import_jsonl(&mut store, &v2).unwrap();
+        assert_eq!(s2.revised, 1, "a changed body propagates as a revision");
+        assert_eq!(s2.imported, 0);
+        assert!(
+            recall(&store, "where does the db live NAS", 3).unwrap().iter().any(|h| h.entity_id == "DEC1" && h.body.contains("NAS")),
+            "recall serves the corrected body"
+        );
+        assert!(
+            recall(&store, "db desktop", 3).unwrap().iter().all(|h| !(h.entity_id == "DEC1" && h.body.contains("desktop"))),
+            "the stale body no longer surfaces"
+        );
+        // re-import the identical corrected body -> idempotent skip
+        assert_eq!(import_jsonl(&mut store, &v2).unwrap().skipped_existing, 1);
+        // a status=superseded line retracts it
+        let v3 = write_jsonl(dir.path(), "v3.jsonl", &[r#"{"entity_id":"DEC1","body":"the db now lives on the NAS","status":"superseded"}"#]);
+        assert_eq!(import_jsonl(&mut store, &v3).unwrap().retracted, 1);
+        assert!(
+            recall(&store, "where does the db live NAS", 3).unwrap().iter().all(|h| h.entity_id != "DEC1"),
+            "a superseded fact stops surfacing"
+        );
     }
 
     #[test]

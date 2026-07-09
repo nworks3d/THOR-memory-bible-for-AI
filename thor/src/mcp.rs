@@ -22,8 +22,10 @@ use uuid::Uuid;
 const INSTRUCTIONS: &str = "THOR is the user's lossless memory. recall searches the current-head \
 facts (read-only), SCOPED to the current project + the global tier - pass all_projects:true to \
 search every project, or project:\"<key>\" for a specific one. get shows one entity's head(s); \
-remember stores a new fact (scoped to the current project by default; pass project:\"global\" for \
-a cross-project fact). Recall before remembering to avoid duplicates.";
+remember stores a NEW fact (scoped to the current project by default; pass project:\"global\" for \
+a cross-project fact). When a fact you already stored CHANGES, do not remember a second copy: \
+revise it (replace its current head) or retract it (stop serving it) by entity_id, so recall never \
+serves a stale version. Recall before remembering to avoid duplicates.";
 
 /// The current project for a stdio server, from its launch cwd (Claude Code starts
 /// the connector in the project dir). `None` for the HTTP server (no cwd).
@@ -74,6 +76,20 @@ pub struct RememberArgs {
     /// cross-project fact. Omitted = the server's current project.
     #[serde(default)]
     pub project: Option<String>,
+}
+
+#[derive(Deserialize, schemars::JsonSchema)]
+pub struct ReviseArgs {
+    /// The entity id whose current head to replace with a corrected version.
+    pub entity_id: String,
+    /// The corrected fact body (replaces the current head).
+    pub body: String,
+}
+
+#[derive(Deserialize, schemars::JsonSchema)]
+pub struct RetractArgs {
+    /// The entity id to retract (its current head stops being served by recall).
+    pub entity_id: String,
 }
 
 #[tool_router]
@@ -174,6 +190,60 @@ impl ThorServer {
             Ok(format!("stored entity {} rev {}", entity_id, ev.this_hash))
         })
         .await
+    }
+
+    #[tool(
+        description = "Correct an existing fact: replace its current head with a new body (a fact_revised), so recall stops serving the old version. Use when a decision/fact you stored earlier CHANGED. Resolves the current head itself; errors if the entity is diverged (multiple contested heads)."
+    )]
+    async fn revise(&self, Parameters(args): Parameters<ReviseArgs>) -> String {
+        self.blocking(move |s| {
+            let body = args.body.trim();
+            if body.is_empty() {
+                return Err("a non-empty 'body' is required".to_string());
+            }
+            let parent = current_head(s, &args.entity_id)?;
+            let ev = s
+                .append_event(
+                    "mcp", "mcp-session", "mcp", EventKind::FactRevised, &args.entity_id, Some(&parent), body,
+                )
+                .map_err(|e| format!("error: {e}"))?;
+            Ok(format!("revised entity {} -> rev {}", args.entity_id, ev.this_hash))
+        })
+        .await
+    }
+
+    #[tool(
+        description = "Retract a fact: mark its current head as no longer true so recall stops serving it (a fact_retracted; nothing is deleted - the history stays). Resolves the current head itself; errors if diverged."
+    )]
+    async fn retract(&self, Parameters(args): Parameters<RetractArgs>) -> String {
+        self.blocking(move |s| {
+            let parent = current_head(s, &args.entity_id)?;
+            let ev = s
+                .append_event(
+                    "mcp", "mcp-session", "mcp", EventKind::FactRetracted, &args.entity_id, Some(&parent),
+                    "[retracted via mcp]",
+                )
+                .map_err(|e| format!("error: {e}"))?;
+            Ok(format!("retracted entity {} -> rev {}", args.entity_id, ev.this_hash))
+        })
+        .await
+    }
+}
+
+/// Resolve the SINGLE current head of an entity for a revise/retract. Errors when
+/// the entity is unknown (no head) or diverged (more than one contested head) - a
+/// diverged fact must be reconciled explicitly, never auto-picked.
+fn current_head(s: &EventStore, entity_id: &str) -> Result<String, String> {
+    let events = s.get_all_events().map_err(|e| format!("error: {e}"))?;
+    let heads = crate::cas::compute_head_sets(&events);
+    match heads.get(entity_id) {
+        None => Err(format!("error: no such entity '{}'", entity_id)),
+        Some(hs) if hs.heads.len() == 1 => Ok(hs.heads.iter().next().unwrap().clone()),
+        Some(hs) => Err(format!(
+            "error: '{}' is diverged ({} contested heads); reconcile it with `thor resolve` before revising/retracting",
+            entity_id,
+            hs.heads.len()
+        )),
     }
 }
 
@@ -279,6 +349,33 @@ mod tests {
             .remember(Parameters(RememberArgs { body: "   ".into(), entity_id: None, project: None }))
             .await;
         assert!(out.contains("non-empty"), "empty body must be rejected: {out}");
+    }
+
+    #[tokio::test]
+    async fn test_revise_and_retract_update_recall() {
+        let server = ThorServer::new(seed()); // e1 = "the deploy watcher gotcha"
+        // revise replaces the head; recall serves the new body
+        let r = server
+            .revise(Parameters(ReviseArgs {
+                entity_id: "e1".into(),
+                body: "the deploy watcher now runs on the NAS".into(),
+            }))
+            .await;
+        assert!(r.starts_with("revised entity e1"), "got: {r}");
+        let rc = server
+            .recall(Parameters(RecallArgs { query: "deploy watcher NAS".into(), limit: None, all_projects: true, project: None }))
+            .await;
+        assert!(rc.contains("NAS"), "recall serves the revised body: {rc}");
+        // retract stops it surfacing
+        let rt = server.retract(Parameters(RetractArgs { entity_id: "e1".into() })).await;
+        assert!(rt.starts_with("retracted entity e1"), "got: {rt}");
+        let rc2 = server
+            .recall(Parameters(RecallArgs { query: "deploy watcher NAS".into(), limit: None, all_projects: true, project: None }))
+            .await;
+        assert!(!rc2.contains("e1"), "a retracted fact stops surfacing: {rc2}");
+        // revising an unknown entity errors (never creates a stray head)
+        let err = server.revise(Parameters(ReviseArgs { entity_id: "nope".into(), body: "x".into() })).await;
+        assert!(err.contains("no such entity"), "got: {err}");
     }
 
     #[tokio::test]

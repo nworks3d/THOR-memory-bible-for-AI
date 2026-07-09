@@ -135,9 +135,25 @@ fn injection_for_hook_json(db: &Path, raw: &str) -> Option<String> {
             proj_label
         ));
     }
+    // If any hit is on a DIVERGED entity, load the head projection ONCE so we can
+    // show the OTHER contested head(s) too - the agent then reconciles a real
+    // conflict instead of silently acting on one auto-picked side.
+    let diverged_ctx = if hits.iter().any(|h| h.is_diverged) {
+        store.get_all_events().ok().map(|events| {
+            let heads = crate::cas::compute_head_sets(&events);
+            let by_rev: std::collections::HashMap<String, String> =
+                events.iter().map(|e| (e.this_hash.clone(), e.body.clone())).collect();
+            (heads, by_rev)
+        })
+    } else {
+        None
+    };
     for hit in &hits {
         let short = &hit.rev[..hit.rev.len().min(8)];
-        let snip = crate::recall::snippet(&hit.body, 220, &query);
+        // A memory/decision/gotcha is short and its actionable half must not be cut;
+        // a code chunk is long and a preview suffices. So give memories a wider window.
+        let cap = if crate::repo::is_chunk_id(&hit.entity_id) { 220 } else { 500 };
+        let snip = crate::recall::snippet(&hit.body, cap, &query);
         let diverged = if hit.is_diverged { " [DIVERGED]" } else { "" };
         // Scope tag so the agent knows which project a hit belongs to (esp. memories,
         // whose ids are opaque): [global] for the global tier, else [proj:<key>].
@@ -147,6 +163,26 @@ fn injection_for_hook_json(db: &Path, raw: &str) -> Option<String> {
             format!("[proj:{}]", hit.project.as_deref().unwrap_or("?"))
         };
         out.push_str(&format!("- {} {} ({}{}): {}\n", scope_tag, hit.entity_id, short, diverged, snip));
+        // Show the other contested head(s) so the agent reconciles, not guesses.
+        if hit.is_diverged {
+            if let Some((heads, by_rev)) = &diverged_ctx {
+                if let Some(hs) = heads.get(&hit.entity_id) {
+                    for rev in &hs.heads {
+                        if rev == &hit.rev {
+                            continue;
+                        }
+                        if let Some(body) = by_rev.get(rev) {
+                            let s = crate::recall::snippet(body, cap, &query);
+                            out.push_str(&format!(
+                                "    | contested head ({}): {}\n",
+                                &rev[..rev.len().min(8)],
+                                s
+                            ));
+                        }
+                    }
+                }
+            }
+        }
     }
     out.push_str("</thor-recall>");
     Some(out)

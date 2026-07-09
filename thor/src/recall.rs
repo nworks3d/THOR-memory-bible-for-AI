@@ -83,6 +83,12 @@ pub fn snippet(body: &str, max: usize, query: &str) -> String {
 const RELEVANCE_FLOOR_FRAC: f64 = 0.3;
 /// Length of the normalized body prefix used to collapse near-duplicate hits
 /// (imported doc-chunks of one fact otherwise burn all 3 slots on one answer).
+///
+/// NOTE: a slot-quality experiment (max-1-chunk-per-source-file dedup + a reserved
+/// memory/doc slot) was measured with a blind A/B/C sim over 200 coverage + 73 drift
+/// scenarios and REVERTED: it cost ~2 points of code coverage (THOR's strongest
+/// category - consecutive chunks of one file are often both needed) for no drift gain
+/// (drift recall is already memory-heavy). The near-duplicate collapse below stayed.
 const DEDUP_PREFIX_CHARS: usize = 120;
 
 /// Common English + Dutch function words. Dropped from the FTS query so a sum of

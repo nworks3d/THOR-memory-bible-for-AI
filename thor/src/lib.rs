@@ -1,5 +1,6 @@
 pub mod event_store;
 pub mod cas;
+pub mod footer;
 pub mod auditor;
 pub mod recall;
 pub mod repo;

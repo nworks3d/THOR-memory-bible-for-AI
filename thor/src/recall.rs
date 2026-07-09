@@ -212,17 +212,10 @@ pub fn dedup_prefix(body: &str) -> String {
         .collect()
 }
 
-/// Strip a trailing single-line `[...]` metadata footer (the mimir/type/chunk
-/// convention: separated by a blank line, one bracketed line, nothing after).
+/// Strip a trailing single-line `[...]` metadata footer (shim: the footer
+/// format and its parsers live together in crate::footer).
 fn strip_footer(body: &str) -> &str {
-    let trimmed = body.trim_end();
-    if !trimmed.ends_with(']') {
-        return body;
-    }
-    match trimmed.rfind("\n\n[") {
-        Some(i) if !trimmed[i + 2..].contains('\n') => &body[..i],
-        _ => body,
-    }
+    crate::footer::strip(body)
 }
 
 /// Build a safe FTS5 MATCH query (content tokens OR-ed, each double-quoted so

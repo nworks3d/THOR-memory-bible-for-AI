@@ -314,49 +314,11 @@ impl FactType {
     }
 }
 
-/// Leading first-line markers that convention already uses in hand-written
-/// bodies. Case-sensitive uppercase on purpose: prose ("the decision was...")
-/// must not classify, a deliberate "DECISION: ..." must. EN + NL.
-const TYPE_MARKERS: &[(&str, FactType)] = &[
-    ("GOTCHA", FactType::Gotcha),
-    ("DECISION", FactType::Decision),
-    ("BESLISSING", FactType::Decision),
-    ("BESLUIT", FactType::Decision),
-    ("PREFERENCE", FactType::Preference),
-    ("VOORKEUR", FactType::Preference),
-    ("WERKVOORKEUR", FactType::Preference),
-    ("WERKWIJZE-VOORKEUR", FactType::Preference),
-    ("HARDE REGEL", FactType::Preference),
-    ("REGEL:", FactType::Preference),
-    ("AFSPRAAK", FactType::Preference),
-];
-
-/// Classify a fact body: the `[memory/<type> ...]` footer (the exact format the
-/// mimir import already writes) wins, else a leading uppercase marker on the
-/// first non-empty line. None for chunks, notes, and everything untyped.
+/// Classify a fact body (shim: the footer format, its parsers and the leading
+/// type markers live together in crate::footer, so the writer and every reader
+/// share ONE definition and can never drift apart).
 pub fn fact_type(body: &str) -> Option<FactType> {
-    // Footer: the LAST line that starts with '[' and carries "memory/<type>".
-    for line in body.lines().rev() {
-        let line = line.trim();
-        if !line.starts_with('[') {
-            continue;
-        }
-        if let Some(rest) = line.strip_prefix("[memory/") {
-            let ty: String = rest.chars().take_while(|c| c.is_ascii_alphabetic() || *c == '-').collect();
-            return match ty.as_str() {
-                "gotcha" => Some(FactType::Gotcha),
-                "decision" => Some(FactType::Decision),
-                "preference" => Some(FactType::Preference),
-                _ => None, // a typed footer of another class (note, insight, ...) is authoritative
-            };
-        }
-    }
-    // Leading marker on the first non-empty line.
-    let first = body.lines().find(|l| !l.trim().is_empty())?.trim_start();
-    TYPE_MARKERS
-        .iter()
-        .find(|(marker, _)| first.starts_with(marker))
-        .map(|(_, ty)| *ty)
+    crate::footer::fact_type(body)
 }
 
 /// The project ROOT directory for a working dir: the nearest ancestor holding a

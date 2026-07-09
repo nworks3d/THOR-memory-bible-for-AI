@@ -155,20 +155,6 @@ pub struct BriefArgs {
     pub project: Option<String>,
 }
 
-/// Strip characters that would corrupt the `[memory/... | tags: ... | ...]`
-/// footer's field structure - including control characters: an interior newline
-/// would make the footer span two lines, which strip_footer no longer strips,
-/// permanently defeating the near-duplicate checks for that fact.
-fn footer_safe(s: &str) -> String {
-    s.chars()
-        .filter(|c| !matches!(c, '|' | '[' | ']'))
-        .map(|c| if c.is_control() { ' ' } else { c })
-        .collect::<String>()
-        .split_whitespace()
-        .collect::<Vec<_>>()
-        .join(" ")
-}
-
 #[tool_router]
 impl ThorServer {
     pub fn new(store: EventStore, db: PathBuf) -> Self {
@@ -293,25 +279,22 @@ impl ThorServer {
                 // A scoped memory is `<key>:mem-<uuid>`, global `mcp-<uuid>`.
                 None => crate::repo::memory_entity_id(mint.as_deref(), &Uuid::new_v4().to_string()),
             };
-            // Typed footer (the mimir-compatible format fact_type parsing reads
-            // back), only when the caller passed a type or tags.
+            // Typed footer, stamped at write time via the footer module (the
+            // format's single owner - the same code every parser reads back).
+            // Only when the caller passed a type or tags.
             let clean_body = body.to_string();
             let mut body = body.to_string();
             if args.fact_type.is_some() || args.tags.as_deref().is_some_and(|t| !t.is_empty()) {
-                let ty = footer_safe(&args.fact_type.unwrap_or_else(|| "note".into())).to_lowercase();
-                let ty = if ty.is_empty() { "note".to_string() } else { ty };
-                let tags = args
-                    .tags
-                    .unwrap_or_default()
-                    .iter()
-                    .map(|t| footer_safe(t))
-                    .filter(|t| !t.is_empty())
-                    .collect::<Vec<_>>()
-                    .join(" ");
                 let scope_label = crate::repo::owner_project(&entity_id)
                     .map(str::to_string)
                     .unwrap_or_else(|| "global".into());
-                body.push_str(&format!("\n\n[memory/{} | tags: {} | project: {}]", ty, tags, scope_label));
+                let footer = crate::footer::compose(
+                    args.fact_type.as_deref().unwrap_or("note"),
+                    &args.tags.unwrap_or_default(),
+                    &scope_label,
+                );
+                body.push_str("\n\n");
+                body.push_str(&footer);
             }
             // Near-duplicate refusal + entity-exists refusal, ATOMIC with the
             // append (same immediate write lock), so a concurrent writer process
@@ -866,15 +849,6 @@ mod tests {
             }))
             .await;
         assert!(chunk.contains("chunk"), "{chunk}");
-    }
-
-    #[test]
-    fn test_footer_safe_strips_control_chars() {
-        // A multi-line footer would defeat strip_footer and thereby BOTH
-        // near-duplicate checks - control chars must never reach the footer.
-        assert_eq!(footer_safe("gotcha\nweird"), "gotcha weird");
-        assert_eq!(footer_safe("tag\r\nwith\tcontrols"), "tag with controls");
-        assert_eq!(footer_safe("a[b]|c"), "abc");
     }
 
     #[tokio::test]

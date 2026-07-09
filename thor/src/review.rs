@@ -48,9 +48,9 @@ pub fn now_secs() -> u64 {
 
 /// A memory id with a mimir import footer is already project-attributed (or
 /// confirmed global) by mimir - it carries a reliable signal, so it is not a review
-/// candidate.
+/// candidate. (Shim over crate::footer, the format's single owner.)
 fn has_footer(body: &str) -> bool {
-    body.contains("| project: ")
+    crate::footer::has_project_field(body)
 }
 
 /// GLOBAL memories with no project signal, created after `reviewed_seq`. "No signal"

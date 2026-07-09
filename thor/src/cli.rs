@@ -1146,12 +1146,10 @@ fn run_reproject(
     Ok(())
 }
 
-/// Parse a mimir import footer's `| project: <name> |` field, if present.
+/// Parse a mimir import footer's `| project: <name> |` field, if present
+/// (shim: the footer format and its parsers live together in crate::footer).
 fn parse_mimir_footer_project(body: &str) -> Option<String> {
-    let idx = body.find("| project: ")?;
-    let rest = &body[idx + "| project: ".len()..];
-    let proj = rest.split(" |").next()?.trim();
-    (!proj.is_empty()).then(|| proj.to_string())
+    crate::footer::project(body)
 }
 
 /// `thor backfill-projects`: attribute legacy unprefixed memories to the project

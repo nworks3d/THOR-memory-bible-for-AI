@@ -195,6 +195,152 @@ pub fn has_content_terms(query: &str) -> bool {
     tokens(query).iter().any(|t| !STOPWORDS.contains(&t.to_lowercase().as_str()))
 }
 
+/// What KIND of source a hit is, from a pure entity-id parse: a hand-written
+/// memory, a prose/doc chunk, or a code chunk. The fused ranker uses this for a
+/// small query-routed prior: code chunks are long, numerous and identifier-dense,
+/// so on a knowledge-phrased question they crowd the few hand-written facts out
+/// of the top slots on raw bm25 - the measured root of the dual-written loss.
+#[cfg(feature = "semantic")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SourceClass {
+    Memory,
+    Doc,
+    Code,
+}
+
+/// Extensions whose chunks are prose, not code. Everything else under a chunk id
+/// counts as code (the conservative default: code never gets a knowledge boost).
+#[cfg(feature = "semantic")]
+const DOC_EXTS: &[&str] = &["md", "markdown", "txt", "rst", "adoc", "org"];
+
+#[cfg(feature = "semantic")]
+fn source_class(entity_id: &str) -> SourceClass {
+    if !crate::repo::is_chunk_id(entity_id) {
+        return SourceClass::Memory;
+    }
+    // `<project>:<rel>#<n>` - classify by the rel path's extension.
+    let rel = entity_id.split_once(':').map(|(_, r)| r).unwrap_or(entity_id);
+    let rel = rel.rsplit_once('#').map(|(r, _)| r).unwrap_or(rel);
+    let ext = std::path::Path::new(rel)
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    if DOC_EXTS.contains(&ext.as_str()) {
+        SourceClass::Doc
+    } else {
+        SourceClass::Code
+    }
+}
+
+/// How a query is phrased, from its surface form alone: identifier-shaped tokens
+/// route to code, decision/constraint vocabulary routes to knowledge, anything
+/// else (or both at once) stays neutral. Routing decides which class prior may
+/// apply - a code-routed query gets NO prior at all, which is what keeps the
+/// code categories' ranking byte-identical (the no-regression gate).
+#[cfg(feature = "semantic")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum QueryRoute {
+    Code,
+    Knowledge,
+    Neutral,
+}
+
+/// Decision/constraint vocabulary (EN + NL), matched on word boundaries over the
+/// lowercased query. Deliberately narrow: generic verbs ("use", "werkt") must
+/// not route ordinary code questions to knowledge.
+#[cfg(feature = "semantic")]
+const KNOWLEDGE_WORDS: &[&str] = &[
+    "beslissing", "besloten", "besluit", "beslist", "afspraak", "afgesproken", "regel",
+    "voorkeur", "werkvoorkeur", "gotcha", "waarom", "conventie", "beleid", "werkwijze",
+    "decision", "decided", "agreed", "agreement", "rule", "preference", "convention",
+    "policy", "why", "rationale", "constraint",
+];
+
+#[cfg(feature = "semantic")]
+fn route_query(query: &str) -> QueryRoute {
+    let lower = query.to_lowercase();
+    let words: HashSet<&str> =
+        lower.split(|c: char| !c.is_alphanumeric()).filter(|w| !w.is_empty()).collect();
+    let knowledge = KNOWLEDGE_WORDS.iter().any(|w| words.contains(w));
+    // Identifier-shaped tokens: snake_case, ::-paths, call syntax, file names or
+    // path separators - the surface forms of a question ABOUT code.
+    let code = query.split_whitespace().any(|t| {
+        let core = t.trim_matches(|c: char| !c.is_alphanumeric() && c != '_' && c != ':' && c != '.' && c != '/');
+        core.contains('_')
+            || core.contains("::")
+            || t.contains("()")
+            || core.contains('/')
+            || std::path::Path::new(core)
+                .extension()
+                .and_then(|e| e.to_str())
+                .is_some_and(|e| e.len() <= 4 && e.chars().all(|c| c.is_ascii_alphabetic()) && core.contains('.'))
+    });
+    match (knowledge, code) {
+        (true, false) => QueryRoute::Knowledge,
+        (false, true) => QueryRoute::Code,
+        _ => QueryRoute::Neutral,
+    }
+}
+
+/// The query-routed class delta added to a candidate's fused score. Small on
+/// purpose: it breaks the near-ties where a memory sits just below a wall of
+/// same-topic chunks, and must never lift an unrelated memory over a strong
+/// lexical/semantic match (bm_norm spans 1.0, cosine up to ~lambda).
+#[cfg(feature = "semantic")]
+fn class_delta(route: QueryRoute, class: SourceClass) -> f64 {
+    match (route, class) {
+        (QueryRoute::Knowledge, SourceClass::Memory) => 0.30,
+        (QueryRoute::Knowledge, SourceClass::Doc) => 0.15,
+        (QueryRoute::Neutral, SourceClass::Memory) => 0.10,
+        // Code-routed queries get no delta anywhere: the code categories'
+        // ranking stays untouched by construction.
+        _ => 0.0,
+    }
+}
+
+/// Term-coverage + proximity bonus over a candidate's body: a hit containing
+/// ALL the query's content terms - tightly - outranks a long chunk matching one
+/// common term often. This is the cheap stand-in for a cross-encoder: exactly
+/// the failure signature (single-term tf winning over full-question matches)
+/// behind clean-note misses. Quadratic in coverage so partial matches gain
+/// little; the tight bonus only fires on FULL coverage within a small window.
+#[cfg(feature = "semantic")]
+const COVERAGE_WEIGHT: f64 = 0.30;
+#[cfg(feature = "semantic")]
+const TIGHT_BONUS: f64 = 0.15;
+#[cfg(feature = "semantic")]
+const TIGHT_WINDOW_CHARS: usize = 240;
+
+#[cfg(feature = "semantic")]
+fn coverage_bonus(body: &str, qterms: &[String]) -> f64 {
+    if qterms.is_empty() {
+        return 0.0;
+    }
+    let hay = fold_diacritics(&body.to_lowercase());
+    // First-occurrence positions of each distinct term (word-boundary-free
+    // substring find is fine here: this is a tie-break bonus, not the gate).
+    let mut found = 0usize;
+    let mut min_pos = usize::MAX;
+    let mut max_pos = 0usize;
+    for t in qterms {
+        if let Some(p) = hay.find(t.as_str()) {
+            found += 1;
+            min_pos = min_pos.min(p);
+            max_pos = max_pos.max(p + t.len());
+        }
+    }
+    if found == 0 {
+        return 0.0;
+    }
+    let cov = found as f64 / qterms.len() as f64;
+    let mut bonus = COVERAGE_WEIGHT * cov * cov;
+    if found == qterms.len() && (max_pos - min_pos) <= TIGHT_WINDOW_CHARS {
+        bonus += TIGHT_BONUS;
+    }
+    bonus
+}
+
 /// The normalized body prefix used for near-duplicate detection, shared by
 /// recall's collapse and the MCP remember refusal: whitespace-collapsed,
 /// lowercased, capped at DEDUP_PREFIX_CHARS - with any trailing
@@ -763,6 +909,18 @@ pub fn recall_fused_scoped(
     let rmin = raws.iter().copied().fold(f64::INFINITY, f64::min);
     let rmax = raws.iter().copied().fold(f64::NEG_INFINITY, f64::max);
     let span = rmax - rmin;
+    // Query-routed class prior + term-coverage rerank inputs, computed once per
+    // query. The folded qterms match covers_query's normalization so "coverage"
+    // means the same thing in both places.
+    let route = route_query(query);
+    let qterms: Vec<String> = {
+        let mut seen = HashSet::new();
+        content_tokens(query)
+            .iter()
+            .map(|t| fold_diacritics(&t.to_lowercase()))
+            .filter(|t| seen.insert(t.clone()))
+            .collect()
+    };
     let mut scored: Vec<(i64, f64, f64)> = cand
         .into_iter()
         .map(|seq| {
@@ -774,7 +932,14 @@ pub fn recall_fused_scoped(
                 None => 0.0,
             };
             let cos = cos_by_seq.get(&seq).copied().unwrap_or(0.0).max(0.0);
-            (seq, rank.unwrap_or(0.0), bm_norm + lambda * cos)
+            let (delta, coverage) = match by_seq.get(&seq) {
+                Some(ev) => (
+                    class_delta(route, source_class(&ev.entity_id)),
+                    coverage_bonus(&ev.body, &qterms),
+                ),
+                None => (0.0, 0.0),
+            };
+            (seq, rank.unwrap_or(0.0), bm_norm + lambda * cos + delta + coverage)
         })
         .collect();
     // Total order (NaN-safe) with a deterministic seq tie-break, so equal fused
@@ -1113,6 +1278,82 @@ mod fused_tests {
             "sanity: bm25 alone cannot reach the zero-overlap gold");
         let hits = recall_fused(&store, "alpha", &axis(1.0), &vecs, 3, 2.0).unwrap();
         assert_eq!(hits[0].entity_id, "e1", "the dense leg surfaces a gold with zero lexical overlap");
+    }
+
+    #[test]
+    fn test_query_routing_and_source_class() {
+        // knowledge vocabulary routes to knowledge
+        assert_eq!(route_query("wat was de beslissing over de sync batches"), QueryRoute::Knowledge);
+        assert_eq!(route_query("why did we pick this rule"), QueryRoute::Knowledge);
+        // identifier-shaped tokens route to code
+        assert_eq!(route_query("where is compute_head_sets called"), QueryRoute::Code);
+        assert_eq!(route_query("recall.rs fused scoring"), QueryRoute::Code);
+        assert_eq!(route_query("src/courier.rs freshness"), QueryRoute::Code);
+        // plain prose (or mixed signals) stays neutral
+        assert_eq!(route_query("how does the deploy watcher work"), QueryRoute::Neutral);
+        assert_eq!(route_query("why does lexical_head_pool cap heads"), QueryRoute::Neutral);
+        // source class from the id shape
+        assert_eq!(source_class("01KMEMORY"), SourceClass::Memory);
+        assert_eq!(source_class("Proj:mem-abc"), SourceClass::Memory);
+        assert_eq!(source_class("Proj:docs/setup.md#2"), SourceClass::Doc);
+        assert_eq!(source_class("Proj:src/main.rs#0"), SourceClass::Code);
+        // code-routed queries never get a delta, for any class
+        assert_eq!(class_delta(QueryRoute::Code, SourceClass::Memory), 0.0);
+        assert_eq!(class_delta(QueryRoute::Code, SourceClass::Doc), 0.0);
+    }
+
+    #[test]
+    fn test_coverage_bonus_prefers_full_tight_matches() {
+        let q = vec!["sync".to_string(), "batches".to_string()];
+        let full_tight = coverage_bonus("the sync refactor keeps batches small", &q);
+        let full_loose = coverage_bonus(
+            &format!("sync {} batches", "filler ".repeat(60)),
+            &q,
+        );
+        let partial = coverage_bonus("sync sync sync everywhere sync", &q);
+        assert!(full_tight > full_loose, "tight window beats loose: {full_tight} vs {full_loose}");
+        assert!(full_loose > partial, "full coverage beats repeated single term: {full_loose} vs {partial}");
+        assert_eq!(coverage_bonus("nothing relevant", &q), 0.0);
+    }
+
+    #[test]
+    fn test_knowledge_query_class_prior_breaks_the_tie_memory_first() {
+        // A memory and a code chunk with lexically EQUIVALENT bodies (same terms,
+        // same length; prefixes differ so near-dup collapse keeps both): bm25
+        // scores them identically, so the outcome isolates the class prior.
+        let mut store = EventStore::in_memory().unwrap();
+        let chunk = store
+            .append_event(
+                "s", "l", "a", EventKind::FactCreated, "P:src/a.rs#0", None,
+                "one alpha sync batches replication text",
+            )
+            .unwrap();
+        store
+            .append_event(
+                "s", "l", "a", EventKind::FactCreated, "P:mem-dec", None,
+                "two alpha sync batches replication text",
+            )
+            .unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let vecs = VectorStore::open(&dir.path().join("v.db")).unwrap(); // no vectors: bm25-only fusion
+
+        // Knowledge-routed: the class prior lifts the memory over the equal chunk.
+        let hits = recall_fused(&store, "wat was de beslissing over sync batches", &axis(1.0), &vecs, 3, 1.5).unwrap();
+        assert_eq!(
+            hits[0].entity_id, "P:mem-dec",
+            "on equal lexical evidence a knowledge query prefers the memory; got: {:?}",
+            hits.iter().map(|h| h.entity_id.as_str()).collect::<Vec<_>>()
+        );
+
+        // Code-routed: NO delta for any class - equal scores fall back to the
+        // deterministic seq tie-break, i.e. the chunk appended first. This is
+        // the code-categories-unchanged gate in miniature.
+        let code_hits = recall_fused(&store, "sync_batches() alpha replication", &axis(1.0), &vecs, 3, 1.5).unwrap();
+        assert_eq!(
+            code_hits[0].rev, chunk.this_hash,
+            "a code-routed query applies no prior (pure bm25 + tie-break); got: {:?}",
+            code_hits.iter().map(|h| h.entity_id.as_str()).collect::<Vec<_>>()
+        );
     }
 
     #[test]

@@ -310,6 +310,13 @@ fn file_memory_advisory(db: &Path, hook: &Value) -> Option<String> {
     ))
 }
 
+/// Eval seam: lets the drift-eval harness (examples/drift_eval.rs) drive the
+/// REAL file-memory path without stdin. Hidden from docs - not a public API.
+#[doc(hidden)]
+pub fn file_memory_advisory_for_eval(db: &Path, hook: &Value) -> Option<String> {
+    file_memory_advisory(db, hook)
+}
+
 /// Post-compaction reset for the file-touch advisories: drop every guard-seen
 /// entry of this session (keys are "session_id|file_path"), positive AND
 /// negative. A compaction destroys the advisory text along with the context, so

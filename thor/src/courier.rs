@@ -78,7 +78,8 @@ fn build_injection(db: &Path) -> Option<String> {
 /// Given the raw hook JSON and a db path, produce the injection block (or None).
 /// Applies the same gates as the mimir hook: min length, whole-prompt-trivial,
 /// prompt truncation, dedup, and a hard cap.
-fn injection_for_hook_json(db: &Path, raw: &str) -> Option<String> {
+/// Public so the drift-eval harness (examples/drift_eval.rs) drives the REAL path.
+pub fn injection_for_hook_json(db: &Path, raw: &str) -> Option<String> {
     // Flip valve: THOR-SILENT.flag silences THOR entirely (its own kill-switch).
     // Checked first, so a silenced courier does nothing else. Flipping is a file,
     // never a code change.

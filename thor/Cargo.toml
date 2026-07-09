@@ -49,3 +49,9 @@ tempfile = "3"
 [[example]]
 name = "recall_eval"
 required-features = ["semantic"]
+
+# The drift eval drives the courier's default entry point, which itself degrades
+# to bm25 when semantic is off - so it is deliberately NOT feature-gated and must
+# compile both with and without `--features semantic`.
+[[example]]
+name = "drift_eval"

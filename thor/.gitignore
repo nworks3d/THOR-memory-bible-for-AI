@@ -11,3 +11,6 @@ guard-rulebook.json
 
 # response Guard rulebook (Stop-hook, capability-amnesia) - keep local, .example is tracked
 guard-response-rulebook.json
+# The committed drift-eval corpus is SYNTHETIC (no real memories) - the only
+# jsonl that belongs in the repo.
+!eval/drift_scenarios.jsonl

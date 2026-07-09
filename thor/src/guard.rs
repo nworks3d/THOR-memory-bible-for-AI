@@ -223,10 +223,8 @@ fn file_memory_advisory(db: &Path, hook: &Value) -> Option<String> {
         // capture_nudge: no debounce identity -> stay silent.
         return None;
     }
-    let ledger_path = crate::ledger::guard_seen_path(db);
     let key = format!("{}|{}", session_id, file_path);
-    let mut seen = crate::ledger::read_map(&ledger_path);
-    match seen.get(&key) {
+    match crate::ledger::get(db, "guard-seen", &key) {
         // already advised for this file this session
         Some(v) if v.is_u64() => return None,
         // fresh negative answer: skip the store open + recall entirely
@@ -279,13 +277,10 @@ fn file_memory_advisory(db: &Path, hook: &Value) -> Option<String> {
     if named.is_empty() {
         // Cache the miss briefly (NEG_CACHE_SECS) so repeated touches of a
         // memory-less file stop re-paying the recall; a memory stored later
-        // still surfaces once the negative entry expires.
+        // still surfaces once the negative entry expires. Per-key upsert: a
+        // concurrent guard on ANOTHER file can no longer lose this entry.
         let now = crate::review::now_secs();
-        seen.insert(key, serde_json::json!({ "ts": now, "neg": true }));
-        crate::ledger::prune_old(&mut seen, now, |v| {
-            v.as_u64().or_else(|| v.get("ts").and_then(|t| t.as_u64()))
-        });
-        crate::ledger::write_map(&ledger_path, &seen);
+        crate::ledger::upsert(db, "guard-seen", &key, &serde_json::json!({ "ts": now, "neg": true }));
         return None;
     }
 
@@ -298,11 +293,7 @@ fn file_memory_advisory(db: &Path, hook: &Value) -> Option<String> {
         .collect();
 
     let now = crate::review::now_secs();
-    seen.insert(key, serde_json::json!(now));
-    crate::ledger::prune_old(&mut seen, now, |v| {
-        v.as_u64().or_else(|| v.get("ts").and_then(|t| t.as_u64()))
-    });
-    crate::ledger::write_map(&ledger_path, &seen);
+    crate::ledger::upsert(db, "guard-seen", &key, &serde_json::json!(now));
 
     Some(format!(
         "stored memory about this file (verify before relying): {}",
@@ -327,14 +318,7 @@ pub fn clear_session_guard_seen(db: &Path, session_id: &str) {
     if session_id.is_empty() {
         return;
     }
-    let path = crate::ledger::guard_seen_path(db);
-    let mut seen = crate::ledger::read_map(&path);
-    let prefix = format!("{}|", session_id);
-    let before = seen.len();
-    seen.retain(|k, _| !k.starts_with(&prefix));
-    if seen.len() != before {
-        crate::ledger::write_map(&path, &seen);
-    }
+    crate::ledger::remove_prefix(db, "guard-seen", &format!("{}|", session_id));
 }
 
 /// Response-rulebook for the Stop guard (the capability-amnesia / ssh-amnesia
@@ -470,15 +454,12 @@ fn capture_nudge(db: &Path, hook: &Value, haystack_lower: &str) -> Option<String
     if !capture_triggers(db).iter().any(|t| haystack_lower.contains(t.as_str())) {
         return None;
     }
-    let path = crate::ledger::capture_ledger_path(db);
-    let mut seen = crate::ledger::read_map(&path);
-    if seen.contains_key(session_id) {
-        return None; // at most one nudge per session
-    }
+    // Atomic once-per-session claim: two concurrent Stop hooks can both pass a
+    // contains-check, but only one INSERT wins - "at most one nudge" is exact.
     let now = crate::review::now_secs();
-    seen.insert(session_id.to_string(), serde_json::json!(now));
-    crate::ledger::prune_old(&mut seen, now, |v| v.as_u64());
-    crate::ledger::write_map(&path, &seen);
+    if !crate::ledger::insert_once(db, "capture", session_id, &serde_json::json!(now)) {
+        return None;
+    }
     Some(
         "[THOR capture] This reply looks like it contains a durable decision, gotcha, or \
          milestone (project start, code/data move, direction change). If it is durable and \
@@ -517,20 +498,16 @@ mod tests {
         // just been destroyed with the context.
         let dir = tempfile::tempdir().unwrap();
         let db = dir.path().join("thor.db");
-        let path = crate::ledger::guard_seen_path(&db);
-        let mut m = std::collections::HashMap::new();
-        m.insert("s1|a.rs".to_string(), json!(100));
-        m.insert("s1|b.rs".to_string(), json!({"ts": 100, "neg": true}));
-        m.insert("s2|a.rs".to_string(), json!(100));
-        crate::ledger::write_map(&path, &m);
+        crate::ledger::upsert(&db, "guard-seen", "s1|a.rs", &json!(100));
+        crate::ledger::upsert(&db, "guard-seen", "s1|b.rs", &json!({"ts": 100, "neg": true}));
+        crate::ledger::upsert(&db, "guard-seen", "s2|a.rs", &json!(100));
         clear_session_guard_seen(&db, "s1");
-        let after = crate::ledger::read_map(&path);
-        assert!(!after.contains_key("s1|a.rs"), "positive entry cleared");
-        assert!(!after.contains_key("s1|b.rs"), "negative-cache entry cleared");
-        assert!(after.contains_key("s2|a.rs"), "other sessions stay untouched");
+        assert!(crate::ledger::get(&db, "guard-seen", "s1|a.rs").is_none(), "positive entry cleared");
+        assert!(crate::ledger::get(&db, "guard-seen", "s1|b.rs").is_none(), "negative-cache entry cleared");
+        assert!(crate::ledger::get(&db, "guard-seen", "s2|a.rs").is_some(), "other sessions stay untouched");
         // an empty session id never wipes anything
         clear_session_guard_seen(&db, "");
-        assert!(crate::ledger::read_map(&path).contains_key("s2|a.rs"));
+        assert!(crate::ledger::get(&db, "guard-seen", "s2|a.rs").is_some());
     }
 
     // Synthetic fixtures only: no real host, container, or secret names live in
@@ -720,11 +697,11 @@ mod tests {
             "tool_input": { "file_path": proj.join("src/other.rs").to_string_lossy() }
         });
         assert!(file_memory_advisory(&db, &other).is_none());
-        let seen = crate::ledger::read_map(&crate::ledger::guard_seen_path(&db));
         let neg_key = format!("s1|{}", proj.join("src/other.rs").to_string_lossy());
+        let neg = crate::ledger::get(&db, "guard-seen", &neg_key);
         assert!(
-            seen.get(&neg_key).and_then(|v| v.get("neg")).is_some(),
-            "a miss writes a short-TTL negative entry: {seen:?}"
+            neg.as_ref().and_then(|v| v.get("neg")).is_some(),
+            "a miss writes a short-TTL negative entry: {neg:?}"
         );
         assert!(file_memory_advisory(&db, &other).is_none(), "cached miss stays silent");
 

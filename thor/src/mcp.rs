@@ -444,12 +444,21 @@ impl ThorServer {
             if s.get_events_by_entity(&args.entity_id).map_err(|e| format!("error: {e}"))?.is_empty() {
                 return Err(format!("unknown entity: {}", args.entity_id));
             }
-            let mut pins = crate::ledger::read_pins(&db);
-            if pins.contains(&args.entity_id) {
+            // One write transaction: a concurrent pin (CLI, another session)
+            // can no longer be dropped by a last-write-wins overwrite.
+            let mut already = false;
+            let pins = crate::ledger::mutate_pins(&db, |mut pins| {
+                if pins.contains(&args.entity_id) {
+                    already = true;
+                } else {
+                    pins.push(args.entity_id.clone());
+                }
+                pins
+            })
+            .map_err(|e| format!("error: {e}"))?;
+            if already {
                 return Ok(format!("already pinned: {}", args.entity_id));
             }
-            pins.push(args.entity_id.clone());
-            crate::ledger::write_pins(&db, &pins).map_err(|e| format!("error: {e}"))?;
             Ok(format!("pinned {} ({} pin(s) total)", args.entity_id, pins.len()))
         })
         .await
@@ -459,13 +468,17 @@ impl ThorServer {
     async fn unpin(&self, Parameters(args): Parameters<EntityArgs>) -> String {
         let db = self.db.clone();
         self.blocking(move |_s| {
-            let mut pins = crate::ledger::read_pins(&db);
-            let before = pins.len();
-            pins.retain(|p| p != &args.entity_id);
-            if pins.len() == before {
+            let mut found = false;
+            crate::ledger::mutate_pins(&db, |mut pins| {
+                let before = pins.len();
+                pins.retain(|p| p != &args.entity_id);
+                found = pins.len() != before;
+                pins
+            })
+            .map_err(|e| format!("error: {e}"))?;
+            if !found {
                 return Ok(format!("not pinned: {}", args.entity_id));
             }
-            crate::ledger::write_pins(&db, &pins).map_err(|e| format!("error: {e}"))?;
             Ok(format!("unpinned {}", args.entity_id))
         })
         .await

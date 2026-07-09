@@ -1,28 +1,29 @@
-//! Fail-open JSON sidecars next to the store, following the review.rs watermark
-//! pattern: any read/parse failure yields the empty default and any write failure
-//! is ignored, so a ledger can never block or break the hook paths that use it.
+//! Local hook/debounce state in ONE SQLite sidecar (`thor-ledger.db`, next to
+//! the store), following the review round that hardened the old JSON files:
+//! per-key reads and writes under SQLite's own locking, so concurrent hook
+//! processes (parallel PreToolUse guards, two sessions' Stop hooks, a pin from
+//! the CLI while the MCP server pins too) can no longer lose each other's
+//! entries or wipe the ledger via a partial read - the failure modes the
+//! atomic-replace JSON interim fix could only soften.
 //!
-//! Three consumers:
-//! - the Stop-hook capture nudge (`thor-capture.json`: session_id -> unix ts);
-//! - the PreToolUse memory advisory (`thor-guard-seen.json`: "session|file" -> ts);
-//! - the courier's per-session injection ledger (`thor-courier-seen.json`:
-//!   session_id -> { ts, count, seen: { "<rev>|<diverged>": at_count } }).
+//! Four namespaces:
+//! - `capture`: session_id -> unix ts (the once-per-session capture nudge;
+//!   claimed with an atomic INSERT so "once" is exact under concurrency);
+//! - `guard-seen`: "session|file" -> ts (positive) or {ts, neg} (negative cache);
+//! - `courier-seen`: session_id -> {ts, count, seen} (per-session injection ledger);
+//! - `pins`: one row holding the pinned entity-id list (mutated in a write
+//!   transaction, so concurrent pin/unpin serialize instead of last-wins).
 //!
-//! Ledgers are LOCAL state (like the flag files), never part of the hash-chained
-//! log, so deleting one only resets a debounce - it can never lose a fact.
-//!
-//! Writes are atomic-replace (temp file + rename in the same directory): a
-//! concurrent reader sees the old or the new ledger, never a truncated one -
-//! else its fail-open "malformed -> empty" path could make it REWRITE the
-//! ledger from empty and wipe every session's debounce state. Concurrent
-//! read-modify-write can still lose the slower writer's entry (cost: one
-//! repeated advisory/nudge, fail-open by design); the race-free fix is moving
-//! this state into SQLite, tracked as a later step.
+//! This is LOCAL state (like the flag files), never part of the hash-chained
+//! log: deleting `thor-ledger.db` only resets debounces - it can never lose a
+//! fact. Every operation is fail-open: any error degrades to "no state" (a
+//! repeat advisory at worst), never to blocking a hook. Legacy JSON sidecars
+//! are imported once on first open and then left untouched.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
-/// Entries older than this are pruned on write, so ledgers never grow unbounded.
+/// Entries older than this are pruned on write, so the ledger never grows unbounded.
 pub const PRUNE_AGE_SECS: u64 = 48 * 60 * 60;
 
 /// THOR's per-user data directory (store, rulebooks, ledgers, flag files):
@@ -43,33 +44,81 @@ pub fn data_dir() -> Option<PathBuf> {
     Some(base.join("thor"))
 }
 
-pub fn capture_ledger_path(db: &Path) -> PathBuf {
-    db.with_file_name("thor-capture.json")
-}
-
-pub fn guard_seen_path(db: &Path) -> PathBuf {
-    db.with_file_name("thor-guard-seen.json")
-}
-
-pub fn courier_seen_path(db: &Path) -> PathBuf {
-    db.with_file_name("thor-courier-seen.json")
-}
-
-pub fn pins_path(db: &Path) -> PathBuf {
-    db.with_file_name("thor-pins.json")
-}
-
 /// True when a flag file (THOR-SILENT.flag, THOR-PRIMARY.flag) sits next to the
 /// store. Flag files ARE the flip valve: create or delete one to change phase
 /// with NO code change and NO settings edit. Shared by the courier and the
-/// guard so the kill switch silences every THOR surface consistently.
+/// guard so the kill switch silences every THOR surface consistently. Flags
+/// deliberately stay FILES (not ledger rows): flipping must never require a
+/// working SQLite open.
 pub fn flag_present(db: &Path, name: &str) -> bool {
     db.parent().map(|dir| dir.join(name).exists()).unwrap_or(false)
 }
 
-/// Read a JSON-object ledger as a string map. Fail-open: a missing, unreadable,
-/// or malformed file is an empty map (the caller then behaves statelessly).
-pub fn read_map(path: &Path) -> HashMap<String, serde_json::Value> {
+fn ledger_path(db: &Path) -> PathBuf {
+    db.with_file_name("thor-ledger.db")
+}
+
+/// Open (and initialize) the ledger sidecar. `None` on any failure - callers
+/// then behave statelessly, exactly like a missing JSON sidecar used to.
+fn conn(db: &Path) -> Option<rusqlite::Connection> {
+    let c = rusqlite::Connection::open(ledger_path(db)).ok()?;
+    let _ = c.busy_timeout(std::time::Duration::from_millis(250));
+    c.execute_batch(
+        "PRAGMA journal_mode=WAL;
+         CREATE TABLE IF NOT EXISTS kv (
+           ns TEXT NOT NULL,
+           k  TEXT NOT NULL,
+           v  TEXT NOT NULL,
+           ts INTEGER NOT NULL,
+           PRIMARY KEY (ns, k)
+         );",
+    )
+    .ok()?;
+    migrate_legacy_json(&c, db);
+    Some(c)
+}
+
+/// One-time import of the pre-SQLite JSON sidecars, so live debounce state and
+/// (critically) the PINNED standing rules survive the upgrade. Idempotent via a
+/// meta row; the legacy files are left in place (dead) rather than deleted.
+fn migrate_legacy_json(c: &rusqlite::Connection, db: &Path) {
+    let migrated: Option<i64> = c
+        .query_row("SELECT 1 FROM kv WHERE ns='meta' AND k='migrated'", [], |r| r.get(0))
+        .ok();
+    if migrated.is_some() {
+        return;
+    }
+    let now = crate::review::now_secs();
+    for (ns, file) in [
+        ("capture", "thor-capture.json"),
+        ("guard-seen", "thor-guard-seen.json"),
+        ("courier-seen", "thor-courier-seen.json"),
+    ] {
+        for (k, v) in legacy_read_map(&db.with_file_name(file)) {
+            let ts = v
+                .as_u64()
+                .or_else(|| v.get("ts").and_then(|t| t.as_u64()))
+                .unwrap_or(now);
+            let _ = c.execute(
+                "INSERT OR IGNORE INTO kv (ns, k, v, ts) VALUES (?, ?, ?, ?)",
+                rusqlite::params![ns, k, v.to_string(), ts as i64],
+            );
+        }
+    }
+    let legacy_pins = legacy_read_pins(&db.with_file_name("thor-pins.json"));
+    if !legacy_pins.is_empty() {
+        let _ = c.execute(
+            "INSERT OR IGNORE INTO kv (ns, k, v, ts) VALUES ('pins', 'list', ?, ?)",
+            rusqlite::params![serde_json::json!(legacy_pins).to_string(), now as i64],
+        );
+    }
+    let _ = c.execute(
+        "INSERT OR IGNORE INTO kv (ns, k, v, ts) VALUES ('meta', 'migrated', '1', ?)",
+        rusqlite::params![now as i64],
+    );
+}
+
+fn legacy_read_map(path: &Path) -> HashMap<String, serde_json::Value> {
     let raw = match std::fs::read_to_string(path) {
         Ok(s) => s,
         Err(_) => return HashMap::new(),
@@ -80,55 +129,130 @@ pub fn read_map(path: &Path) -> HashMap<String, serde_json::Value> {
     }
 }
 
-/// Atomic-replace write: temp file in the SAME directory (rename is only atomic
-/// within one filesystem), unique per process so concurrent writers never share
-/// a temp file. On both Unix and Windows the rename replaces the destination.
-fn write_atomic(path: &Path, contents: &str) -> std::io::Result<()> {
-    let tmp = path.with_extension(format!("tmp{}", std::process::id()));
-    std::fs::write(&tmp, contents)?;
-    std::fs::rename(&tmp, path)
-}
-
-/// Best-effort write (fail-open: an IO error is swallowed, matching the
-/// review.rs watermark contract - state loss only means a repeat nudge).
-pub fn write_map(path: &Path, map: &HashMap<String, serde_json::Value>) {
-    let obj: serde_json::Map<String, serde_json::Value> =
-        map.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
-    let _ = write_atomic(path, &serde_json::Value::Object(obj).to_string());
-}
-
-/// Drop entries whose timestamp (extracted by `ts_of`; None = undatable, drop it
-/// too) is older than PRUNE_AGE_SECS. Called on write so stale sessions age out.
-pub fn prune_old<F>(map: &mut HashMap<String, serde_json::Value>, now: u64, ts_of: F)
-where
-    F: Fn(&serde_json::Value) -> Option<u64>,
-{
-    map.retain(|_, v| match ts_of(v) {
-        Some(ts) => now.saturating_sub(ts) <= PRUNE_AGE_SECS,
-        None => false,
-    });
-}
-
-/// The pinned entity ids (`thor pin` / the post-compaction brief). Order is
-/// preserved; a malformed file is an empty list (fail-open).
-pub fn read_pins(db: &Path) -> Vec<String> {
-    let raw = match std::fs::read_to_string(pins_path(db)) {
+fn legacy_read_pins(path: &Path) -> Vec<String> {
+    let raw = match std::fs::read_to_string(path) {
         Ok(s) => s,
         Err(_) => return Vec::new(),
     };
-    let v: serde_json::Value = match serde_json::from_str(&raw) {
-        Ok(v) => v,
-        Err(_) => return Vec::new(),
-    };
-    v.get("pins")
-        .and_then(|p| p.as_array())
-        .map(|a| a.iter().filter_map(|s| s.as_str().map(String::from)).collect())
+    serde_json::from_str::<serde_json::Value>(&raw)
+        .ok()
+        .and_then(|v| {
+            v.get("pins").and_then(|p| p.as_array()).map(|a| {
+                a.iter().filter_map(|s| s.as_str().map(String::from)).collect()
+            })
+        })
         .unwrap_or_default()
 }
 
-pub fn write_pins(db: &Path, pins: &[String]) -> std::io::Result<()> {
-    let v = serde_json::json!({ "pins": pins });
-    write_atomic(&pins_path(db), &v.to_string())
+/// Read one entry. `None` = absent or any error (fail-open).
+pub fn get(db: &Path, ns: &str, key: &str) -> Option<serde_json::Value> {
+    let c = conn(db)?;
+    let raw: String = c
+        .query_row("SELECT v FROM kv WHERE ns=? AND k=?", rusqlite::params![ns, key], |r| r.get(0))
+        .ok()?;
+    serde_json::from_str(&raw).ok()
+}
+
+/// Write one entry (last write wins for THIS key only - other keys are never
+/// touched, which is the whole point vs the old whole-map JSON writes) and
+/// prune entries past PRUNE_AGE_SECS in the same namespace.
+pub fn upsert(db: &Path, ns: &str, key: &str, value: &serde_json::Value) {
+    let now = crate::review::now_secs();
+    if let Some(c) = conn(db) {
+        let _ = c.execute(
+            "INSERT INTO kv (ns, k, v, ts) VALUES (?, ?, ?, ?)
+             ON CONFLICT (ns, k) DO UPDATE SET v=excluded.v, ts=excluded.ts",
+            rusqlite::params![ns, key, value.to_string(), now as i64],
+        );
+        let _ = c.execute(
+            "DELETE FROM kv WHERE ns=? AND ts < ?",
+            rusqlite::params![ns, (now.saturating_sub(PRUNE_AGE_SECS)) as i64],
+        );
+    }
+}
+
+/// Atomically claim a key: true iff the row was newly inserted. False when it
+/// already exists OR on any error - for a once-per-session nudge, an error must
+/// mean silence, never a repeat. This is the exactly-once primitive the JSON
+/// contains-then-insert could not provide under concurrency.
+pub fn insert_once(db: &Path, ns: &str, key: &str, value: &serde_json::Value) -> bool {
+    let now = crate::review::now_secs();
+    match conn(db) {
+        Some(c) => c
+            .execute(
+                "INSERT OR IGNORE INTO kv (ns, k, v, ts) VALUES (?, ?, ?, ?)",
+                rusqlite::params![ns, key, value.to_string(), now as i64],
+            )
+            .map(|inserted| inserted == 1)
+            .unwrap_or(false),
+        None => false,
+    }
+}
+
+/// Remove one entry (absent = no-op).
+pub fn remove(db: &Path, ns: &str, key: &str) {
+    if let Some(c) = conn(db) {
+        let _ = c.execute("DELETE FROM kv WHERE ns=? AND k=?", rusqlite::params![ns, key]);
+    }
+}
+
+/// Remove every entry in `ns` whose key starts with `prefix` (the post-compaction
+/// reset for one session's "session|file" guard-seen entries).
+pub fn remove_prefix(db: &Path, ns: &str, prefix: &str) {
+    if prefix.is_empty() {
+        return;
+    }
+    if let Some(c) = conn(db) {
+        // ESCAPE so a '%' or '_' in a session id cannot widen the match.
+        let pattern = format!(
+            "{}%",
+            prefix.replace('\\', "\\\\").replace('%', "\\%").replace('_', "\\_")
+        );
+        let _ = c.execute(
+            "DELETE FROM kv WHERE ns=? AND k LIKE ? ESCAPE '\\'",
+            rusqlite::params![ns, pattern],
+        );
+    }
+}
+
+/// The pinned entity ids (`thor pin` / the post-compaction brief). Order is
+/// preserved; any error is an empty list (fail-open).
+pub fn read_pins(db: &Path) -> Vec<String> {
+    get(db, "pins", "list")
+        .and_then(|v| {
+            v.as_array().map(|a| a.iter().filter_map(|s| s.as_str().map(String::from)).collect())
+        })
+        .unwrap_or_default()
+}
+
+/// Read-modify-write the pin list inside ONE immediate write transaction, so
+/// concurrent pin/unpin (CLI + MCP server, two sessions) serialize instead of
+/// last-write-wins dropping a pin. Returns the resulting list.
+pub fn mutate_pins<F>(db: &Path, mutate: F) -> std::io::Result<Vec<String>>
+where
+    F: FnOnce(Vec<String>) -> Vec<String>,
+{
+    let err = |e: String| std::io::Error::other(e);
+    let mut c = conn(db).ok_or_else(|| err("ledger unavailable".into()))?;
+    let tx = c
+        .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+        .map_err(|e| err(e.to_string()))?;
+    let current: Vec<String> = tx
+        .query_row("SELECT v FROM kv WHERE ns='pins' AND k='list'", [], |r| {
+            r.get::<_, String>(0)
+        })
+        .ok()
+        .and_then(|raw| serde_json::from_str::<Vec<String>>(&raw).ok())
+        .unwrap_or_default();
+    let next = mutate(current);
+    tx.execute(
+        "INSERT INTO kv (ns, k, v, ts) VALUES ('pins', 'list', ?, ?)
+         ON CONFLICT (ns, k) DO UPDATE SET v=excluded.v, ts=excluded.ts",
+        rusqlite::params![serde_json::json!(next).to_string(), crate::review::now_secs() as i64],
+    )
+    .map_err(|e| err(e.to_string()))?;
+    tx.commit().map_err(|e| err(e.to_string()))?;
+    Ok(next)
 }
 
 #[cfg(test)]
@@ -136,38 +260,82 @@ mod tests {
     use super::*;
 
     #[test]
-    fn read_write_roundtrip_and_failopen() {
+    fn get_upsert_remove_roundtrip_and_failopen() {
         let dir = tempfile::tempdir().unwrap();
-        let p = dir.path().join("ledger.json");
-        assert!(read_map(&p).is_empty(), "missing file -> empty map");
-        std::fs::write(&p, "not json").unwrap();
-        assert!(read_map(&p).is_empty(), "malformed file -> empty map (fail-open)");
-        let mut m = HashMap::new();
-        m.insert("s1".to_string(), serde_json::json!(123));
-        write_map(&p, &m);
-        assert_eq!(read_map(&p).get("s1").and_then(|v| v.as_u64()), Some(123));
+        let db = dir.path().join("thor.db");
+        assert!(get(&db, "guard-seen", "s1|a.rs").is_none(), "absent -> None");
+        upsert(&db, "guard-seen", "s1|a.rs", &serde_json::json!(123));
+        assert_eq!(get(&db, "guard-seen", "s1|a.rs").and_then(|v| v.as_u64()), Some(123));
+        // another namespace is invisible
+        assert!(get(&db, "capture", "s1|a.rs").is_none());
+        remove(&db, "guard-seen", "s1|a.rs");
+        assert!(get(&db, "guard-seen", "s1|a.rs").is_none());
     }
 
     #[test]
-    fn prune_drops_old_and_undatable() {
-        let mut m = HashMap::new();
-        m.insert("fresh".to_string(), serde_json::json!(1_000_000));
-        m.insert("old".to_string(), serde_json::json!(1_000_000 - PRUNE_AGE_SECS - 1));
-        m.insert("junk".to_string(), serde_json::json!("no ts"));
-        prune_old(&mut m, 1_000_000, |v| v.as_u64());
-        assert!(m.contains_key("fresh"));
-        assert!(!m.contains_key("old"), "past the prune age -> dropped");
-        assert!(!m.contains_key("junk"), "undatable -> dropped");
+    fn insert_once_claims_exactly_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("thor.db");
+        assert!(insert_once(&db, "capture", "s1", &serde_json::json!(1)), "first claim wins");
+        assert!(!insert_once(&db, "capture", "s1", &serde_json::json!(2)), "second claim loses");
+        assert_eq!(get(&db, "capture", "s1").and_then(|v| v.as_u64()), Some(1), "value is the winner's");
     }
 
     #[test]
-    fn pins_roundtrip() {
+    fn remove_prefix_only_hits_that_session() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("thor.db");
+        upsert(&db, "guard-seen", "s1|a.rs", &serde_json::json!(1));
+        upsert(&db, "guard-seen", "s1|b.rs", &serde_json::json!(2));
+        upsert(&db, "guard-seen", "s2|a.rs", &serde_json::json!(3));
+        remove_prefix(&db, "guard-seen", "s1|");
+        assert!(get(&db, "guard-seen", "s1|a.rs").is_none());
+        assert!(get(&db, "guard-seen", "s1|b.rs").is_none());
+        assert!(get(&db, "guard-seen", "s2|a.rs").is_some(), "other sessions untouched");
+        remove_prefix(&db, "guard-seen", ""); // empty prefix must never wipe
+        assert!(get(&db, "guard-seen", "s2|a.rs").is_some());
+    }
+
+    #[test]
+    fn pins_roundtrip_and_transactional_mutate() {
         let dir = tempfile::tempdir().unwrap();
         let db = dir.path().join("thor.db");
         assert!(read_pins(&db).is_empty());
-        write_pins(&db, &["e1".to_string(), "e2".to_string()]).unwrap();
-        assert_eq!(read_pins(&db), vec!["e1", "e2"]);
-        std::fs::write(pins_path(&db), "garbage").unwrap();
-        assert!(read_pins(&db).is_empty(), "malformed pins file -> empty (fail-open)");
+        let after = mutate_pins(&db, |mut pins| {
+            pins.push("e1".to_string());
+            pins
+        })
+        .unwrap();
+        assert_eq!(after, vec!["e1"]);
+        mutate_pins(&db, |mut pins| {
+            pins.push("e2".to_string());
+            pins
+        })
+        .unwrap();
+        assert_eq!(read_pins(&db), vec!["e1", "e2"], "order preserved");
+        mutate_pins(&db, |mut pins| {
+            pins.retain(|p| p != "e1");
+            pins
+        })
+        .unwrap();
+        assert_eq!(read_pins(&db), vec!["e2"]);
+    }
+
+    #[test]
+    fn legacy_json_migrates_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("thor.db");
+        // legacy sidecars from the JSON era: pins + a capture debounce
+        std::fs::write(db.with_file_name("thor-pins.json"), r#"{"pins":["rule-1","rule-2"]}"#)
+            .unwrap();
+        std::fs::write(db.with_file_name("thor-capture.json"), r#"{"s9":1234}"#).unwrap();
+        assert_eq!(read_pins(&db), vec!["rule-1", "rule-2"], "pins survive the upgrade");
+        assert!(
+            !insert_once(&db, "capture", "s9", &serde_json::json!(9)),
+            "a migrated capture debounce still counts as claimed"
+        );
+        // migration runs once: a legacy file appearing later is ignored
+        std::fs::write(db.with_file_name("thor-pins.json"), r#"{"pins":["late"]}"#).unwrap();
+        assert_eq!(read_pins(&db), vec!["rule-1", "rule-2"], "no re-import after the marker");
     }
 }

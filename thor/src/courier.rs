@@ -366,10 +366,11 @@ fn select_hits(pool: Vec<RecallHit>, echo: &HashMap<String, i64>) -> Vec<RecallH
 
 // ---- Per-session injection ledger --------------------------------------------
 
-/// Sliding-window suppression state for one session, persisted in the fail-open
-/// `thor-courier-seen.json` sidecar (crate::ledger). Inactive (stateless, the
-/// pre-ledger behavior) when the hook carries no session_id or the file cannot
-/// be read - the courier contract (never block, never error) is preserved.
+/// Sliding-window suppression state for one session, persisted as one row in
+/// the fail-open ledger sidecar (crate::ledger, ns "courier-seen"). Inactive
+/// (stateless, the pre-ledger behavior) when the hook carries no session_id or
+/// the ledger cannot be read - the courier contract (never block, never error)
+/// is preserved.
 struct SessionLedger {
     session_id: String,
     /// This prompt's ordinal within the session (1-based; already incremented).
@@ -390,8 +391,7 @@ impl SessionLedger {
         if session_id.is_empty() {
             return this; // inactive
         }
-        let map = crate::ledger::read_map(&crate::ledger::courier_seen_path(db));
-        if let Some(entry) = map.get(session_id) {
+        if let Some(entry) = crate::ledger::get(db, "courier-seen", session_id) {
             this.count = entry.get("count").and_then(|v| v.as_u64()).unwrap_or(0);
             if let Some(seen) = entry.get("seen").and_then(|v| v.as_object()) {
                 this.seen = seen
@@ -454,17 +454,15 @@ impl SessionLedger {
         if !self.active() {
             return;
         }
-        let path = crate::ledger::courier_seen_path(db);
-        let mut map = crate::ledger::read_map(&path);
         let now = crate::review::now_secs();
         let seen: serde_json::Map<String, serde_json::Value> =
             self.seen.iter().map(|(k, v)| (k.clone(), serde_json::json!(v))).collect();
-        map.insert(
-            self.session_id.clone(),
-            serde_json::json!({ "ts": now, "count": self.count, "seen": seen }),
+        crate::ledger::upsert(
+            db,
+            "courier-seen",
+            &self.session_id,
+            &serde_json::json!({ "ts": now, "count": self.count, "seen": seen }),
         );
-        crate::ledger::prune_old(&mut map, now, |v| v.get("ts").and_then(|t| t.as_u64()));
-        crate::ledger::write_map(&path, &map);
     }
 }
 
@@ -474,11 +472,7 @@ pub fn clear_session_ledger(db: &Path, session_id: &str) {
     if session_id.is_empty() {
         return;
     }
-    let path = crate::ledger::courier_seen_path(db);
-    let mut map = crate::ledger::read_map(&path);
-    if map.remove(session_id).is_some() {
-        crate::ledger::write_map(&path, &map);
-    }
+    crate::ledger::remove(db, "courier-seen", session_id);
 }
 
 // ---- Freshness ----------------------------------------------------------------

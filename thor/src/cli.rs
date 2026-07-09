@@ -930,12 +930,20 @@ pub fn run() -> Result<()> {
                     if store.get_events_by_entity(&id)?.is_empty() {
                         anyhow::bail!("unknown entity: {}", id);
                     }
-                    if pins.contains(&id) {
+                    // One write transaction (see ledger::mutate_pins): a pin from
+                    // the MCP server at the same moment can no longer be dropped.
+                    let mut already = false;
+                    let pins = crate::ledger::mutate_pins(&db, |mut pins| {
+                        if pins.contains(&id) {
+                            already = true;
+                        } else {
+                            pins.push(id.clone());
+                        }
+                        pins
+                    })?;
+                    if already {
                         println!("already pinned: {}", id);
                     } else {
-                        let mut pins = pins;
-                        pins.push(id.clone());
-                        crate::ledger::write_pins(&db, &pins)?;
                         println!("pinned {} ({} pin(s) total) - it now re-injects at every session start", id, pins.len());
                     }
                 }
@@ -966,14 +974,17 @@ pub fn run() -> Result<()> {
             }
         }
         Commands::Unpin { entity_id } => {
-            let mut pins = crate::ledger::read_pins(&db);
-            let before = pins.len();
-            pins.retain(|p| p != &entity_id);
-            if pins.len() == before {
-                println!("not pinned: {}", entity_id);
-            } else {
-                crate::ledger::write_pins(&db, &pins)?;
+            let mut found = false;
+            crate::ledger::mutate_pins(&db, |mut pins| {
+                let before = pins.len();
+                pins.retain(|p| p != &entity_id);
+                found = pins.len() != before;
+                pins
+            })?;
+            if found {
                 println!("unpinned {}", entity_id);
+            } else {
+                println!("not pinned: {}", entity_id);
             }
         }
         Commands::ReviewScope { mark } => {

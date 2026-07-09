@@ -233,13 +233,8 @@ pub fn injection_for_hook_json(db: &Path, raw: &str) -> Option<String> {
         // Freshness: a chunk of the CURRENT project is re-read from disk, so the
         // agent sees today's code (tagged [refreshed]) - or a warning when the
         // stored chunk no longer exists ([stale?]). Memories pass through.
-        let (fresh_tag, snip) = match freshness(&hit.entity_id, &hit.body, project.as_deref(), cwd.as_deref()) {
-            Freshness::Current => (String::new(), crate::recall::snippet(&hit.body, cap, &query)),
-            Freshness::Refreshed(live) => {
-                (" [refreshed]".to_string(), crate::recall::snippet(&live, cap, &query))
-            }
-            Freshness::Stale => (" [stale?]".to_string(), crate::recall::snippet(&hit.body, cap, &query)),
-        };
+        let (fresh_tag, snip) =
+            fresh_snippet(&hit.entity_id, &hit.body, &query, cap, project.as_deref(), cwd.as_deref());
         // Type tag for hand-written constraints, so a gotcha/decision reads as
         // one at a glance instead of blending in with chunks.
         let type_tag = hit.fact_type.map(|t| format!(" [{}]", t.as_str())).unwrap_or_default();
@@ -313,13 +308,26 @@ fn echo_counts_for(store: &EventStore, ids: &[String]) -> HashMap<String, i64> {
     rows.flatten().collect()
 }
 
+/// Rank slack for the typed-constraint slot: a deeper gotcha/decision/preference
+/// may take slot 3 only when its bm25 strength is within this factor of slot 3's.
+/// Same conservatism as the echo prior: a typed fact never displaces a clearly
+/// stronger match, and slots 1-2 are never touched.
+const TYPED_RANK_SLACK: f64 = 1.5;
+
 /// Pick MAX_HITS from the (already gated + suppression-filtered) pool, in rank
-/// order - then, if NO pick was ever marked useful but a deeper hit was, and
-/// that hit's bm25 strength is within ECHO_RANK_SLACK of slot 3's, promote it
-/// into slot 3. Conservative by construction: a marked fact never displaces a
-/// clearly stronger match, and slots 1-2 are never touched.
+/// order - then at most ONE slot-3 promotion, in priority order:
+/// 1. echo prior: if NO pick was ever marked useful but a deeper hit was (and
+///    ranks within ECHO_RANK_SLACK of slot 3), it takes slot 3 - "this actually
+///    helped before" is the strongest prior we have;
+/// 2. typed constraint: else, if NO pick is a typed gotcha/decision/preference
+///    but a deeper one is (within TYPED_RANK_SLACK), it takes slot 3 - the
+///    drift preventer is usually a typed fact ranked just below a wall of
+///    same-topic chunks.
+/// Conservative by construction; a promotion never fires against a dense-only
+/// slot 3 (rank 0.0 = no lexical evidence to compare against).
 fn select_hits(pool: Vec<RecallHit>, echo: &HashMap<String, i64>) -> Vec<RecallHit> {
     let echoed = |h: &RecallHit| echo.get(&h.entity_id).copied().unwrap_or(0) > 0;
+    let typed = |h: &RecallHit| h.fact_type.is_some();
     let mut selected: Vec<RecallHit> = Vec::with_capacity(MAX_HITS);
     let mut rest: Vec<RecallHit> = Vec::new();
     for h in pool {
@@ -329,16 +337,27 @@ fn select_hits(pool: Vec<RecallHit>, echo: &HashMap<String, i64>) -> Vec<RecallH
             rest.push(h);
         }
     }
-    if selected.len() == MAX_HITS && !selected.iter().any(&echoed) {
+    if selected.len() == MAX_HITS {
         let slot3_rank = selected[MAX_HITS - 1].rank;
         // bm25 ranks are negative (more negative = stronger); a rank of 0.0 is a
         // dense-only hit with no lexical evidence - never promote against that.
         if slot3_rank < 0.0 {
-            if let Some(cand) = rest
-                .into_iter()
-                .find(|h| echoed(h) && h.rank < 0.0 && h.rank <= slot3_rank / ECHO_RANK_SLACK)
-            {
-                selected[MAX_HITS - 1] = cand;
+            let within =
+                |h: &RecallHit, slack: f64| h.rank < 0.0 && h.rank <= slot3_rank / slack;
+            if !selected.iter().any(&echoed) {
+                if let Some(pos) =
+                    rest.iter().position(|h| echoed(h) && within(h, ECHO_RANK_SLACK))
+                {
+                    selected[MAX_HITS - 1] = rest.swap_remove(pos);
+                    return selected;
+                }
+            }
+            if !selected.iter().any(&typed) {
+                if let Some(pos) =
+                    rest.iter().position(|h| typed(h) && within(h, TYPED_RANK_SLACK))
+                {
+                    selected[MAX_HITS - 1] = rest.swap_remove(pos);
+                }
             }
         }
     }
@@ -464,7 +483,28 @@ pub fn clear_session_ledger(db: &Path, session_id: &str) {
 
 // ---- Freshness ----------------------------------------------------------------
 
-enum Freshness {
+/// Freshness tag + display snippet for one hit, shared by every surface that
+/// shows recall hits (courier injection, MCP recall, CLI recall): the tag is
+/// "" / " [refreshed]" / " [stale?]" and the snippet is cut from the LIVE text
+/// when the file changed since ingest.
+pub(crate) fn fresh_snippet(
+    entity_id: &str,
+    body: &str,
+    query: &str,
+    cap: usize,
+    project: Option<&str>,
+    cwd: Option<&str>,
+) -> (String, String) {
+    match freshness(entity_id, body, project, cwd) {
+        Freshness::Current => (String::new(), crate::recall::snippet(body, cap, query)),
+        Freshness::Refreshed(live) => {
+            (" [refreshed]".to_string(), crate::recall::snippet(&live, cap, query))
+        }
+        Freshness::Stale => (" [stale?]".to_string(), crate::recall::snippet(body, cap, query)),
+    }
+}
+
+pub(crate) enum Freshness {
     /// Stored chunk still matches the file on disk (or the hit is not a chunk of
     /// the current project, or anything errored - fail-open to the stored body).
     Current,
@@ -477,8 +517,11 @@ enum Freshness {
 /// Ingest is a snapshot; the agent edits all session long. Before injecting a
 /// chunk of the CURRENT project, re-read its file (same truncation + chunking as
 /// ingest) and compare - so THOR never presents outdated code as fresh context.
-/// Bounded: at most MAX_HITS single-file reads per prompt. Hard fail-open.
-fn freshness(entity_id: &str, stored_body: &str, project: Option<&str>, cwd: Option<&str>) -> Freshness {
+/// Bounded: at most a handful of single-file reads per call site (courier slots,
+/// MCP/CLI recall hits, one get). Hard fail-open. Shared with the deliberate
+/// read surfaces (MCP recall/get, CLI recall/get) so a stale chunk is flagged
+/// everywhere, not only in auto-injection.
+pub(crate) fn freshness(entity_id: &str, stored_body: &str, project: Option<&str>, cwd: Option<&str>) -> Freshness {
     if !crate::repo::is_chunk_id(entity_id) {
         return Freshness::Current;
     }
@@ -546,12 +589,14 @@ fn freshness(entity_id: &str, stored_body: &str, project: Option<&str>, cwd: Opt
     }
 }
 
-/// Recall for the courier: the semantic score-fusion path when the feature is
-/// built AND the local model + sidecar are present AND a warm query vector is
-/// available; otherwise pure bm25. EVERY semantic failure degrades to bm25 (and
-/// warms the daemon for next time), so the courier never pays the ~1.25s cold
-/// model load, never blocks a prompt, and never returns worse than bm25.
-fn recall_for(
+/// Recall for the courier AND the MCP recall tool (fused parity: a deliberate
+/// agent query deserves the same semantic path auto-injection gets): the
+/// semantic score-fusion path when the feature is built AND the local model +
+/// sidecar are present AND a warm query vector is available; otherwise pure
+/// bm25. EVERY semantic failure degrades to bm25 (and warms the daemon for next
+/// time), so a caller never pays the ~1.25s cold model load, never blocks, and
+/// never returns worse than bm25.
+pub(crate) fn recall_for(
     db: &Path,
     store: &EventStore,
     query: &str,
@@ -841,6 +886,66 @@ mod tests {
         let pool = vec![mk("e1", -9.0), mk("e2", -8.0), mk("e3", -6.0), mk("e4", -5.9)];
         let sel = select_hits(pool, &echo2);
         assert_eq!(sel[2].entity_id, "e3", "top already carries an echoed fact");
+    }
+
+    #[test]
+    fn test_select_hits_typed_constraint_slot3() {
+        let mk = |id: &str, rank: f64, ty: Option<crate::repo::FactType>| RecallHit {
+            entity_id: id.to_string(),
+            rev: format!("rev-{id}"),
+            body: "b".to_string(),
+            kind: EventKind::FactCreated,
+            is_diverged: false,
+            rank,
+            project: None,
+            fact_type: ty,
+            matched_and: true,
+        };
+        use crate::repo::FactType::Gotcha;
+        let no_echo = std::collections::HashMap::new();
+
+        // no typed hit in the top 3, a close-ranked gotcha below -> slot 3
+        let pool = vec![
+            mk("c1", -9.0, None),
+            mk("c2", -8.0, None),
+            mk("c3", -6.0, None),
+            mk("g", -5.0, Some(Gotcha)),
+        ];
+        let sel = select_hits(pool, &no_echo);
+        assert_eq!(sel[2].entity_id, "g", "close-ranked typed constraint takes slot 3");
+
+        // a typed hit already selected -> untouched
+        let pool = vec![
+            mk("c1", -9.0, Some(Gotcha)),
+            mk("c2", -8.0, None),
+            mk("c3", -6.0, None),
+            mk("g", -5.9, Some(Gotcha)),
+        ];
+        let sel = select_hits(pool, &no_echo);
+        assert_eq!(sel[2].entity_id, "c3", "top already carries a typed fact");
+
+        // echo promotion outranks typed promotion (one swap max)
+        let mut echo = std::collections::HashMap::new();
+        echo.insert("e".to_string(), 1i64);
+        let pool = vec![
+            mk("c1", -9.0, None),
+            mk("c2", -8.0, None),
+            mk("c3", -6.0, None),
+            mk("g", -5.5, Some(Gotcha)),
+            mk("e", -5.0, None),
+        ];
+        let sel = select_hits(pool, &echo);
+        assert_eq!(sel[2].entity_id, "e", "the echo prior wins the single slot-3 swap");
+
+        // a far-weaker typed hit never displaces a strong match
+        let pool = vec![
+            mk("c1", -9.0, None),
+            mk("c2", -8.0, None),
+            mk("c3", -6.0, None),
+            mk("g", -1.0, Some(Gotcha)),
+        ];
+        let sel = select_hits(pool, &no_echo);
+        assert_eq!(sel[2].entity_id, "c3", "slack still guards the typed slot");
     }
 
     #[test]

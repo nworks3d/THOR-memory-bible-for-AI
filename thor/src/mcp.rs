@@ -13,7 +13,7 @@
 
 use crate::cli::{render_get, render_history};
 use crate::event_store::{EventKind, EventStore, MutateConflict, ResolveConflict};
-use crate::recall::{recall_memories_scoped, recall_scoped, RecallScope};
+use crate::recall::{recall_memories_scoped, RecallScope};
 use rmcp::handler::server::router::tool::ToolRouter;
 use rmcp::handler::server::wrapper::Parameters;
 use rmcp::model::{ServerCapabilities, ServerInfo};
@@ -185,6 +185,7 @@ impl ThorServer {
     #[tool(description = "Search THOR memory and return the best-matching CURRENT-HEAD facts, ranked. Read-only. kind:\"memory\" excludes repo code chunks.")]
     async fn recall(&self, Parameters(args): Parameters<RecallArgs>) -> String {
         let server_project = self.project.clone();
+        let db = self.db.clone();
         self.blocking(move |s| {
             // Scope: all_projects > explicit project > the server's current project.
             let scope = if args.all_projects {
@@ -197,18 +198,27 @@ impl ThorServer {
             let limit = args.limit.unwrap_or(8);
             let memories_only = args.kind.as_deref().is_some_and(|k| k.eq_ignore_ascii_case("memory"));
             let hits = if memories_only {
-                recall_memories_scoped(s, &args.query, limit, &scope)
+                recall_memories_scoped(s, &args.query, limit, &scope).map_err(|e| format!("error: {e}"))?
             } else {
-                recall_scoped(s, &args.query, limit, &scope)
-            }
-            .map_err(|e| format!("error: {e}"))?;
+                // Fused parity with the courier: a deliberate agent query gets
+                // the same semantic score-fusion path (bm25 on non-semantic
+                // builds or any semantic failure - recall_for degrades itself).
+                crate::courier::recall_for(&db, s, &args.query, &scope, limit)
+            };
             if hits.is_empty() {
                 return Ok(format!("No THOR hits for: {}", args.query));
             }
+            // Freshness context: the stdio server's launch cwd (the project the
+            // agent is working in). The HTTP server has no meaningful cwd and
+            // freshness passes through - it never re-reads another machine's disk.
+            let cwd = std::env::current_dir().ok().map(|c| c.display().to_string());
+            let fresh_project = cwd.as_deref().and_then(|c| crate::repo::project_key(Path::new(c)));
             let mut out = String::new();
             for hit in hits {
                 let short = &hit.rev[..hit.rev.len().min(8)];
-                let snip = crate::recall::snippet(&hit.body, 220, &args.query);
+                let (fresh_tag, snip) = crate::courier::fresh_snippet(
+                    &hit.entity_id, &hit.body, &args.query, 220, fresh_project.as_deref(), cwd.as_deref(),
+                );
                 let diverged = if hit.is_diverged { " [DIVERGED]" } else { "" };
                 let ty = hit.fact_type.map(|t| format!(" [{}]", t.as_str())).unwrap_or_default();
                 let tag = if crate::repo::is_global(hit.project.as_deref()) {
@@ -216,7 +226,10 @@ impl ThorServer {
                 } else {
                     format!("[proj:{}]", hit.project.as_deref().unwrap_or("?"))
                 };
-                out.push_str(&format!("{}{} {} ({}{}): {}\n", tag, ty, hit.entity_id, short, diverged, snip));
+                out.push_str(&format!(
+                    "{}{} {} ({}{}{}): {}\n",
+                    tag, ty, hit.entity_id, short, diverged, fresh_tag, snip
+                ));
             }
             out.push_str("(full body: get <entity_id>; helped you? mark <entity_id>)\n");
             Ok(out)

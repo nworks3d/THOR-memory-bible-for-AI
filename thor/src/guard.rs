@@ -382,6 +382,29 @@ const CAPTURE_TRIGGERS: &[&str] = &[
     "new project",
 ];
 
+/// The capture triggers, user-tunable as a rulebook file next to the store
+/// (`guard-capture-triggers.json`: a JSON array of lowercase substrings) - the
+/// same customize-without-recompiling contract as the command/response
+/// rulebooks. The built-in list is the fallback so the nudge works with zero
+/// setup; a missing, malformed, or empty file falls back too (fail-open).
+fn capture_triggers(db: &Path) -> Vec<String> {
+    let path = db.with_file_name("guard-capture-triggers.json");
+    if let Ok(raw) = std::fs::read_to_string(&path) {
+        if let Ok(Value::Array(entries)) = serde_json::from_str(&raw) {
+            let list: Vec<String> = entries
+                .iter()
+                .filter_map(|v| v.as_str())
+                .map(|s| s.trim().to_lowercase())
+                .filter(|s| !s.is_empty())
+                .collect();
+            if !list.is_empty() {
+                return list;
+            }
+        }
+    }
+    CAPTURE_TRIGGERS.iter().map(|s| s.to_string()).collect()
+}
+
 fn try_stop_guard(db: &Path, rulebook: &Path) -> anyhow::Result<()> {
     // The kill switch silences the response rules too - a silenced THOR must
     // never actively BLOCK a stop.
@@ -444,7 +467,7 @@ fn capture_nudge(db: &Path, hook: &Value, haystack_lower: &str) -> Option<String
     if session_id.is_empty() {
         return None; // no session identity -> cannot debounce -> stay silent
     }
-    if !CAPTURE_TRIGGERS.iter().any(|t| haystack_lower.contains(t)) {
+    if !capture_triggers(db).iter().any(|t| haystack_lower.contains(t.as_str())) {
         return None;
     }
     let path = crate::ledger::capture_ledger_path(db);
@@ -469,6 +492,23 @@ fn capture_nudge(db: &Path, hook: &Value, haystack_lower: &str) -> Option<String
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn test_capture_triggers_rulebook_overrides_and_fails_open() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("thor.db");
+        // no file -> built-in list
+        assert!(capture_triggers(&db).iter().any(|t| t == "gotcha:"));
+        // a valid rulebook replaces the list entirely
+        std::fs::write(db.with_file_name("guard-capture-triggers.json"), r#"["mijn eigen trigger"]"#).unwrap();
+        let list = capture_triggers(&db);
+        assert_eq!(list, vec!["mijn eigen trigger"]);
+        // malformed / empty -> fallback (fail-open)
+        std::fs::write(db.with_file_name("guard-capture-triggers.json"), "not json").unwrap();
+        assert!(capture_triggers(&db).iter().any(|t| t == "we decided"));
+        std::fs::write(db.with_file_name("guard-capture-triggers.json"), "[]").unwrap();
+        assert!(capture_triggers(&db).iter().any(|t| t == "besloten"));
+    }
 
     #[test]
     fn test_clear_session_guard_seen_only_this_session() {

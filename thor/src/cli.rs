@@ -378,13 +378,33 @@ pub fn render_get(entity_id: &str, all_events: &[Event]) -> String {
     } else {
         let rev = head_set.heads.iter().next().unwrap();
         match event_by_hash.get(rev.as_str()) {
-            Some(event) => format!(
-                "Entity: {}\nRev: {}\nBody: {}\nKind: {}\n",
-                entity_id,
-                rev,
-                event.body,
-                event.kind.as_str()
-            ),
+            Some(event) => {
+                // Freshness for a current-project chunk read deliberately: warn
+                // when the stored snapshot no longer matches the file on disk
+                // (get shows the STORED body - the log is the record - but the
+                // agent must know it is looking at yesterday's code).
+                let cwd = std::env::current_dir().ok().map(|c| c.display().to_string());
+                let project = cwd.as_deref().and_then(|c| crate::repo::project_key(Path::new(c)));
+                let fresh_note = match crate::courier::freshness(
+                    entity_id, &event.body, project.as_deref(), cwd.as_deref(),
+                ) {
+                    crate::courier::Freshness::Refreshed(_) => {
+                        "Freshness: [refreshed] the file changed since ingest - this stored chunk is outdated (re-ingest or read the file)\n"
+                    }
+                    crate::courier::Freshness::Stale => {
+                        "Freshness: [stale?] the file or chunk no longer exists on disk\n"
+                    }
+                    crate::courier::Freshness::Current => "",
+                };
+                format!(
+                    "Entity: {}\nRev: {}\nBody: {}\nKind: {}\n{}",
+                    entity_id,
+                    rev,
+                    event.body,
+                    event.kind.as_str(),
+                    fresh_note
+                )
+            }
             None => format!("Entity: {}\nRev: {} (event not found)\n", entity_id, rev),
         }
     }
@@ -581,16 +601,23 @@ pub fn run() -> Result<()> {
             if hits.is_empty() {
                 println!("No recall hits for: {}", query);
             } else {
+                // Freshness context: the CLI runs in the project dir, so a
+                // current-project chunk is re-read live ([refreshed]/[stale?]).
+                let cwd = std::env::current_dir().ok().map(|c| c.display().to_string());
+                let fresh_project =
+                    cwd.as_deref().and_then(|c| crate::repo::project_key(Path::new(c)));
                 for hit in hits {
                     let short = &hit.rev[..hit.rev.len().min(8)];
-                    let snip = crate::recall::snippet(&hit.body, 220, &query);
+                    let (fresh_tag, snip) = crate::courier::fresh_snippet(
+                        &hit.entity_id, &hit.body, &query, 220, fresh_project.as_deref(), cwd.as_deref(),
+                    );
                     let diverged = if hit.is_diverged { " [DIVERGED]" } else { "" };
                     let tag = if crate::repo::is_global(hit.project.as_deref()) {
                         "[global]".to_string()
                     } else {
                         format!("[proj:{}]", hit.project.as_deref().unwrap_or("?"))
                     };
-                    println!("{} {} ({}{}): {}", tag, hit.entity_id, short, diverged, snip);
+                    println!("{} {} ({}{}{}): {}", tag, hit.entity_id, short, diverged, fresh_tag, snip);
                 }
             }
         }

@@ -15,62 +15,42 @@
 > `kind:"memory"` recall, duplicate-refusing typed remember, CAS-checked writes);
 > and the **dense-leg head-filter bugfix** (compile-verified here; run
 > `cargo test --features semantic` locally to execute its regression test).
-> Phase 1's ranking work (source-class prior, term-coverage rerank) and the
-> reproducible drift eval remain open — see below.
 
-## Open points (next round) + expected outcomes
+> **Status update (2026-07-09, evening): every open point below is CLOSED.**
+> The merged code went through an adversarial multi-agent review (5 dimensions,
+> 3 refuters per finding): 16 findings confirmed, all fixed with regression
+> tests - including a permission-system bypass in the guard's hook output, a
+> cwd-relative store fallback that let a cloned repo plant its own thor.db, an
+> importer head-rule that froze source corrections after mark/reproject, and a
+> fused-recall candidate gap for strict-AND hits. Then: (1) validated + deployed
+> locally AND on the remote server, standing rules pinned; (2) the reproducible
+> drift eval landed (`examples/drift_eval.rs` + the committed corpus in
+> `eval/drift_scenarios.jsonl`) - current build: courier 84.4% preventer-
+> surfaced, guard channel 8/8, either-channel 93.8% on the committed corpus;
+> (3) the ranking track shipped (query-routed source-class prior +
+> term-coverage/proximity rerank + a typed slot-3 reservation): 52-query
+> battery @3 67→69%, @5 71→73%, code categories byte-identical; (4) the footer
+> module owns compose + every parser with a roundtrip test; (5) the "later"
+> tranche shipped too - MCP recall has fused parity with the courier, capture
+> triggers are a rulebook file, hook/debounce state moved to one SQLite ledger
+> sidecar (per-key writes, atomic once-per-session claim, transactional pins),
+> and freshness tags every read surface. Still open beyond this document: a
+> fresh judged benchmark run to re-verify the published numbers end to end.
 
-In priority order:
+**Original expected outcomes, and where they landed:**
 
-1. **Validate + deploy locally** (first action, owner's machine): run
-   `cargo test --features semantic` (the cloud environment could not download
-   the onnxruntime binaries), install the new binary + hooks, **replace the old
-   live MCP server** (still a create-only, unscoped build — verified live), and
-   pin the standing rules:
-
-   ```sh
-   thor recall "<your standing rule>"   # find the entity id
-   thor pin <entity_id>                 # repeat per rule
-   thor pin --list                      # verify
-   ```
-
-   What to pin: few (the brief caps at 8 lines), stable, and costly-if-
-   forgotten — behavioral rules and dangerous gotchas, not trivia. The
-   concrete per-rule shortlist with store ids deliberately lives in the
-   PRIVATE memory store (note tagged `thor pin-shortlist`), never in this
-   public document. If the storage-safety gotcha ("never open thor.db over a
-   network share") is not in the store yet, `remember` it first, then pin it.
-2. **Reproducible drift eval** (`examples/drift_eval.rs` + a committed scenario
-   corpus): makes the 39.7% full-catch falsifiable and is the measurement gate
-   for everything below.
-3. **Ranking track (phase 1)**: source-class prior (memories/docs over code,
-   query-routed) + term-coverage/proximity rerank. Target: dual-written cut
-   82.1% → ~88-90%, Project 1 docs 67% → 80%+.
-4. **One footer module + write-time fact_type** (review finding): three parsers
-   and one inline writer currently share only a convention; stamp the type
-   structurally at write time, keep the body parser as an import shim.
-5. **Later**: fused-recall parity over MCP (semantic server build), a reserved
-   typed courier slot, capture triggers as a rulebook class instead of a const,
-   hook-ledger state in SQLite (race-free), freshness in `get`/MCP-recall/brief.
-
-**Expected outcomes to hold this work against:**
-
-- *By construction, already demonstrated in the lab*: pinned rules ~100%
-  present after a compaction (previously: a measured miss); zero repeated
-  injection blocks within the 5-prompt window; the measured noise-injection
-  scenario now silent; file-naming gotchas surfaced at the moment of action;
-  near-duplicates refused at write time.
-- *To re-verify via the drift eval + a fresh benchmark run*:
-  preventer-surfaced 54.8% → ≥65%; full-catch 39.7% → ≥55% on
-  compaction/file-touch scenarios; injected tokens/prompt in focused sessions
-  ~239 → <100.
+- *By construction, demonstrated in the lab*: pinned rules ~100% present after
+  a compaction; zero repeated injection blocks within the 5-prompt window; the
+  measured noise-injection scenario silent; file-naming gotchas surfaced at the
+  moment of action; near-duplicates refused atomically at write time. All hold.
+- *Via the drift eval*: the committed-corpus and live-replay numbers above are
+  the reproducible baseline going forward (the mechanical entity-surfaced
+  metric undercounts vs the judged 54.8%, so they are not directly comparable;
+  re-judging is the remaining step).
 - *Qualitative, over weeks of use*: the agent maintains the store
   (revise/retract/mark/resolve visible in the log), no banner blindness, and
   the capture nudge catches missed facts at ≤1 nudge/session without
   irritating (watch its false-positive rate).
-- *Honest caveat*: the pin/guard channels bypass ranking rather than improve
-  it — the pure ranking win (dual-written cut toward mimir's 89.6%) only
-  arrives with point 3.
 
 An improvement trajectory derived from a full code walk (all of `thor/src`),
 the published benchmarks, and **empirical verification**: the binary was built

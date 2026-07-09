@@ -67,18 +67,31 @@ for "which functions call X". THOR chunks source into recall instead. See
   hits and rotates deeper ones in), stays silent instead of injecting weak
   one-word coincidences, and re-reads a chunk's file live so changed code is
   injected `[refreshed]` (or flagged `[stale?]`) instead of as a stale snapshot.
+  Ranking is query-routed: a knowledge-phrased question ("what did we decide
+  about X") gives hand-written facts a small prior over the wall of same-topic
+  code chunks, hits matching the WHOLE question tightly outrank one-word tf
+  spam, and slot 3 is reserved for a close-ranked typed constraint
+  (gotcha/decision/preference) when none made the top - while code-phrased
+  queries get none of this, so code ranking stays untouched. Hook/debounce
+  state lives in one SQLite sidecar (`thor-ledger.db`), so parallel hooks and
+  sessions never lose each other's entries.
 - **Drift hooks.** Pin standing rules (`thor pin`) and SessionStart re-injects
   their full body at every start - including right after a compaction, when
   prompt-recall has nothing to match against. The first time a session touches a
   file, the guard surfaces stored memories that *name* that file (memories only,
-  never code chunks). A Stop-hook capture nudge fires (once per session) when a
-  reply contains an unstored decision/gotcha, so durable facts stop depending on
-  the model remembering to remember.
+  never code chunks). A Stop-hook capture nudge fires (once per session, claimed
+  atomically) when a reply contains an unstored decision/gotcha, so durable facts
+  stop depending on the model remembering to remember; its trigger list is
+  tunable via `guard-capture-triggers.json` next to the store (built-in list as
+  fail-open fallback, like the guard rulebooks).
 - **Agent stewardship.** Over MCP the agent can maintain the memory, not just
   fill it: `revise`/`retract` with real CAS (a stale parent returns the fresh
   head-set instead of minting a silent branch), `resolve` for DIVERGED facts,
-  `mark` ("this helped" - feeds the ranking prior), duplicate-refusing typed
-  `remember`, `reproject`, and a `brief` overview of what THOR knows here.
+  `mark` ("this helped" - feeds the ranking prior), typed `remember` whose
+  duplicate/exists refusal is atomic with the write, `reproject`, and a `brief`
+  overview of what THOR knows here. MCP `recall` runs the same semantic
+  score-fusion path the courier uses (fused parity), and every read surface
+  (MCP/CLI recall and `get`) carries the `[refreshed]`/`[stale?]` freshness tags.
 - **Guard.** A moment-of-action hook (`PreToolUse`) that emits an advisory when a
   tool call matches a risk rulebook (fail-open, never blocks).
 - **Cross-machine sync.** Log-shipping (`thor ship` / `thor recv`) replicates the
@@ -98,6 +111,14 @@ dual-written cut, 90% vs 82%). Plus **multi-project coverage** across three seed
 repos (73% vs 53% overall - though mimir's curated design docs win one project, 93% vs
 67%), session-drift compensation (55% vs 48%), and ~3.1x lower latency. Full method,
 per-category tables and honest weaknesses in [BENCHMARKS.md](BENCHMARKS.md).
+
+Drift compensation is also measurable IN-REPO, no judge needed: `cargo run
+--example drift_eval` replays a committed synthetic corpus
+([eval/drift_scenarios.jsonl](thor/eval/drift_scenarios.jsonl), 32 scenarios,
+EN/NL, distractors included) through the REAL courier and guard hook paths and
+scores whether the mistake-preventing fact actually surfaces (current build:
+courier 84%, guard channel 8/8, either-channel 94%). `--live <corpus>` replays a
+private prompt set against your live store read-only.
 
 ## Quick start
 
@@ -213,6 +234,12 @@ internal network, and front it with an authenticating reverse proxy (the
 transport itself has no auth). Fill in the `<placeholder>` values in the compose
 file for your own network and route.
 
+For sudo-less redeploys from your workstation, `deploy/deploy-watcher.sh` is a
+root scheduled-task template (Synology-tested): copy a `git archive` tarball of
+the crate over ssh, touch a trigger file, and the watcher unpacks + rebuilds +
+restarts the container on its next tick, logging to `deploy.log`. It never
+overwrites your live compose file and never touches the data volume.
+
 ## Command reference
 
 | command | what |
@@ -248,8 +275,9 @@ file for your own network and route.
 ```
 thor/
   src/            the Rust crate (event store, recall, ingest, guard, sync, mcp, courier)
-  examples/       recall_eval.rs - measure recall over a query battery
-  deploy/         Dockerfile + docker-compose template
+  examples/       recall_eval.rs (recall battery) + drift_eval.rs (drift compensation)
+  eval/           drift_scenarios.jsonl - the committed synthetic drift corpus
+  deploy/         Dockerfile + docker-compose template + deploy-watcher.sh
   tools/          helper scripts (mimir export, side-by-side eval)
   *.example.json  guard rulebook templates (copy + fill in)
 ```

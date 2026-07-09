@@ -103,6 +103,13 @@ fn injection_for_hook_json(db: &Path, raw: &str) -> Option<String> {
         return None;
     }
     let query: String = trimmed.chars().take(MAX_PROMPT_CHARS).collect();
+    // An all-stopword prompt ("wat is dat dan") carries no content to match:
+    // recall's best-effort fallback would search the stopwords themselves, and
+    // a body containing two of them could even earn matched_and and bypass the
+    // coverage gate below. Nothing worth recalling - stay silent.
+    if !crate::recall::has_content_terms(&query) {
+        return None;
+    }
 
     // Store unreachable -> silent (the "hub-down -> exit 0" contract). Opening
     // creates an empty store if none exists, which simply yields no hits.
@@ -201,8 +208,16 @@ fn injection_for_hook_json(db: &Path, raw: &str) -> Option<String> {
     let diverged_ctx = if selected.iter().any(|h| h.is_diverged) {
         store.get_all_events().ok().map(|events| {
             let heads = crate::cas::compute_head_sets(&events);
-            let by_rev: std::collections::HashMap<String, String> =
-                events.iter().map(|e| (e.this_hash.clone(), e.body.clone())).collect();
+            // rev -> (body, is_retracted): a retracted contested head must be
+            // LABELED as such - its body is a (possibly empty) reason, and an
+            // unlabeled blank line is not something an agent can reconcile.
+            let by_rev: std::collections::HashMap<String, (String, bool)> = events
+                .iter()
+                .map(|e| {
+                    let retracted = matches!(e.kind, crate::event_store::EventKind::FactRetracted);
+                    (e.this_hash.clone(), (e.body.clone(), retracted))
+                })
+                .collect();
             (heads, by_rev)
         })
     } else {
@@ -246,11 +261,13 @@ fn injection_for_hook_json(db: &Path, raw: &str) -> Option<String> {
                         if rev == &hit.rev {
                             continue;
                         }
-                        if let Some(body) = by_rev.get(rev) {
+                        if let Some((body, retracted)) = by_rev.get(rev) {
                             let s = crate::recall::snippet(body, cap, &query);
+                            let label = if *retracted { ", retracted" } else { "" };
                             out.push_str(&format!(
-                                "    | contested head ({}): {}\n",
+                                "    | contested head ({}{}): {}\n",
                                 &rev[..rev.len().min(8)],
+                                label,
                                 s
                             ));
                         }
@@ -499,6 +516,18 @@ fn freshness(entity_id: &str, stored_body: &str, project: Option<&str>, cwd: Opt
         None => return Freshness::Current,
     };
     let path = root.join(rel);
+    // Size guard BEFORE the read: this runs synchronously inside the per-prompt
+    // hook, and read_to_string would load the whole file even though ingest only
+    // ever chunked the first MAX_FILE_CHARS. A file too big for a cheap re-read
+    // falls back to the stored snapshot (fail-open), never to a multi-hundred-MB
+    // allocation on the prompt path. 4 bytes/char covers any UTF-8 text within
+    // the ingest window.
+    const FRESHNESS_MAX_BYTES: u64 = (crate::repo::MAX_FILE_CHARS as u64) * 4;
+    match std::fs::metadata(&path) {
+        Ok(m) if m.len() > FRESHNESS_MAX_BYTES => return Freshness::Current,
+        Ok(_) => {}
+        Err(_) => return Freshness::Stale, // tracked at ingest, gone now
+    }
     let mut text = match std::fs::read_to_string(&path) {
         Ok(t) => t,
         Err(_) => return Freshness::Stale, // tracked at ingest, unreadable now
@@ -663,6 +692,8 @@ mod tests {
         seed(&db);
         // trivial prompt -> silent
         assert!(injection_for_hook_json(&db, r#"{"prompt":"ok"}"#).is_none());
+        // all-stopword prompt -> silent (its stopwords must never become the query)
+        assert!(injection_for_hook_json(&db, r#"{"prompt":"wat is dat dan"}"#).is_none());
         // too short -> silent
         assert!(injection_for_hook_json(&db, r#"{"prompt":"hi"}"#).is_none());
         // no match -> silent

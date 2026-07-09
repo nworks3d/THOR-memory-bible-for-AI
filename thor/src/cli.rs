@@ -20,15 +20,14 @@ struct Cli {
 }
 
 /// The default central store, kept out of any repo so create/recall/courier all
-/// agree on one location without a flag. Falls back to a cwd-relative file if
-/// the platform dir is unavailable.
-fn default_db_path() -> PathBuf {
-    if let Ok(local) = std::env::var("LOCALAPPDATA") {
-        let dir = Path::new(&local).join("thor");
-        let _ = std::fs::create_dir_all(&dir);
-        return dir.join("thor.db");
-    }
-    PathBuf::from("thor.db")
+/// agree on one location without a flag (see ledger::data_dir for the platform
+/// resolution). `None` when no per-user location resolves - callers error out
+/// instead of falling back to a cwd-relative file, which would plant store
+/// files inside the user's repo and open a repo-shipped thor.db.
+fn default_db_path() -> Option<PathBuf> {
+    let dir = crate::ledger::data_dir()?;
+    let _ = std::fs::create_dir_all(&dir);
+    Some(dir.join("thor.db"))
 }
 
 /// True iff `db` is a Windows UNC / network path (\\server\share or the verbatim
@@ -503,7 +502,13 @@ fn read_hook_stdin() -> Option<serde_json::Value> {
 
 pub fn run() -> Result<()> {
     let cli = Cli::parse();
-    let db = cli.db.clone().unwrap_or_else(default_db_path);
+    let db = match cli.db.clone().or_else(default_db_path) {
+        Some(db) => db,
+        None => anyhow::bail!(
+            "no THOR store location: LOCALAPPDATA, XDG_DATA_HOME and HOME are all unset. \
+             Pass --db <path> explicitly."
+        ),
+    };
     // Every subcommand opens this one db; refuse a network path up front.
     refuse_network_db(&db)?;
 
@@ -821,10 +826,13 @@ pub fn run() -> Result<()> {
                 .map(PathBuf::from)
                 .or_else(|| std::env::current_dir().ok());
 
-            // Post-compaction: clear this session's courier ledger, so everything
-            // relevant may (and will) inject again into the now-empty context.
+            // Post-compaction: clear this session's courier ledger AND its
+            // guard-seen entries, so everything relevant may (and will) inject
+            // again into the now-empty context - including the file-touch
+            // advisories, whose text was just destroyed with the context.
             if source == "compact" {
                 crate::courier::clear_session_ledger(&db, &session_id);
+                crate::guard::clear_session_guard_seen(&db, &session_id);
             }
 
             if let Some(cwd) = cwd.as_deref() {

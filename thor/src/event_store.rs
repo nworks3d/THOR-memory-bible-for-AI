@@ -639,6 +639,76 @@ impl EventStore {
         Ok(event)
     }
 
+    /// Append a fact_created with its uniqueness checks under the SAME immediate
+    /// write lock, so a concurrent writer process (another MCP server, a running
+    /// `thor import`) cannot slip an equal fact between check and append:
+    /// - the entity must not exist yet: a second parentless root would silently
+    ///   ADD a contested head (create is never an upsert);
+    /// - no live (non-retracted) head accepted by `is_dup` may exist; the caller
+    ///   supplies the near-duplicate predicate over
+    ///   (entity_id, effective_project, head_body).
+    /// On conflict nothing is written and a typed MutateConflict names the
+    /// blocking entity (reason "already exists" or "near-duplicate").
+    pub fn append_created_unique<F>(
+        &mut self,
+        session_id: &str,
+        lineage_id: &str,
+        actor: &str,
+        entity_id: &str,
+        body: &str,
+        is_dup: F,
+    ) -> anyhow::Result<Event>
+    where
+        F: Fn(&str, Option<&str>, &str) -> bool,
+    {
+        let tx = self
+            .conn
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+
+        // The dup scan needs every entity's live heads, so this one loads the
+        // full log under the lock - creates are rare (a handful per session),
+        // unlike the per-entity mutate path above.
+        let events = query_all_events(&tx)?;
+        let head_sets = crate::cas::compute_head_sets(&events);
+        if let Some(head_set) = head_sets.get(entity_id) {
+            let mut heads: Vec<String> = head_set.heads.iter().cloned().collect();
+            heads.sort();
+            return Err(MutateConflict {
+                entity_id: entity_id.to_string(),
+                reason: "entity already exists (create is never an upsert): revise it, or omit \
+                         entity_id to mint a new one"
+                    .to_string(),
+                current_heads: heads,
+            }
+            .into());
+        }
+        let projects = crate::cas::compute_projects(&events);
+        let by_hash: std::collections::HashMap<&str, &Event> =
+            events.iter().map(|e| (e.this_hash.as_str(), e)).collect();
+        for (id, head_set) in &head_sets {
+            let project = projects.get(id).and_then(|p| p.as_deref());
+            for rev in &head_set.heads {
+                let Some(head_ev) = by_hash.get(rev.as_str()) else { continue };
+                if matches!(head_ev.kind, EventKind::FactRetracted) {
+                    continue; // a retracted head is not a live duplicate
+                }
+                if is_dup(id, project, &head_ev.body) {
+                    return Err(MutateConflict {
+                        entity_id: id.clone(),
+                        reason: "near-duplicate of an existing live fact".to_string(),
+                        current_heads: vec![rev.clone()],
+                    }
+                    .into());
+                }
+            }
+        }
+
+        let event =
+            insert_event(&tx, session_id, lineage_id, actor, EventKind::FactCreated, entity_id, None, body)?;
+        tx.commit()?;
+        Ok(event)
+    }
+
     pub fn get_event_by_uuid(&self, event_uuid: &str) -> SqlResult<Option<Event>> {
         let mut stmt = self
             .conn

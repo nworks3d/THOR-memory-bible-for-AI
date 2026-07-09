@@ -156,9 +156,17 @@ pub struct BriefArgs {
 }
 
 /// Strip characters that would corrupt the `[memory/... | tags: ... | ...]`
-/// footer's field structure.
+/// footer's field structure - including control characters: an interior newline
+/// would make the footer span two lines, which strip_footer no longer strips,
+/// permanently defeating the near-duplicate checks for that fact.
 fn footer_safe(s: &str) -> String {
-    s.chars().filter(|c| !matches!(c, '|' | '[' | ']')).collect::<String>().trim().to_string()
+    s.chars()
+        .filter(|c| !matches!(c, '|' | '[' | ']'))
+        .map(|c| if c.is_control() { ' ' } else { c })
+        .collect::<String>()
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 #[tool_router]
@@ -268,35 +276,26 @@ impl ThorServer {
                 None => server_project,
             };
             let entity_id = match args.entity_id.filter(|s| !s.is_empty()) {
-                // A caller-supplied id is used verbatim (its prefix defines scope).
-                Some(id) => id,
+                // A caller-supplied id is used verbatim (its prefix defines scope) -
+                // but never a chunk id: repo chunks are managed by ingest alone, and
+                // a fact_created on one would mint a contested head ingest can never
+                // reconcile. (Existing MEMORY ids are refused atomically below.)
+                Some(id) => {
+                    if crate::repo::is_chunk_id(&id) {
+                        return Err(format!(
+                            "{} is a repo chunk id (managed by ingest); omit entity_id to mint a \
+                             memory id",
+                            id
+                        ));
+                    }
+                    id
+                }
                 // A scoped memory is `<key>:mem-<uuid>`, global `mcp-<uuid>`.
                 None => crate::repo::memory_entity_id(mint.as_deref(), &Uuid::new_v4().to_string()),
             };
-            // Near-duplicate refusal: the store's hygiene must not depend on the
-            // model remembering to recall first. Same normalization as recall's
-            // near-duplicate collapse (footer-stripped, so a typed fact's footer
-            // cannot defeat it), scoped to where the NEW fact will live - the
-            // same body deliberately stored for a different project is a
-            // legitimate write, not a duplicate.
-            let scope = RecallScope::current(crate::repo::owner_project(&entity_id).map(str::to_string));
-            let dups = recall_scoped(s, body, 3, &scope).unwrap_or_default();
-            if let Some(dup) = dups
-                .iter()
-                .find(|h| crate::recall::dedup_prefix(&h.body) == crate::recall::dedup_prefix(body))
-            {
-                return Err(format!(
-                    "NOT stored: near-duplicate of {} (rev {}). Use revise(entity_id:\"{}\") to \
-                     update it, mark(entity_id:\"{}\") if it just proved useful, or reword if it is \
-                     genuinely a different fact.",
-                    dup.entity_id,
-                    &dup.rev[..dup.rev.len().min(8)],
-                    dup.entity_id,
-                    dup.entity_id
-                ));
-            }
             // Typed footer (the mimir-compatible format fact_type parsing reads
             // back), only when the caller passed a type or tags.
+            let clean_body = body.to_string();
             let mut body = body.to_string();
             if args.fact_type.is_some() || args.tags.as_deref().is_some_and(|t| !t.is_empty()) {
                 let ty = footer_safe(&args.fact_type.unwrap_or_else(|| "note".into())).to_lowercase();
@@ -314,10 +313,36 @@ impl ThorServer {
                     .unwrap_or_else(|| "global".into());
                 body.push_str(&format!("\n\n[memory/{} | tags: {} | project: {}]", ty, tags, scope_label));
             }
-            let ev = s
-                .append_event("mcp", "mcp-session", "mcp", EventKind::FactCreated, &entity_id, None, &body)
-                .map_err(|e| format!("error: {e}"))?;
-            Ok(format!("stored entity {} rev {}", entity_id, ev.this_hash))
+            // Near-duplicate refusal + entity-exists refusal, ATOMIC with the
+            // append (same immediate write lock), so a concurrent writer process
+            // cannot slip an equal fact between check and append. Same
+            // normalization as recall's near-duplicate collapse (footer-stripped,
+            // so a typed fact's footer cannot defeat it), scoped to where the NEW
+            // fact will live - the same body deliberately stored for a different
+            // project is a legitimate write, not a duplicate.
+            let scope = RecallScope::current(crate::repo::owner_project(&entity_id).map(str::to_string));
+            let prefix = crate::recall::dedup_prefix(&clean_body);
+            match s.append_created_unique("mcp", "mcp-session", "mcp", &entity_id, &body, |_, project, head_body| {
+                scope.allows(project) && crate::recall::dedup_prefix(head_body) == prefix
+            }) {
+                Ok(ev) => Ok(format!("stored entity {} rev {}", entity_id, ev.this_hash)),
+                Err(e) => match e.downcast_ref::<MutateConflict>() {
+                    Some(c) if c.reason.starts_with("near-duplicate") => Err(format!(
+                        "NOT stored: near-duplicate of {} (rev {}). Use revise(entity_id:\"{}\") to \
+                         update it, mark(entity_id:\"{}\") if it just proved useful, or reword if it is \
+                         genuinely a different fact.",
+                        c.entity_id,
+                        c.current_heads.first().map(|r| &r[..r.len().min(8)]).unwrap_or(""),
+                        c.entity_id,
+                        c.entity_id
+                    )),
+                    Some(c) => Err(format!(
+                        "NOT stored: {} - {}. Current head-set: {:?}.",
+                        c.entity_id, c.reason, c.current_heads
+                    )),
+                    None => Err(format!("error: {e}")),
+                },
+            }
         })
         .await
     }
@@ -348,7 +373,14 @@ impl ThorServer {
     #[tool(description = "Retract a wrong or obsolete fact (fact_retracted): recall stops surfacing it, the log keeps its history. Same CAS rules as revise.")]
     async fn retract(&self, Parameters(args): Parameters<RetractArgs>) -> String {
         self.blocking(move |s| {
-            let body = args.reason.unwrap_or_default();
+            // Never store an empty retraction body: a retracted rev STAYS a head,
+            // and when it is one side of a DIVERGED entity the courier renders its
+            // body - a blank, unlabeled line is not something an agent can
+            // reconcile against.
+            let body = args
+                .reason
+                .filter(|r| !r.trim().is_empty())
+                .unwrap_or_else(|| "[retracted via mcp]".to_string());
             match s.append_mutate_checked(
                 "mcp",
                 "mcp-session",
@@ -803,6 +835,46 @@ mod tests {
             out.contains("invalid project key"),
             "a ':' in the key would silently mis-scope the fact (owner = prefix before FIRST ':'): {out}"
         );
+    }
+
+    #[tokio::test]
+    async fn test_remember_refuses_existing_entity_and_chunk_ids() {
+        let (server, _d) = server_with(seed());
+        // Existing entity: create is never an upsert - a second parentless root
+        // would silently ADD a contested head (DIVERGED).
+        let out = server
+            .remember(Parameters(RememberArgs {
+                body: "an entirely different corrected body".into(),
+                entity_id: Some("e1".into()),
+                project: None,
+                fact_type: None,
+                tags: None,
+            }))
+            .await;
+        assert!(out.contains("NOT stored"), "{out}");
+        assert!(out.contains("already exists"), "{out}");
+        let get = server.get(Parameters(GetArgs { entity_id: "e1".into() })).await;
+        assert!(!get.contains("DIVERGED"), "a refused remember must not mint a branch: {get}");
+        // Chunk id: managed by ingest alone.
+        let chunk = server
+            .remember(Parameters(RememberArgs {
+                body: "text for a chunk".into(),
+                entity_id: Some("Proj:src/a.rs#0".into()),
+                project: None,
+                fact_type: None,
+                tags: None,
+            }))
+            .await;
+        assert!(chunk.contains("chunk"), "{chunk}");
+    }
+
+    #[test]
+    fn test_footer_safe_strips_control_chars() {
+        // A multi-line footer would defeat strip_footer and thereby BOTH
+        // near-duplicate checks - control chars must never reach the footer.
+        assert_eq!(footer_safe("gotcha\nweird"), "gotcha weird");
+        assert_eq!(footer_safe("tag\r\nwith\tcontrols"), "tag with controls");
+        assert_eq!(footer_safe("a[b]|c"), "abc");
     }
 
     #[tokio::test]

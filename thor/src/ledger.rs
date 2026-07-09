@@ -10,12 +10,38 @@
 //!
 //! Ledgers are LOCAL state (like the flag files), never part of the hash-chained
 //! log, so deleting one only resets a debounce - it can never lose a fact.
+//!
+//! Writes are atomic-replace (temp file + rename in the same directory): a
+//! concurrent reader sees the old or the new ledger, never a truncated one -
+//! else its fail-open "malformed -> empty" path could make it REWRITE the
+//! ledger from empty and wipe every session's debounce state. Concurrent
+//! read-modify-write can still lose the slower writer's entry (cost: one
+//! repeated advisory/nudge, fail-open by design); the race-free fix is moving
+//! this state into SQLite, tracked as a later step.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 /// Entries older than this are pruned on write, so ledgers never grow unbounded.
 pub const PRUNE_AGE_SECS: u64 = 48 * 60 * 60;
+
+/// THOR's per-user data directory (store, rulebooks, ledgers, flag files):
+/// %LOCALAPPDATA%\thor on Windows, else $XDG_DATA_HOME/thor, else
+/// $HOME/.local/share/thor. `None` when no per-user base dir is resolvable -
+/// callers must treat that as "no store", NEVER fall back to a cwd-relative
+/// path: hooks run with cwd = the user's project, so a relative path would
+/// plant store files inside the repo and OPEN whatever thor.db a cloned repo
+/// ships (attacker-controlled "memories" injected as trusted context).
+pub fn data_dir() -> Option<PathBuf> {
+    let base = std::env::var("LOCALAPPDATA")
+        .or_else(|_| std::env::var("XDG_DATA_HOME"))
+        .map(PathBuf::from)
+        .ok()
+        .or_else(|| {
+            std::env::var("HOME").ok().map(|h| Path::new(&h).join(".local").join("share"))
+        })?;
+    Some(base.join("thor"))
+}
 
 pub fn capture_ledger_path(db: &Path) -> PathBuf {
     db.with_file_name("thor-capture.json")
@@ -54,12 +80,21 @@ pub fn read_map(path: &Path) -> HashMap<String, serde_json::Value> {
     }
 }
 
+/// Atomic-replace write: temp file in the SAME directory (rename is only atomic
+/// within one filesystem), unique per process so concurrent writers never share
+/// a temp file. On both Unix and Windows the rename replaces the destination.
+fn write_atomic(path: &Path, contents: &str) -> std::io::Result<()> {
+    let tmp = path.with_extension(format!("tmp{}", std::process::id()));
+    std::fs::write(&tmp, contents)?;
+    std::fs::rename(&tmp, path)
+}
+
 /// Best-effort write (fail-open: an IO error is swallowed, matching the
 /// review.rs watermark contract - state loss only means a repeat nudge).
 pub fn write_map(path: &Path, map: &HashMap<String, serde_json::Value>) {
     let obj: serde_json::Map<String, serde_json::Value> =
         map.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
-    let _ = std::fs::write(path, serde_json::Value::Object(obj).to_string());
+    let _ = write_atomic(path, &serde_json::Value::Object(obj).to_string());
 }
 
 /// Drop entries whose timestamp (extracted by `ts_of`; None = undatable, drop it
@@ -93,7 +128,7 @@ pub fn read_pins(db: &Path) -> Vec<String> {
 
 pub fn write_pins(db: &Path, pins: &[String]) -> std::io::Result<()> {
     let v = serde_json::json!({ "pins": pins });
-    std::fs::write(pins_path(db), v.to_string())
+    write_atomic(&pins_path(db), &v.to_string())
 }
 
 #[cfg(test)]

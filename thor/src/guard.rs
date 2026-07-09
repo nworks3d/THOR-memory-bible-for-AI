@@ -23,14 +23,13 @@ pub struct Rule {
 }
 
 /// Default rulebook next to the store, so the hook command needs no path.
+/// Never falls back to a CWD-relative name: a project directory could plant a
+/// guard-rulebook.json and inject reminders. An empty path fails to read ->
+/// the guard stays silent (no rulebook), which is the safe default.
 pub fn default_rulebook_path() -> PathBuf {
-    if let Ok(local) = std::env::var("LOCALAPPDATA") {
-        return Path::new(&local).join("thor").join("guard-rulebook.json");
-    }
-    // Never fall back to a CWD-relative name: a project directory could plant a
-    // guard-rulebook.json and inject reminders. An empty path fails to read ->
-    // the guard stays silent (no rulebook), which is the safe default.
-    PathBuf::new()
+    crate::ledger::data_dir()
+        .map(|d| d.join("guard-rulebook.json"))
+        .unwrap_or_default()
 }
 
 fn parse_rules(text: &str) -> Vec<Rule> {
@@ -134,14 +133,22 @@ pub fn evaluate(rules: &[Rule], tool: &str, haystack_lower: &str) -> Vec<String>
 
 /// Run as a PreToolUse guard: read the hook JSON on stdin, and if any rulebook
 /// rule fires OR a stored memory names the file being touched, emit a
-/// hookSpecificOutput with additionalContext (advisory-only, permissionDecision
-/// "allow" so the tool proceeds). HARD fail-open: any error prints nothing and
-/// exits 0 - the guard must never block a tool call.
+/// hookSpecificOutput with additionalContext ONLY - advisory text for the model,
+/// while the tool call itself goes through the NORMAL permission flow untouched.
+/// Never emit a permissionDecision: "allow" would BYPASS the permission system
+/// (auto-approve the very calls the guard flags as risky), and blocking is not
+/// the guard's job. HARD fail-open: any error prints nothing and exits 0 - the
+/// guard must never block a tool call.
 pub fn run_guard(db: &Path, rulebook: &Path) {
     let _ = try_guard(db, rulebook);
 }
 
 fn try_guard(db: &Path, rulebook: &Path) -> anyhow::Result<()> {
+    // The kill switch silences EVERY guard surface (rulebook advisories too),
+    // matching the documented contract on ledger::flag_present.
+    if crate::ledger::flag_present(db, "THOR-SILENT.flag") {
+        return Ok(());
+    }
     let mut raw = String::new();
     std::io::stdin().read_to_string(&mut raw)?;
     let raw = raw.trim_start_matches('\u{feff}');
@@ -170,10 +177,12 @@ fn try_guard(db: &Path, rulebook: &Path) -> anyhow::Result<()> {
     }
 
     let context = format!("[THOR guard] {}", parts.join("  ||  "));
+    // additionalContext WITHOUT a permissionDecision: the advisory reaches the
+    // model and the permission system decides about the tool call as if no hook
+    // existed. ("allow" would auto-approve past allowlists and permission mode.)
     let out = serde_json::json!({
         "hookSpecificOutput": {
             "hookEventName": "PreToolUse",
-            "permissionDecision": "allow",
             "additionalContext": context
         }
     });
@@ -301,13 +310,33 @@ fn file_memory_advisory(db: &Path, hook: &Value) -> Option<String> {
     ))
 }
 
-/// Response-rulebook for the Stop guard (the capability-amnesia / ssh-amnesia
-/// class), separate from the PreToolUse command rulebook.
-pub fn default_response_rulebook_path() -> PathBuf {
-    if let Ok(local) = std::env::var("LOCALAPPDATA") {
-        return Path::new(&local).join("thor").join("guard-response-rulebook.json");
+/// Post-compaction reset for the file-touch advisories: drop every guard-seen
+/// entry of this session (keys are "session_id|file_path"), positive AND
+/// negative. A compaction destroys the advisory text along with the context, so
+/// the next touch of a constrained file must re-advise - that window is exactly
+/// what the memory-backed guard exists for. Fail-open: errors leave the ledger
+/// as-is.
+pub fn clear_session_guard_seen(db: &Path, session_id: &str) {
+    if session_id.is_empty() {
+        return;
     }
-    PathBuf::new()
+    let path = crate::ledger::guard_seen_path(db);
+    let mut seen = crate::ledger::read_map(&path);
+    let prefix = format!("{}|", session_id);
+    let before = seen.len();
+    seen.retain(|k, _| !k.starts_with(&prefix));
+    if seen.len() != before {
+        crate::ledger::write_map(&path, &seen);
+    }
+}
+
+/// Response-rulebook for the Stop guard (the capability-amnesia / ssh-amnesia
+/// class), separate from the PreToolUse command rulebook. Same no-CWD-fallback
+/// rule as default_rulebook_path.
+pub fn default_response_rulebook_path() -> PathBuf {
+    crate::ledger::data_dir()
+        .map(|d| d.join("guard-response-rulebook.json"))
+        .unwrap_or_default()
 }
 
 /// Run as a Stop guard: read the Stop-hook JSON on stdin and, if the assistant's
@@ -347,6 +376,11 @@ const CAPTURE_TRIGGERS: &[&str] = &[
 ];
 
 fn try_stop_guard(db: &Path, rulebook: &Path) -> anyhow::Result<()> {
+    // The kill switch silences the response rules too - a silenced THOR must
+    // never actively BLOCK a stop.
+    if crate::ledger::flag_present(db, "THOR-SILENT.flag") {
+        return Ok(());
+    }
     let mut raw = String::new();
     std::io::stdin().read_to_string(&mut raw)?;
     let raw = raw.trim_start_matches('\u{feff}');
@@ -428,6 +462,29 @@ fn capture_nudge(db: &Path, hook: &Value, haystack_lower: &str) -> Option<String
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn test_clear_session_guard_seen_only_this_session() {
+        // Review finding: post-compaction only the courier ledger was reset, so
+        // file-touch advisories stayed suppressed exactly when their text had
+        // just been destroyed with the context.
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("thor.db");
+        let path = crate::ledger::guard_seen_path(&db);
+        let mut m = std::collections::HashMap::new();
+        m.insert("s1|a.rs".to_string(), json!(100));
+        m.insert("s1|b.rs".to_string(), json!({"ts": 100, "neg": true}));
+        m.insert("s2|a.rs".to_string(), json!(100));
+        crate::ledger::write_map(&path, &m);
+        clear_session_guard_seen(&db, "s1");
+        let after = crate::ledger::read_map(&path);
+        assert!(!after.contains_key("s1|a.rs"), "positive entry cleared");
+        assert!(!after.contains_key("s1|b.rs"), "negative-cache entry cleared");
+        assert!(after.contains_key("s2|a.rs"), "other sessions stay untouched");
+        // an empty session id never wipes anything
+        clear_session_guard_seen(&db, "");
+        assert!(crate::ledger::read_map(&path).contains_key("s2|a.rs"));
+    }
 
     // Synthetic fixtures only: no real host, container, or secret names live in
     // committed code (the real rulebook holding those is gitignored). "app-prod"

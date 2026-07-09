@@ -1,5 +1,4 @@
 use crate::event_store::{Event, EventKind, EventStore};
-use std::collections::HashSet;
 use std::io::BufRead;
 use std::path::Path;
 
@@ -13,15 +12,21 @@ pub struct ImportStats {
     pub skipped_diverged: usize,
 }
 
-/// The single current head rev of an entity from its own event chain (a head is a
-/// this_hash that is no other event's parent). `None` when the entity is diverged
-/// (more than one contested head) - the importer then leaves it untouched rather
-/// than guess which head a correction supersedes.
+/// The single current head rev of an entity, via the ONE authoritative CAS fold
+/// (`cas::compute_head_sets`, the same rule `append_mutate_checked` uses). A
+/// parent-pointer heuristic is NOT equivalent: head-neutral events (fact_echoed
+/// from `mark`, fact_reprojected, fact_resolved bookkeeping) are appended with
+/// no parent, so counting "hashes nobody cites" as heads would flag a marked or
+/// reprojected entity as diverged and freeze source corrections forever.
+/// `None` when the entity is genuinely diverged (more than one contested head) -
+/// the importer then leaves it untouched rather than guess which head a
+/// correction supersedes.
 fn single_head(events: &[Event]) -> Option<String> {
-    let parents: HashSet<&str> = events.iter().filter_map(|e| e.parent_rev.as_deref()).collect();
-    let heads: Vec<&Event> = events.iter().filter(|e| !parents.contains(e.this_hash.as_str())).collect();
-    if heads.len() == 1 {
-        Some(heads[0].this_hash.clone())
+    let entity_id = events.first().map(|e| e.entity_id.as_str())?;
+    let head_sets = crate::cas::compute_head_sets(events);
+    let head_set = head_sets.get(entity_id)?;
+    if head_set.heads.len() == 1 {
+        head_set.heads.iter().next().cloned()
     } else {
         None
     }
@@ -206,6 +211,39 @@ mod tests {
             recall(&store, "where does the db live NAS", 3).unwrap().iter().all(|h| h.entity_id != "DEC1"),
             "a superseded fact stops surfacing"
         );
+    }
+
+    #[test]
+    fn test_import_still_revises_after_head_neutral_events() {
+        // review finding: mark (fact_echoed), reproject and resolve append
+        // parent-less, head-NEUTRAL events. The old parent-pointer heuristic
+        // counted those as extra "heads" and froze the entity as false-diverged,
+        // silently disabling source-correction propagation forever.
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("n.db");
+        let mut store = EventStore::new(&db).unwrap();
+        let v1 = write_jsonl(dir.path(), "v1.jsonl", &[r#"{"entity_id":"M1","body":"the db lives on the desktop"}"#]);
+        assert_eq!(import_jsonl(&mut store, &v1).unwrap().imported, 1);
+        // the agent marks the fact useful (exactly what the tools tell it to do)
+        store
+            .append_event("s", "l", "a", EventKind::FactEchoed, "M1", None, "")
+            .unwrap();
+        // ...and a reproject also lands (thor backfill-projects stamps every import)
+        store
+            .append_event("s", "l", "a", EventKind::FactReprojected, "M1", None, r#"{"project":"ProjA"}"#)
+            .unwrap();
+        // the source corrects the fact: it must still propagate as a revision
+        let v2 = write_jsonl(dir.path(), "v2.jsonl", &[r#"{"entity_id":"M1","body":"the db now lives on the NAS"}"#]);
+        let s2 = import_jsonl(&mut store, &v2).unwrap();
+        assert_eq!(s2.revised, 1, "head-neutral events must not freeze corrections");
+        assert_eq!(s2.skipped_diverged, 0, "a marked entity is not diverged");
+        assert!(
+            recall(&store, "where does the db live NAS", 3).unwrap().iter().any(|h| h.entity_id == "M1" && h.body.contains("NAS")),
+            "recall serves the corrected body"
+        );
+        // a status line still retracts it afterwards
+        let v3 = write_jsonl(dir.path(), "v3.jsonl", &[r#"{"entity_id":"M1","body":"the db now lives on the NAS","status":"deleted"}"#]);
+        assert_eq!(import_jsonl(&mut store, &v3).unwrap().retracted, 1);
     }
 
     #[test]

@@ -166,8 +166,15 @@ fn fold_diacritics(s: &str) -> String {
 /// matches only one word of a multi-word question is a coincidence, not an
 /// answer - the courier stays silent instead of injecting it confidently.
 pub fn covers_query(body: &str, query: &str) -> bool {
-    let qterms: HashSet<String> =
-        content_tokens(query).iter().map(|t| fold_diacritics(&t.to_lowercase())).collect();
+    // NO stopword fallback here (unlike content_tokens' best-effort search): a
+    // stopword-only query has no content terms and never covers - with the
+    // fallback, "wat is dat dan" would count its own stopwords as content and
+    // any body containing two of them would pass the gate as a confident answer.
+    let qterms: HashSet<String> = tokens(query)
+        .iter()
+        .filter(|t| !STOPWORDS.contains(&t.to_lowercase().as_str()))
+        .map(|t| fold_diacritics(&t.to_lowercase()))
+        .collect();
     if qterms.is_empty() {
         return false;
     }
@@ -178,6 +185,14 @@ pub fn covers_query(body: &str, query: &str) -> bool {
         .map(|t| fold_diacritics(&t.to_lowercase()))
         .collect();
     qterms.iter().filter(|t| body_tokens.contains(*t)).count() >= required
+}
+
+/// True when the query has at least one non-stopword token. The courier gates
+/// recall on this: an all-stopword prompt ("wat is dat dan") carries no content
+/// to match, and content_tokens' best-effort fallback would otherwise let its
+/// stopwords earn matched_and via the AND query and bypass the coverage gate.
+pub fn has_content_terms(query: &str) -> bool {
+    tokens(query).iter().any(|t| !STOPWORDS.contains(&t.to_lowercase().as_str()))
 }
 
 /// The normalized body prefix used for near-duplicate detection, shared by
@@ -665,17 +680,26 @@ pub fn recall_fused_scoped(
         Some(or_query) => lexical_head_pool(store, &or_query, &by_seq, &heads, &filter, FUSION_POOL),
         None => vec![],
     };
-    let bm_rank: HashMap<i64, f64> = lexical.iter().copied().collect();
 
-    // Evidence set for matched_and: the seqs that matched the WHOLE question
-    // (strict AND pass). Dense (cosine) evidence is added below once computed.
-    let mut strong: HashSet<i64> = match fts_query_and(query) {
-        Some(aq) => lexical_head_pool(store, &aq, &by_seq, &heads, &filter, FUSION_POOL)
-            .into_iter()
-            .map(|(s, _)| s)
-            .collect(),
-        None => HashSet::new(),
+    // Strict-AND pass: the seqs that matched the WHOLE question. Besides feeding
+    // the matched_and evidence set, these are CANDIDATES in their own right: a
+    // head matching every content term can still bm25-rank below FUSION_POOL
+    // single-term high-scorers on the OR query (one very common token matched by
+    // hundreds of short chunks), and without a dense vector it would otherwise
+    // not be a candidate at all - dropped exactly where pure bm25 (AND-first)
+    // would have returned it first.
+    let and_pool: Vec<(i64, f64)> = match fts_query_and(query) {
+        Some(aq) => lexical_head_pool(store, &aq, &by_seq, &heads, &filter, FUSION_POOL),
+        None => vec![],
     };
+    let mut strong: HashSet<i64> = and_pool.iter().map(|(s, _)| *s).collect();
+
+    // Lexical rank for scoring: the OR walk's rank, else the AND walk's (an
+    // AND-only candidate gets its own bm25 evidence instead of bm_norm 0).
+    let mut bm_rank: HashMap<i64, f64> = lexical.iter().copied().collect();
+    for (seq, rank) in &and_pool {
+        bm_rank.entry(*seq).or_insert(*rank);
+    }
 
     // Dense leg: brute-force the query cosine over EVERY stored vector, keep the
     // top-M. Real dense retrieval (not a pool rerank), so a paraphrase gold with
@@ -702,21 +726,14 @@ pub fn recall_fused_scoped(
         .collect();
     dense.sort_by(|a, b| b.1.total_cmp(&a.1).then(a.0.cmp(&b.0)));
     dense.truncate(DENSE_TOPM);
-    // Dense evidence: a candidate whose cosine clears the floor genuinely
-    // resembles the query in meaning - that (or an AND match) is what lets a
-    // hit bypass the courier's OR-coincidence coverage gate.
-    for (s, c) in &dense {
-        if *c >= DENSE_EVIDENCE_MIN {
-            strong.insert(*s);
-        }
-    }
 
-    // Union of the two candidate sets, de-duplicated, in a DETERMINISTIC order:
-    // lexical hits first (rank order), then dense-only hits (cosine order). Never
-    // seeded from HashMap iteration, so identical inputs give identical candidates.
+    // Union of the candidate sets, de-duplicated, in a DETERMINISTIC order:
+    // OR-pool hits first (rank order), then AND-only extras, then dense-only
+    // hits (cosine order). Never seeded from HashMap iteration, so identical
+    // inputs give identical candidates.
     let mut seen: HashSet<i64> = HashSet::new();
     let mut cand: Vec<i64> = Vec::new();
-    for (seq, _) in &lexical {
+    for (seq, _) in lexical.iter().chain(and_pool.iter()) {
         if seen.insert(*seq) {
             cand.push(*seq);
         }
@@ -728,6 +745,18 @@ pub fn recall_fused_scoped(
     }
     if cand.is_empty() {
         return Ok(vec![]);
+    }
+
+    // Dense evidence over ALL candidates' cosines, not only the truncated
+    // top-M: the stated rule is "an AND match or real cosine support"
+    // (>= DENSE_EVIDENCE_MIN), and a lexical candidate genuinely resembling
+    // the query must not lose its evidence - and then get silenced by the
+    // courier's coverage gate - just because DENSE_TOPM other vectors rank
+    // higher on this query.
+    for seq in &cand {
+        if cos_by_seq.get(seq).copied().unwrap_or(0.0) >= DENSE_EVIDENCE_MIN {
+            strong.insert(*seq);
+        }
     }
 
     // Normalize the lexical leg: min-max the pool's -rank to [0,1] so a strong
@@ -929,8 +958,16 @@ mod tests {
         // single-content-term query: that one term suffices (no self-silencing)
         assert!(covers_query("the deploy watcher gotcha", "deploy"));
         assert!(!covers_query("unrelated text", "deploy"));
-        // stopword-only query -> no content terms -> never covers
+        // stopword-only query -> no content terms -> never covers. The body
+        // CONTAINING those stopwords is the review-found leak: content_tokens'
+        // fallback made the stopwords themselves count as query terms.
         assert!(!covers_query("anything", "de het een"));
+        assert!(
+            !covers_query("dit is wat we doen als het faalt", "wat is dat dan"),
+            "a body containing the query's stopwords must not cover a contentless query"
+        );
+        assert!(!has_content_terms("wat is dat dan"), "all-stopword prompt has no content");
+        assert!(has_content_terms("wat is de sync refactor"), "a real term counts as content");
     }
 
     #[test]
@@ -1083,6 +1120,91 @@ mod fused_tests {
             "sanity: bm25 alone cannot reach the zero-overlap gold");
         let hits = recall_fused(&store, "alpha", &axis(1.0), &vecs, 3, 2.0).unwrap();
         assert_eq!(hits[0].entity_id, "e1", "the dense leg surfaces a gold with zero lexical overlap");
+    }
+
+    #[test]
+    fn test_fused_keeps_strict_and_hit_outside_or_pool() {
+        // Review finding: a head matching EVERY content term can bm25-rank below
+        // FUSION_POOL single-term high-scorers on the OR query; without a dense
+        // vector it then used to vanish from the candidate set entirely, while
+        // pure bm25 (AND-first) would have returned it FIRST. The AND pool must
+        // feed candidates, not only the matched_and evidence set.
+        let mut store = EventStore::in_memory().unwrap();
+        // Flood the OR pool: FUSION_POOL+ single-term spam heads with high tf in
+        // tiny bodies (maximal bm25), half on each query term.
+        for i in 0..(FUSION_POOL + 20) {
+            let term = if i % 2 == 0 { "alpha" } else { "bravo" };
+            let body = format!("{t} {t} {t} {t} {t} {t} {t} {t}", t = term);
+            store
+                .append_event("s", "l", "a", EventKind::FactCreated, &format!("spam{}", i), None, &body)
+                .unwrap();
+        }
+        // The gold: the ONLY head containing BOTH terms, once each, in a long
+        // body (low bm25 on the OR query by construction).
+        let gold_body = "the decision was that alpha and bravo stay coupled through the \
+                         batching layer with every event under the configured ceiling for \
+                         replication safety and reconcile order across machines";
+        store
+            .append_event("s", "l", "a", EventKind::FactCreated, "gold", None, gold_body)
+            .unwrap();
+
+        let dir = tempfile::tempdir().unwrap();
+        let vecs = VectorStore::open(&dir.path().join("v.db")).unwrap(); // no vectors at all
+
+        let hits = recall_fused(&store, "alpha bravo", &axis(1.0), &vecs, 3, 1.5).unwrap();
+        assert!(
+            hits.iter().any(|h| h.entity_id == "gold"),
+            "the strict-AND gold must stay a candidate even outside the OR pool; got: {:?}",
+            hits.iter().map(|h| h.entity_id.as_str()).collect::<Vec<_>>()
+        );
+        let gold = hits.iter().find(|h| h.entity_id == "gold").unwrap();
+        assert!(gold.matched_and, "an AND-pass hit carries matched_and evidence");
+    }
+
+    #[test]
+    fn test_dense_evidence_not_limited_to_top_m() {
+        // Review finding: a lexical candidate with cosine >= DENSE_EVIDENCE_MIN
+        // used to get matched_and=false when DENSE_TOPM other vectors ranked
+        // higher - the evidence check ran over the truncated dense list instead
+        // of the candidates' own cosines.
+        let mut store = EventStore::in_memory().unwrap();
+        // DENSE_TOPM boilerplate heads, each with a vector at cosine ~0.6.
+        let mut batch: Vec<(i64, Vec<f32>)> = Vec::new();
+        let mut boiler = vec![0.0f32; DIM];
+        boiler[0] = 0.6;
+        boiler[1] = 0.8; // unit norm: 0.36 + 0.64 = 1
+        for i in 0..DENSE_TOPM {
+            let ev = store
+                .append_event("s", "l", "a", EventKind::FactCreated, &format!("b{}", i), None, &format!("boilerplate filler {}", i))
+                .unwrap();
+            batch.push((ev.seq, boiler.clone()));
+        }
+        // The gold: matches ONE query term lexically ("sync"), cosine 0.5 - real
+        // semantic support (>= DENSE_EVIDENCE_MIN) but below all the boilerplate.
+        let ev = store
+            .append_event("s", "l", "a", EventKind::FactCreated, "gold", None, "sync ceiling stays at one hundred")
+            .unwrap();
+        let mut gv = vec![0.0f32; DIM];
+        gv[0] = 0.5;
+        gv[1] = (1.0f32 - 0.25).sqrt();
+        batch.push((ev.seq, gv));
+
+        let dir = tempfile::tempdir().unwrap();
+        let mut vecs = VectorStore::open(&dir.path().join("v.db")).unwrap();
+        vecs.upsert_batch(&batch).unwrap();
+
+        // Query "sync bug": gold matches only "sync" literally, so it needs its
+        // cosine as evidence to pass the courier's coverage gate downstream.
+        let hits = recall_fused(&store, "sync bug", &axis(1.0), &vecs, 5, 1.5).unwrap();
+        let gold = hits
+            .iter()
+            .find(|h| h.entity_id == "gold")
+            .expect("gold matches the only content term and must surface");
+        assert!(
+            gold.matched_and,
+            "cosine {} >= DENSE_EVIDENCE_MIN must grant evidence even below the dense top-M",
+            0.5
+        );
     }
 
     #[test]

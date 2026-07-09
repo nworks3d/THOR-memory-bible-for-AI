@@ -10,6 +10,9 @@ pub struct ImportStats {
     pub skipped_existing: usize,
     pub skipped_malformed: usize,
     pub skipped_diverged: usize,
+    /// New entities refused because a live fact with the same normalized body
+    /// prefix already exists under ANOTHER id - the dual-write round-trip twin.
+    pub skipped_duplicate: usize,
 }
 
 /// The single current head rev of an entity, via the ONE authoritative CAS fold
@@ -48,6 +51,29 @@ pub fn import_jsonl(store: &mut EventStore, path: &Path) -> anyhow::Result<Impor
     let file = std::fs::File::open(path)?;
     let reader = std::io::BufReader::new(file);
     let mut stats = ImportStats::default();
+
+    // Near-duplicate refusal for NEW entities, same normalization as the MCP
+    // remember tool: without it, every dual-written fact (stored directly in
+    // THOR and in the source) comes back as a TWIN under the source's id on the
+    // next import - measured live: 19 twins accumulated in two days. The map is
+    // built once per run; entities created by THIS run are added as we go.
+    let mut live_prefixes: std::collections::HashMap<String, String> = {
+        let events = store.get_all_events()?;
+        let heads = crate::cas::compute_head_sets(&events);
+        let by_hash: std::collections::HashMap<&str, &Event> =
+            events.iter().map(|e| (e.this_hash.as_str(), e)).collect();
+        heads
+            .iter()
+            .flat_map(|(id, hs)| {
+                hs.heads.iter().filter_map(|rev| {
+                    by_hash.get(rev.as_str()).and_then(|ev| {
+                        (!matches!(ev.kind, EventKind::FactRetracted))
+                            .then(|| (crate::recall::dedup_prefix(&ev.body), id.clone()))
+                    })
+                })
+            })
+            .collect()
+    };
 
     for line in reader.lines() {
         let line = line?;
@@ -125,6 +151,16 @@ pub fn import_jsonl(store: &mut EventStore, path: &Path) -> anyhow::Result<Impor
             continue;
         }
 
+        // A NEW id whose body prefix matches an existing live fact is the
+        // dual-write round-trip twin - skip it instead of minting a duplicate.
+        let prefix = crate::recall::dedup_prefix(body);
+        if let Some(existing_id) = live_prefixes.get(&prefix) {
+            if existing_id != &entity_id {
+                stats.skipped_duplicate += 1;
+                continue;
+            }
+        }
+
         store.append_event(
             "import",
             "mimir-import",
@@ -134,6 +170,7 @@ pub fn import_jsonl(store: &mut EventStore, path: &Path) -> anyhow::Result<Impor
             None,
             body,
         )?;
+        live_prefixes.insert(prefix, entity_id.clone());
         stats.imported += 1;
     }
 
@@ -244,6 +281,34 @@ mod tests {
         // a status line still retracts it afterwards
         let v3 = write_jsonl(dir.path(), "v3.jsonl", &[r#"{"entity_id":"M1","body":"the db now lives on the NAS","status":"deleted"}"#]);
         assert_eq!(import_jsonl(&mut store, &v3).unwrap().retracted, 1);
+    }
+
+    #[test]
+    fn test_import_refuses_dual_write_twin() {
+        // The dual-write round-trip: a fact stored directly in THOR comes back
+        // from the source under the SOURCE's id. The importer must refuse the
+        // twin instead of minting a second live entity with the same body.
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("t.db");
+        let mut store = EventStore::new(&db).unwrap();
+        store
+            .append_event(
+                "s", "l", "a", EventKind::FactCreated, "mcp-direct-write", None,
+                "REGEL: the deploy tarball is copied with scp -O because the NAS has no SFTP subsystem",
+            )
+            .unwrap();
+        let snap = write_jsonl(
+            dir.path(),
+            "t.jsonl",
+            &[
+                r#"{"entity_id":"01KROUNDTRIP","body":"REGEL: the deploy tarball is copied with scp -O because the NAS has no SFTP subsystem\n\n[memory/decision | tags: deploy | project: global | mimir:01KROUNDTRIP]"}"#,
+                r#"{"entity_id":"01KFRESH","body":"a genuinely different fact about the backup schedule"}"#,
+            ],
+        );
+        let stats = import_jsonl(&mut store, &snap).unwrap();
+        assert_eq!(stats.skipped_duplicate, 1, "the twin is refused (footer stripped before compare)");
+        assert_eq!(stats.imported, 1, "the genuinely new fact still imports");
+        assert!(store.get_events_by_entity("01KROUNDTRIP").unwrap().is_empty());
     }
 
     #[test]

@@ -755,12 +755,19 @@ pub fn run() -> Result<()> {
         Commands::Import { path } => {
             let mut store = EventStore::new(&db)?;
             let stats = crate::importer::import_jsonl(&mut store, &path)?;
+            // Report EVERY counter: a status-driven run that only retracts used
+            // to print "Imported 0 facts" and read as a no-op.
             println!(
-                "Imported {} facts into {} (skipped {} already present, {} malformed).",
-                stats.imported,
+                "Import into {}: {} created, {} revised, {} retracted \
+                 ({} unchanged, {} duplicates refused, {} malformed, {} diverged skipped).",
                 db.display(),
+                stats.imported,
+                stats.revised,
+                stats.retracted,
                 stats.skipped_existing,
-                stats.skipped_malformed
+                stats.skipped_duplicate,
+                stats.skipped_malformed,
+                stats.skipped_diverged
             );
         }
         Commands::Recv { http } => {
@@ -1173,8 +1180,19 @@ fn run_reproject(
     let mut store = EventStore::new(db)?;
     let mut n = 0;
     for id in &ids {
+        // Trim control/whitespace residue: a CRLF text file fed through a shell
+        // loop delivers "id\r", and an unchecked append would then mint a
+        // reproject for a PHANTOM entity (happened live 2026-07-10: 153 stray
+        // events against ids that never existed).
+        let id = id.trim();
         if crate::repo::is_chunk_id(id) && !force {
             eprintln!("skip chunk-shaped id (managed by ingest; use --force to override): {}", id);
+            continue;
+        }
+        // Same existence contract as the MCP reproject tool: never append scope
+        // metadata for an entity the log does not know.
+        if store.get_events_by_entity(id)?.is_empty() {
+            eprintln!("skip unknown entity: {}", id);
             continue;
         }
         store.append_event("reproject", "reproject", "cli", EventKind::FactReprojected, id, None, &body)?;

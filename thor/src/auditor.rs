@@ -129,7 +129,14 @@ impl DifferentialAuditor {
         let mut per_entity: HashMap<String, Vec<&Event>> = HashMap::new();
         for event in events {
             match event.kind {
-                EventKind::FactReasserted | EventKind::FactEchoed => {}
+                // Head-neutral kinds are excluded for the same reason the
+                // canonical fold never stores an entry for them: an entity whose
+                // only events are head-neutral (e.g. a stray reproject against an
+                // id that never existed) must yield NO entry on either side. The
+                // spec used to keep an EMPTY entry for such an entity while the
+                // canonical fold kept none - a representation mismatch reported
+                // as a false head error (hit live on 2026-07-10).
+                EventKind::FactReasserted | EventKind::FactEchoed | EventKind::FactReprojected => {}
                 _ => per_entity
                     .entry(event.entity_id.clone())
                     .or_default()
@@ -286,6 +293,29 @@ mod tests {
         let events = vec![];
         let result = DifferentialAuditor::verify_consistency(&events);
         assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_reprojected_only_entity_is_consistent() {
+        // A stray reproject against an id with no other events (CLI misuse, a
+        // CRLF-mangled id) is head-neutral: BOTH derivations must omit the
+        // entity. The spec used to keep an empty entry while the canonical fold
+        // kept none, and fsck reported a false head error on a healthy log.
+        let mut store = EventStore::in_memory().unwrap();
+        store
+            .append_event("s", "l", "a", EventKind::FactCreated, "real", None, "a fact")
+            .unwrap();
+        store
+            .append_event(
+                "s", "l", "a", EventKind::FactReprojected, "phantom\r", None,
+                r#"{"project":"ProjA"}"#,
+            )
+            .unwrap();
+        let events = store.get_all_events().unwrap();
+        assert!(
+            DifferentialAuditor::verify_consistency(&events).is_ok(),
+            "a reprojected-only entity must not trip the differential auditor"
+        );
     }
 
     #[test]

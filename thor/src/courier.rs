@@ -224,11 +224,20 @@ pub fn injection_for_hook_json(db: &Path, raw: &str) -> Option<String> {
     } else {
         None
     };
-    for hit in &selected {
+    for (slot, hit) in selected.iter().enumerate() {
         let short = &hit.rev[..hit.rev.len().min(8)];
         // A memory/decision/gotcha is short and its actionable half must not be cut;
-        // a code chunk is long and a preview suffices. So give memories a wider window.
-        let cap = if crate::repo::is_chunk_id(&hit.entity_id) { 220 } else { 500 };
+        // a code chunk is long and a preview suffices. So give memories a wider
+        // window - and give the TOP hit the widest one: the measured drift-miss
+        // mode is "right chunk injected, actionable details cut from the snippet"
+        // (partial-catch 23/73 on the judged corpus), and slot 1 is where the
+        // preventer usually sits when it surfaces at all. Bounded: one wide
+        // snippet per prompt, slots 2-3 stay cheap.
+        let cap = match (slot, crate::repo::is_chunk_id(&hit.entity_id)) {
+            (0, _) => 700,
+            (_, true) => 220,
+            (_, false) => 500,
+        };
         let diverged = if hit.is_diverged { " [DIVERGED]" } else { "" };
         // Freshness: a chunk of the CURRENT project is re-read from disk, so the
         // agent sees today's code (tagged [refreshed]) - or a warning when the

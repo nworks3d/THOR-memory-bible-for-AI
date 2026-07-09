@@ -99,9 +99,13 @@ fn main() -> anyhow::Result<()> {
         }
         let hits: Vec<String> = match channel.as_str() {
             "courier" => {
+                // Session id unique PER PROCESS RUN: a fixed id would let the
+                // suppression ledger of a previous harness run rotate this
+                // run's injections (measured: it silently halved coverage on a
+                // re-run) - every invocation must look like a fresh session.
                 let hook = serde_json::json!({
                     "prompt": query,
-                    "session_id": format!("bench-{}", i),
+                    "session_id": format!("bench-{}-{}", std::process::id(), i),
                     "cwd": cwd,
                 });
                 thor::courier::injection_for_hook_json(&db, &hook.to_string())

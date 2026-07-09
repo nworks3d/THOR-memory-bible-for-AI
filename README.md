@@ -104,13 +104,16 @@ for "which functions call X". THOR chunks source into recall instead. See
 ## Benchmarks
 
 A blind, judged head-to-head against [mimir](https://github.com/MakerViking/mimir),
-reported as two separate fair tests: **as-deployed coverage** (67% vs 38% on 504
-questions, because THOR indexes repo code mimir's recall does not) and
-**same-knowledge quality** (61% vs 56% on the broad shared set; mimir wins the strict
-dual-written cut, 90% vs 82%). Plus **multi-project coverage** across three seeded
-repos (73% vs 53% overall - though mimir's curated design docs win one project, 93% vs
-67%), session-drift compensation (55% vs 48%), and ~3.1x lower latency. Full method,
-per-category tables and honest weaknesses in [BENCHMARKS.md](BENCHMARKS.md).
+re-measured fresh on 2026-07-09 with an independent jury: **coverage** 67.8% vs
+58.5% on a 200-question balanced set, **same-knowledge quality** 64.8% vs 56.8%
+on the 118 facts both stores hold (mimir still wins the strict dual-written cut,
+94.3% vs 90.6% - the gap halved after the ranking round), **multi-project** 94%
+vs 59% across three seeded repos (mimir's curated design docs still win one
+project, 97% vs 87%), ~1.9x lower latency at ~2.4x fewer injected tokens. On
+prompt-only drift association mimir's full-catch is higher (43.8% vs 39.7%) -
+THOR's drift answer is structural (pins + file-touch guard, measured by the
+in-repo drift eval below), not ranking alone. Full method, per-category tables
+and honest weaknesses in [BENCHMARKS.md](BENCHMARKS.md).
 
 Drift compensation is also measurable IN-REPO, no judge needed: `cargo run
 --example drift_eval` replays a committed synthetic corpus

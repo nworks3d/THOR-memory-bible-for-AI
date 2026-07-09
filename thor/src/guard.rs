@@ -187,6 +187,11 @@ fn try_guard(db: &Path, rulebook: &Path) -> anyhow::Result<()> {
 
 /// How many file-naming memories to surface per (session, file).
 const FILE_MEMORY_HITS: usize = 2;
+/// How long a "no memory names this file" answer is cached (seconds). Without
+/// it every tool call on a memory-less file - the overwhelmingly common case -
+/// re-pays a full store open + O(n) recall on the per-tool-call hot path. Short
+/// enough that a memory stored mid-session still surfaces within minutes.
+const NEG_CACHE_SECS: u64 = 15 * 60;
 
 /// The memory-backed half of the guard: for a tool call carrying a file_path,
 /// recall MEMORIES (never chunks) that literally name the file, at most once per
@@ -195,16 +200,34 @@ const FILE_MEMORY_HITS: usize = 2;
 /// returns 8/8 code chunks and 0 memories, so the candidate set must exclude
 /// chunks up front, and a hit must name the file to count as "about" it.
 fn file_memory_advisory(db: &Path, hook: &Value) -> Option<String> {
+    if crate::ledger::flag_present(db, "THOR-SILENT.flag") {
+        return None; // the THOR kill switch silences the file advisory too
+    }
     let file_path = hook.get("tool_input")?.get("file_path")?.as_str()?.trim();
     if file_path.is_empty() {
         return None;
     }
     let session_id = hook.get("session_id").and_then(|v| v.as_str()).unwrap_or("");
+    if session_id.is_empty() {
+        // No session identity: a shared "|<file>" key would suppress the
+        // advisory across DIFFERENT sessions for the whole prune window. Match
+        // capture_nudge: no debounce identity -> stay silent.
+        return None;
+    }
     let ledger_path = crate::ledger::guard_seen_path(db);
     let key = format!("{}|{}", session_id, file_path);
     let mut seen = crate::ledger::read_map(&ledger_path);
-    if seen.contains_key(&key) {
-        return None; // already advised for this file this session
+    match seen.get(&key) {
+        // already advised for this file this session
+        Some(v) if v.is_u64() => return None,
+        // fresh negative answer: skip the store open + recall entirely
+        Some(v) => {
+            let neg_ts = v.get("ts").and_then(|t| t.as_u64()).unwrap_or(0);
+            if crate::review::now_secs().saturating_sub(neg_ts) <= NEG_CACHE_SECS {
+                return None;
+            }
+        }
+        None => {}
     }
 
     let p = Path::new(file_path);
@@ -245,7 +268,16 @@ fn file_memory_advisory(db: &Path, hook: &Value) -> Option<String> {
         .take(FILE_MEMORY_HITS)
         .collect();
     if named.is_empty() {
-        return None; // no ledger write: a memory stored later this session still surfaces
+        // Cache the miss briefly (NEG_CACHE_SECS) so repeated touches of a
+        // memory-less file stop re-paying the recall; a memory stored later
+        // still surfaces once the negative entry expires.
+        let now = crate::review::now_secs();
+        seen.insert(key, serde_json::json!({ "ts": now, "neg": true }));
+        crate::ledger::prune_old(&mut seen, now, |v| {
+            v.as_u64().or_else(|| v.get("ts").and_then(|t| t.as_u64()))
+        });
+        crate::ledger::write_map(&ledger_path, &seen);
+        return None;
     }
 
     let lines: Vec<String> = named
@@ -258,7 +290,9 @@ fn file_memory_advisory(db: &Path, hook: &Value) -> Option<String> {
 
     let now = crate::review::now_secs();
     seen.insert(key, serde_json::json!(now));
-    crate::ledger::prune_old(&mut seen, now, |v| v.as_u64());
+    crate::ledger::prune_old(&mut seen, now, |v| {
+        v.as_u64().or_else(|| v.get("ts").and_then(|t| t.as_u64()))
+    });
     crate::ledger::write_map(&ledger_path, &seen);
 
     Some(format!(
@@ -290,19 +324,21 @@ pub fn run_stop_guard(db: &Path, rulebook: &Path) {
 /// Hard capture triggers (EN + NL), per the user's own capture rule: a new
 /// project, a move/relocation of code or data, a major decision or direction
 /// change, a confirmed gotcha. Deliberately conservative substrings - a false
-/// positive costs one nudge per session, a false negative costs a lost fact.
+/// positive costs a forced extra turn (the Stop guard is installed by DEFAULT),
+/// so casual usage must not fire: bare "gotcha" ("Gotcha, I'll fix that") and
+/// bare "decided to" ("I decided to grep first") are excluded; the marker
+/// forms ("gotcha:", "we decided") are kept.
 const CAPTURE_TRIGGERS: &[&str] = &[
     "besloten",
-    "beslissing",
+    "beslissing:",
     "besluit:",
     "afgesproken",
     "harde regel",
     "voortaan",
     "decision:",
     "we decided",
-    "decided to",
     "from now on",
-    "gotcha",
+    "gotcha:",
     "verplaatst naar",
     "gemigreerd naar",
     "migrated to",
@@ -360,6 +396,9 @@ fn try_stop_guard(db: &Path, rulebook: &Path) -> anyhow::Result<()> {
 /// proactivity is no longer the only thing standing between a durable fact and
 /// oblivion. Fail-open at every step.
 fn capture_nudge(db: &Path, hook: &Value, haystack_lower: &str) -> Option<String> {
+    if crate::ledger::flag_present(db, "THOR-SILENT.flag") {
+        return None; // the THOR kill switch silences the nudge too
+    }
     let session_id = hook.get("session_id").and_then(|v| v.as_str()).unwrap_or("");
     if session_id.is_empty() {
         return None; // no session identity -> cannot debounce -> stay silent
@@ -509,6 +548,17 @@ mod tests {
         assert!(capture_nudge(&db, &hook("s3"), &plain).is_none(), "no trigger -> no nudge");
         // no session id -> cannot debounce -> silent
         assert!(capture_nudge(&db, &json!({}), &hay).is_none(), "sessionless stop stays silent");
+        // casual usage must NOT fire (the Stop guard is installed by default)
+        let casual = tool_input_text(&json!("Gotcha, I'll rename the file and rerun the tests."));
+        assert!(capture_nudge(&db, &hook("s4"), &casual).is_none(), "bare 'gotcha' is casual, not a fact");
+        let casual2 = tool_input_text(&json!("I decided to grep the logs first."));
+        assert!(capture_nudge(&db, &hook("s4"), &casual2).is_none(), "bare 'decided to' is prose");
+        // the marker form still fires
+        let marked = tool_input_text(&json!("GOTCHA: nginx strips X-Forwarded-Proto here."));
+        assert!(capture_nudge(&db, &hook("s5"), &marked).is_some(), "'gotcha:' marker fires");
+        // the THOR kill switch silences the nudge
+        std::fs::write(dir.path().join("THOR-SILENT.flag"), "").unwrap();
+        assert!(capture_nudge(&db, &hook("s6"), &hay).is_none(), "THOR-SILENT.flag silences capture");
     }
 
     #[test]
@@ -557,7 +607,8 @@ mod tests {
             "tool_input": { "file_path": proj.join("src/courier.rs").to_string_lossy() }
         });
         assert!(file_memory_advisory(&db, &hook2).is_some());
-        // a file no memory names: silent, and no ledger entry is burned
+        // a file no memory names: silent, and the miss is negative-cached so
+        // repeated touches skip the store open (a second call is also None)
         let other = json!({
             "session_id": "s1",
             "cwd": proj.to_string_lossy(),
@@ -565,6 +616,32 @@ mod tests {
             "tool_input": { "file_path": proj.join("src/other.rs").to_string_lossy() }
         });
         assert!(file_memory_advisory(&db, &other).is_none());
+        let seen = crate::ledger::read_map(&crate::ledger::guard_seen_path(&db));
+        let neg_key = format!("s1|{}", proj.join("src/other.rs").to_string_lossy());
+        assert!(
+            seen.get(&neg_key).and_then(|v| v.get("neg")).is_some(),
+            "a miss writes a short-TTL negative entry: {seen:?}"
+        );
+        assert!(file_memory_advisory(&db, &other).is_none(), "cached miss stays silent");
+
+        // sessionless hooks stay silent (no debounce identity, no 48h cross-
+        // session suppression via a shared \"|<file>\" key)
+        let sessionless = json!({
+            "cwd": proj.to_string_lossy(),
+            "tool_name": "Edit",
+            "tool_input": { "file_path": proj.join("src/courier.rs").to_string_lossy() }
+        });
+        assert!(file_memory_advisory(&db, &sessionless).is_none(), "no session_id -> silent");
+
+        // the THOR kill switch silences the advisory
+        std::fs::write(dir.path().join("THOR-SILENT.flag"), "").unwrap();
+        let hook3 = json!({
+            "session_id": "s3",
+            "cwd": proj.to_string_lossy(),
+            "tool_name": "Edit",
+            "tool_input": { "file_path": proj.join("src/courier.rs").to_string_lossy() }
+        });
+        assert!(file_memory_advisory(&db, &hook3).is_none(), "THOR-SILENT.flag silences the guard advisory");
     }
 
     #[test]

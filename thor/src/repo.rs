@@ -229,6 +229,19 @@ pub fn is_skip_ext(rel: &str) -> bool {
     }
 }
 
+/// Truncate a file's text to MAX_FILE_CHARS on a char boundary. Returns true
+/// when it truncated. ONE implementation shared by ingest and the courier's
+/// freshness check: the freshness comparison only works if both sides chunk
+/// byte-for-byte the same text, so the cut rule must never fork.
+pub fn truncate_to_max_file_chars(text: &mut String) -> bool {
+    if text.chars().count() <= MAX_FILE_CHARS {
+        return false;
+    }
+    let cut = text.char_indices().nth(MAX_FILE_CHARS).map(|(i, _)| i).unwrap_or(text.len());
+    text.truncate(cut);
+    true
+}
+
 /// Split text into <= `max`-char chunks on line boundaries; a single line longer
 /// than `max` is hard-split on char boundaries. Blank-only chunks are dropped.
 /// Mirrors the reference ingest so re-ingesting an unchanged file is a no-op.

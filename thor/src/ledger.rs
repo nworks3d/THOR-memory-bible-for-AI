@@ -33,6 +33,14 @@ pub fn pins_path(db: &Path) -> PathBuf {
     db.with_file_name("thor-pins.json")
 }
 
+/// True when a flag file (THOR-SILENT.flag, THOR-PRIMARY.flag) sits next to the
+/// store. Flag files ARE the flip valve: create or delete one to change phase
+/// with NO code change and NO settings edit. Shared by the courier and the
+/// guard so the kill switch silences every THOR surface consistently.
+pub fn flag_present(db: &Path, name: &str) -> bool {
+    db.parent().map(|dir| dir.join(name).exists()).unwrap_or(false)
+}
+
 /// Read a JSON-object ledger as a string map. Fail-open: a missing, unreadable,
 /// or malformed file is an empty map (the caller then behaves statelessly).
 pub fn read_map(path: &Path) -> HashMap<String, serde_json::Value> {

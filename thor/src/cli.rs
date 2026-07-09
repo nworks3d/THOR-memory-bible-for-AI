@@ -448,6 +448,9 @@ pub fn render_brief(
         let mut head_revs: Vec<&String> = hs.heads.iter().collect();
         head_revs.sort();
         for rev in head_revs {
+            if lines.len() >= MAX_PINS {
+                break; // the cap bounds LINES: diverged pins push one per head
+            }
             let ev = match by_hash.get(rev.as_str()) {
                 Some(e) => *e,
                 None => continue,

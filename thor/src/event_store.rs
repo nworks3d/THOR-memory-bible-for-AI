@@ -319,6 +319,13 @@ fn query_all_events(conn: &Connection) -> SqlResult<Vec<Event>> {
     events.collect()
 }
 
+fn query_events_by_entity(conn: &Connection, entity_id: &str) -> SqlResult<Vec<Event>> {
+    let mut stmt = conn
+        .prepare(&format!("SELECT {} FROM event WHERE entity_id = ? ORDER BY seq", EVENT_COLUMNS))?;
+    let events = stmt.query_map([entity_id], row_to_event)?;
+    events.collect()
+}
+
 /// Insert one event on a handle that ALREADY holds the immediate (RESERVED)
 /// write lock. seq and prev_hash are read on that same handle, inside the
 /// transaction: two writers can therefore never observe the same
@@ -523,7 +530,9 @@ impl EventStore {
             .conn
             .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
 
-        let events = query_all_events(&tx)?;
+        // Per-entity load (idx_event_entity): the head fold only ever needs this
+        // entity's events, so the whole log is never materialized under the lock.
+        let events = query_events_by_entity(&tx, entity_id)?;
         let current: HashSet<String> = crate::cas::compute_head_sets(&events)
             .get(entity_id)
             .map(|head_set| head_set.heads.clone())
@@ -586,7 +595,9 @@ impl EventStore {
             .conn
             .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
 
-        let events = query_all_events(&tx)?;
+        // Head-set fold is per-entity, so only this entity's events are loaded
+        // (idx_event_entity) - never the whole log while holding the write lock.
+        let events = query_events_by_entity(&tx, entity_id)?;
         let current: HashSet<String> = crate::cas::compute_head_sets(&events)
             .get(entity_id)
             .map(|head_set| head_set.heads.clone())

@@ -47,12 +47,9 @@ fn is_all_trivial(prompt: &str) -> bool {
     true
 }
 
-/// True iff a flag file (THOR-SILENT.flag, THOR-PRIMARY.flag) sits next to the
-/// store. These flag files ARE the flip valve: create or delete one to change
-/// phase (shadow / THOR-primary / silent) with NO code change and NO settings
-/// edit - a remote-doable, reversible file operation.
+/// Flag-file check (THOR-SILENT.flag, THOR-PRIMARY.flag): see ledger::flag_present.
 fn flag_present(db: &Path, name: &str) -> bool {
-    db.parent().map(|dir| dir.join(name).exists()).unwrap_or(false)
+    crate::ledger::flag_present(db, name)
 }
 
 /// Stateless per-hook courier. Reads the UserPromptSubmit hook JSON on stdin,
@@ -123,27 +120,39 @@ fn injection_for_hook_json(db: &Path, raw: &str) -> Option<String> {
 
     // Silence threshold: an OR-fallback pool (only some query words matched) is
     // gated on real term coverage, so "best of an all-weak pool" is silence, not
-    // three confident-looking noise lines. Strict-AND and fused hits pass as-is.
+    // three confident-looking noise lines. Strict-AND/semantic-evidence hits
+    // (matched_and) pass as-is.
     let pool: Vec<RecallHit> = pool
         .into_iter()
         .filter(|h| h.matched_and || crate::recall::covers_query(&h.body, &query))
         .collect();
-    if pool.is_empty() {
-        return None;
-    }
 
     // Per-session injection ledger: never re-inject a rev shown within the last
     // SUPPRESS_WINDOW prompts; deeper pool hits rotate into the freed slots.
     // Sessionless hooks (no session_id) behave statelessly, exactly as before.
+    // Loaded (and saved) even when the pool is empty: the suppression window
+    // slides on every recall-eligible prompt, not only on prompts with hits -
+    // else "shown 5 prompts ago" could mean 50 real prompts ago.
     let mut ledger = SessionLedger::load(db, session_id);
+    if pool.is_empty() {
+        ledger.save(db);
+        return None;
+    }
     let pool_top_rev = pool[0].rev.clone();
     let survivors: Vec<RecallHit> =
         pool.into_iter().filter(|h| !ledger.suppressed(h)).collect();
 
     // Echo prior: if none of the top picks was ever marked useful but a
-    // below-the-fold fact was (and it ranks close enough), give it slot 3.
-    let echo = echo_counts(&store);
-    let selected = select_hits(survivors, &echo);
+    // below-the-fold fact was (and it ranks close enough), give it slot 3. The
+    // echo query only runs when a promotion is even possible (survivors deeper
+    // than the slots), and only over the survivors' own entity ids.
+    let selected = if survivors.len() > MAX_HITS {
+        let ids: Vec<String> = survivors.iter().map(|h| h.entity_id.clone()).collect();
+        let echo = echo_counts_for(&store, &ids);
+        select_hits(survivors, &echo)
+    } else {
+        select_hits(survivors, &HashMap::new())
+    };
 
     // One-line stub when the best match was suppressed: the agent keeps the
     // pointer without paying the repeated block.
@@ -257,17 +266,29 @@ fn injection_for_hook_json(db: &Path, raw: &str) -> Option<String> {
     Some(out)
 }
 
-/// FactEchoed count per entity: the "this actually helped me" signal written by
-/// the mark tool. Fail-soft: any query error means an empty map (no prior).
-fn echo_counts(store: &EventStore) -> HashMap<String, i64> {
+/// FactEchoed count per entity, restricted to the given entity ids (served by
+/// idx_event_entity instead of a full-table scan - this runs on the per-prompt
+/// hot path). The "this actually helped me" signal written by the mark tool.
+/// Fail-soft: any query error means an empty map (no prior).
+fn echo_counts_for(store: &EventStore, ids: &[String]) -> HashMap<String, i64> {
+    if ids.is_empty() {
+        return HashMap::new();
+    }
     let conn = store.conn();
-    let mut stmt = match conn
-        .prepare("SELECT entity_id, COUNT(*) FROM event WHERE kind = 'fact_echoed' GROUP BY entity_id")
-    {
+    let placeholders = vec!["?"; ids.len()].join(",");
+    let sql = format!(
+        "SELECT entity_id, COUNT(*) FROM event WHERE kind = ? AND entity_id IN ({}) GROUP BY entity_id",
+        placeholders
+    );
+    let mut stmt = match conn.prepare(&sql) {
         Ok(s) => s,
         Err(_) => return HashMap::new(),
     };
-    let rows = match stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?))) {
+    let params = std::iter::once(crate::event_store::EventKind::FactEchoed.as_str().to_string())
+        .chain(ids.iter().cloned());
+    let rows = match stmt.query_map(rusqlite::params_from_iter(params), |r| {
+        Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?))
+    }) {
         Ok(r) => r,
         Err(_) => return HashMap::new(),
     };
@@ -463,8 +484,14 @@ fn freshness(entity_id: &str, stored_body: &str, project: Option<&str>, cwd: Opt
         None => return Freshness::Current,
     };
     // Path safety: a chunk rel is always a forward-slash relative path; refuse
-    // anything that could escape the project root.
-    if rel.is_empty() || rel.starts_with('/') || rel.contains("..") || rel.contains(':') {
+    // anything that could escape the project root. The ':' rule is a Windows-ism
+    // (drive-letter absolutes like "C:\x"); on Unix ':' is a legal filename char
+    // that ingest itself will produce, so it must not disable freshness there.
+    if rel.is_empty()
+        || rel.starts_with('/')
+        || rel.contains("..")
+        || (cfg!(windows) && rel.contains(':'))
+    {
         return Freshness::Current;
     }
     let root = match crate::repo::project_root(Path::new(cwd)) {
@@ -476,14 +503,7 @@ fn freshness(entity_id: &str, stored_body: &str, project: Option<&str>, cwd: Opt
         Ok(t) => t,
         Err(_) => return Freshness::Stale, // tracked at ingest, unreadable now
     };
-    if text.chars().count() > crate::repo::MAX_FILE_CHARS {
-        let cut = text
-            .char_indices()
-            .nth(crate::repo::MAX_FILE_CHARS)
-            .map(|(i, _)| i)
-            .unwrap_or(text.len());
-        text.truncate(cut);
-    }
+    crate::repo::truncate_to_max_file_chars(&mut text);
     let chunks = crate::repo::chunk_text(&text, crate::repo::MAX_CHUNK_CHARS);
     if n >= chunks.len() {
         return Freshness::Stale;
@@ -704,6 +724,33 @@ mod tests {
         assert!(
             injection_for_hook_json(&db, raw).is_some(),
             "post-compaction the same facts must inject again"
+        );
+    }
+
+    #[test]
+    fn test_suppression_window_slides_on_hitless_prompts() {
+        // Regression: the prompt counter must advance on EVERY recall-eligible
+        // prompt, not only on prompts with hits - else facts shown "5 prompts
+        // ago" stay suppressed after 50 unrelated prompts.
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("m.db");
+        {
+            let mut store = EventStore::new(&db).unwrap();
+            store
+                .append_event("s", "l", "a", EventKind::FactCreated, "e1", None, "deploy watcher fact")
+                .unwrap();
+        }
+        let hit = r#"{"prompt":"deploy watcher","cwd":"x","session_id":"slide-1"}"#;
+        let miss = r#"{"prompt":"completely unrelated xyzzy topic","cwd":"x","session_id":"slide-1"}"#;
+        assert!(injection_for_hook_json(&db, hit).is_some(), "prompt 1 injects");
+        assert!(injection_for_hook_json(&db, hit).is_none(), "immediate repeat suppressed");
+        for _ in 0..SUPPRESS_WINDOW {
+            assert!(injection_for_hook_json(&db, miss).is_none(), "unrelated prompts are silent");
+        }
+        assert!(
+            injection_for_hook_json(&db, hit).is_some(),
+            "after {} hitless prompts the window has slid and the fact re-injects",
+            SUPPRESS_WINDOW
         );
     }
 

@@ -140,14 +140,34 @@ fn content_tokens(text: &str) -> Vec<String> {
     chosen
 }
 
+/// Fold common Latin diacritics to ASCII, mirroring what FTS5's default
+/// unicode61 tokenizer (remove_diacritics=1) does at index time. Without this,
+/// a hit FTS legitimately matched on "privé" vs "prive" would be miscounted by
+/// the coverage gate and silenced - a real regression for a Dutch/EN store.
+fn fold_diacritics(s: &str) -> String {
+    s.chars()
+        .map(|c| match c {
+            'á' | 'à' | 'â' | 'ä' | 'ã' | 'å' => 'a',
+            'ç' => 'c',
+            'é' | 'è' | 'ê' | 'ë' => 'e',
+            'í' | 'ì' | 'î' | 'ï' => 'i',
+            'ñ' => 'n',
+            'ó' | 'ò' | 'ô' | 'ö' | 'õ' | 'ø' => 'o',
+            'ú' | 'ù' | 'û' | 'ü' => 'u',
+            'ý' | 'ÿ' => 'y',
+            other => other,
+        })
+        .collect()
+}
+
 /// Coverage gate for OR-fallback hits: does `body` literally contain (word-
-/// boundary, case-insensitive, the FTS tokenization rule) at least
+/// boundary, case-insensitive, diacritics folded like FTS unicode61) at least
 /// min(2, #query-content-terms) DISTINCT content terms of `query`? A hit that
 /// matches only one word of a multi-word question is a coincidence, not an
 /// answer - the courier stays silent instead of injecting it confidently.
 pub fn covers_query(body: &str, query: &str) -> bool {
     let qterms: HashSet<String> =
-        content_tokens(query).iter().map(|t| t.to_lowercase()).collect();
+        content_tokens(query).iter().map(|t| fold_diacritics(&t.to_lowercase())).collect();
     if qterms.is_empty() {
         return false;
     }
@@ -155,9 +175,39 @@ pub fn covers_query(body: &str, query: &str) -> bool {
     let body_tokens: HashSet<String> = body
         .split(|c: char| !c.is_alphanumeric())
         .filter(|t| t.chars().count() >= 2)
-        .map(|t| t.to_lowercase())
+        .map(|t| fold_diacritics(&t.to_lowercase()))
         .collect();
     qterms.iter().filter(|t| body_tokens.contains(*t)).count() >= required
+}
+
+/// The normalized body prefix used for near-duplicate detection, shared by
+/// recall's collapse and the MCP remember refusal: whitespace-collapsed,
+/// lowercased, capped at DEDUP_PREFIX_CHARS - with any trailing
+/// `[memory/... ]` / `[repo file ...]` footer stripped first, so a stored
+/// typed fact (whose footer bleeds into a short body's prefix) still matches
+/// the same body offered without a footer.
+pub fn dedup_prefix(body: &str) -> String {
+    strip_footer(body)
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .to_lowercase()
+        .chars()
+        .take(DEDUP_PREFIX_CHARS)
+        .collect()
+}
+
+/// Strip a trailing single-line `[...]` metadata footer (the mimir/type/chunk
+/// convention: separated by a blank line, one bracketed line, nothing after).
+fn strip_footer(body: &str) -> &str {
+    let trimmed = body.trim_end();
+    if !trimmed.ends_with(']') {
+        return body;
+    }
+    match trimmed.rfind("\n\n[") {
+        Some(i) if !trimmed[i + 2..].contains('\n') => &body[..i],
+        _ => body,
+    }
 }
 
 /// Build a safe FTS5 MATCH query (content tokens OR-ed, each double-quoted so
@@ -242,15 +292,7 @@ fn collect_heads(
         }
         // Near-duplicate collapse: skip a body whose normalized prefix duplicates
         // an already-kept hit, freeing the slot for distinct content.
-        let prefix: String = ev
-            .body
-            .split_whitespace()
-            .collect::<Vec<_>>()
-            .join(" ")
-            .to_lowercase()
-            .chars()
-            .take(DEDUP_PREFIX_CHARS)
-            .collect();
+        let prefix = dedup_prefix(&ev.body);
         if seen_prefixes.iter().any(|p| *p == prefix) {
             continue;
         }
@@ -443,6 +485,13 @@ const FUSION_POOL: usize = 200;
 #[cfg(feature = "semantic")]
 const DENSE_TOPM: usize = 64;
 
+/// Minimum cosine for a fused hit to count as SEMANTIC evidence (matched_and).
+/// Below it, a hit that also failed the AND pass is a lexical coincidence and
+/// stays subject to the courier's coverage gate. Conservative for a MiniLM-class
+/// embedder, where genuinely related pairs sit well above this.
+#[cfg(feature = "semantic")]
+const DENSE_EVIDENCE_MIN: f64 = 0.30;
+
 /// Cosine of two unit-norm vectors (a plain dot product, in f64 to avoid drift).
 #[cfg(feature = "semantic")]
 fn dot(a: &[f32], b: &[f32]) -> f64 {
@@ -524,6 +573,7 @@ fn finalize_heads(
     by_seq: &HashMap<i64, &Event>,
     heads: &HashMap<String, crate::cas::HeadSet>,
     filter: &ScopeFilter,
+    strong: &HashSet<i64>,
     limit: usize,
 ) -> Vec<RecallHit> {
     let mut hits: Vec<RecallHit> = Vec::new();
@@ -547,15 +597,7 @@ fn finalize_heads(
         if !seen.insert(ev.this_hash.clone()) {
             continue;
         }
-        let prefix: String = ev
-            .body
-            .split_whitespace()
-            .collect::<Vec<_>>()
-            .join(" ")
-            .to_lowercase()
-            .chars()
-            .take(DEDUP_PREFIX_CHARS)
-            .collect();
+        let prefix = dedup_prefix(&ev.body);
         if seen_prefixes.contains(&prefix) {
             continue;
         }
@@ -569,9 +611,10 @@ fn finalize_heads(
             rank,
             project: filter.projects.get(&ev.entity_id).cloned().flatten(),
             fact_type: crate::repo::fact_type(&ev.body),
-            // The fused path carries its own (semantic) evidence; the OR-fallback
-            // coverage gate is a pure-bm25 concern and never applies here.
-            matched_and: true,
+            // Per-hit evidence: an AND-pass match or real dense (cosine) support.
+            // A one-word OR coincidence with ~0 cosine must NOT claim strength,
+            // or the courier's silence gate is bypassed on semantic builds.
+            matched_and: strong.contains(&seq),
         });
         if hits.len() >= limit {
             break;
@@ -624,6 +667,16 @@ pub fn recall_fused_scoped(
     };
     let bm_rank: HashMap<i64, f64> = lexical.iter().copied().collect();
 
+    // Evidence set for matched_and: the seqs that matched the WHOLE question
+    // (strict AND pass). Dense (cosine) evidence is added below once computed.
+    let mut strong: HashSet<i64> = match fts_query_and(query) {
+        Some(aq) => lexical_head_pool(store, &aq, &by_seq, &heads, &filter, FUSION_POOL)
+            .into_iter()
+            .map(|(s, _)| s)
+            .collect(),
+        None => HashSet::new(),
+    };
+
     // Dense leg: brute-force the query cosine over EVERY stored vector, keep the
     // top-M. Real dense retrieval (not a pool rerank), so a paraphrase gold with
     // no lexical overlap is reachable. An empty/absent sidecar leaves this empty.
@@ -649,6 +702,14 @@ pub fn recall_fused_scoped(
         .collect();
     dense.sort_by(|a, b| b.1.total_cmp(&a.1).then(a.0.cmp(&b.0)));
     dense.truncate(DENSE_TOPM);
+    // Dense evidence: a candidate whose cosine clears the floor genuinely
+    // resembles the query in meaning - that (or an AND match) is what lets a
+    // hit bypass the courier's OR-coincidence coverage gate.
+    for (s, c) in &dense {
+        if *c >= DENSE_EVIDENCE_MIN {
+            strong.insert(*s);
+        }
+    }
 
     // Union of the two candidate sets, de-duplicated, in a DETERMINISTIC order:
     // lexical hits first (rank order), then dense-only hits (cosine order). Never
@@ -703,6 +764,7 @@ pub fn recall_fused_scoped(
         &by_seq,
         &heads,
         &filter,
+        &strong,
         limit,
     ))
 }
@@ -869,6 +931,29 @@ mod tests {
         assert!(!covers_query("unrelated text", "deploy"));
         // stopword-only query -> no content terms -> never covers
         assert!(!covers_query("anything", "de het een"));
+    }
+
+    #[test]
+    fn test_covers_query_folds_diacritics_like_fts() {
+        // FTS unicode61 (remove_diacritics=1) matches "privé" against "prive";
+        // the coverage gate must count that match instead of silencing it.
+        assert!(covers_query(
+            "sync faalt op prive paden",
+            "waarom crasht de sync bij privé bestanden"
+        ));
+        assert!(covers_query("een privé café", "privé café"));
+    }
+
+    #[test]
+    fn test_dedup_prefix_strips_metadata_footer() {
+        let plain = "GOTCHA: never open the db over SMB";
+        let typed = "GOTCHA: never open the db over SMB\n\n[memory/gotcha | tags: db | project: P]";
+        assert_eq!(dedup_prefix(plain), dedup_prefix(typed), "footer must not defeat duplicate detection");
+        let chunk = "port: 8080\n\n[repo file | P/conf.yml | chunk 1/1]";
+        assert_eq!(dedup_prefix(chunk), dedup_prefix("port: 8080"));
+        // a mid-body bracket line followed by more text is NOT a footer
+        let not_footer = "text\n\n[note] more\ntext after";
+        assert!(dedup_prefix(not_footer).contains("more"));
     }
 
     #[test]
@@ -1042,6 +1127,37 @@ mod fused_tests {
         assert_eq!(hits.len(), 1, "the current head must not be starved by superseded revs");
         assert_eq!(hits[0].rev, parent, "the surviving hit is the current head");
         assert!(hits[0].body.contains(&format!("v{}", FUSION_POOL + 10)));
+    }
+
+    #[test]
+    fn test_fused_matched_and_reflects_real_evidence() {
+        // A one-word OR coincidence with ~0 cosine must NOT claim matched_and
+        // (else the courier's silence gate is bypassed on semantic builds);
+        // an AND match or a high-cosine dense hit MUST claim it.
+        let mut store = EventStore::in_memory().unwrap();
+        let weak = store
+            .append_event("s", "l", "a", EventKind::FactCreated, "e1", None, "the sync module ships batches")
+            .unwrap();
+        let dense_gold = store
+            .append_event("s", "l", "a", EventKind::FactCreated, "e2", None, "resident model stays warm")
+            .unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let mut vecs = VectorStore::open(&dir.path().join("v.db")).unwrap();
+        // e1: no semantic relation to the query; e2: perfectly aligned
+        vecs.upsert_batch(&[(weak.seq, axis(-1.0)), (dense_gold.seq, axis(1.0))]).unwrap();
+
+        // multi-word query where only "sync" matches e1 lexically, nothing matches e2
+        let hits = recall_fused(&store, "ga verder met de sync refactor", &axis(1.0), &vecs, 5, 1.5).unwrap();
+        let h1 = hits.iter().find(|h| h.entity_id == "e1").expect("lexical hit present");
+        assert!(!h1.matched_and, "a one-word OR coincidence with no cosine support is weak evidence");
+        let h2 = hits.iter().find(|h| h.entity_id == "e2").expect("dense hit present");
+        assert!(h2.matched_and, "a high-cosine dense hit carries real semantic evidence");
+
+        // whole-question lexical match -> strong via the AND set (zero query
+        // vector: cosine contributes nothing; the AND pass carries it)
+        let both = recall_fused(&store, "sync ships batches", &axis(0.0), &vecs, 5, 1.5).unwrap();
+        let h1 = both.iter().find(|h| h.entity_id == "e1").expect("hit present");
+        assert!(h1.matched_and, "an AND-pass match is strong evidence even without vectors");
     }
 
     #[test]

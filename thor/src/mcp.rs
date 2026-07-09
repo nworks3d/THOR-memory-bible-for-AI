@@ -155,18 +155,6 @@ pub struct BriefArgs {
     pub project: Option<String>,
 }
 
-/// Normalized body prefix for the near-duplicate check (same normalization as
-/// recall's near-duplicate collapse: whitespace-collapsed, lowercased, 120 chars).
-fn dup_prefix(body: &str) -> String {
-    body.split_whitespace()
-        .collect::<Vec<_>>()
-        .join(" ")
-        .to_lowercase()
-        .chars()
-        .take(120)
-        .collect()
-}
-
 /// Strip characters that would corrupt the `[memory/... | tags: ... | ...]`
 /// footer's field structure.
 fn footer_safe(s: &str) -> String {
@@ -268,12 +256,35 @@ impl ThorServer {
             if body.is_empty() {
                 return Err("a non-empty 'body' is required".to_string());
             }
+            let mint = match args.project {
+                Some(p) if p.eq_ignore_ascii_case("global") => None,
+                Some(p) => {
+                    // Same validation as init/reproject/ingest: a key with ':' or
+                    // '#' would mis-split the minted id and silently mis-scope
+                    // the fact (owner_project takes the prefix before the FIRST ':').
+                    crate::repo::validate_project_key(&p)?;
+                    Some(p)
+                }
+                None => server_project,
+            };
+            let entity_id = match args.entity_id.filter(|s| !s.is_empty()) {
+                // A caller-supplied id is used verbatim (its prefix defines scope).
+                Some(id) => id,
+                // A scoped memory is `<key>:mem-<uuid>`, global `mcp-<uuid>`.
+                None => crate::repo::memory_entity_id(mint.as_deref(), &Uuid::new_v4().to_string()),
+            };
             // Near-duplicate refusal: the store's hygiene must not depend on the
             // model remembering to recall first. Same normalization as recall's
-            // near-duplicate collapse, checked across every project (a duplicate
-            // is a duplicate wherever it lives).
-            let dups = recall_scoped(s, body, 3, &RecallScope::everything()).unwrap_or_default();
-            if let Some(dup) = dups.iter().find(|h| dup_prefix(&h.body) == dup_prefix(body)) {
+            // near-duplicate collapse (footer-stripped, so a typed fact's footer
+            // cannot defeat it), scoped to where the NEW fact will live - the
+            // same body deliberately stored for a different project is a
+            // legitimate write, not a duplicate.
+            let scope = RecallScope::current(crate::repo::owner_project(&entity_id).map(str::to_string));
+            let dups = recall_scoped(s, body, 3, &scope).unwrap_or_default();
+            if let Some(dup) = dups
+                .iter()
+                .find(|h| crate::recall::dedup_prefix(&h.body) == crate::recall::dedup_prefix(body))
+            {
                 return Err(format!(
                     "NOT stored: near-duplicate of {} (rev {}). Use revise(entity_id:\"{}\") to \
                      update it, mark(entity_id:\"{}\") if it just proved useful, or reword if it is \
@@ -284,17 +295,6 @@ impl ThorServer {
                     dup.entity_id
                 ));
             }
-            let mint = match args.project {
-                Some(p) if p.eq_ignore_ascii_case("global") => None,
-                Some(p) => Some(p),
-                None => server_project,
-            };
-            let entity_id = match args.entity_id.filter(|s| !s.is_empty()) {
-                // A caller-supplied id is used verbatim (its prefix defines scope).
-                Some(id) => id,
-                // A scoped memory is `<key>:mem-<uuid>`, global `mcp-<uuid>`.
-                None => crate::repo::memory_entity_id(mint.as_deref(), &Uuid::new_v4().to_string()),
-            };
             // Typed footer (the mimir-compatible format fact_type parsing reads
             // back), only when the caller passed a type or tags.
             let mut body = body.to_string();
@@ -732,6 +732,77 @@ mod tests {
         // a genuinely different fact still stores
         let ok = server.remember(Parameters(remember_args("an entirely different filament note"))).await;
         assert!(ok.starts_with("stored entity"), "{ok}");
+    }
+
+    #[tokio::test]
+    async fn test_remember_dup_check_survives_typed_footer_and_respects_scope() {
+        let (server, _d) = server_with(seed());
+        // store a SHORT typed fact (footer bleeds into a naive 120-char prefix)
+        let first = server
+            .remember(Parameters(RememberArgs {
+                body: "GOTCHA: never open the db over SMB".into(),
+                entity_id: None,
+                project: None,
+                fact_type: Some("gotcha".into()),
+                tags: Some(vec!["db".into()]),
+            }))
+            .await;
+        assert!(first.starts_with("stored entity"), "{first}");
+        // the exact same body again: the footer must NOT defeat the refusal
+        let dup = server
+            .remember(Parameters(RememberArgs {
+                body: "GOTCHA: never open the db over SMB".into(),
+                entity_id: None,
+                project: None,
+                fact_type: Some("gotcha".into()),
+                tags: None,
+            }))
+            .await;
+        assert!(dup.contains("NOT stored"), "typed footer must not defeat dup detection: {dup}");
+        // ...but the same body deliberately scoped to a PROJECT is a legitimate
+        // write (the global fact would surface there anyway, so THAT is refused;
+        // a fact living only in ProjA must be storable for ProjB).
+        let a = server
+            .remember(Parameters(RememberArgs {
+                body: "ProjA-only rule: pin the flux version".into(),
+                entity_id: None,
+                project: Some("ProjA".into()),
+                fact_type: None,
+                tags: None,
+            }))
+            .await;
+        assert!(a.starts_with("stored entity"), "{a}");
+        let b = server
+            .remember(Parameters(RememberArgs {
+                body: "ProjA-only rule: pin the flux version".into(),
+                entity_id: None,
+                project: Some("ProjB".into()),
+                fact_type: None,
+                tags: None,
+            }))
+            .await;
+        assert!(
+            b.starts_with("stored entity"),
+            "the same body for ANOTHER project is not a duplicate (ProjA's fact is out of ProjB's scope): {b}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_remember_validates_project_key() {
+        let (server, _d) = server_with(seed());
+        let out = server
+            .remember(Parameters(RememberArgs {
+                body: "a fact for a malformed key".into(),
+                entity_id: None,
+                project: Some("acme:widgets".into()),
+                fact_type: None,
+                tags: None,
+            }))
+            .await;
+        assert!(
+            out.contains("invalid project key"),
+            "a ':' in the key would silently mis-scope the fact (owner = prefix before FIRST ':'): {out}"
+        );
     }
 
     #[tokio::test]

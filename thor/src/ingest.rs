@@ -124,10 +124,7 @@ pub fn ingest_repos(
                     continue;
                 }
             };
-            if text.chars().count() > repo::MAX_FILE_CHARS {
-                let cut =
-                    text.char_indices().nth(repo::MAX_FILE_CHARS).map(|(i, _)| i).unwrap_or(text.len());
-                text.truncate(cut);
+            if repo::truncate_to_max_file_chars(&mut text) {
                 stats.skipped_big += 1;
             }
             let chunks = repo::chunk_text(&text, repo::MAX_CHUNK_CHARS);

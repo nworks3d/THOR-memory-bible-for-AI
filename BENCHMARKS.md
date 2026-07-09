@@ -3,9 +3,13 @@
 An honest, measured comparison of THOR against
 [mimir](https://github.com/MakerViking/mimir) on the same machine. Every number
 below is measured; nothing is invented, and the weaknesses are listed in full.
-Every test was re-measured fresh on 2026-07-09 (evening), on the post-improvement
-build, with an independent blind jury - no number below is carried over from an
-earlier run.
+Every test was re-measured fresh on 2026-07-10, on the post-improvement build,
+with an independent blind jury - no number below is carried over from an
+earlier run. Before measuring, BOTH stores got a hygiene pass: THOR's store was
+cleaned with its own stewardship tools (duplicate doc-chunks retracted,
+mis-scoped facts reprojected, dual-write twins deduplicated, fsck green), and
+mimir was given the one project it previously had no documentation for - so
+every number below is a fair fight, not a coverage accident.
 
 ![THOR vs mimir - coverage, quality, drift and speed](assets/benchmark.svg)
 
@@ -46,32 +50,33 @@ earlier 504-question set that was dominated by code-only questions.
 
 | category | THOR | mimir |
 |---|---:|---:|
-| code-structure | 53.0% | 53.0% |
-| code-behavior | **70.8%** | 53.3% |
-| doc-reference | **65.0%** | 53.8% |
-| config how-to | **82.4%** | 76.5% |
-| gotcha | 69.6% | **71.7%** |
-| decision | **72.2%** | 61.1% |
-| **overall (n=200)** | **67.8%** | **58.5%** |
+| code-structure | **62.1%** | 51.5% |
+| code-behavior | **71.7%** | 52.5% |
+| doc-reference | **73.8%** | 60.0% |
+| config how-to | **79.4%** | 73.5% |
+| gotcha | 71.7% | **73.9%** |
+| decision | **64.8%** | 61.1% |
+| **overall (n=200)** | **70.2%** | **59.2%** |
 
-THOR leads overall and in most categories; mimir edges the gotcha category and
-ties code-structure. The earlier headline gap (67% vs 38% on the 504-set) was
-mostly coverage over code-only questions - this balanced set is the fairer
-picture, and THOR still leads by ~9 points.
+THOR leads overall and in five of six categories; mimir edges the gotcha
+category. The earlier headline gap (67% vs 38% on the 504-set) was mostly
+coverage over code-only questions - this balanced set is the fairer picture,
+and THOR leads by ~11 points.
 
 ## Test 2 - Same knowledge (118 facts both systems have)
 
 The fair, apples-to-apples comparison: only questions whose source fact is a
 dual-written memory or a doc chunk **both** stores hold.
 
-**Overall (n=118): THOR 64.8% vs mimir 56.8%** - on the broad shared set THOR
-leads by +8 points, thanks to score-fusion plus the query-routed class prior
-(knowledge-phrased questions now give hand-written facts a small edge over the
-wall of same-topic code chunks). **On the strictest cut - only dual-written
+**Overall (n=118): THOR 63.6% vs mimir 57.6%** - on the broad shared set THOR
+leads by +6 points, thanks to score-fusion plus the query-routed class prior
+(knowledge-phrased questions give hand-written facts a small edge over the wall
+of same-topic code chunks). **On the strictest cut - only dual-written
 memories, where there is zero doubt both stores have the fact (n=53) - mimir
-still wins, 94.3% vs 90.6%, but the gap closed from ~7.5 points to ~3.7.** Pure
-memory recall over a small, clean set of hand-written notes remains mimir's home
-turf; the ranking round moved THOR most of the way there.
+wins, 94.3% vs 87.7%.** Pure memory recall over a small, clean set of
+hand-written notes remains mimir's home turf, consistently across runs
+(94.3-89.6 vs 90.6-82.1 over three fresh juries); THOR's breadth is the
+counterweight, not a substitute.
 
 ## Test 3 - Multi-project (three private project repos seeded)
 
@@ -85,20 +90,19 @@ the project's working dir); the top-5 retrieved chunks were pulled in full and j
 
 | project | THOR | mimir |
 |---|---:|---:|
-| Project 1 | 87% | **97%** |
-| Project 2 | **100%** | 0% |
-| Project 3 | **97%** | 80% |
-| **overall (n=45)** | **94.4%** | **58.9%** |
+| Project 1 | 93% | **97%** |
+| Project 2 | **100%** | 93% |
+| Project 3 | **97%** | 77% |
+| **overall (n=45)** | **96.7%** | **88.9%** |
 
-**THOR wins overall (94% vs 59%) and dominates where it uniquely holds the code** -
-Project 2 has no mimir doc collection at all (its store holds only tangential
-notes about the project), and on Project 3 THOR's full source beats mimir's
-docs-only view. **mimir still wins Project 1, 97% vs 87%**: those questions lean
-on hand-curated architecture/bring-up docs that mimir indexes as a clean
-collection. The gap there closed from 26 points to 10 after the ranking round
-(the class prior stops code chunks from crowding out the docs). This remains the
-honest complementary strength: a curated doc collection can out-retrieve raw
-source ingest on design questions.
+Before this run mimir was deliberately GIVEN Project 2's documentation (it
+previously had none there and scored 0% - a coverage accident, not a ranking
+result). On the level playing field THOR still wins overall (97% vs 89%) and
+takes Project 2 (100% vs 93%) and Project 3 (97% vs 77%, where full source
+ingest beats a docs-only view). **mimir still edges Project 1, 97% vs 93%**:
+hand-curated architecture/bring-up docs remain a strong retrieval substrate -
+but the gap has closed from 26 points to 3 over two improvement rounds (density
+snippets + the class prior stop code chunks from crowding the docs out).
 
 ## Session drift compensation (73 scenarios, 3-way)
 
@@ -114,21 +118,20 @@ tool serves), and mimir searching **every** project (`--all`, its best case).
 
 | metric | THOR courier (as-deployed) | THOR recall (deliberate) | mimir (--all) |
 |---|---:|---:|---:|
-| preventer surfaced (>=partial) | 50.7% | **60.3%** | 53.4% |
-| clear catch (fully surfaced) | 19.2% | 39.7% | **43.8%** |
+| preventer surfaced (>=partial) | **72.6%** | 67.1% | 58.9% |
+| clear catch (fully surfaced) | **53.4%** | 43.8% | 43.8% |
 
-The honest reading: on prompt-only association THOR's deliberate recall surfaces
-the preventer most often, but **mimir fully catches it more often than either
-THOR channel** on this fresh, stricter jury - and THOR's as-deployed courier
-pays a real price for its noise gates (the same gates that keep everyday
-injection quiet filter out weakly-associated preventers). Prompt-association is
-no longer THOR's primary drift mechanism, and this table deliberately does not
-credit the channels built for exactly this window: **pinned rules** re-inject in
-full after every compaction by construction, and the **file-touch guard**
-surfaces file-naming constraints at the moment of action (8/8 on the committed
-drift corpus - see `cargo run --example drift_eval`, the in-repo reproducible
-measurement). Those channels bypass ranking instead of improving it, which is
-why they are reported separately instead of blended into this table.
+The as-deployed courier now leads BOTH metrics - one improvement round earlier
+it caught only 19.2%, losing to mimir's 43.8%. What changed is instructive: not
+ranking, but presentation and hygiene. The snippet window is now chosen for
+maximum query-term density (the details usually sit past the first match) and
+slot 1 gets a wide window; the store was deduplicated; and a harness bug that
+let a previous run's suppression ledger rotate the measured injections was
+fixed. The channels built for the post-compaction window on top of this -
+**pinned rules** (re-injected in full by construction) and the **file-touch +
+command guards** (fired at the moment of action, 14/14 surfaced on the
+committed corpus incl. six command-class scenarios) - are reported via the
+in-repo reproducible measurement: `cargo run --example drift_eval`.
 
 ## Speed and cost
 
@@ -137,17 +140,16 @@ same (long, realistic task-prompt) query set for both, same machine:
 
 | | THOR | mimir |
 |---|---:|---:|
-| latency (warm, median) | **268 ms** | 505 ms |
+| latency (warm, median) | **145 ms** | 238 ms |
 | tokens injected / prompt (same set) | **~351** | ~845 |
 | resident RAM | ~570 MB (semantic daemon) / **0** (bm25 default) | ~700 MB observed |
 
-THOR is **~1.9x faster** per prompt on this set - a single native binary with no
-wrapper process - while injecting **~2.4x fewer tokens** (three tight snippets
-against mimir's longer bodies). Both are slower here than on the earlier
-short-query set (83 vs 254 ms then): the drift task prompts are long, which
-costs both systems; the ratio is what carries. THOR's default bm25 mode needs no
-resident process at all; the optional semantic mode keeps a warm ~570 MB
-embedder resident.
+THOR is **~1.6x faster** per prompt on this set - a single native binary with no
+wrapper process - while injecting **~2.4x fewer tokens** (tight density-chosen
+snippets against mimir's longer bodies). Absolute numbers move with prompt
+length and machine load between runs (83-268 ms observed across sets); the
+ratio is what carries. THOR's default bm25 mode needs no resident process at
+all; the optional semantic mode keeps a warm ~570 MB embedder resident.
 
 ## What each is built for (structural)
 
@@ -167,17 +169,18 @@ embedder resident.
   same index auto-recall searches, so a code question is answered automatically at
   the prompt. mimir keeps code in a separate graph you must call by hand - great
   for "which functions call X", but it never fires at a session boundary.
-- **It ranks better on equal footing (score-fusion + class prior).** THOR fuses
-  lexical bm25 with a dense multilingual embedding, and routes knowledge-phrased
-  questions toward hand-written facts. That is the +8 points on the broad shared
-  set in Test 2, where coverage is held equal - though on the strictest
-  dual-written cut mimir still edges ahead (its home turf, gap now ~3.7 points).
-- **It compensates for session drift by construction, not only by ranking.**
-  Pinned rules come back in full after every compaction, and the file-touch
-  guard fires at the moment of action (8/8 on the committed corpus). On pure
-  prompt-association the fresh jury scores mimir's full-catch higher - see the
-  drift table for the honest split.
-- **It is faster and lighter to run.** ~1.9x lower per-prompt latency as a single
+- **It ranks better on equal footing (score-fusion + class prior + density
+  snippets).** THOR fuses lexical bm25 with a dense multilingual embedding,
+  routes knowledge-phrased questions toward hand-written facts, and cuts its
+  snippets where the query terms cluster. That is the +6 points on the broad
+  shared set in Test 2, where coverage is held equal - though on the strictest
+  dual-written cut mimir stays ahead (its home turf).
+- **It compensates for session drift on every channel.** The as-deployed
+  auto-injection now surfaces the drift-preventing fact more often than mimir
+  at its best (72.6% vs 58.9%) and fully catches it more often (53.4% vs
+  43.8%) - and the pins + file-touch/command guards cover the windows
+  prompt-association cannot reach, by construction.
+- **It is faster and lighter to run.** ~1.6x lower per-prompt latency as a single
   binary, injecting ~2.4x fewer tokens; the default mode holds no resident process.
 - **It never loses a write.** Every fact is an event in a hash-chained append-only
   log; a conflicting edit branches (both heads kept and surfaced) instead of
@@ -187,15 +190,12 @@ embedder resident.
 
 ## Honest weaknesses
 
-- **On the strictest dual-written cut mimir wins (94.3% vs 90.6%).** Pure memory
-  recall over a small, clean set of hand-written notes is mimir's home turf; the
-  ranking round narrowed the gap (from ~7.5 to ~3.7 points) but did not close it.
-- **On prompt-only drift association mimir's full-catch is higher (43.8% vs
-  39.7% deliberate / 19.2% as-deployed).** THOR's noise gates cost catch on the
-  auto-injection channel; its drift answer is structural (pins + file-touch
-  guard), which this test deliberately does not blend in.
-- **mimir wins the curated-docs project (97% vs 87%).** A clean, hand-curated
-  doc collection still out-retrieves raw source ingest on design questions.
+- **On the strictest dual-written cut mimir wins (94.3% vs 87.7%).** Pure memory
+  recall over a small, clean set of hand-written notes is mimir's home turf,
+  consistently across three fresh juries.
+- **mimir edges the gotcha category (73.9% vs 71.7%) and the curated-docs
+  project (97% vs 93%).** A clean, hand-curated doc collection remains a strong
+  retrieval substrate on design questions.
 - **No code-symbol graph.** For "which functions call X" mimir routes to a symbol
   graph; THOR chunks source directly (which is why it wins the code categories
   here) but has no graph queries.
@@ -207,7 +207,9 @@ embedder resident.
   exact numbers are not independently reproducible from this repo (the drift
   mechanism IS reproducible in-repo via `examples/drift_eval.rs` and its
   committed synthetic corpus). Jury strictness moves absolute numbers between
-  runs; every number in this document comes from one fresh 2026-07-09 run.
+  runs (the dual-written cut swung 82-91% for THOR across three juries); every
+  number in this document comes from one fresh 2026-07-10 run, measured after a
+  store-hygiene pass and with the harness's session-ledger leak fixed.
 
 ## Method
 
@@ -225,4 +227,7 @@ embedder resident.
   written by an agent reading each repo (ground truth, not THOR's store), both
   systems scoped to the project, top-5 full chunks. Drift = 73 fresh-session
   task prompts built from the store's gotchas and decisions, three channels
-  measured per scenario. Numbers are the measured aggregates.
+  measured per scenario; scenarios without a home project run PROJECTLESS on
+  both systems (a neutral working directory). Before measuring: a store-hygiene
+  pass (dedup, retract, rescope, fsck) and no store writes between hit
+  generation and judging. Numbers are the measured aggregates.

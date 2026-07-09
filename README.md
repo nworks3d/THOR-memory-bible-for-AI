@@ -104,16 +104,17 @@ for "which functions call X". THOR chunks source into recall instead. See
 ## Benchmarks
 
 A blind, judged head-to-head against [mimir](https://github.com/MakerViking/mimir),
-re-measured fresh on 2026-07-09 with an independent jury: **coverage** 67.8% vs
-58.5% on a 200-question balanced set, **same-knowledge quality** 64.8% vs 56.8%
-on the 118 facts both stores hold (mimir still wins the strict dual-written cut,
-94.3% vs 90.6% - the gap halved after the ranking round), **multi-project** 94%
-vs 59% across three seeded repos (mimir's curated design docs still win one
-project, 97% vs 87%), ~1.9x lower latency at ~2.4x fewer injected tokens. On
-prompt-only drift association mimir's full-catch is higher (43.8% vs 39.7%) -
-THOR's drift answer is structural (pins + file-touch guard, measured by the
-in-repo drift eval below), not ranking alone. Full method, per-category tables
-and honest weaknesses in [BENCHMARKS.md](BENCHMARKS.md).
+re-measured fresh on 2026-07-10 with an independent jury, after a store-hygiene
+pass on THOR and after deliberately giving mimir the one project it lacked
+documentation for: **coverage** 70.2% vs 59.2% on a 200-question balanced set,
+**same-knowledge quality** 63.6% vs 57.6% on the 118 facts both stores hold
+(mimir keeps the strict dual-written cut, 94.3% vs 87.7% - its home turf),
+**multi-project** 96.7% vs 88.9% on the level playing field (mimir's curated
+docs still edge one project, 97% vs 93%), **session drift** now THOR-led on
+both metrics (as-deployed injection surfaces the preventing fact 72.6% vs
+58.9%, full catch 53.4% vs 43.8%), at ~1.6x lower latency and ~2.4x fewer
+injected tokens. Full method, per-category tables and honest weaknesses in
+[BENCHMARKS.md](BENCHMARKS.md).
 
 Drift compensation is also measurable IN-REPO, no judge needed: `cargo run
 --example drift_eval` replays a committed synthetic corpus

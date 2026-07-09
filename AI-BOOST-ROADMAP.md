@@ -26,8 +26,20 @@ In priority order:
    `cargo test --features semantic` (the cloud environment could not download
    the onnxruntime binaries), install the new binary + hooks, **replace the old
    live MCP server** (still a create-only, unscoped build — verified live), and
-   pin the standing rules (at minimum the WAL/NAS gotcha and the
-   source-of-truth rule).
+   pin the standing rules:
+
+   ```sh
+   thor recall "<your standing rule>"   # find the entity id
+   thor pin <entity_id>                 # repeat per rule
+   thor pin --list                      # verify
+   ```
+
+   What to pin: few (the brief caps at 8 lines), stable, and costly-if-
+   forgotten — behavioral rules and dangerous gotchas, not trivia. The
+   concrete per-rule shortlist with store ids deliberately lives in the
+   PRIVATE memory store (note tagged `thor pin-shortlist`), never in this
+   public document. If the storage-safety gotcha ("never open thor.db over a
+   network share") is not in the store yet, `remember` it first, then pin it.
 2. **Reproducible drift eval** (`examples/drift_eval.rs` + a committed scenario
    corpus): makes the 39.7% full-catch falsifiable and is the measurement gate
    for everything below.

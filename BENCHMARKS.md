@@ -1,4 +1,4 @@
-# THOR vs mimir - the honest two-test picture
+# THOR vs mimir - the honest picture
 
 An honest, measured comparison of THOR against
 [mimir](https://github.com/MakerViking/mimir) on the same machine. Every number
@@ -75,25 +75,54 @@ catching paraphrases that lexical-only search misses. It is consistent with an
 independent, hand-curated 52-question set built to be answerable by both systems:
 **85.6% vs 74.0%**.
 
-## Session drift compensation (74 scenarios)
+## Test 3 - Multi-project (three private project repos seeded)
+
+After ingesting three private project repos into THOR - Project 1, Project 2, and
+Project 3 - each scoped and isolated, we asked whether both systems can answer real
+questions about *each* project. 15 questions per project (45 total) were written by
+an agent reading the repo itself (ground truth, **not** THOR's store), each with a
+gold answer. Both systems were scoped to the project (THOR `--project <key>`, mimir by
+the project's working dir); the top-5 retrieved chunks were pulled in full and judged
+**blind by a 3-judge majority** (the judge never knows which system is which).
+
+| project | THOR | mimir |
+|---|---:|---:|
+| Project 1 | 67% | **93%** |
+| Project 2 | **67%** | 0% |
+| Project 3 | **87%** | 67% |
+| **overall (n=45)** | **73.3%** | **53.3%** |
+
+**THOR wins overall (73% vs 53%) and dominates where it uniquely holds the code** -
+Project 2 has no mimir doc collection at all, and on Project 3 THOR's full source
+beats mimir's docs-only view. **But mimir wins Project 1, 93% vs 67%**: those
+questions lean on hand-curated architecture/bring-up docs that mimir indexes as a
+clean collection, while THOR - which holds the same docs mixed in with firmware
+source - ranks code above them. This is the honest complementary strength: a curated
+doc collection can out-retrieve raw source ingest on design questions. Isolation held
+throughout: **0 of 211 THOR retrievals came from a foreign project.**
+
+## Session drift compensation (72 scenarios, 3-way)
 
 This is what THOR is *for*: at the start of a fresh session (empty context, just
-after a compaction), does the automatic injection surface the one fact that stops
-the agent drifting into a mistake? Each scenario is a realistic task where an agent
-that has *forgotten* a gotcha or decision would violate it - and the prompt never
-names the constraint, so the memory must connect the task to it on its own.
+after a compaction), does the automatic top-3 injection surface the one fact that
+stops the agent drifting into a mistake? Each scenario is a realistic task where an
+agent that has *forgotten* a gotcha or decision would violate it - the prompt never
+names the constraint, so memory must connect the task to it on its own. Measured
+three ways: THOR scoped to the project (its default), THOR unscoped, and mimir
+searching **every** project (`--all`, its best case - not scoped to a wrong project).
 
-| metric | THOR | mimir |
-|---|---:|---:|
-| preventer surfaced (0-2 avg) | **74.7%** | 45.9% |
-| clear catch (fully surfaced) | **54.8%** | 30.1% |
-| on gotchas | **76.4%** | 48.6% |
-| on decisions | **73.0%** | 43.2% |
+| metric | THOR (scoped) | THOR (unscoped) | mimir (--all) |
+|---|---:|---:|---:|
+| preventer surfaced (0-2 avg) | **74.3%** | 72.2% | 59.0% |
+| clear catch (fully surfaced) | **51.4%** | 47.2% | 34.7% |
+| on gotchas | **75.0%** | 75.0% | 61.1% |
+| on decisions | **73.6%** | 69.4% | 56.9% |
 
-At the drift moment THOR surfaces the drift-preventing fact **1.6x more often** and
-fully catches it **1.8x more often**. Both systems inject the same budget (top-3),
-so this is not a "more context" effect - it is better association between a task
-and the constraint that governs it.
+THOR surfaces the drift-preventing fact **~1.25x** more often than mimir at its best,
+and fully catches it **~1.5x** more often - both inject the same top-3 budget, so this
+is better task-to-constraint association, not "more context". Project scoping helps
+here too (74.3% vs 72.2% unscoped): with fewer other-project distractors competing for
+the three slots, the right preventer lands more often.
 
 ## Speed and cost
 
@@ -155,10 +184,11 @@ embedder resident.
 - **Semantic mode has a cost.** It needs a ~235 MB model file plus a ~570 MB warm
   daemon (client-only, **off by default**; recall degrades cleanly to bm25).
 - **Maturity.** THOR is new; mimir is battle-tested in daily use.
-- **Measurement caveats.** One machine, a single judge per question, and a private
-  corpus - so these exact numbers are not independently reproducible from this
-  repo. The auto-generated 500-set has noisier per-question ground truth than the
-  hand-curated 52-set (reported alongside it for exactly that reason).
+- **Measurement caveats.** One machine, LLM judging (Test 3 by a 3-judge majority,
+  Tests 1-2 single-judge), and a private corpus - so these exact numbers are not
+  independently reproducible from this repo. The auto-generated 500-set has noisier
+  per-question ground truth than the hand-curated 52-set and the Test 3 set (both
+  written from ground truth, reported for exactly that reason).
 
 ## Method
 
@@ -166,5 +196,8 @@ embedder resident.
   `mimir recall --json` for mimir; a blind A/B judge pass over both.
 - Latency: `thor courier` vs `mimir recall`, wall-clock, warm daemon, median.
 - Test 1 = 500 auto-generated questions over THOR's store. Test 2 = the subset
-  whose source fact both stores hold. Drift = 74 fresh-session task prompts built
-  from the store's gotchas and decisions. Numbers are the measured aggregates.
+  whose source fact both stores hold. Test 3 = 45 questions (15 per project) written
+  by an agent reading each repo (ground truth, not THOR's store), both systems scoped
+  to the project, top-5 full chunks judged blind by a 3-judge majority. Drift = 74
+  fresh-session task prompts built from the store's gotchas and decisions. Numbers are
+  the measured aggregates.

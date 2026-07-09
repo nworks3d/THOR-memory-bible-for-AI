@@ -66,6 +66,10 @@ pub enum EventKind {
     FactReasserted,
     FactEchoed,
     FactResolved,
+    /// Reassigns the fact's PROJECT scope (body = `{"project":"<key>"}` or
+    /// `{"project":null}` for global). Never changes the head-set; folded like a
+    /// no-op for heads, read only by the project fold (see cas::compute_projects).
+    FactReprojected,
 }
 
 impl EventKind {
@@ -78,6 +82,7 @@ impl EventKind {
             EventKind::FactReasserted => "fact_reasserted",
             EventKind::FactEchoed => "fact_echoed",
             EventKind::FactResolved => "fact_resolved",
+            EventKind::FactReprojected => "fact_reprojected",
         }
     }
 
@@ -90,6 +95,7 @@ impl EventKind {
             "fact_reasserted" => Some(EventKind::FactReasserted),
             "fact_echoed" => Some(EventKind::FactEchoed),
             "fact_resolved" => Some(EventKind::FactResolved),
+            "fact_reprojected" => Some(EventKind::FactReprojected),
             _ => None,
         }
     }

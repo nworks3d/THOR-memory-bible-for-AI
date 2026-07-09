@@ -94,6 +94,70 @@ enum Commands {
     },
     Recall {
         query: String,
+        /// Search every project, not just the current one + the global tier.
+        #[arg(long)]
+        all_projects: bool,
+        /// Scope to a specific project key (default: the current directory's project).
+        #[arg(long)]
+        project: Option<String>,
+    },
+    /// Ingest a folder's text files into the store as recall chunks, incrementally
+    /// (new -> create, changed -> revise, deleted -> retract). No path = the current
+    /// directory. A GIT repo reads tracked files only (`git ls-files`), so gitignored
+    /// secrets are never ingested; a plain NON-git folder is walked directly (dotfiles
+    /// and heavy dirs skipped - use it for loose docs folders, like mimir's non-git doc
+    /// collections). Chunk ids are `<project>:<rel>#<n>`, which is how recall keeps one
+    /// project from bleeding into another.
+    Ingest {
+        /// Folder path(s) to ingest (default: the current directory).
+        paths: Vec<PathBuf>,
+        /// Spawn detached and return at once (non-blocking; for SessionStart).
+        #[arg(long)]
+        detach: bool,
+        /// Ingest as GLOBAL cross-cutting knowledge (the `@global` tier, available in
+        /// every project) instead of scoping to this repo's own project.
+        #[arg(long)]
+        global: bool,
+        /// Force the PROJECT KEY for every ingested chunk instead of deriving it from
+        /// the folder (a `.thor` marker, else the basename). Pins a stable key when the
+        /// folder name differs from how you open the project (e.g. a backup/source folder
+        /// whose basename is not the project's key). Conflicts with --global.
+        #[arg(long, conflicts_with = "global")]
+        project: Option<String>,
+    },
+    /// Set up THOR for a project: write a `.thor` marker (a stable project key) and
+    /// ingest its tracked files. Makes the project "known" so SessionStart refreshes
+    /// it silently instead of prompting.
+    Init {
+        /// Project path (default: the current directory).
+        path: Option<PathBuf>,
+        /// Project key to write (default: the repo-root basename).
+        #[arg(long)]
+        key: Option<String>,
+    },
+    /// Reassign a fact's PROJECT scope (appends a fact_reprojected event; sync-safe).
+    Reproject {
+        /// The entity id to reproject (omit with --batch to read ids from stdin).
+        entity_id: Option<String>,
+        /// Reassign to this project key.
+        #[arg(long)]
+        project: Option<String>,
+        /// Make the fact global (cross-project). Mutually exclusive with --project.
+        #[arg(long)]
+        global: bool,
+        /// Read newline-separated entity ids from stdin instead of the argument.
+        #[arg(long)]
+        batch: bool,
+        /// Allow reprojecting a chunk-shaped id (normally managed by ingest).
+        #[arg(long)]
+        force: bool,
+    },
+    /// Backfill project scope for legacy unprefixed memories from their mimir import
+    /// footer (`... | project: <name> | ...`). Dry-run unless --apply.
+    BackfillProjects {
+        /// Actually append the reproject events (default: dry-run preview only).
+        #[arg(long)]
+        apply: bool,
     },
     Resolve {
         entity_id: String,
@@ -237,6 +301,18 @@ enum Commands {
     /// non-blocking - safe to run at SessionStart so the first prompt is already
     /// warm. A no-op on a bm25-only build.
     Warm,
+    /// SessionStart helper: refresh a KNOWN project (has a `.thor` marker) in the
+    /// background, or emit a `<thor-setup>` cue for an un-onboarded git project so
+    /// the agent offers to set it up. Prints nothing for a scratch dir. Run as a
+    /// SessionStart hook.
+    SessionStart,
+    /// List GLOBAL memories with no project signal added since the last review, so
+    /// the agent can propose reprojecting the project-specific ones. `--mark` records
+    /// that the current tip has been reviewed (advances the watermark).
+    ReviewScope {
+        #[arg(long)]
+        mark: bool,
+    },
 }
 
 /// Render the authoritative answer for one entity: its full head-set. A
@@ -365,9 +441,20 @@ pub fn run() -> Result<()> {
                 }
             }
         }
-        Commands::Recall { query } => {
+        Commands::Recall { query, all_projects, project } => {
             let store = EventStore::new(&db)?;
-            let hits = crate::recall::recall(&store, &query, 8)?;
+            // Scope: --all-projects = everything; --project <key> = that project +
+            // global; default = the current directory's project + global.
+            let scope = if all_projects {
+                crate::recall::RecallScope::everything()
+            } else if project.is_some() {
+                crate::recall::RecallScope::current(project)
+            } else {
+                crate::recall::RecallScope::current(
+                    std::env::current_dir().ok().and_then(|c| crate::repo::project_key(&c)),
+                )
+            };
+            let hits = crate::recall::recall_scoped(&store, &query, 8, &scope)?;
             if hits.is_empty() {
                 println!("No recall hits for: {}", query);
             } else {
@@ -375,9 +462,42 @@ pub fn run() -> Result<()> {
                     let short = &hit.rev[..hit.rev.len().min(8)];
                     let snip = crate::recall::snippet(&hit.body, 220, &query);
                     let diverged = if hit.is_diverged { " [DIVERGED]" } else { "" };
-                    println!("{} ({}{}): {}", hit.entity_id, short, diverged, snip);
+                    let tag = if crate::repo::is_global(hit.project.as_deref()) {
+                        "[global]".to_string()
+                    } else {
+                        format!("[proj:{}]", hit.project.as_deref().unwrap_or("?"))
+                    };
+                    println!("{} {} ({}{}): {}", tag, hit.entity_id, short, diverged, snip);
                 }
             }
+        }
+        Commands::Ingest { paths, detach, global, project } => {
+            let paths =
+                if paths.is_empty() { vec![std::env::current_dir()?] } else { paths };
+            // Validate a user-supplied key exactly like init/reproject, so a ':' or
+            // '#' can never mint a mis-scoped chunk id.
+            if let Some(k) = project.as_deref() {
+                crate::repo::validate_project_key(k).map_err(|e| anyhow::anyhow!(e))?;
+            }
+            // --global wins over --project (clap already rejects both together); an
+            // explicit --project pins a canonical key, else derive per folder.
+            let override_key: Option<String> =
+                if global { Some(crate::repo::GLOBAL_KEY.to_string()) } else { project };
+            if detach {
+                spawn_detached_ingest(&db, &paths, override_key.as_deref())?;
+            } else {
+                run_ingest(&db, &paths, override_key.as_deref())?;
+            }
+        }
+        Commands::Init { path, key } => {
+            let path = path.map(Ok).unwrap_or_else(std::env::current_dir)?;
+            run_init(&db, &path, key)?;
+        }
+        Commands::Reproject { entity_id, project, global, batch, force } => {
+            run_reproject(&db, entity_id, project, global, batch, force)?;
+        }
+        Commands::BackfillProjects { apply } => {
+            run_backfill_projects(&db, apply)?;
         }
         Commands::Resolve {
             entity_id,
@@ -559,8 +679,303 @@ pub fn run() -> Result<()> {
                 // the same SessionStart hook is harmless on any build.
             }
         }
+        Commands::SessionStart => {
+            if let Ok(cwd) = std::env::current_dir() {
+                if crate::repo::thor_marker_key(&cwd).is_some() {
+                    // known project: refresh its ingest in the background (non-blocking)
+                    let _ = spawn_detached_ingest(&db, &[cwd], None);
+                } else if let Some(key) = crate::repo::project_key(&cwd) {
+                    // a git project with no marker: ask before indexing anything
+                    println!(
+                        "<thor-setup>\nYou are in project '{}', not set up in THOR yet (no .thor \
+                         marker). Ask the user whether to set it up now with `thor init` (index its \
+                         tracked files), and decide which docs are GLOBAL (cross-cutting, available \
+                         in every project) versus project-specific. Do NOT index without the user's \
+                         OK. Propose as global by default: CLAUDE.md, dev-loop.md, START-HERE.md and \
+                         any conventions docs; keep source code project-scoped.\n</thor-setup>",
+                        key
+                    );
+                }
+                // scratch dir (project_key is None): print nothing.
+            }
+            // Scope-review nudge (independent of cwd, debounced once per window):
+            // surface no-signal global memories added since the last review so the
+            // agent can offer to reproject the project-specific ones.
+            if let Ok(store) = EventStore::new(&db) {
+                if let Ok(events) = store.get_all_events() {
+                    let wm = crate::review::read_watermark(&db);
+                    let cands = crate::review::candidates(&events, wm.reviewed_seq);
+                    let now = crate::review::now_secs();
+                    if !cands.is_empty() && now.saturating_sub(wm.prompted_at) >= crate::review::DEBOUNCE_SECS {
+                        println!(
+                            "<thor-scope-review>\n{} global memory(ies) were added without a project since the \
+                             last review. Run `thor review-scope` to list them, decide WITH THE USER which belong \
+                             to a project, `thor reproject <id> --project <key>` those (leave genuine globals), \
+                             then `thor review-scope --mark`. Do not reproject without the user's OK.\n</thor-scope-review>",
+                            cands.len()
+                        );
+                        crate::review::write_watermark(
+                            &db,
+                            crate::review::Watermark { reviewed_seq: wm.reviewed_seq, prompted_at: now },
+                        );
+                    }
+                }
+            }
+        }
+        Commands::ReviewScope { mark } => {
+            let store = EventStore::new(&db)?;
+            let events = store.get_all_events()?;
+            if mark {
+                let tip = crate::review::max_seq(&events);
+                crate::review::write_watermark(
+                    &db,
+                    crate::review::Watermark { reviewed_seq: tip, prompted_at: crate::review::now_secs() },
+                );
+                println!("scope review marked done up to seq {tip}");
+            } else {
+                let wm = crate::review::read_watermark(&db);
+                let cands = crate::review::candidates(&events, wm.reviewed_seq);
+                if cands.is_empty() {
+                    println!("no global memories to review (all attributed, or none new since the last review).");
+                } else {
+                    println!("{} global memory(ies) with no project signal since the last review:", cands.len());
+                    for (id, first, seq) in &cands {
+                        println!("  {} (seq {}): {}", id, seq, first);
+                    }
+                    println!(
+                        "\nReproject the project-specific ones: thor reproject <id> --project <key> \
+                         (leave genuine globals). Then run: thor review-scope --mark"
+                    );
+                }
+            }
+        }
     }
 
+    Ok(())
+}
+
+/// TTL for the ingest lock: a fresh lock means another ingest is in flight, so a
+/// second run (e.g. a rapid SessionStart) skips instead of racing the writer.
+const INGEST_LOCK_TTL: std::time::Duration = std::time::Duration::from_secs(30 * 60);
+
+/// Ingest repos into the store, then (semantic build) sync the vector sidecar so
+/// new chunks are searchable by meaning too. A lock keeps concurrent runs from
+/// piling up on the single writer; a stale lock (> TTL) is ignored.
+fn run_ingest(db: &Path, paths: &[PathBuf], project_override: Option<&str>) -> Result<()> {
+    let lock = db.with_file_name("thor-ingest.lock");
+    if let Ok(meta) = std::fs::metadata(&lock) {
+        let fresh = meta
+            .modified()
+            .ok()
+            .and_then(|m| m.elapsed().ok())
+            .map(|e| e < INGEST_LOCK_TTL)
+            .unwrap_or(false);
+        if fresh {
+            eprintln!("thor ingest: another ingest is in flight; skipping");
+            return Ok(());
+        }
+    }
+    let _ = std::fs::write(&lock, "");
+    let result = (|| -> Result<()> {
+        let mut store = EventStore::new(db)?;
+        let s = crate::ingest::ingest_repos(&mut store, paths, "repo-ingest", project_override)?;
+        let tag = match project_override {
+            Some(crate::repo::GLOBAL_KEY) => " [global]".to_string(),
+            Some(k) => format!(" [{}]", k),
+            None => String::new(),
+        };
+        println!(
+            "ingest{}: {} created, {} revised, {} unchanged, {} retracted ({} files; \
+             skipped {} binary, {} truncated{})",
+            tag,
+            s.created,
+            s.revised,
+            s.unchanged,
+            s.retracted,
+            s.files,
+            s.skipped_binary,
+            s.skipped_big,
+            if s.diverged_skipped > 0 {
+                format!(", {} diverged", s.diverged_skipped)
+            } else {
+                String::new()
+            },
+        );
+        #[cfg(feature = "semantic")]
+        if s.created + s.revised + s.retracted > 0 {
+            if let Err(e) = run_vectors(db, "sync", None, false) {
+                eprintln!(
+                    "thor ingest: vector sidecar sync skipped ({e}); recall still works via bm25"
+                );
+            }
+        }
+        Ok(())
+    })();
+    let _ = std::fs::remove_file(&lock);
+    result
+}
+
+/// Spawn `thor ingest <paths>` detached with null std handles so it outlives the
+/// SessionStart hook and never blocks prompt submission.
+fn spawn_detached_ingest(db: &Path, paths: &[PathBuf], project_override: Option<&str>) -> Result<()> {
+    let exe = std::env::current_exe()?;
+    let mut cmd = std::process::Command::new(exe);
+    cmd.arg("--db").arg(db).arg("ingest");
+    match project_override {
+        Some(crate::repo::GLOBAL_KEY) => {
+            cmd.arg("--global");
+        }
+        Some(k) => {
+            cmd.arg("--project").arg(k);
+        }
+        None => {}
+    }
+    for p in paths {
+        cmd.arg(p);
+    }
+    cmd.stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null());
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        const DETACHED_PROCESS: u32 = 0x0000_0008;
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        cmd.creation_flags(DETACHED_PROCESS | CREATE_NO_WINDOW);
+    }
+    cmd.spawn()?;
+    Ok(())
+}
+
+/// Resolve a path to an absolute, git-friendly root (canonicalize + strip Windows'
+/// verbatim prefix + walk up to the repo root).
+fn resolve_repo_root(path: &Path) -> PathBuf {
+    let abs = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+    let abs = crate::repo::clean_verbatim_prefix(&abs);
+    crate::repo::find_repo_root(&abs).unwrap_or(abs)
+}
+
+/// `thor init`: write a `.thor` marker (the stable project key) at the repo root,
+/// then ingest the project so it is immediately "known".
+fn run_init(db: &Path, path: &Path, key: Option<String>) -> Result<()> {
+    let root = resolve_repo_root(path);
+    let key = key
+        .or_else(|| root.file_name().and_then(|n| n.to_str()).map(|s| s.to_string()))
+        .ok_or_else(|| anyhow::anyhow!("cannot determine a project key for {}", root.display()))?;
+    crate::repo::validate_project_key(&key).map_err(|e| anyhow::anyhow!(e))?;
+    let marker = root.join(".thor");
+    std::fs::write(&marker, format!("{}\n", key))?;
+    println!("wrote {} (project key '{}')", marker.display(), key);
+    run_ingest(db, &[root], None)
+}
+
+/// `thor reproject`: append fact_reprojected event(s) that reassign scope. Sync-safe
+/// (the reassignment travels as an event); refuses chunk ids unless `--force`.
+fn run_reproject(
+    db: &Path,
+    entity_id: Option<String>,
+    project: Option<String>,
+    global: bool,
+    batch: bool,
+    force: bool,
+) -> Result<()> {
+    if global && project.is_some() {
+        anyhow::bail!("--global and --project are mutually exclusive");
+    }
+    let (body, target_desc) = if global {
+        (r#"{"project":null}"#.to_string(), "global".to_string())
+    } else if let Some(key) = project {
+        crate::repo::validate_project_key(&key).map_err(|e| anyhow::anyhow!(e))?;
+        (serde_json::json!({ "project": key }).to_string(), key)
+    } else {
+        anyhow::bail!("pass --project <key> or --global");
+    };
+    let ids: Vec<String> = if batch {
+        use std::io::BufRead;
+        std::io::stdin()
+            .lock()
+            .lines()
+            .map_while(std::result::Result::ok)
+            .map(|l| l.trim().to_string())
+            .filter(|l| !l.is_empty())
+            .collect()
+    } else {
+        match entity_id {
+            Some(id) => vec![id],
+            None => anyhow::bail!("pass an entity_id, or --batch to read ids from stdin"),
+        }
+    };
+    let mut store = EventStore::new(db)?;
+    let mut n = 0;
+    for id in &ids {
+        if crate::repo::is_chunk_id(id) && !force {
+            eprintln!("skip chunk-shaped id (managed by ingest; use --force to override): {}", id);
+            continue;
+        }
+        store.append_event("reproject", "reproject", "cli", EventKind::FactReprojected, id, None, &body)?;
+        n += 1;
+    }
+    println!("reprojected {} entit{} to {}", n, if n == 1 { "y" } else { "ies" }, target_desc);
+    Ok(())
+}
+
+/// Parse a mimir import footer's `| project: <name> |` field, if present.
+fn parse_mimir_footer_project(body: &str) -> Option<String> {
+    let idx = body.find("| project: ")?;
+    let rest = &body[idx + "| project: ".len()..];
+    let proj = rest.split(" |").next()?.trim();
+    (!proj.is_empty()).then(|| proj.to_string())
+}
+
+/// `thor backfill-projects`: attribute legacy unprefixed memories to the project
+/// named in their mimir import footer (deterministic, idempotent). Dry-run unless
+/// `apply`. Memories with no footer / a global footer stay global.
+fn run_backfill_projects(db: &Path, apply: bool) -> Result<()> {
+    let mut store = EventStore::new(db)?;
+    let events = store.get_all_events()?;
+    let heads = compute_head_sets(&events);
+    let projects = crate::cas::compute_projects(&events);
+    let by_rev: HashMap<&str, &Event> = events.iter().map(|e| (e.this_hash.as_str(), e)).collect();
+    let mut planned: Vec<(String, String)> = Vec::new();
+    for (eid, hs) in &heads {
+        // only unprefixed (global-born) entities with no existing project override
+        if crate::repo::owner_project(eid).is_some() {
+            continue;
+        }
+        if projects.get(eid).and_then(|o| o.as_deref()).is_some() {
+            continue;
+        }
+        if hs.heads.len() != 1 {
+            continue;
+        }
+        let ev = match hs.heads.iter().next().and_then(|rev| by_rev.get(rev.as_str())) {
+            Some(e) => *e,
+            None => continue,
+        };
+        if let Some(proj) = parse_mimir_footer_project(&ev.body) {
+            if proj != "global" {
+                planned.push((eid.clone(), proj));
+            }
+        }
+    }
+    if planned.is_empty() {
+        println!("backfill: nothing to attribute (no footers with a non-global project).");
+        return Ok(());
+    }
+    planned.sort();
+    println!("backfill: {} memor{} to reproject:", planned.len(), if planned.len() == 1 { "y" } else { "ies" });
+    for (eid, proj) in &planned {
+        println!("  {} -> {}", eid, proj);
+    }
+    if !apply {
+        println!("(dry-run; re-run with --apply to write the reprojections)");
+        return Ok(());
+    }
+    for (eid, proj) in &planned {
+        let body = serde_json::json!({ "project": proj }).to_string();
+        store.append_event("backfill", "backfill", "cli", EventKind::FactReprojected, eid, None, &body)?;
+    }
+    println!("backfill: applied {} reprojection(s).", planned.len());
     Ok(())
 }
 
@@ -646,6 +1061,55 @@ fn run_vectors(db: &Path, action: &str, model_dir: Option<PathBuf>, force: bool)
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn footer_parse() {
+        assert_eq!(
+            parse_mimir_footer_project(
+                "body\n\n[memory/gotcha | tags: x y | project: SomeProj | mimir:01K]"
+            ),
+            Some("SomeProj".to_string())
+        );
+        assert_eq!(
+            parse_mimir_footer_project("[... | project: global | mimir:z]"),
+            Some("global".to_string())
+        );
+        assert_eq!(parse_mimir_footer_project("no footer here"), None);
+    }
+
+    #[test]
+    fn reproject_flips_scope_and_backfill_from_footer() {
+        use crate::recall::{recall_scoped, RecallScope};
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("t.db");
+        {
+            let mut store = EventStore::new(&db).unwrap();
+            store
+                .append_event("s", "l", "a", EventKind::FactCreated, "mcp-widget", None, "the widget setting is blue")
+                .unwrap();
+            store
+                .append_event(
+                    "s", "l", "a", EventKind::FactCreated, "01KDEVICE", None,
+                    "device heater note\n\n[memory/gotcha | tags: firmware | project: SomeProj | mimir:01KDEVICE]",
+                )
+                .unwrap();
+        }
+        // reproject the global memory to ProjA; backfill the SomeProj memory from its footer
+        run_reproject(&db, Some("mcp-widget".into()), Some("ProjA".into()), false, false, false).unwrap();
+        run_backfill_projects(&db, true).unwrap();
+
+        let store = EventStore::new(&db).unwrap();
+        let in_scope = |q: &str, proj: &str| {
+            recall_scoped(&store, q, 5, &RecallScope::current(Some(proj.to_string()))).unwrap()
+        };
+        assert!(in_scope("widget setting", "ProjA").iter().any(|h| h.entity_id == "mcp-widget"), "reproject -> ProjA");
+        assert!(!in_scope("widget setting", "ProjB").iter().any(|h| h.entity_id == "mcp-widget"), "not in ProjB");
+        assert!(in_scope("device heater", "SomeProj").iter().any(|h| h.entity_id == "01KDEVICE"), "backfill -> SomeProj");
+        assert!(
+            !in_scope("device heater", "OtherProj").iter().any(|h| h.entity_id == "01KDEVICE"),
+            "the backfilled memory no longer bleeds into another project"
+        );
+    }
 
     #[test]
     fn test_render_get_single_head() {

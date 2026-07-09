@@ -119,6 +119,28 @@ pub fn run_install(
         ) {
             added.push("UserPromptSubmit (recall courier)");
         }
+        // The courier pairs with two SessionStart hooks: `warm` pre-warms the
+        // semantic embedder so the first prompt is fast, and `session-start`
+        // refreshes a known project's index in the background (or offers to set up
+        // a new one). Both are no-ops when not applicable, so they are safe to add.
+        let warm_cmd = cmd("warm");
+        if add(
+            hooks,
+            "SessionStart",
+            json!({ "hooks": [ { "type": "command", "command": warm_cmd } ] }),
+            &warm_cmd,
+        ) {
+            added.push("SessionStart (pre-warm embedder)");
+        }
+        let session_cmd = cmd("session-start");
+        if add(
+            hooks,
+            "SessionStart",
+            json!({ "hooks": [ { "type": "command", "command": session_cmd } ] }),
+            &session_cmd,
+        ) {
+            added.push("SessionStart (project refresh + onboarding cue)");
+        }
     }
 
     if let Some(repo) = backup_repo {
@@ -224,6 +246,16 @@ mod tests {
         // exactly one thor stop-guard, not two
         let n = twice["hooks"]["Stop"].as_array().unwrap().len();
         assert_eq!(n, 1, "re-running must not duplicate the Stop hook");
+        // with_courier also wires SessionStart warm + session-start, once each (idempotent)
+        let ss: Vec<String> = twice["hooks"]["SessionStart"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .flat_map(|g| g["hooks"].as_array().unwrap().iter())
+            .filter_map(|h| h["command"].as_str().map(String::from))
+            .collect();
+        assert_eq!(ss.iter().filter(|c| c.ends_with("warm")).count(), 1, "one warm hook");
+        assert_eq!(ss.iter().filter(|c| c.contains("session-start")).count(), 1, "one session-start hook");
     }
 
     #[test]

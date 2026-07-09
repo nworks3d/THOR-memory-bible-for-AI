@@ -14,6 +14,9 @@ pub struct RecallHit {
     pub is_diverged: bool,
     /// FTS5 bm25 rank (lower = better match).
     pub rank: f64,
+    /// The fact's effective project (`None` = the global tier). Lets the courier /
+    /// CLI label a hit `[global]` or `[proj:<key>]` so the agent knows its scope.
+    pub project: Option<String>,
 }
 
 /// A one-line preview of a fact body for display: whitespace collapsed to single
@@ -157,6 +160,7 @@ fn collect_heads(
     fts: &str,
     by_seq: &HashMap<i64, &Event>,
     heads: &HashMap<String, crate::cas::HeadSet>,
+    filter: &ScopeFilter,
     limit: usize,
 ) -> Vec<RecallHit> {
     let conn = store.conn();
@@ -188,6 +192,9 @@ fn collect_heads(
         };
         if !head_set.heads.contains(&ev.this_hash) {
             continue; // drop hits on revs that are no longer a current head
+        }
+        if !filter.keep(ev) {
+            continue; // out of project scope, or a retracted (non-live) head
         }
         if !seen.insert(ev.this_hash.clone()) {
             continue;
@@ -224,6 +231,7 @@ fn collect_heads(
             kind: ev.kind,
             is_diverged: head_set.is_diverged,
             rank,
+            project: filter.projects.get(&ev.entity_id).cloned().flatten(),
         });
         if hits.len() >= limit {
             break;
@@ -238,7 +246,67 @@ fn collect_heads(
 /// always reflects the authoritative head projection, never stale content.
 /// Fail-soft: a malformed FTS query or a query error yields an empty result,
 /// never an error the courier would have to handle.
-pub fn recall(store: &EventStore, query: &str, limit: usize) -> anyhow::Result<Vec<RecallHit>> {
+/// What recall may surface. The default (derived from the session cwd) is the
+/// CURRENT project + the always-in-scope global tier; `all_projects` widens to
+/// everything (an explicit cross-project search). A `None` project with
+/// `all_projects=false` = global-only (a scratch dir with no project).
+#[derive(Debug, Clone, Default)]
+pub struct RecallScope {
+    pub project: Option<String>,
+    pub all_projects: bool,
+}
+
+impl RecallScope {
+    /// No scoping: every project + global. Used by tests, the eval harness, and the
+    /// `recall`/`recall_fused` compatibility wrappers.
+    pub fn everything() -> Self {
+        RecallScope { project: None, all_projects: true }
+    }
+    /// Scope to a specific project (its facts + the global tier); `None` = global-only.
+    pub fn current(key: Option<String>) -> Self {
+        RecallScope { project: key, all_projects: false }
+    }
+    /// Whether a fact with the given EFFECTIVE project (None = global) is in scope.
+    fn allows(&self, effective: Option<&str>) -> bool {
+        if self.all_projects {
+            return true;
+        }
+        if crate::repo::is_global(effective) {
+            return true; // the global tier always surfaces
+        }
+        match &self.project {
+            Some(cur) => effective == Some(cur.as_str()),
+            None => false, // no current project -> global only
+        }
+    }
+}
+
+/// Bundles the per-entity effective-project map with the scope, plus the "a
+/// retracted head is not live" rule, so every candidate path filters identically
+/// with a single `keep(ev)` check.
+struct ScopeFilter<'a> {
+    projects: &'a HashMap<String, Option<String>>,
+    scope: &'a RecallScope,
+}
+
+impl ScopeFilter<'_> {
+    fn keep(&self, ev: &Event) -> bool {
+        if matches!(ev.kind, EventKind::FactRetracted) {
+            return false; // a retracted head is not live: never surface it
+        }
+        let effective = self.projects.get(&ev.entity_id).and_then(|o| o.as_deref());
+        self.scope.allows(effective)
+    }
+}
+
+/// Lexical bm25 recall over current heads, scoped to `scope` (global tier always;
+/// other projects only when matched, or under `all_projects`).
+pub fn recall_scoped(
+    store: &EventStore,
+    query: &str,
+    limit: usize,
+    scope: &RecallScope,
+) -> anyhow::Result<Vec<RecallHit>> {
     if limit == 0 {
         return Ok(vec![]);
     }
@@ -250,21 +318,29 @@ pub fn recall(store: &EventStore, query: &str, limit: usize) -> anyhow::Result<V
 
     // Head projection. M1a folds the whole log per call (O(n)); a materialized
     // heads table updated in the append tx is the M2 optimization. Loaded before
-    // the FTS cursor so the (owned) events/heads outlive the lazy iteration.
+    // the FTS cursor so the (owned) events/heads outlive the lazy iteration. The
+    // project fold rides the SAME pass over the events.
     let events = store.get_all_events()?;
     let by_seq: HashMap<i64, &Event> = events.iter().map(|e| (e.seq, e)).collect();
     let heads = compute_head_sets(&events);
+    let projects = crate::cas::compute_projects(&events);
+    let filter = ScopeFilter { projects: &projects, scope };
 
     // AND-first: prefer memories that match the WHOLE question over a single-word
     // coincidence; fall back to the OR query only when the strict pass finds no
     // head. collect_heads applies the relevance floor + near-duplicate collapse.
     if let Some(aq) = and_query {
-        let strict = collect_heads(store, &aq, &by_seq, &heads, limit);
+        let strict = collect_heads(store, &aq, &by_seq, &heads, &filter, limit);
         if !strict.is_empty() {
             return Ok(strict);
         }
     }
-    Ok(collect_heads(store, &or_query, &by_seq, &heads, limit))
+    Ok(collect_heads(store, &or_query, &by_seq, &heads, &filter, limit))
+}
+
+/// Unscoped bm25 recall (every project + global). Thin wrapper over `recall_scoped`.
+pub fn recall(store: &EventStore, query: &str, limit: usize) -> anyhow::Result<Vec<RecallHit>> {
+    recall_scoped(store, query, limit, &RecallScope::everything())
 }
 
 // ---- Semantic score-fusion recall (feature `semantic`) --------------------
@@ -325,6 +401,7 @@ fn lexical_head_pool(
     fts: &str,
     by_seq: &HashMap<i64, &Event>,
     heads: &HashMap<String, crate::cas::HeadSet>,
+    filter: &ScopeFilter,
     cap: usize,
 ) -> Vec<(i64, f64)> {
     let conn = store.conn();
@@ -354,6 +431,9 @@ fn lexical_head_pool(
         if !head_set.heads.contains(&ev.this_hash) {
             continue; // a superseded rev never counts toward the head budget
         }
+        if !filter.keep(ev) {
+            continue; // out of scope / retracted: never spends a pool slot
+        }
         if !seen.insert(ev.this_hash.clone()) {
             continue;
         }
@@ -375,6 +455,7 @@ fn finalize_heads(
     ordered: impl Iterator<Item = (i64, f64)>,
     by_seq: &HashMap<i64, &Event>,
     heads: &HashMap<String, crate::cas::HeadSet>,
+    filter: &ScopeFilter,
     limit: usize,
 ) -> Vec<RecallHit> {
     let mut hits: Vec<RecallHit> = Vec::new();
@@ -391,6 +472,9 @@ fn finalize_heads(
         };
         if !head_set.heads.contains(&ev.this_hash) {
             continue; // drop hits on revs that are no longer a current head
+        }
+        if !filter.keep(ev) {
+            continue; // out of project scope, or a retracted (non-live) head
         }
         if !seen.insert(ev.this_hash.clone()) {
             continue;
@@ -415,6 +499,7 @@ fn finalize_heads(
             kind: ev.kind,
             is_diverged: head_set.is_diverged,
             rank,
+            project: filter.projects.get(&ev.entity_id).cloned().flatten(),
         });
         if hits.len() >= limit {
             break;
@@ -439,13 +524,14 @@ fn finalize_heads(
 /// degrades to bm25. The bm25 relevance floor is deliberately NOT applied here -
 /// under fusion a low-bm25 but high-cosine hit is precisely what we want to surface.
 #[cfg(feature = "semantic")]
-pub fn recall_fused(
+pub fn recall_fused_scoped(
     store: &EventStore,
     query: &str,
     qvec: &[f32],
     vecs: &crate::vectors::VectorStore,
     limit: usize,
     lambda: f64,
+    scope: &RecallScope,
 ) -> anyhow::Result<Vec<RecallHit>> {
     if limit == 0 {
         return Ok(vec![]);
@@ -454,12 +540,14 @@ pub fn recall_fused(
     let events = store.get_all_events()?;
     let by_seq: HashMap<i64, &Event> = events.iter().map(|e| (e.seq, e)).collect();
     let heads = compute_head_sets(&events);
+    let projects = crate::cas::compute_projects(&events);
+    let filter = ScopeFilter { projects: &projects, scope };
 
     // Lexical leg: current-head candidates in bm25 rank order (streaming head-walk,
     // NO fixed raw-row window - see lexical_head_pool). Empty if the query has no
     // content tokens.
     let lexical: Vec<(i64, f64)> = match fts_query(query) {
-        Some(or_query) => lexical_head_pool(store, &or_query, &by_seq, &heads, FUSION_POOL),
+        Some(or_query) => lexical_head_pool(store, &or_query, &by_seq, &heads, &filter, FUSION_POOL),
         None => vec![],
     };
     let bm_rank: HashMap<i64, f64> = lexical.iter().copied().collect();
@@ -469,7 +557,13 @@ pub fn recall_fused(
     // no lexical overlap is reachable. An empty/absent sidecar leaves this empty.
     let all = vecs.all_vectors().unwrap_or_default();
     let cos_by_seq: HashMap<i64, f64> = all.iter().map(|(s, v)| (*s, dot(qvec, v))).collect();
-    let mut dense: Vec<(i64, f64)> = cos_by_seq.iter().map(|(s, c)| (*s, *c)).collect();
+    // Keep only in-scope dense candidates, so out-of-project vectors never consume a
+    // DENSE_TOPM slot from an in-scope paraphrase gold.
+    let mut dense: Vec<(i64, f64)> = cos_by_seq
+        .iter()
+        .filter(|(s, _)| by_seq.get(s).map(|ev| filter.keep(ev)).unwrap_or(false))
+        .map(|(s, c)| (*s, *c))
+        .collect();
     dense.sort_by(|a, b| b.1.total_cmp(&a.1).then(a.0.cmp(&b.0)));
     dense.truncate(DENSE_TOPM);
 
@@ -525,13 +619,42 @@ pub fn recall_fused(
         scored.into_iter().map(|(seq, rank, _)| (seq, rank)),
         &by_seq,
         &heads,
+        &filter,
         limit,
     ))
+}
+
+/// Unscoped hybrid score-fusion recall (every project + global). Thin wrapper over
+/// `recall_fused_scoped` - used by tests and the eval harness.
+#[cfg(feature = "semantic")]
+pub fn recall_fused(
+    store: &EventStore,
+    query: &str,
+    qvec: &[f32],
+    vecs: &crate::vectors::VectorStore,
+    limit: usize,
+    lambda: f64,
+) -> anyhow::Result<Vec<RecallHit>> {
+    recall_fused_scoped(store, query, qvec, vecs, limit, lambda, &RecallScope::everything())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn scope_allows_global_and_current_project() {
+        let all = RecallScope::everything();
+        assert!(all.allows(None) && all.allows(Some("X")) && all.allows(Some("@global")));
+        let a = RecallScope::current(Some("ProjA".to_string()));
+        assert!(a.allows(None), "global memory always in scope");
+        assert!(a.allows(Some("@global")), "global file always in scope");
+        assert!(a.allows(Some("ProjA")), "current project in scope");
+        assert!(!a.allows(Some("ProjB")), "another project is hidden (no bleed)");
+        let none = RecallScope::current(None);
+        assert!(none.allows(None) && none.allows(Some("@global")), "projectless -> global tier only");
+        assert!(!none.allows(Some("ProjA")), "projectless hides all projects");
+    }
 
     #[test]
     fn test_snippet_surfaces_content_past_a_heading() {

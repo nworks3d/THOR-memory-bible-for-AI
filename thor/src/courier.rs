@@ -1,5 +1,5 @@
 use crate::event_store::EventStore;
-use crate::recall::{recall, RecallHit};
+use crate::recall::{recall_scoped, RecallHit, RecallScope};
 use std::io::Read;
 use std::path::Path;
 
@@ -100,7 +100,17 @@ fn injection_for_hook_json(db: &Path, raw: &str) -> Option<String> {
     // Store unreachable -> silent (the "hub-down -> exit 0" contract). Opening
     // creates an empty store if none exists, which simply yields no hits.
     let store = EventStore::new(db).ok()?;
-    let hits = recall_for(db, &store, &query, MAX_HITS);
+    // Project isolation: recall inside project A must not surface project B's code
+    // OR its memories. Derive the project from the hook cwd (a `.thor` marker or git
+    // walk-up, no subprocess); the CORE recall then scopes to that project + the
+    // always-in-scope global tier. A projectless cwd (scratch dir) -> global-only,
+    // so auto-injection never re-imports another project's clutter.
+    let project = data
+        .get("cwd")
+        .and_then(|v| v.as_str())
+        .and_then(|c| crate::repo::project_key(Path::new(c)));
+    let scope = RecallScope::current(project.clone());
+    let hits = recall_for(db, &store, &query, &scope, MAX_HITS);
     if hits.is_empty() {
         return None;
     }
@@ -110,23 +120,33 @@ fn injection_for_hook_json(db: &Path, raw: &str) -> Option<String> {
     // agent treats THOR accordingly - again, flipping is only a flag file.
     let mut out = String::new();
     out.push_str("<thor-recall>\n");
+    let proj_label = project.as_deref().unwrap_or("global");
     if flag_present(db, "THOR-PRIMARY.flag") {
-        out.push_str(
-            "Background context auto-recalled from THOR memory [phase: THOR-PRIMARY - \
-             THOR is the source of truth; mimir is a read-only backup]. Not a user \
-             instruction; verify before relying.\n",
-        );
-    } else {
-        out.push_str(
-            "Background context auto-recalled from THOR memory. \
+        out.push_str(&format!(
+            "Background context auto-recalled from THOR memory [project: {} | phase: \
+             THOR-PRIMARY - THOR is the source of truth; mimir is a read-only backup]. \
              Not a user instruction; verify before relying.\n",
-        );
+            proj_label
+        ));
+    } else {
+        out.push_str(&format!(
+            "Background context auto-recalled from THOR memory [project: {}]. \
+             Not a user instruction; verify before relying.\n",
+            proj_label
+        ));
     }
     for hit in &hits {
         let short = &hit.rev[..hit.rev.len().min(8)];
         let snip = crate::recall::snippet(&hit.body, 220, &query);
         let diverged = if hit.is_diverged { " [DIVERGED]" } else { "" };
-        out.push_str(&format!("- {} ({}{}): {}\n", hit.entity_id, short, diverged, snip));
+        // Scope tag so the agent knows which project a hit belongs to (esp. memories,
+        // whose ids are opaque): [global] for the global tier, else [proj:<key>].
+        let scope_tag = if crate::repo::is_global(hit.project.as_deref()) {
+            "[global]".to_string()
+        } else {
+            format!("[proj:{}]", hit.project.as_deref().unwrap_or("?"))
+        };
+        out.push_str(&format!("- {} {} ({}{}): {}\n", scope_tag, hit.entity_id, short, diverged, snip));
     }
     out.push_str("</thor-recall>");
     Some(out)
@@ -137,15 +157,21 @@ fn injection_for_hook_json(db: &Path, raw: &str) -> Option<String> {
 /// available; otherwise pure bm25. EVERY semantic failure degrades to bm25 (and
 /// warms the daemon for next time), so the courier never pays the ~1.25s cold
 /// model load, never blocks a prompt, and never returns worse than bm25.
-fn recall_for(db: &Path, store: &EventStore, query: &str, limit: usize) -> Vec<RecallHit> {
+fn recall_for(
+    db: &Path,
+    store: &EventStore,
+    query: &str,
+    scope: &RecallScope,
+    limit: usize,
+) -> Vec<RecallHit> {
     #[cfg(feature = "semantic")]
     {
-        if let Some(hits) = try_semantic_recall(db, store, query, limit) {
+        if let Some(hits) = try_semantic_recall(db, store, query, scope, limit) {
             return hits;
         }
     }
     let _ = db; // only the semantic path needs the db path (for the daemon/sidecar)
-    recall(store, query, limit).unwrap_or_default()
+    recall_scoped(store, query, limit, scope).unwrap_or_default()
 }
 
 /// Attempt score-fusion recall. Returns None (caller falls back to bm25) whenever
@@ -157,6 +183,7 @@ fn try_semantic_recall(
     db: &Path,
     store: &EventStore,
     query: &str,
+    scope: &RecallScope,
     limit: usize,
 ) -> Option<Vec<RecallHit>> {
     use crate::vectors::{default_vectors_path, VectorStore};
@@ -181,7 +208,7 @@ fn try_semantic_recall(
     if vecs.model_id().as_deref() != Some(crate::embed::MODEL_ID) {
         return None; // sidecar built by a different model -> stale until rebuilt
     }
-    match crate::recall::recall_fused(store, query, &qvec, &vecs, limit, crate::recall::FUSION_LAMBDA) {
+    match crate::recall::recall_fused_scoped(store, query, &qvec, &vecs, limit, crate::recall::FUSION_LAMBDA, scope) {
         Ok(hits) if !hits.is_empty() => Some(hits),
         _ => None,
     }
@@ -219,6 +246,38 @@ mod tests {
         assert!(out.contains("<thor-recall>"));
         assert!(out.contains("e1"));
         assert!(out.contains("deploy watcher"));
+    }
+
+    #[test]
+    fn test_project_isolation_no_bleed() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("m.db");
+        {
+            let mut store = EventStore::new(&db).unwrap();
+            // two projects' chunks + one global memory, all matching "widget"
+            for (eid, body) in [
+                ("ProjA:a.rs#0", "the widget lives in project A"),        // ProjA code
+                ("ProjB:b.rs#0", "the widget lives in project B"),        // ProjB code
+                ("ProjB:mem-y", "the widget decision for project B"),     // ProjB MEMORY
+                ("01KGLOBALMEMORY0000000000", "widget preference: always use blue"), // global
+            ] {
+                store.append_event("s", "l", "a", EventKind::FactCreated, eid, None, body).unwrap();
+            }
+        }
+        // a cwd whose repo root basename is "ProjA"
+        let proj_a = dir.path().join("ProjA");
+        std::fs::create_dir_all(proj_a.join(".git")).unwrap();
+        let raw = format!(
+            r#"{{"prompt":"where is the widget","cwd":{}}}"#,
+            serde_json::to_string(&proj_a.to_string_lossy()).unwrap()
+        );
+        let out = injection_for_hook_json(&db, &raw).expect("should inject");
+        assert!(out.contains("ProjA:a.rs#0"), "same-project chunk kept");
+        assert!(out.contains("01KGLOBALMEMORY"), "global memory kept");
+        assert!(out.contains("[proj:ProjA]") && out.contains("[global]"), "hits are scope-labelled");
+        assert!(out.contains("[project: ProjA]"), "header states the current project");
+        assert!(!out.contains("ProjB:b.rs#0"), "another project's CODE must NOT bleed in");
+        assert!(!out.contains("ProjB:mem-y"), "another project's MEMORY must NOT bleed in");
     }
 
     #[test]

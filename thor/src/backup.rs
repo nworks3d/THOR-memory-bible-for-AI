@@ -180,6 +180,31 @@ mod tests {
     }
 
     #[test]
+    fn test_reproject_survives_roundtrip() {
+        let mut src = EventStore::in_memory().unwrap();
+        src.append_event("s", "l", "act", EventKind::FactCreated, "ProjA:mem-x", None, "a decision")
+            .unwrap();
+        src.append_event(
+            "s",
+            "l",
+            "act",
+            EventKind::FactReprojected,
+            "ProjA:mem-x",
+            None,
+            r#"{"project":"ProjB"}"#,
+        )
+        .unwrap();
+        let mut buf: Vec<u8> = Vec::new();
+        export_jsonl(&src, &mut buf).unwrap();
+        let mut dst = EventStore::in_memory().unwrap();
+        let n = restore_jsonl(&mut dst, Cursor::new(&buf)).unwrap();
+        assert_eq!(n, 2, "the fact_reprojected event replays with a verified hash");
+        // the effective project reassignment travelled to the fresh replica
+        let projects = crate::cas::compute_projects(&dst.get_all_events().unwrap());
+        assert_eq!(projects["ProjA:mem-x"], Some("ProjB".to_string()));
+    }
+
+    #[test]
     fn test_restore_refuses_nonempty_store() {
         let mut dst = EventStore::in_memory().unwrap();
         seed(&mut dst);

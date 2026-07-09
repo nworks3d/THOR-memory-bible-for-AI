@@ -8,7 +8,7 @@ index and gives the relevant pieces back **automatically, at the right moment** 
 so a session never starts from zero, even right after a compaction. It is a single
 Rust binary: no external services, no git required, and it never loses a write.
 
-![THOR vs mimir - coverage, quality, drift and speed](assets/benchmark.svg)
+![THOR vs mimir - coverage, quality, multi-project, drift and speed](assets/benchmark.svg)
 
 ## Why THOR
 
@@ -25,8 +25,8 @@ one thing the agent can search automatically. Measured against
   leads **91% vs 75%** - a dense score-fusion layer catches paraphrases that
   keyword search misses.
 - **It compensates for session drift.** After a compaction the agent starts blank;
-  THOR puts the governing gotcha/decision back in front of it **1.6x more often**
-  than mimir (75% vs 46%). This is what the tool is *for*.
+  THOR puts the governing gotcha/decision back in front of it **~1.25x more often**
+  than mimir at its best (74% vs 59%). This is what the tool is *for*.
 - **It is faster and lighter.** ~**3.1x** lower per-prompt latency (83 ms vs
   254 ms) as a single native binary; the default mode holds no resident process.
 - **It never loses a write.** Every fact is an event in a hash-chained append-only
@@ -41,9 +41,19 @@ for "which functions call X". THOR chunks source into recall instead. See
 
 ## What it does
 
-- **Unified local ingest.** `thor` chunks your repositories (source + docs) and
-  your remembered facts into one append-only store, so auto-recall can answer
-  questions about the code itself - not just about saved notes.
+- **Unified local ingest.** `thor ingest <path>` chunks a folder's text files
+  (source + docs) into the same append-only store as your remembered facts, so
+  auto-recall answers questions about the code itself - not just saved notes. A
+  **git repo** reads tracked files only (gitignored secrets are never indexed); a
+  plain **non-git folder** is walked directly (dotfiles, heavy dirs and any nested
+  git repo skipped), so a loose docs folder indexes too - the same reach as mimir's
+  non-git doc collections. It runs incrementally (only changed files are re-chunked; a deleted
+  file's chunks are retracted), and, wired into `SessionStart`, keeps the project
+  you are working in indexed automatically. CAD/mesh/EDA asset dumps (STEP, STL,
+  Gerber, ...) are skipped so they never drown a project's real docs.
+- **Project isolation.** A chunk's id is `<project>:<path>#<n>`, so recall inside
+  project A never surfaces project B's code (global memories are always kept). No
+  bleed between repositories.
 - **Lossless append-only store.** Every fact is an event in a hash-chained,
   append-only SQLite log. A concurrent conflicting edit *branches* (both heads are
   kept and surfaced) instead of silently overwriting - nothing is ever lost. A
@@ -66,9 +76,11 @@ for "which functions call X". THOR chunks source into recall instead. See
 A blind, judged head-to-head against [mimir](https://github.com/MakerViking/mimir),
 reported as two separate fair tests: **as-deployed coverage** (86% vs 27% on 500
 questions, because THOR indexes repo code mimir's recall does not) and
-**same-knowledge quality** (91% vs 75% on facts both have). Plus session-drift
-compensation (75% vs 46%) and ~3.1x lower latency. Full method, per-category
-tables and honest weaknesses in [BENCHMARKS.md](BENCHMARKS.md).
+**same-knowledge quality** (91% vs 75% on facts both have). Plus **multi-project
+coverage** across three seeded repos (73% vs 53% overall - though mimir's curated
+design docs win one project, 93% vs 67%), session-drift compensation (74% vs 59%), and
+~3.1x lower latency. Full method, per-category tables and honest weaknesses in
+[BENCHMARKS.md](BENCHMARKS.md).
 
 ## Quick start
 
@@ -79,10 +91,10 @@ cargo build --release # build the binary (target/release/thor)
 ```
 
 Install the hooks into your agent's settings (backs up first, only adds THOR
-entries, idempotent):
+entries, idempotent). Full step-by-step, incl. project scoping: **[SETUP.md](SETUP.md)**.
 
 ```sh
-thor install --with-courier          # auto-recall on every prompt
+thor install --with-courier          # auto-recall + SessionStart warm + project refresh/onboarding
 thor install --with-guard            # + the moment-of-action guard
 ```
 
@@ -90,12 +102,45 @@ Use it:
 
 ```sh
 thor remember "<a durable fact>"     # (via the MCP tool in an agent session)
-thor recall "how does X work"        # search memory
+thor ingest <repo-path>              # index a repo's tracked files (incremental)
+thor recall "how does X work"        # search memory (scoped to the current project)
 thor get <entity_id>                 # the authoritative head(s) for one fact
 thor fsck                            # verify chain integrity
 ```
 
 The courier runs automatically per prompt and injects a `<thor-recall>` block.
+
+## Projects: index your repos, keep them isolated
+
+THOR holds every project in one store but keeps them **isolated**: recall in project
+A never surfaces project B's code or memories. Cross-cutting knowledge you mark
+**global** (working rules, dev-loop, conventions) is the exception - it surfaces in
+*every* project. The project is decided by the session's working directory (a `.thor`
+marker, else the git repo name), exactly like the mimir convention.
+
+```sh
+thor init                       # set up the current project (writes .thor + indexes it)
+thor ingest .                   # (re-)index the current repo (or a non-git folder), incrementally
+thor ingest --project <key> <path>  # pin a canonical key (e.g. a NAS source folder named differently)
+thor ingest --global <docs-dir> # hold cross-cutting docs in the @global tier (everywhere)
+thor recall "how does X work"   # scoped to the current project + global
+thor recall --all-projects "X"  # search every project
+thor reproject <id> --project <key> | --global   # fix a fact's scope (sync-safe)
+thor backfill-projects          # attribute legacy memories from their import footer (dry-run)
+```
+
+- Ingest is **incremental** (unchanged files skipped, changed re-chunked, deleted
+  retracted). A **git repo** reads **tracked files only**, so gitignored secrets are
+  never indexed; a **non-git folder** is walked directly (dotfiles like `.env`, heavy
+  dirs, and any nested git repo skipped) - point it at docs, not at a tree with
+  plaintext secrets in loose non-dot files.
+- Chunk ids are `<project>:<path>#<n>`; scoped memories `<project>:mem-<uuid>`; global
+  facts are unprefixed or under `@global:`. Recall (courier, CLI, MCP) scopes to the
+  current project + the global tier by default.
+- Wire `thor session-start` into your `SessionStart` hook: it refreshes a known project
+  in the background, and for a new project it asks the agent to offer setup rather than
+  indexing silently. Mis-scoped a fact? `thor reproject` moves it (it travels as an event,
+  so a replica agrees after sync).
 
 ## Semantic recall (optional, off by default)
 
@@ -156,7 +201,12 @@ file for your own network and route.
 | command | what |
 |---|---|
 | `thor remember` / `recall` / `get` / `history` | write / search / read facts |
-| `thor courier` | per-prompt recall hook (reads hook JSON on stdin) |
+| `thor ingest [<path>] [--global] [--project <key>] [--detach]` | index a folder's text files (incremental; git repo = tracked-only, plain folder = walked; `--global` = the `@global` tier; `--project` pins a key) |
+| `thor init [<path>]` | set up a project: write a `.thor` marker + first ingest |
+| `thor reproject <id> --project <key> \| --global` | reassign a fact's project scope (sync-safe) |
+| `thor backfill-projects [--apply]` | attribute legacy memories from their import footer |
+| `thor review-scope [--mark]` | list no-signal global memories to review (SessionStart nudges once/day) |
+| `thor courier` / `thor session-start` | per-prompt recall hook / SessionStart refresh + setup cue |
 | `thor warm` | pre-warm the semantic embedder (idempotent; for SessionStart) |
 | `thor guard` / `thor stop-guard` | moment-of-action / response advisories |
 | `thor install` | write the hooks into settings.json |
@@ -178,10 +228,10 @@ file for your own network and route.
 
 ```
 thor/
-  src/            the Rust crate (event store, recall, guard, sync, mcp, courier)
+  src/            the Rust crate (event store, recall, ingest, guard, sync, mcp, courier)
   examples/       recall_eval.rs - measure recall over a query battery
   deploy/         Dockerfile + docker-compose template
-  tools/          helper scripts (repo ingest, side-by-side eval)
+  tools/          helper scripts (mimir export, side-by-side eval)
   *.example.json  guard rulebook templates (copy + fill in)
 ```
 

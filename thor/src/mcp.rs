@@ -9,7 +9,7 @@
 
 use crate::cli::render_get;
 use crate::event_store::{EventKind, EventStore};
-use crate::recall::recall;
+use crate::recall::{recall_scoped, RecallScope};
 use rmcp::handler::server::router::tool::ToolRouter;
 use rmcp::handler::server::wrapper::Parameters;
 use rmcp::model::{ServerCapabilities, ServerInfo};
@@ -20,12 +20,23 @@ use std::sync::{Arc, Mutex};
 use uuid::Uuid;
 
 const INSTRUCTIONS: &str = "THOR is the user's lossless memory. recall searches the current-head \
-facts (read-only); get shows one entity's head(s); remember stores a new fact. Recall before \
-remembering to avoid duplicates.";
+facts (read-only), SCOPED to the current project + the global tier - pass all_projects:true to \
+search every project, or project:\"<key>\" for a specific one. get shows one entity's head(s); \
+remember stores a new fact (scoped to the current project by default; pass project:\"global\" for \
+a cross-project fact). Recall before remembering to avoid duplicates.";
+
+/// The current project for a stdio server, from its launch cwd (Claude Code starts
+/// the connector in the project dir). `None` for the HTTP server (no cwd).
+fn startup_project() -> Option<String> {
+    std::env::current_dir().ok().and_then(|c| crate::repo::project_key(&c))
+}
 
 #[derive(Clone)]
 pub struct ThorServer {
     store: Arc<Mutex<EventStore>>,
+    /// Project the server was launched in (`None` = unscoped / HTTP). Recall
+    /// defaults to this; remember tags new facts with it.
+    project: Option<String>,
     #[allow(dead_code)] // read only inside the #[tool_handler] macro expansion
     tool_router: ToolRouter<Self>,
 }
@@ -37,6 +48,13 @@ pub struct RecallArgs {
     /// Max hits (default 8).
     #[serde(default)]
     pub limit: Option<usize>,
+    /// Search every project, not just the current one + the global tier.
+    #[serde(default)]
+    pub all_projects: bool,
+    /// Scope to a specific project key (that project + global). Overrides the
+    /// server's current project.
+    #[serde(default)]
+    pub project: Option<String>,
 }
 
 #[derive(Deserialize, schemars::JsonSchema)]
@@ -52,16 +70,20 @@ pub struct RememberArgs {
     /// Optional entity id; a new one is minted if omitted.
     #[serde(default)]
     pub entity_id: Option<String>,
+    /// Project scope for the new fact: a project key, or "global" for a
+    /// cross-project fact. Omitted = the server's current project.
+    #[serde(default)]
+    pub project: Option<String>,
 }
 
 #[tool_router]
 impl ThorServer {
     pub fn new(store: EventStore) -> Self {
-        Self::from_shared(Arc::new(Mutex::new(store)))
+        Self::from_shared(Arc::new(Mutex::new(store)), None)
     }
 
-    pub fn from_shared(store: Arc<Mutex<EventStore>>) -> Self {
-        ThorServer { store, tool_router: Self::tool_router() }
+    pub fn from_shared(store: Arc<Mutex<EventStore>>, project: Option<String>) -> Self {
+        ThorServer { store, project, tool_router: Self::tool_router() }
     }
 
     /// Run a sync store closure off the async runtime; its Ok/Err String is the
@@ -83,8 +105,18 @@ impl ThorServer {
 
     #[tool(description = "Search THOR memory and return the best-matching CURRENT-HEAD facts, ranked. Read-only.")]
     async fn recall(&self, Parameters(args): Parameters<RecallArgs>) -> String {
+        let server_project = self.project.clone();
         self.blocking(move |s| {
-            let hits = recall(s, &args.query, args.limit.unwrap_or(8)).map_err(|e| format!("error: {e}"))?;
+            // Scope: all_projects > explicit project > the server's current project.
+            let scope = if args.all_projects {
+                RecallScope::everything()
+            } else if args.project.is_some() {
+                RecallScope::current(args.project.clone())
+            } else {
+                RecallScope::current(server_project.clone())
+            };
+            let hits = recall_scoped(s, &args.query, args.limit.unwrap_or(8), &scope)
+                .map_err(|e| format!("error: {e}"))?;
             if hits.is_empty() {
                 return Ok(format!("No THOR hits for: {}", args.query));
             }
@@ -93,7 +125,12 @@ impl ThorServer {
                 let short = &hit.rev[..hit.rev.len().min(8)];
                 let snip = crate::recall::snippet(&hit.body, 220, &args.query);
                 let diverged = if hit.is_diverged { " [DIVERGED]" } else { "" };
-                out.push_str(&format!("{} ({}{}): {}\n", hit.entity_id, short, diverged, snip));
+                let tag = if crate::repo::is_global(hit.project.as_deref()) {
+                    "[global]".to_string()
+                } else {
+                    format!("[proj:{}]", hit.project.as_deref().unwrap_or("?"))
+                };
+                out.push_str(&format!("{} {} ({}{}): {}\n", tag, hit.entity_id, short, diverged, snip));
             }
             Ok(out)
         })
@@ -111,15 +148,26 @@ impl ThorServer {
 
     #[tool(description = "Store a new fact in THOR as a fact_created. Returns the entity id and rev.")]
     async fn remember(&self, Parameters(args): Parameters<RememberArgs>) -> String {
+        let server_project = self.project.clone();
         self.blocking(move |s| {
             let body = args.body.trim();
             if body.is_empty() {
                 return Err("a non-empty 'body' is required".to_string());
             }
-            let entity_id = args
-                .entity_id
-                .filter(|s| !s.is_empty())
-                .unwrap_or_else(|| format!("mcp-{}", Uuid::new_v4()));
+            let entity_id = match args.entity_id.filter(|s| !s.is_empty()) {
+                // A caller-supplied id is used verbatim (its prefix defines scope).
+                Some(id) => id,
+                None => {
+                    // Mint scope: explicit arg ("global" -> global) else the server's
+                    // project. A scoped memory is `<key>:mem-<uuid>`, global `mcp-<uuid>`.
+                    let mint = match args.project {
+                        Some(p) if p.eq_ignore_ascii_case("global") => None,
+                        Some(p) => Some(p),
+                        None => server_project,
+                    };
+                    crate::repo::memory_entity_id(mint.as_deref(), &Uuid::new_v4().to_string())
+                }
+            };
             let ev = s
                 .append_event("mcp", "mcp-session", "mcp", EventKind::FactCreated, &entity_id, None, body)
                 .map_err(|e| format!("error: {e}"))?;
@@ -152,7 +200,8 @@ fn run(db: &Path, http: Option<String>) -> anyhow::Result<()> {
         match http {
             Some(bind) => serve_http(shared, &bind).await,
             None => {
-                let service = ThorServer::from_shared(shared).serve(rmcp::transport::stdio()).await?;
+                let service =
+                    ThorServer::from_shared(shared, startup_project()).serve(rmcp::transport::stdio()).await?;
                 service.waiting().await?;
                 Ok(())
             }
@@ -164,7 +213,9 @@ fn run(db: &Path, http: Option<String>) -> anyhow::Result<()> {
 /// bind to localhost on the NAS and front it with the Cloudflare Access gate,
 /// exactly like mimir's remote MCP.
 async fn serve_http(store: Arc<Mutex<EventStore>>, bind: &str) -> anyhow::Result<()> {
-    let app = mcp_http_router(move || Ok(ThorServer::from_shared(store.clone())));
+    // HTTP/remote has no cwd: unscoped by default (a cwd-less remote consumer is
+    // cross-project by nature), honoring an explicit `project` arg per call.
+    let app = mcp_http_router(move || Ok(ThorServer::from_shared(store.clone(), None)));
     let listener = tokio::net::TcpListener::bind(bind).await?;
     println!("thor MCP (streamable-http) listening on http://{bind}/mcp");
     axum::serve(listener, app).await?;
@@ -203,7 +254,7 @@ mod tests {
     async fn test_recall_tool_returns_hit() {
         let server = ThorServer::new(seed());
         let out = server
-            .recall(Parameters(RecallArgs { query: "deploy watcher".into(), limit: None }))
+            .recall(Parameters(RecallArgs { query: "deploy watcher".into(), limit: None, all_projects: false, project: None }))
             .await;
         assert!(out.contains("e1"), "recall must surface the seeded fact: {out}");
     }
@@ -212,11 +263,11 @@ mod tests {
     async fn test_remember_then_recall_roundtrip() {
         let server = ThorServer::new(seed());
         let stored = server
-            .remember(Parameters(RememberArgs { body: "a brand new zephyr fact".into(), entity_id: None }))
+            .remember(Parameters(RememberArgs { body: "a brand new zephyr fact".into(), entity_id: None, project: None }))
             .await;
         assert!(stored.starts_with("stored entity mcp-"), "got: {stored}");
         let rc = server
-            .recall(Parameters(RecallArgs { query: "zephyr".into(), limit: None }))
+            .recall(Parameters(RecallArgs { query: "zephyr".into(), limit: None, all_projects: false, project: None }))
             .await;
         assert!(rc.contains("zephyr"), "the new fact must be recallable: {rc}");
     }
@@ -225,7 +276,7 @@ mod tests {
     async fn test_remember_rejects_empty_body() {
         let server = ThorServer::new(seed());
         let out = server
-            .remember(Parameters(RememberArgs { body: "   ".into(), entity_id: None }))
+            .remember(Parameters(RememberArgs { body: "   ".into(), entity_id: None, project: None }))
             .await;
         assert!(out.contains("non-empty"), "empty body must be rejected: {out}");
     }

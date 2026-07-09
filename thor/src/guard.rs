@@ -1,4 +1,5 @@
 use serde_json::Value;
+use std::collections::HashSet;
 use std::io::Read;
 use std::path::{Path, PathBuf};
 
@@ -172,6 +173,14 @@ fn try_guard(db: &Path, rulebook: &Path) -> anyhow::Result<()> {
     if let Some(mem) = file_memory_advisory(db, &hook) {
         parts.push(mem);
     }
+    // Same idea for COMMANDS: a typed gotcha/decision that names a distinctive
+    // command token ("force-recreate", a host, a subcommand) fires when that
+    // command is about to run - the class of drift (ssh-amnesia, hot-patch-as-
+    // deploy) that prompt-recall can never see because the prompt shares no
+    // words with the constraint.
+    if let Some(mem) = command_memory_advisory(db, &hook) {
+        parts.push(mem);
+    }
     if parts.is_empty() {
         return Ok(());
     }
@@ -306,6 +315,161 @@ fn file_memory_advisory(db: &Path, hook: &Value) -> Option<String> {
 #[doc(hidden)]
 pub fn file_memory_advisory_for_eval(db: &Path, hook: &Value) -> Option<String> {
     file_memory_advisory(db, hook)
+}
+
+/// Eval seam for the command advisory, same contract as above.
+#[doc(hidden)]
+pub fn command_memory_advisory_for_eval(db: &Path, hook: &Value) -> Option<String> {
+    command_memory_advisory(db, hook)
+}
+
+/// Shell verbs and generic words too common to identify a constraint: a salient
+/// command token must clear these AND the recall stopword lists. Precision over
+/// recall by design - the advisory interrupts, so a false fire costs trust.
+const COMMAND_NOISE: &[&str] = &[
+    "sudo", "bash", "powershell", "cmd", "echo", "cat", "type", "grep", "find", "ls", "dir",
+    "cd", "cp", "mv", "rm", "mkdir", "touch", "head", "tail", "curl", "wget", "python", "node",
+    "npm", "cargo", "git", "docker", "compose", "build", "run", "test", "install", "update",
+    "status", "start", "stop", "restart", "list", "show", "get", "set", "add", "remove", "push",
+    "pull", "commit", "checkout", "branch", "log", "diff", "clone", "fetch", "merge", "config",
+    "select", "where", "print", "write", "read", "file", "files", "output", "input", "true",
+    "false", "null", "name", "force", "quiet", "verbose", "version", "help",
+];
+
+/// Distinctive tokens of a shell command: what could plausibly NAME a stored
+/// constraint. Kept when len >= 5 and not noise/stopword, or when the token
+/// carries structure (a '-'/'.'/':' composite like "force-recreate", a host, a
+/// flag name) - single common words never qualify.
+fn salient_command_tokens(command: &str) -> Vec<String> {
+    let mut seen = HashSet::new();
+    let mut out: Vec<String> = Vec::new();
+    let mut push = |t: String, seen: &mut HashSet<String>, out: &mut Vec<String>| {
+        let ok = t.chars().count() >= 5
+            && t.chars().any(|c| c.is_alphabetic())
+            && !COMMAND_NOISE.contains(&t.as_str())
+            && (t.contains('-')
+                || t.contains('.')
+                || t.contains(':')
+                || t.contains('/')
+                || t.contains('@')
+                || t.chars().count() >= 6);
+        if ok && seen.insert(t.clone()) {
+            out.push(t);
+        }
+    };
+    for raw in command.split(|c: char| {
+        c.is_whitespace() || matches!(c, '"' | '\'' | '|' | ';' | '&' | '(' | ')' | '<' | '>' | '=' | ',')
+    }) {
+        let t = raw.trim_matches(|c: char| matches!(c, '-' | '/' | '.' | ':')).to_lowercase();
+        if t.is_empty() {
+            continue;
+        }
+        push(t.clone(), &mut seen, &mut out);
+        // Composite tokens (remote specs, paths) rarely appear verbatim in a
+        // memory body - their PARTS do. Also emit the path leaf and the host
+        // segment: "deploy@storage.internal:/srv/x" -> "storage.internal";
+        // "//fileserver/data/orders.db" -> "orders.db".
+        if t.contains('/') || t.contains('@') || t.contains(':') {
+            if let Some(leaf) = t.rsplit('/').next() {
+                let leaf = leaf.split(':').next().unwrap_or(leaf);
+                push(leaf.to_string(), &mut seen, &mut out);
+            }
+            let host_part = t.rsplit('@').next().unwrap_or(&t);
+            let host = host_part.split([':', '/']).find(|s| !s.is_empty()).unwrap_or("");
+            push(host.to_string(), &mut seen, &mut out);
+        }
+        if out.len() >= 10 {
+            break;
+        }
+    }
+    out.truncate(10);
+    out
+}
+
+/// The command half of the memory-backed guard: on a Bash/PowerShell call,
+/// recall TYPED constraint memories (gotcha/decision/preference - never notes,
+/// never chunks) that literally contain one of the command's distinctive
+/// tokens. Debounced per (session, token-set) with the same negative-cache
+/// pattern as the file advisory; every failure path is silent (fail-open).
+fn command_memory_advisory(db: &Path, hook: &Value) -> Option<String> {
+    if crate::ledger::flag_present(db, "THOR-SILENT.flag") {
+        return None;
+    }
+    let tool = hook.get("tool_name").and_then(|v| v.as_str()).unwrap_or("");
+    if !matches!(tool, "Bash" | "PowerShell") {
+        return None;
+    }
+    let command = hook.get("tool_input")?.get("command")?.as_str()?;
+    let session_id = hook.get("session_id").and_then(|v| v.as_str()).unwrap_or("");
+    if session_id.is_empty() {
+        return None; // no debounce identity -> stay silent (match the file guard)
+    }
+    let tokens = salient_command_tokens(command);
+    if tokens.is_empty() {
+        return None;
+    }
+    // Debounce on the token SET, not the raw command: trivially-different
+    // invocations (an extra flag value, another filename) share the key.
+    let mut sorted = tokens.clone();
+    sorted.sort();
+    let key = format!("{}|cmd:{}", session_id, sorted.join(","));
+    match crate::ledger::get(db, "guard-seen", &key) {
+        Some(v) if v.is_u64() => return None,
+        Some(v) => {
+            let neg_ts = v.get("ts").and_then(|t| t.as_u64()).unwrap_or(0);
+            if crate::review::now_secs().saturating_sub(neg_ts) <= NEG_CACHE_SECS {
+                return None;
+            }
+        }
+        None => {}
+    }
+
+    let project = hook
+        .get("cwd")
+        .and_then(|v| v.as_str())
+        .and_then(|c| crate::repo::project_key(Path::new(c)));
+    let scope = crate::recall::RecallScope::current(project);
+    let store = crate::event_store::EventStore::new(db).ok()?;
+    let query = tokens.join(" ");
+    let hits = crate::recall::recall_memories_scoped(&store, &query, 6, &scope).ok()?;
+
+    // Precision filter: TYPED constraints only, and the match must be more
+    // than one shared plain word - "same topic" is not "about this command".
+    // Measured against the live store: single generic-word matches ("semantic",
+    // "origin", "upload") fired on loosely-related decisions on 4 of 12 benign
+    // commands. A hit qualifies only via a STRUCTURED token (a composite like
+    // "force-recreate", a host, a path leaf - near-unique by construction) or
+    // via >= 2 distinct shared tokens.
+    let structured = |t: &str| {
+        t.contains('-') || t.contains('.') || t.contains(':') || t.contains('/') || t.contains('@')
+    };
+    let named: Vec<_> = hits
+        .into_iter()
+        .filter(|h| h.fact_type.is_some())
+        .filter(|h| {
+            let b = h.body.to_lowercase();
+            let matched: Vec<&String> = tokens.iter().filter(|t| b.contains(t.as_str())).collect();
+            matched.iter().any(|t| structured(t)) || matched.len() >= 2
+        })
+        .take(FILE_MEMORY_HITS)
+        .collect();
+    let now = crate::review::now_secs();
+    if named.is_empty() {
+        crate::ledger::upsert(db, "guard-seen", &key, &serde_json::json!({ "ts": now, "neg": true }));
+        return None;
+    }
+    let lines: Vec<String> = named
+        .iter()
+        .map(|h| {
+            let ty = h.fact_type.map(|t| format!("[{}] ", t.as_str())).unwrap_or_default();
+            format!("{}{}: {}", ty, h.entity_id, crate::recall::snippet(&h.body, 200, &query))
+        })
+        .collect();
+    crate::ledger::upsert(db, "guard-seen", &key, &serde_json::json!(now));
+    Some(format!(
+        "stored memory about this command (verify before relying): {}",
+        lines.join("  ||  ")
+    ))
 }
 
 /// Post-compaction reset for the file-touch advisories: drop every guard-seen
@@ -473,6 +637,66 @@ fn capture_nudge(db: &Path, hook: &Value, haystack_lower: &str) -> Option<String
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn test_salient_command_tokens_precision() {
+        // structured composites and rare words survive; shell verbs and short
+        // generic tokens never do
+        assert_eq!(
+            salient_command_tokens("docker compose -p app up -d --force-recreate"),
+            vec!["force-recreate"]
+        );
+        let t = salient_command_tokens("ssh user@nas.example.lan \"touch /srv/share/deploy.flag\"");
+        assert!(t.iter().any(|x| x.contains("nas.example.lan")), "hostnames are salient: {t:?}");
+        assert!(t.iter().any(|x| x.contains("deploy.flag")), "path leaves are salient: {t:?}");
+        assert!(salient_command_tokens("git status && git log").is_empty(), "pure shell noise -> no tokens");
+        assert!(salient_command_tokens("ls -la").is_empty());
+    }
+
+    #[test]
+    fn test_command_memory_advisory_typed_only_once_per_session() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("thor.db");
+        {
+            use crate::event_store::EventKind;
+            let mut store = crate::event_store::EventStore::new(&db).unwrap();
+            store
+                .append_event(
+                    "s", "l", "a", EventKind::FactCreated, "g1", None,
+                    "GOTCHA: never run --force-recreate against the prod stack; use the deploy route\n\n[memory/gotcha | tags: deploy | project: global]",
+                )
+                .unwrap();
+            store
+                .append_event(
+                    "s", "l", "a", EventKind::FactCreated, "n1", None,
+                    "plain note that also mentions force-recreate once",
+                )
+                .unwrap();
+        }
+        let hook = json!({
+            "session_id": "s1",
+            "tool_name": "Bash",
+            "tool_input": { "command": "docker compose -p app up -d --force-recreate" }
+        });
+        let adv = command_memory_advisory(&db, &hook).expect("typed gotcha naming the token fires");
+        assert!(adv.contains("g1"), "{adv}");
+        assert!(adv.contains("[gotcha]"), "{adv}");
+        assert!(!adv.contains("n1"), "untyped notes never fire the command guard: {adv}");
+        // debounced per (session, token-set)
+        assert!(command_memory_advisory(&db, &hook).is_none(), "once per session per token-set");
+        // a different session advises again
+        let hook2 = json!({
+            "session_id": "s2",
+            "tool_name": "Bash",
+            "tool_input": { "command": "docker compose up --force-recreate" }
+        });
+        assert!(command_memory_advisory(&db, &hook2).is_some());
+        // non-shell tools and noise-only commands stay silent
+        let edit = json!({ "session_id": "s1", "tool_name": "Edit", "tool_input": { "command": "x --force-recreate y" } });
+        assert!(command_memory_advisory(&db, &edit).is_none(), "only Bash/PowerShell");
+        let noise = json!({ "session_id": "s3", "tool_name": "Bash", "tool_input": { "command": "git status" } });
+        assert!(command_memory_advisory(&db, &noise).is_none(), "no salient tokens -> silent");
+    }
 
     #[test]
     fn test_capture_triggers_rulebook_overrides_and_fails_open() {

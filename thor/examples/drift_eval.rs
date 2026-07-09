@@ -67,6 +67,10 @@ struct Scenario {
     channel_hint: String,
     #[serde(default)]
     guard_file: Option<String>,
+    /// Guard channel, command class: the Bash command whose PreToolUse moment
+    /// must surface the constraint (mutually exclusive with guard_file).
+    #[serde(default)]
+    guard_command: Option<String>,
 }
 
 #[derive(Clone, Copy)]
@@ -155,8 +159,8 @@ fn validate(s: &Scenario) -> anyhow::Result<()> {
     }
     match s.channel_hint.as_str() {
         "courier" => {}
-        "guard" if s.guard_file.is_some() => {}
-        "guard" => return fail("channel_hint guard requires guard_file".into()),
+        "guard" if s.guard_file.is_some() || s.guard_command.is_some() => {}
+        "guard" => return fail("channel_hint guard requires guard_file or guard_command".into()),
         other => return fail(format!("unknown channel_hint '{}'", other)),
     }
     let mut seen = std::collections::HashSet::new();
@@ -229,19 +233,30 @@ fn run_scenario(s: &Scenario) -> anyhow::Result<ScenarioResult> {
     let block = thor::courier::injection_for_hook_json(&db, &raw);
     let courier = score_courier(block.as_deref(), &s.preventer_id, &s.match_terms);
 
-    // Guard channel: the first touch of the constrained file this session
-    // (PreToolUse hook JSON). The file need not exist - the advisory keys on
-    // the path, which is all a real Edit-before-create carries too.
-    let guard = s.guard_file.as_deref().map(|gf| {
+    // Guard channel: the first touch of the constrained file this session, OR
+    // the Bash call carrying the risky command (PreToolUse hook JSON). The file
+    // need not exist - the advisory keys on the path/command text, which is all
+    // a real pre-action hook carries too.
+    let advisory = if let Some(gf) = s.guard_file.as_deref() {
         let hook = json!({
             "tool_name": "Edit",
             "tool_input": { "file_path": cwd.join(gf).to_string_lossy() },
             "session_id": format!("eval-{}", s.id),
             "cwd": cwd_str,
         });
-        let adv = thor::guard::file_memory_advisory_for_eval(&db, &hook);
-        score_guard(adv.as_deref(), &s.preventer_id, &s.match_terms)
-    });
+        Some(thor::guard::file_memory_advisory_for_eval(&db, &hook))
+    } else if let Some(gc) = s.guard_command.as_deref() {
+        let hook = json!({
+            "tool_name": "Bash",
+            "tool_input": { "command": gc },
+            "session_id": format!("eval-{}", s.id),
+            "cwd": cwd_str,
+        });
+        Some(thor::guard::command_memory_advisory_for_eval(&db, &hook))
+    } else {
+        None
+    };
+    let guard = advisory.map(|adv| score_guard(adv.as_deref(), &s.preventer_id, &s.match_terms));
 
     Ok(ScenarioResult { id: s.id.clone(), hint: s.channel_hint.clone(), courier, guard })
 }

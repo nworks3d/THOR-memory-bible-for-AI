@@ -388,27 +388,110 @@ const TIGHT_WINDOW_CHARS: usize = 240;
 /// no-sidecar fallback).
 const TRIGGER_WEIGHT: f64 = 0.35;
 
-fn trigger_bonus(body: &str, qterms: &[String]) -> f64 {
+/// A trigger term shorter than this is too generic to count as evidence in
+/// either match mode. It still occupies its slot in the DENOMINATOR: filtering
+/// it out entirely used to collapse `fires-when: docker cp` into the 1-element
+/// list ["docker"], which then fired at FULL weight on any prompt mentioning
+/// docker - measured as real courier noise on the silence set (n02).
+const MIN_TRIGGER_TERM_LEN: usize = 3;
+/// Stricter floor for SUBSTRING-CONTAINMENT matching (identifier/path-shaped
+/// terms): containment is inherently more permissive than token equality - a
+/// short structured fragment like "a.b" appears by coincidence inside URLs and
+/// version strings. Load-bearing, not decorative.
+const MIN_IDENTIFIER_PHRASE_LEN: usize = 5;
+
+/// True when `s` looks like an identifier or path rather than a plain word: a
+/// `::` scope, a slash/dot/underscore/hyphen-separated form, or a genuine
+/// camelCase transition (a lowercase char immediately followed by an uppercase
+/// one - "Docker" has none, "MatrixCache"/"fooBar" do). Such terms are matched
+/// by case-folded substring containment on the RAW query (the guard's anchor
+/// idiom), because tokens() shreds them into fragments that exact token
+/// equality can never reassemble.
+fn is_identifier_shaped(s: &str) -> bool {
+    if s.contains("::") || s.contains('/') || s.contains('.') || s.contains('_') || s.contains('-') {
+        return true;
+    }
+    s.chars().zip(s.chars().skip(1)).any(|(a, b)| a.is_lowercase() && b.is_uppercase())
+}
+
+/// Matched trigger terms, split by evidence kind: (generic word matches,
+/// identifier/path matches, declared term count). Shared by the scoring bonus
+/// and the below-floor rescue so both read the same match semantics.
+fn trigger_evidence(body: &str, query: &str, qterms: &[String]) -> (usize, usize, usize) {
     if qterms.is_empty() {
-        return 0.0;
+        return (0, 0, 0);
     }
     let Some(fires) = crate::footer::fires_when(body) else {
-        return 0.0;
+        return (0, 0, 0);
     };
-    let tterms: Vec<String> = fires
-        .split_whitespace()
-        .map(|t| fold_diacritics(&t.to_lowercase()))
-        .filter(|t| t.chars().count() >= 3)
-        .collect();
+    let tterms: Vec<String> =
+        fires.split_whitespace().map(|t| fold_diacritics(&t.to_lowercase())).collect();
     if tterms.is_empty() {
+        return (0, 0, 0);
+    }
+    let folded_query = fold_diacritics(&query.to_lowercase());
+    let (mut generic, mut identifier) = (0usize, 0usize);
+    for t in &tterms {
+        if t.chars().count() < MIN_TRIGGER_TERM_LEN {
+            continue; // too generic to count - but stays in the denominator
+        }
+        if is_identifier_shaped(t) {
+            if t.chars().count() >= MIN_IDENTIFIER_PHRASE_LEN && folded_query.contains(t.as_str()) {
+                identifier += 1;
+            }
+        } else if qterms.iter().any(|q| q == t) {
+            generic += 1;
+        }
+    }
+    (generic, identifier, tterms.len())
+}
+
+fn trigger_bonus(body: &str, query: &str, qterms: &[String]) -> f64 {
+    let (generic, identifier, declared) = trigger_evidence(body, query, qterms);
+    if declared == 0 {
         return 0.0;
     }
-    let matched = tterms.iter().filter(|t| qterms.iter().any(|q| q == *t)).count();
-    TRIGGER_WEIGHT * (matched as f64 / tterms.len() as f64)
+    TRIGGER_WEIGHT * ((generic + identifier) as f64 / declared as f64)
+}
+
+/// Below-floor rescue takes SPECIFIC evidence, not any partial ratio: at least
+/// two matched trigger terms, or a single match that is itself an
+/// identifier/path phrase (a declared file or scoped name appearing verbatim
+/// in the prompt). One generic word ('docker') never lifts a fact past the
+/// relevance floor - measured as real courier noise on the silence set (n02)
+/// when it could. Rescoring within the pool still uses the full partial ratio;
+/// only the RESCUE is gated.
+fn trigger_rescues(body: &str, query: &str, qterms: &[String]) -> bool {
+    let (generic, identifier, _) = trigger_evidence(body, query, qterms);
+    identifier >= 1 || generic + identifier >= 2
+}
+
+/// Bounded reward when a candidate body contains an exact identifier/path
+/// phrase from the query (`MatrixCache::ensure`, `server/lib/be-postal.json`):
+/// for a question ABOUT a specific symbol, the defining body beats one that
+/// merely shares the generic fragments bm25 sees. Folded into coverage_bonus -
+/// the ONE lexical-evidence bonus concept, not a second nudge. 0.20 validated
+/// on the 52-query battery (no category regressed, @5 held 71-73% across
+/// lambdas) and the committed drift corpus (catch unchanged, noise unchanged);
+/// re-sweep together with the serving-side footer-strip round before raising.
+#[cfg(feature = "semantic")]
+const IDENTIFIER_BONUS: f64 = 0.20;
+
+/// Identifier/path-shaped tokens of the raw query, folded, deduped, floor-gated.
+#[cfg(feature = "semantic")]
+fn identifier_phrases(query: &str) -> Vec<String> {
+    let mut seen = HashSet::new();
+    query
+        .split_whitespace()
+        .map(|t| t.trim_matches(|c: char| !c.is_alphanumeric() && !"_:./-".contains(c)))
+        .map(|t| fold_diacritics(&t.to_lowercase()))
+        .filter(|t| t.chars().count() >= MIN_IDENTIFIER_PHRASE_LEN && is_identifier_shaped(t))
+        .filter(|t| seen.insert(t.clone()))
+        .collect()
 }
 
 #[cfg(feature = "semantic")]
-fn coverage_bonus(body: &str, qterms: &[String]) -> f64 {
+fn coverage_bonus(body: &str, qterms: &[String], id_phrases: &[String]) -> f64 {
     if qterms.is_empty() {
         return 0.0;
     }
@@ -425,13 +508,19 @@ fn coverage_bonus(body: &str, qterms: &[String]) -> f64 {
             max_pos = max_pos.max(p + t.len());
         }
     }
+    let id_hit = id_phrases.iter().any(|p| hay.contains(p.as_str()));
     if found == 0 {
-        return 0.0;
+        // An exact identifier phrase is stronger evidence than any single
+        // fragment, so it stands on its own even without term coverage.
+        return if id_hit { IDENTIFIER_BONUS } else { 0.0 };
     }
     let cov = found as f64 / qterms.len() as f64;
     let mut bonus = COVERAGE_WEIGHT * cov * cov;
     if found == qterms.len() && (max_pos - min_pos) <= TIGHT_WINDOW_CHARS {
         bonus += TIGHT_BONUS;
+    }
+    if id_hit {
+        bonus += IDENTIFIER_BONUS;
     }
     bonus
 }
@@ -499,6 +588,7 @@ fn collect_heads(
     by_seq: &HashMap<i64, &Event>,
     heads: &HashMap<String, crate::cas::HeadSet>,
     filter: &ScopeFilter,
+    query: &str,
     qterms: &[String],
     limit: usize,
 ) -> Vec<RecallHit> {
@@ -551,7 +641,7 @@ fn collect_heads(
                 if below_floor > FLOOR_TRIGGER_SCAN_CAP {
                     break;
                 }
-                if trigger_bonus(&ev.body, qterms) == 0.0 {
+                if !trigger_rescues(&ev.body, query, qterms) {
                     continue;
                 }
             }
@@ -714,16 +804,16 @@ fn recall_scoped_inner(
     };
     let fetch = limit.saturating_add(TRIGGER_POOL_EXTRA);
     if let Some(aq) = and_query {
-        let mut strict = collect_heads(store, &aq, &by_seq, &heads, &filter, &qterms, fetch);
+        let mut strict = collect_heads(store, &aq, &by_seq, &heads, &filter, query, &qterms, fetch);
         if !strict.is_empty() {
             for h in &mut strict {
                 h.matched_and = true; // every content term matched: strong evidence
             }
-            return Ok(trigger_boost(strict, &qterms, limit));
+            return Ok(trigger_boost(strict, query, &qterms, limit));
         }
     }
-    let pool = collect_heads(store, &or_query, &by_seq, &heads, &filter, &qterms, fetch);
-    Ok(trigger_boost(pool, &qterms, limit))
+    let pool = collect_heads(store, &or_query, &by_seq, &heads, &filter, query, &qterms, fetch);
+    Ok(trigger_boost(pool, query, &qterms, limit))
 }
 
 /// Extra heads collected past `limit` purely as trigger-boost headroom.
@@ -734,8 +824,8 @@ const TRIGGER_POOL_EXTRA: usize = 8;
 /// carries a fires-when field, the pool is returned in plain bm25 order
 /// truncated to `limit` - byte-identical to the pre-trigger behavior by
 /// construction (the wider fetch walks the same rank-ordered cursor).
-fn trigger_boost(mut hits: Vec<RecallHit>, qterms: &[String], limit: usize) -> Vec<RecallHit> {
-    let bonuses: Vec<f64> = hits.iter().map(|h| trigger_bonus(&h.body, qterms)).collect();
+fn trigger_boost(mut hits: Vec<RecallHit>, query: &str, qterms: &[String], limit: usize) -> Vec<RecallHit> {
+    let bonuses: Vec<f64> = hits.iter().map(|h| trigger_bonus(&h.body, query, qterms)).collect();
     if bonuses.iter().all(|b| *b == 0.0) {
         hits.truncate(limit);
         return hits;
@@ -1083,6 +1173,7 @@ pub fn recall_fused_scoped(
             .filter(|t| seen.insert(t.clone()))
             .collect()
     };
+    let id_phrases = identifier_phrases(query);
     let mut scored: Vec<(i64, f64, f64)> = cand
         .into_iter()
         .map(|seq| {
@@ -1097,8 +1188,8 @@ pub fn recall_fused_scoped(
             let (delta, coverage, trigger) = match by_seq.get(&seq) {
                 Some(ev) => (
                     class_delta(route, source_class(&ev.entity_id)),
-                    coverage_bonus(&ev.body, &qterms),
-                    trigger_bonus(&ev.body, &qterms),
+                    coverage_bonus(&ev.body, &qterms, &id_phrases),
+                    trigger_bonus(&ev.body, query, &qterms),
                 ),
                 None => (0.0, 0.0, 0.0),
             };
@@ -1551,36 +1642,106 @@ mod fused_tests {
 
     #[test]
     fn test_trigger_bonus_fires_only_on_declared_vocabulary() {
+        let raw = "export resume progressbar";
         let q: Vec<String> =
             ["export", "resume", "progressbar"].iter().map(|s| s.to_string()).collect();
         let tagged = "the export rule\n\n[memory/gotcha | tags: x | fires-when: export progressbar | project: P]";
         let untagged = "the export rule about export and progressbar, mentioned inline";
-        let full = trigger_bonus(tagged, &q);
+        let full = trigger_bonus(tagged, raw, &q);
         assert!((full - TRIGGER_WEIGHT).abs() < 1e-9, "both declared triggers matched: {full}");
-        assert_eq!(trigger_bonus(untagged, &q), 0.0, "no fires-when field = no bonus, ever");
+        assert_eq!(trigger_bonus(untagged, raw, &q), 0.0, "no fires-when field = no bonus, ever");
         // partial: one of two declared triggers matched = half the weight
         let half = trigger_bonus(
             "r\n\n[memory/note | tags: | fires-when: export tarball | project: P]",
+            raw,
             &q,
         );
         assert!((half - TRIGGER_WEIGHT / 2.0).abs() < 1e-9, "matched/declared scoring: {half}");
         // an unrelated query never fires
         let other: Vec<String> = ["courier", "snippet"].iter().map(|s| s.to_string()).collect();
-        assert_eq!(trigger_bonus(tagged, &other), 0.0);
+        assert_eq!(trigger_bonus(tagged, "courier snippet", &other), 0.0);
+    }
+
+    #[test]
+    fn test_is_identifier_shaped_detects_structure_not_plain_words() {
+        for s in ["foo::bar", "server/lib/be-postal.json", "snake_case_name", "matrixcache.get",
+                  "kebab-case", "fooBar", "MatrixCache"] {
+            assert!(is_identifier_shaped(s), "{s} must read as identifier-shaped");
+        }
+        for s in ["docker", "Docker", "ALLCAPS", "hi", "gewoon"] {
+            assert!(!is_identifier_shaped(s), "{s} must read as a plain word");
+        }
+    }
+
+    #[test]
+    fn test_trigger_bonus_matches_path_trigger_via_substring() {
+        // Regression: a path-shaped trigger term is ONE whitespace token but the
+        // query side is split on every non-alphanumeric char, so exact token
+        // equality could never fire - provably 0 before the containment mode.
+        let tagged = "postal dataset rule\n\n[memory/gotcha | tags: | fires-when: server/lib/be-postal.json | project: P]";
+        let raw = "werk server/lib/be-postal.json bij met de nieuwe fusiegemeenten";
+        let q: Vec<String> = tokens(raw);
+        let bonus = trigger_bonus(tagged, raw, &q);
+        assert!((bonus - TRIGGER_WEIGHT).abs() < 1e-9, "path trigger fires via containment: {bonus}");
+        // and not on an unrelated prompt that merely shares fragments
+        let other = "de server leest json config bij het opstarten";
+        assert_eq!(trigger_bonus(tagged, other, &tokens(other)), 0.0);
+    }
+
+    #[test]
+    fn test_trigger_bonus_docker_cp_no_longer_overfires_on_generic_word_alone() {
+        // Regression for the denominator bug: 'cp' (2 chars) used to be DROPPED
+        // from the list, collapsing 'docker cp deploy' into a 2-term list and
+        // inflating the ratio. It now stays in the denominator as a non-match.
+        let tagged = "copy rule\n\n[memory/gotcha | tags: | fires-when: docker cp deploy | project: P]";
+        let raw = "schrijf uitleg over docker containers";
+        let bonus = trigger_bonus(tagged, raw, &tokens(raw));
+        assert!(
+            (bonus - TRIGGER_WEIGHT / 3.0).abs() < 1e-9,
+            "docker alone = 1 of 3 declared terms, not full weight: {bonus}"
+        );
+    }
+
+    #[test]
+    fn test_trigger_bonus_min_length_floor_blocks_short_identifier_fragments() {
+        // 'a.b' is identifier-shaped but below MIN_IDENTIFIER_PHRASE_LEN: too
+        // short for containment to be trustworthy evidence.
+        let tagged = "short rule\n\n[memory/note | tags: | fires-when: a.b | project: P]";
+        let raw = "config a.b staat in de repo";
+        assert_eq!(trigger_bonus(tagged, raw, &tokens(raw)), 0.0);
     }
 
     #[test]
     fn test_coverage_bonus_prefers_full_tight_matches() {
         let q = vec!["sync".to_string(), "batches".to_string()];
-        let full_tight = coverage_bonus("the sync refactor keeps batches small", &q);
+        let none: Vec<String> = vec![];
+        let full_tight = coverage_bonus("the sync refactor keeps batches small", &q, &none);
         let full_loose = coverage_bonus(
             &format!("sync {} batches", "filler ".repeat(60)),
             &q,
+            &none,
         );
-        let partial = coverage_bonus("sync sync sync everywhere sync", &q);
+        let partial = coverage_bonus("sync sync sync everywhere sync", &q, &none);
         assert!(full_tight > full_loose, "tight window beats loose: {full_tight} vs {full_loose}");
         assert!(full_loose > partial, "full coverage beats repeated single term: {full_loose} vs {partial}");
-        assert_eq!(coverage_bonus("nothing relevant", &q), 0.0);
+        assert_eq!(coverage_bonus("nothing relevant", &q, &none), 0.0);
+    }
+
+    #[test]
+    fn test_identifier_bonus_rewards_exact_phrase_and_respects_floor() {
+        let q = vec!["matrixcache".to_string(), "ensure".to_string()];
+        let phrases = identifier_phrases("how does MatrixCache::ensure work");
+        assert_eq!(phrases, vec!["matrixcache::ensure".to_string()], "one folded phrase extracted");
+        let defining = "fn ensure() rebuilds; matrixcache::ensure reloads the sidecar";
+        let distractor = "matrixcache matrixcache matrixcache ensure rebuild everywhere";
+        let with_phrase = coverage_bonus(defining, &q, &phrases);
+        let without_phrase = coverage_bonus(distractor, &q, &phrases);
+        assert!(
+            with_phrase > without_phrase,
+            "the body carrying the exact phrase must outscore fragments: {with_phrase} vs {without_phrase}"
+        );
+        // floor: short identifier fragments never become phrases
+        assert!(identifier_phrases("check a.b now").is_empty(), "below-floor fragment filtered");
     }
 
     #[test]

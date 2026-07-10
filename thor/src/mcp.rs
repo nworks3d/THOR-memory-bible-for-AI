@@ -328,6 +328,13 @@ impl ThorServer {
             if body.is_empty() {
                 return Err("a non-empty 'body' is required".to_string());
             }
+            // Same write-time integrity check as revise: a caller pasting a
+            // pre-baked (and possibly malformed) [memory/...] footer into the
+            // body would end up with a degraded or doubled footer once
+            // compose() appends its own.
+            if let Some(defect) = crate::footer::write_defect(body) {
+                return Err(format!("body refused: {defect}"));
+            }
             let mint = match args.project {
                 Some(p) if p.eq_ignore_ascii_case("global") => None,
                 Some(p) => {
@@ -422,6 +429,14 @@ impl ThorServer {
             let body = args.body.trim();
             if body.is_empty() {
                 return Err("a non-empty 'body' is required".to_string());
+            }
+            // Write-time footer integrity: a malformed footer (CLI-dump tail,
+            // missing blank-line separator) silently loses the fact's type and
+            // leaks bracket syntax into served snippets - measured live as 16
+            // broken heads. Refuse with the exact defect so the caller fixes
+            // the body instead of storing a degraded head.
+            if let Some(defect) = crate::footer::write_defect(body) {
+                return Err(format!("body refused: {defect}"));
             }
             match s.append_mutate_checked(
                 "mcp",

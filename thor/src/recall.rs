@@ -517,6 +517,18 @@ pub fn trigger_authorizes(body: &str, query: &str) -> bool {
 #[cfg(feature = "semantic")]
 const IDENTIFIER_BONUS: f64 = 0.20;
 
+/// Same-file sibling vote (fused path): bounded lift for the OTHER chunks of
+/// a file whose best candidate already scores near the pool's top. Fixes the
+/// measured "right file, wrong chunk, crowded out" code-structure pattern.
+/// Values chosen by mini-sim sweep (52-battery: code categories may only
+/// rise, others must not fall) - see the sweep note at the call site.
+#[cfg(feature = "semantic")]
+const SIBLING_BONUS: f64 = 0.10;
+/// A file only lends its vote when its best candidate is within this fraction
+/// of the pool's global best - weak files never lift their siblings.
+#[cfg(feature = "semantic")]
+const SIBLING_FILE_FRAC: f64 = 0.8;
+
 /// Identifier/path-shaped tokens of the raw query, folded, deduped, floor-gated.
 #[cfg(feature = "semantic")]
 fn identifier_phrases(query: &str) -> Vec<String> {
@@ -1236,6 +1248,43 @@ pub fn recall_fused_scoped(
             (seq, rank.unwrap_or(0.0), bm_norm + lambda * cos + delta + coverage + trigger)
         })
         .collect();
+    // Same-file sibling vote: the measured code-structure failure mode is
+    // "right file found, decisive sibling chunk buried under tangential
+    // distractors" (a caller file outranks the defining file's other chunks).
+    // A file whose best candidate already scores near the pool's top lends its
+    // OTHER chunks a bounded lift - one lexical-evidence concept alongside
+    // coverage/identifier, never a reorder of the file's own best hit.
+    // Swept: 0.15 and 0.10 both gave +1 code-behavior at the production
+    // lambda with every other category unchanged; a code-route-only gate was
+    // tried and REJECTED (the winning question was not code-routed, and no
+    // regression needed the gate). 0.10 kept as the smaller equal-yield value.
+    {
+        use std::collections::HashMap as Map;
+        let file_of = |seq: i64| -> Option<String> {
+            by_seq.get(&seq).and_then(|ev| {
+                ev.entity_id.rsplit_once('#').map(|(prefix, _)| prefix.to_string())
+            })
+        };
+        let mut file_best: Map<String, f64> = Map::new();
+        let mut global_best = f64::NEG_INFINITY;
+        for (seq, _, score) in &scored {
+            global_best = global_best.max(*score);
+            if let Some(f) = file_of(*seq) {
+                let e = file_best.entry(f).or_insert(f64::NEG_INFINITY);
+                *e = e.max(*score);
+            }
+        }
+        if global_best.is_finite() {
+            for (seq, _, score) in &mut scored {
+                if let Some(f) = file_of(*seq) {
+                    let best = file_best[&f];
+                    if best >= SIBLING_FILE_FRAC * global_best && *score < best {
+                        *score += SIBLING_BONUS;
+                    }
+                }
+            }
+        }
+    }
     // Total order (NaN-safe) with a deterministic seq tie-break, so equal fused
     // scores always resolve the same way across runs.
     scored.sort_by(|a, b| b.2.total_cmp(&a.2).then(a.0.cmp(&b.0)));

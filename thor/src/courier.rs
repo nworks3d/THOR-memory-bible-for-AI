@@ -254,19 +254,20 @@ pub fn injection_for_hook_json(db: &Path, raw: &str) -> Option<String> {
         // the cheap windowed caps; slot order is untouched (a typed fact is
         // never promoted here - rank decides slots, the budget only decides
         // how much of the winning fact is shown).
-        let cap = if hit.fact_type.is_some() {
+        // EVERY hand-written memory serves full-body up to the per-fact cap:
+        // the v5 diagnosis found note/idea facts (not gotcha/decision/
+        // preference) losing their decisive detail to the small windows -
+        // being hand-written, not chunked, is what makes a body worth serving
+        // whole. Chunks keep windowed caps (widened for the drift-catch
+        // class: most live replay misses were CHUNK golds whose decisive
+        // lines fell outside the old 700/220 windows). The per-prompt budget
+        // (8000 chars) stays the hard ceiling.
+        let cap = if !crate::repo::is_chunk_id(&hit.entity_id) {
             TYPED_FULL_BODY_CAP_CHARS
+        } else if slot == 0 {
+            1200
         } else {
-            // Chunk caps widened for the drift-catch class: 28 of 40 live
-            // replay misses were CHUNK golds whose decisive lines fell outside
-            // the old 700/220 windows. The per-prompt budget (8000 chars)
-            // stays the hard ceiling; slots only spend what content needs.
-            match (slot, crate::repo::is_chunk_id(&hit.entity_id)) {
-                (0, true) => 1200,
-                (0, false) => 700,
-                (_, true) => 500,
-                (_, false) => 500,
-            }
+            500
         };
         let cap = cap.min(remaining.max(220)); // budget floor: never serve less than the old minimum
         let diverged = if hit.is_diverged { " [DIVERGED]" } else { "" };

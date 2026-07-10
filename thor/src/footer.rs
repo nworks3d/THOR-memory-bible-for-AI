@@ -126,6 +126,48 @@ pub fn strip(body: &str) -> &str {
     }
 }
 
+/// Write-time footer integrity check for agent-supplied bodies (MCP
+/// revise/remember). Catches the two defect classes measured live in the v5
+/// diagnosis: (1) trailing garbage after the footer's closing `]` - typically
+/// a "Kind: fact_created" line pasted back from a CLI dump - which breaks
+/// strip() and fact_type(); (2) a footer glued to the content without the
+/// blank-line separator, which strip() can never find. A body WITHOUT any
+/// `[memory/...` marker passes (untyped facts are legitimate); a body WITH
+/// one must round-trip. Returns a human-readable defect, or None when clean.
+pub fn write_defect(body: &str) -> Option<String> {
+    let Some(marker) = body.rfind("[memory/") else {
+        return None; // no footer intended - nothing to validate
+    };
+    let trimmed = body.trim_end();
+    if !trimmed.ends_with(']') {
+        return Some(
+            "footer is followed by trailing text after its closing ']' (did a CLI dump line like \
+             'Kind: ...' get pasted into the body?) - strip()/fact_type() would break; end the \
+             body at the footer's ']'"
+                .to_string(),
+        );
+    }
+    let has_separator = matches!(trimmed.rfind("\n\n["), Some(i) if !trimmed[i + 2..].contains('\n'));
+    if !has_separator {
+        return Some(
+            "footer is not separated from the content by a blank line (the convention is \
+             '<content>\\n\\n[memory/...]', one bracketed line, nothing after) - strip() would \
+             never find it"
+                .to_string(),
+        );
+    }
+    // The bracketed tail must BE the marker's line (not a marker buried mid-body
+    // with a different bracketed line at the end).
+    if trimmed[marker..].contains('\n') {
+        return Some(
+            "the [memory/...] marker is not on the final footer line - move the footer to the \
+             single trailing bracketed line"
+                .to_string(),
+        );
+    }
+    None
+}
+
 /// Parse the footer's `| project: <name> |` field, if present.
 pub fn project(body: &str) -> Option<String> {
     let idx = body.find("| project: ")?;
@@ -141,6 +183,28 @@ pub fn project(body: &str) -> Option<String> {
 /// review-scope trusts: mimir already attributed or confirmed-global the fact).
 pub fn has_project_field(body: &str) -> bool {
     body.contains("| project: ")
+}
+
+#[cfg(test)]
+mod write_defect_tests {
+    use super::*;
+
+    #[test]
+    fn write_defect_catches_the_measured_defect_classes() {
+        // clean typed body
+        assert!(write_defect("a rule\n\n[memory/gotcha | tags: x | project: P]").is_none());
+        // untyped body without any footer: legitimate
+        assert!(write_defect("just a plain note without a footer").is_none());
+        // defect 1: CLI-dump tail after the closing bracket
+        let tail = "a rule\n\n[memory/gotcha | tags: x | project: P]\nKind: fact_created";
+        assert!(write_defect(tail).unwrap().contains("trailing text"));
+        // defect 2: footer glued to the content (no blank-line separator)
+        let glued = "a rule\n[memory/decision | tags: x | project: P]";
+        assert!(write_defect(glued).unwrap().contains("blank line"));
+        // defect 3: marker buried mid-body, different bracketed tail
+        let buried = "text [memory/gotcha | tags: x] more\n\n[other]";
+        assert!(write_defect(buried).is_some());
+    }
 }
 
 /// Parse the footer's `| fires-when: <words> |` field: the author-declared

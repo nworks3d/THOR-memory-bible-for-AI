@@ -95,6 +95,27 @@ both systems score near zero on those, which drags both overalls down
 equally; see Test 2 for the cuts that exclude them. No category clears an 80%
 bar this run (config how-to closest again at 79.4%).
 
+**V6 code-round addendum (same evening).** The two code categories were
+diagnosed A-B style (93 questions, mechanical gold-coverage on the real fused
+channel) and re-judged by a fresh category-scoped 3-lens blind mini-jury after
+two targeted fixes: (1) **serving parity** - the deliberate path now serves a
+found chunk's FULL body instead of a 500-char query window (mimir was always
+judged on full bodies; the window frequently cut the answer out of the chunk
+THOR had already found), and (2) a **path-affinity ranking bonus** - a query
+that names a file by its stem ("the Fleet page", "the event store") lifts that
+file's chunks (the path sits once in a chunk footer, so bm25 barely felt it;
+deliberate path only - on the courier pool it measurably displaced drift
+preventers and stays off). Re-judged result on the identical 93 items:
+**code-behavior THOR 71.7% vs mimir 57.5%** (was 60.0 vs 62.5 - the category
+flipped) and **code-structure THOR 50.0% vs mimir 57.6%** (was 42.4 vs 63.6 -
+gap halved, still a mimir win). A pre-registered per-symbol/nested chunking
+A-B on a store clone came out net NEGATIVE (smaller chunks win
+structure-shaped questions but lose behavior context) and was rejected, same
+verdict as the earlier round's chunker attempt; the remaining structure gap is
+the symbol-graph route (see SIMILAR-PROJECTS.md R2), not chunk-shuffling.
+Note: 4 of the 33 structure items reference repo-removed sources on which both
+systems score zero, capping the reachable maximum at ~88%.
+
 ## Test 2 - Same knowledge (cuts over the judged Test 1 set)
 
 The fair, apples-to-apples comparison: only questions whose source fact
@@ -307,10 +328,13 @@ injection block.
   fresh re-index (including THOR's own fast-moving source tree) is the
   plausible driver, and the honest reading is that mimir's code-content
   indexing keeps compounding.
-- **mimir now wins code-structure decisively (63.6% vs 42.4%).** THOR's
-  symbol-boundary chunker plus the new same-file sibling vote did not close
-  the gap on the judged score - code ranking is the clearest open problem in
-  THOR's recall.
+- **mimir still wins code-structure (57.6% vs 50.0% on the V6 re-judge; was
+  63.6% vs 42.4%).** The V6 serving-parity + path-affinity round halved the
+  gap and flipped code-behavior outright, but structure-shaped questions
+  ("what is the shape of X's state") keep favoring mimir's symbol-level
+  retrieval; the chunking A-B that targeted it came out net negative and was
+  rejected. The symbol-graph sidecar (SIMILAR-PROJECTS.md, R2) is the open
+  route.
 - **mimir wins the broad shared cut (81.2% vs 77.0%)** - two-thirds of that
   cut is code/doc-chunk questions, the same weakness as above on an equal
   corpus.

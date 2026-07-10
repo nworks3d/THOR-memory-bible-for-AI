@@ -207,6 +207,15 @@ enum Commands {
     /// each code chunk defines and calls. Powers where_used/impact and the
     /// deliberate-recall symbol bonus. Safe to delete and rebuild any time.
     Symbols,
+    /// PreCompact hook: one advisory per session, just before a compaction,
+    /// nudging the agent to persist durable decisions via remember. Installed
+    /// by `thor install --with-courier`. Always exits 0.
+    PreCompact,
+    /// Prepare a stewardship review: write the consolidate report plus the
+    /// proven conservative review rubric to a file an agent session can work
+    /// through with the MCP tools (revise/retract/pin). Makes NO store writes
+    /// itself - every action stays an explicit, auditable event.
+    Steward,
     /// Moment-of-action Guard: reads a PreToolUse hook JSON on stdin and, if a
     /// rulebook rule matches the tool call, emits an advisory additionalContext.
     /// Hard fail-open, always exit 0.
@@ -819,6 +828,59 @@ pub fn run() -> Result<()> {
                 stats.chunks, stats.symbols, stats.edges,
                 crate::symbols::default_symbols_path(&db).display()
             );
+        }
+        Commands::PreCompact => {
+            crate::courier::run_pre_compact(&db);
+        }
+        Commands::Steward => {
+            let store = EventStore::new(&db)?;
+            let events = store.get_all_events()?;
+            let tip = events.last().map(|e| e.seq).unwrap_or(0);
+            let report = crate::consolidate::build_report(
+                &store,
+                &db,
+                &events,
+                &crate::consolidate::Options { min_age_events: 2000 },
+            );
+            let dir = db.parent().unwrap_or_else(|| std::path::Path::new(".")).join("steward");
+            std::fs::create_dir_all(&dir)?;
+            let path = dir.join(format!("steward-{tip}.md"));
+            let mut out = String::new();
+            out.push_str(&format!(
+                "# THOR stewardship review (store tip seq {tip})
+
+                 The proven conservative rubric (V5 decay review: 280 candidates -> 216 keep,
+                 61 retype, 1 retract; zero damage). Work through the report below in an agent
+                 session armed with the THOR MCP tools. Every action is an ordinary event in
+                 the hash-chained log - nothing here is mechanical or irreversible.
+
+                 ## Rubric (per candidate, in order)
+
+                 1. KEEP (default, no action): anything with plausible future reuse value.
+                    Reference data, formulas, business facts, hardware knowledge, preferences,
+                    gotchas, design rationale: ALWAYS keep. Doubt = keep.
+                 2. RETYPE (revise): durable reusable knowledge without a typed footer - add
+                    [memory/<gotcha|decision|preference> | tags | fires-when (6-10 single words,
+                    bilingual NL+EN task vocabulary, body-derived) | project] with a blank line
+                    before it; body text stays byte-identical. REPLACE an existing footer, never
+                    stack a second one (the double-footer incident is documented).
+                 3. RETRACT: ONLY an evidently dead session/status log whose outcome is fully
+                    covered by current state and which contains zero unique durable knowledge.
+                 4. Duplicate twins: `thor consolidate --apply-dedup` handles those separately.
+                 5. Clusters are leads, not verdicts: resolve contradictions via revise/resolve.
+
+                 Run this review roughly every ~2000 store events, or after a heavy write burst.
+
+                 ## Consolidate report
+
+"
+            ));
+            out.push_str(&crate::consolidate::render_report(&report));
+            std::fs::write(&path, &out)?;
+            crate::consolidate::print_report(&report);
+            println!("
+steward review prepared: {}", path.display());
+            println!("(open it in an agent session with the THOR MCP tools; no writes were made)");
         }
         Commands::Guard { rulebook } => {
             let path = rulebook.unwrap_or_else(crate::guard::default_rulebook_path);

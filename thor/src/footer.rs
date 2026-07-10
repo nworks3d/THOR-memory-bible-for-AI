@@ -24,6 +24,7 @@ pub fn compose(
     project_label: &str,
     triggers: &[String],
     anchors: &[String],
+    expires: Option<&str>,
 ) -> String {
     let ty = {
         let t = field_safe(fact_type).to_lowercase();
@@ -49,8 +50,63 @@ pub fn compose(
     if !anchors.is_empty() {
         out.push_str(&format!(" | anchors: {}", anchors));
     }
+    if let Some(exp) = expires {
+        let exp = field_safe(exp);
+        if !exp.is_empty() {
+            out.push_str(&format!(" | expires: {}", exp));
+        }
+    }
     out.push_str(&format!(" | project: {}]", project_label));
     out
+}
+
+/// Parse the footer's `| expires: YYYY-MM-DD` field: the date after which the
+/// fact stops surfacing in recall (history keeps it - losslessness holds; the
+/// filter is rank-time, never an eviction). None when absent.
+pub fn expires(body: &str) -> Option<String> {
+    let idx = body.find("| expires: ")?;
+    let rest = &body[idx + "| expires: ".len()..];
+    let date = rest.split(" |").next()?.trim().trim_end_matches(']').trim();
+    (!date.is_empty()).then(|| date.to_string())
+}
+
+/// Today as YYYY-MM-DD (UTC), for the rank-time expiry compare. Civil-date
+/// from days-since-epoch (Howard Hinnant's algorithm) - no chrono dependency,
+/// and deliberately NOT usable from the fold modules (cas/auditor stay
+/// clock-free; test_2_purity_no_time enforces that).
+pub fn today() -> String {
+    let secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
+    let z = secs.div_euclid(86_400) + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z.rem_euclid(146_097);
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y = if m <= 2 { y + 1 } else { y };
+    format!("{:04}-{:02}-{:02}", y, m, d)
+}
+
+/// Valid `expires` value at write time: strictly YYYY-MM-DD with a plausible
+/// month/day. Refusing malformed dates at the write keeps the recall-time
+/// comparison a plain string compare (ISO dates order lexicographically).
+pub fn valid_expiry(date: &str) -> bool {
+    let b = date.as_bytes();
+    if b.len() != 10 || b[4] != b'-' || b[7] != b'-' {
+        return false;
+    }
+    let digits = |r: std::ops::Range<usize>| date[r].chars().all(|c| c.is_ascii_digit());
+    if !(digits(0..4) && digits(5..7) && digits(8..10)) {
+        return false;
+    }
+    let month: u32 = date[5..7].parse().unwrap_or(0);
+    let day: u32 = date[8..10].parse().unwrap_or(0);
+    (1..=12).contains(&month) && (1..=31).contains(&day)
 }
 
 /// Strip characters that would corrupt the footer's field structure - including
@@ -256,7 +312,7 @@ mod tests {
     fn compose_parse_roundtrip() {
         // The property the module exists for: whatever compose writes, every
         // parser reads back - writer and parsers can no longer drift apart.
-        let footer = compose("gotcha", &["db".into(), "wal".into()], "ProjA", &[], &[]);
+        let footer = compose("gotcha", &["db".into(), "wal".into()], "ProjA", &[], &[], None);
         let body = format!("never open the db over SMB\n\n{}", footer);
         assert_eq!(fact_type(&body), Some(FactType::Gotcha));
         assert_eq!(project(&body).as_deref(), Some("ProjA"));
@@ -273,6 +329,7 @@ mod tests {
             "ProjA",
             &["docker compose".into(), "deploy.flag".into()],
             &[],
+            None,
         );
         let body = format!("the deploy rule\n\n{}", footer);
         assert_eq!(fires_when(&body).as_deref(), Some("docker compose deploy.flag"));
@@ -281,7 +338,7 @@ mod tests {
         assert_eq!(project(&body).as_deref(), Some("ProjA"));
         assert_eq!(strip(&body), "the deploy rule");
         // hostile trigger content cannot corrupt the footer structure
-        let hostile = compose("note", &[], "global", &["a|b\n[x]".into()], &[]);
+        let hostile = compose("note", &[], "global", &["a|b\n[x]".into()], &[], None);
         assert!(!hostile.contains('\n'), "single line survives: {hostile}");
         let body2 = format!("f\n\n{}", hostile);
         assert_eq!(project(&body2).as_deref(), Some("global"));
@@ -300,7 +357,7 @@ mod tests {
     fn compose_sanitizes_hostile_fields() {
         // A newline or bracket in a field must never produce a multi-line or
         // structurally broken footer.
-        let footer = compose("gotcha\nweird", &["a|b".into(), "[x]".into()], "global", &[], &[]);
+        let footer = compose("gotcha\nweird", &["a|b".into(), "[x]".into()], "global", &[], &[], None);
         assert!(!footer.contains('\n'), "footer stays single-line: {footer}");
         let body = format!("fact\n\n{}", footer);
         assert_eq!(fact_type(&body), Some(FactType::Gotcha), "type survives sanitizing: {footer}");
@@ -309,9 +366,31 @@ mod tests {
 
     #[test]
     fn empty_type_defaults_to_note() {
-        let footer = compose("", &[], "global", &[], &[]);
+        let footer = compose("", &[], "global", &[], &[], None);
         assert!(footer.starts_with("[memory/note "), "{footer}");
         assert_eq!(fact_type(&format!("x\n\n{}", footer)), None, "note is untyped by design");
+    }
+
+    #[test]
+    fn expires_roundtrip_and_validation() {
+        let footer = compose("note", &["pin".into()], "global", &[], &[], Some("2027-01-15"));
+        let body = format!("pin serde to 1.9 until the upstream fix
+
+{}", footer);
+        assert_eq!(expires(&body).as_deref(), Some("2027-01-15"));
+        // every other parser still reads through the new field
+        assert_eq!(project(&body).as_deref(), Some("global"));
+        assert_eq!(strip(&body), "pin serde to 1.9 until the upstream fix");
+        assert_eq!(expires("no footer here"), None);
+        // write-time validation: strict YYYY-MM-DD only
+        for good in ["2026-01-01", "2030-12-31"] {
+            assert!(valid_expiry(good), "{good}");
+        }
+        for bad in ["2026-1-1", "morgen", "2026-13-01", "2026-00-10", "2026-01-32", "20260101", ""] {
+            assert!(!valid_expiry(bad), "{bad}");
+        }
+        // today() emits the same shape the validator accepts
+        assert!(valid_expiry(&today()), "today() must be a valid ISO date: {}", today());
     }
 
     #[test]
@@ -322,6 +401,7 @@ mod tests {
             "ProjA",
             &["deploy".into()],
             &["deploy/watcher.sh".into(), "docker compose up".into(), "a,b".into()],
+            None,
         );
         let body = format!("the rule\n\n{}", footer);
         assert_eq!(

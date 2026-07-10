@@ -92,6 +92,41 @@ fn build_injection(db: &Path) -> Option<String> {
     injection_for_hook_json(db, &raw)
 }
 
+/// PreCompact hook: the ONE moment memory can still act BEFORE a compaction
+/// erases working context - everything else THOR does for the post-compaction
+/// window (pins, brief) is recovery-after-the-fact. Prints a single advisory
+/// per session (ledger-deduped) nudging the agent to persist durable
+/// decisions/gotchas via remember NOW; silent on every failure path, like the
+/// courier. Idea credit: Letta's memory-pressure warning (SIMILAR-PROJECTS R7).
+pub fn run_pre_compact(db: &Path) {
+    let mut raw = String::new();
+    if std::io::stdin().read_to_string(&mut raw).is_err() {
+        return;
+    }
+    if flag_present(db, "THOR-SILENT.flag") {
+        return;
+    }
+    let session = serde_json::from_str::<serde_json::Value>(raw.trim_start_matches('\u{feff}'))
+        .ok()
+        .and_then(|v| v.get("session_id").and_then(|s| s.as_str()).map(str::to_string))
+        .unwrap_or_default();
+    if session.is_empty() {
+        return; // no session identity -> no dedup possible; stay silent
+    }
+    // fire-once per session: the second compaction of a session already had
+    // its warning, and a repeated nudge is noise in an already-tight context
+    if crate::ledger::counter(db, "precompact-seen", &session) > 0 {
+        return;
+    }
+    crate::ledger::increment(db, "precompact-seen", &session);
+    println!(
+        "[THOR pre-compact] Context is about to compact. Durable decisions, gotchas and \
+         open-thread state that live ONLY in this conversation will not survive it - persist \
+         them NOW via the thor remember tool (fact_type + fires-when). Pins and the brief \
+         re-inject automatically after compaction; unsaved working context does not."
+    );
+}
+
 /// The store-independent half of the courier gates: everything that can say
 /// "silent" WITHOUT opening the store. Shared verbatim by the cold path and
 /// the warm daemon so both stay behaviorally identical by construction.

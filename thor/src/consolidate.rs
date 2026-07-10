@@ -515,63 +515,80 @@ pub fn apply_dedup(db: &Path, store: &mut EventStore, report: &Report) -> anyhow
     Ok(stats)
 }
 
-pub fn print_report(report: &Report) {
-    println!("THOR consolidate - metabolism report");
+/// The report as text: shared by the CLI print and `thor steward`'s file.
+pub fn render_report(report: &Report) -> String {
+    let mut out = String::new();
+    let mut line = |s: String| {
+        out.push_str(&s);
+        out.push('\n');
+    };
+    line("THOR consolidate - metabolism report".into());
     if report.is_clean() && report.needs_retro_tag.is_empty() {
-        println!("clean: nothing to digest");
-        return;
+        line("clean: nothing to digest".into());
+        return out;
     }
     if report.is_clean() {
         // Hygiene is clean (exit 0); the retro-tag WORK LIST below is
         // informational and never fails the gate.
-        println!("hygiene clean; retro-tag work list below");
+        line("hygiene clean; retro-tag work list below".into());
     }
     if !report.dups.is_empty() {
-        println!(
-            "\n{} duplicate group(s) (same normalized body prefix; --apply-dedup retracts the twins):",
+        line(format!(
+            "
+{} duplicate group(s) (same normalized body prefix; --apply-dedup retracts the twins):",
             report.dups.len()
-        );
+        ));
         for g in &report.dups {
             let ids: Vec<&str> = g.retract.iter().map(|t| t.entity_id.as_str()).collect();
-            println!("  keep {}  retract {}  | {}", g.keep, ids.join(" "), g.first_line);
+            line(format!("  keep {}  retract {}  | {}", g.keep, ids.join(" "), g.first_line));
         }
     }
     if !report.decay.is_empty() {
-        println!(
-            "\n{} decay candidate(s) (untyped, never marked, never read, long inactive) - confirm each via retract:",
+        line(format!(
+            "
+{} decay candidate(s) (untyped, never marked, never read, long inactive) - confirm each via retract:",
             report.decay.len()
-        );
+        ));
         for d in &report.decay {
-            println!("  {} ({} events behind tip) | {}", d.entity_id, d.events_behind_tip, d.first_line);
+            line(format!("  {} ({} events behind tip) | {}", d.entity_id, d.events_behind_tip, d.first_line));
         }
     }
     if !report.needs_retro_tag.is_empty() {
-        println!(
-            "\n{} typed fact(s) without fires-when triggers (proven-useful first) - retro-tag via revise:",
+        line(format!(
+            "
+{} typed fact(s) without fires-when triggers (proven-useful first) - retro-tag via revise:",
             report.needs_retro_tag.len()
-        );
+        ));
         for c in &report.needs_retro_tag {
-            println!("  {} (strength {:.2}) | {}", c.entity_id, c.strength, c.first_line);
+            line(format!("  {} (strength {:.2}) | {}", c.entity_id, c.strength, c.first_line));
         }
     }
     if !report.clusters.is_empty() {
-        println!(
-            "\n{} same-topic cluster(s) - review for contradiction/distillation (revise/supersede/resolve); a cluster is a lead, not a verdict:",
+        line(format!(
+            "
+{} same-topic cluster(s) - review for contradiction/distillation (revise/supersede/resolve); a cluster is a lead, not a verdict:",
             report.clusters.len()
-        );
+        ));
         for c in &report.clusters {
-            println!("  [{}] {}", c.reason, c.members.join(" "));
+            line(format!("  [{}] {}", c.reason, c.members.join(" ")));
         }
     }
     if report.broad_clusters_skipped > 0 {
-        println!(
-            "\n({} broad cluster(s) over {MAX_CLUSTER_MEMBERS} members skipped: batch/template families and union-find chains are not actionable leads)",
+        line(format!(
+            "
+({} broad cluster(s) over {MAX_CLUSTER_MEMBERS} members skipped: batch/template families and union-find chains are not actionable leads)",
             report.broad_clusters_skipped
-        );
+        ));
     }
     if !report.cosine_ran {
-        println!("\n(cosine pass skipped: vectors sidecar unavailable - lexical bands only)");
+        line("
+(cosine pass skipped: vectors sidecar unavailable - lexical bands only)".into());
     }
+    out
+}
+
+pub fn print_report(report: &Report) {
+    print!("{}", render_report(report));
 }
 
 #[cfg(test)]

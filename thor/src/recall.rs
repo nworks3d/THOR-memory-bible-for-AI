@@ -952,6 +952,15 @@ impl ScopeFilter<'_> {
         if self.memories_only && crate::repo::is_chunk_id(&ev.entity_id) {
             return false; // chunks never spend a slot in a memories-only recall
         }
+        // Expiry is RANK-TIME only: an `| expires: YYYY-MM-DD |` footer field
+        // past its date stops surfacing (history and the chain keep the fact -
+        // losslessness holds; `get`/`history` still show it). ISO dates order
+        // lexicographically, so a plain string compare suffices.
+        if let Some(exp) = crate::footer::expires(&ev.body) {
+            if exp.as_str() < crate::footer::today().as_str() {
+                return false;
+            }
+        }
         let effective = self.projects.get(&ev.entity_id).and_then(|o| o.as_deref());
         self.scope.allows(effective)
     }
@@ -2066,6 +2075,30 @@ mod fused_tests {
             (bonus - TRIGGER_WEIGHT / 3.0).abs() < 1e-9,
             "only 'ship' matches exactly; 'prod' must not stem onto 'production': {bonus}"
         );
+    }
+
+    #[test]
+    fn test_expired_head_stops_surfacing_but_stays_in_the_log() {
+        let mut store = EventStore::in_memory().unwrap();
+        store
+            .append_event("s", "l", "a", EventKind::FactCreated, "e-live", None,
+                "the zulu convention holds
+
+[memory/note | tags: zulu | expires: 2999-01-01 | project: global]")
+            .unwrap();
+        store
+            .append_event("s", "l", "a", EventKind::FactCreated, "e-expired", None,
+                "the zulu workaround was temporary
+
+[memory/note | tags: zulu | expires: 2020-01-01 | project: global]")
+            .unwrap();
+        let hits = recall_scoped(&store, "zulu", 5, &RecallScope::everything()).unwrap();
+        let ids: Vec<&str> = hits.iter().map(|h| h.entity_id.as_str()).collect();
+        assert!(ids.contains(&"e-live"), "future expiry stays live: {ids:?}");
+        assert!(!ids.contains(&"e-expired"), "past expiry stops surfacing: {ids:?}");
+        // losslessness: the event itself is untouched in the log
+        let all = store.get_all_events().unwrap();
+        assert!(all.iter().any(|e| e.entity_id == "e-expired"), "history keeps the fact");
     }
 
     #[test]

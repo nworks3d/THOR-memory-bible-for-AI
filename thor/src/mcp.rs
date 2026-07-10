@@ -157,6 +157,11 @@ pub struct RememberArgs {
     /// or command.
     #[serde(default)]
     pub anchors: Option<Vec<String>>,
+    /// Known-temporary fact? YYYY-MM-DD after which it stops surfacing in
+    /// recall ("pin to v1.9 until the upstream fix lands"). History keeps it;
+    /// nothing is deleted. Omit for facts without a natural end date.
+    #[serde(default)]
+    pub expires: Option<String>,
 }
 
 #[derive(Deserialize, schemars::JsonSchema)]
@@ -584,10 +589,19 @@ impl ThorServer {
             let mut body = body.to_string();
             let triggers = args.triggers.unwrap_or_default();
             let anchors = args.anchors.unwrap_or_default();
+            if let Some(exp) = args.expires.as_deref() {
+                if !crate::footer::valid_expiry(exp) {
+                    return Err(format!(
+                        "expires must be a YYYY-MM-DD date (got '{exp}'); the fact stops \
+                         surfacing in recall after that day but stays in history"
+                    ));
+                }
+            }
             if args.fact_type.is_some()
                 || args.tags.as_deref().is_some_and(|t| !t.is_empty())
                 || !triggers.is_empty()
                 || !anchors.is_empty()
+                || args.expires.is_some()
             {
                 let scope_label = crate::repo::owner_project(&entity_id)
                     .map(str::to_string)
@@ -598,6 +612,7 @@ impl ThorServer {
                     &scope_label,
                     &triggers,
                     &anchors,
+                    args.expires.as_deref(),
                 );
                 body.push_str("\n\n");
                 body.push_str(&footer);
@@ -1244,6 +1259,7 @@ mod tests {
             tags: None,
             triggers: None,
             anchors: None,
+            expires: None,
         }
     }
 
@@ -1299,6 +1315,7 @@ mod tests {
                 tags: Some(vec!["zephyr".into(), "test".into()]),
                 triggers: None,
                 anchors: None,
+                expires: None,
             }))
             .await;
         assert!(stored.starts_with("stored entity mcp-"), "got: {stored}");
@@ -1334,6 +1351,7 @@ mod tests {
                 tags: Some(vec!["db".into()]),
                 triggers: None,
                 anchors: None,
+                expires: None,
             }))
             .await;
         assert!(first.starts_with("stored entity"), "{first}");
@@ -1347,6 +1365,7 @@ mod tests {
                 tags: None,
                 triggers: None,
                 anchors: None,
+                expires: None,
             }))
             .await;
         assert!(dup.contains("NOT stored"), "typed footer must not defeat dup detection: {dup}");
@@ -1362,6 +1381,7 @@ mod tests {
                 tags: None,
                 triggers: None,
                 anchors: None,
+                expires: None,
             }))
             .await;
         assert!(a.starts_with("stored entity"), "{a}");
@@ -1374,6 +1394,7 @@ mod tests {
                 tags: None,
                 triggers: None,
                 anchors: None,
+                expires: None,
             }))
             .await;
         assert!(
@@ -1394,6 +1415,7 @@ mod tests {
                 tags: None,
                 triggers: None,
                 anchors: None,
+                expires: None,
             }))
             .await;
         assert!(
@@ -1416,6 +1438,7 @@ mod tests {
                 tags: None,
                 triggers: None,
                 anchors: None,
+                expires: None,
             }))
             .await;
         assert!(out.contains("NOT stored"), "{out}");
@@ -1432,6 +1455,7 @@ mod tests {
                 tags: None,
                 triggers: None,
                 anchors: None,
+                expires: None,
             }))
             .await;
         assert!(chunk.contains("chunk"), "{chunk}");

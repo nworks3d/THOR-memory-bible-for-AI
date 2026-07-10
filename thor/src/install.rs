@@ -133,6 +133,17 @@ pub fn run_install(
         ) {
             added.push("SessionStart (pre-warm embedder)");
         }
+        // One advisory per session just before a compaction: the only moment
+        // memory can still save working context instead of recovering after.
+        let precompact_cmd = cmd("pre-compact");
+        if add(
+            hooks,
+            "PreCompact",
+            json!({ "hooks": [ { "type": "command", "command": precompact_cmd } ] }),
+            &precompact_cmd,
+        ) {
+            added.push("PreCompact (persist-before-compaction nudge)");
+        }
         let session_cmd = cmd("session-start");
         if add(
             hooks,
@@ -273,6 +284,14 @@ mod tests {
         assert_eq!(ss.iter().filter(|c| c.ends_with("warm")).count(), 1, "one warm hook");
         assert_eq!(ss.iter().filter(|c| c.contains("session-start")).count(), 1, "one session-start hook");
         assert_eq!(ss.iter().filter(|c| c.contains("ensure-daemon")).count(), 1, "one ensure-daemon hook");
+        let pc: Vec<String> = twice["hooks"]["PreCompact"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .flat_map(|g| g["hooks"].as_array().unwrap().iter())
+            .filter_map(|h| h["command"].as_str().map(String::from))
+            .collect();
+        assert_eq!(pc.iter().filter(|c| c.contains("pre-compact")).count(), 1, "one pre-compact hook");
     }
 
     #[test]

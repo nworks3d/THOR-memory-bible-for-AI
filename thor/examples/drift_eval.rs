@@ -62,7 +62,11 @@ struct Scenario {
     seed_facts: Vec<SeedFact>,
     #[serde(default)]
     seed_chunks: Vec<SeedChunk>,
-    preventer_id: String,
+    /// Absent on `channel_hint: "silence"` scenarios: nothing in the store
+    /// governs the task, so ANY injection at all counts as noise.
+    #[serde(default)]
+    preventer_id: Option<String>,
+    #[serde(default)]
     match_terms: Vec<String>,
     channel_hint: String,
     #[serde(default)]
@@ -109,8 +113,14 @@ fn contains_all(text: &str, terms: &[String]) -> bool {
 /// keying on `" <id> ("` means an id can never match as a substring of a longer
 /// id, and the suppressed-top stub / contested-head sublines never count as a
 /// slot. Slot = 1-based position among the hit lines.
-fn score_courier(block: Option<&str>, preventer: &str, terms: &[String]) -> ChannelScore {
+fn score_courier(block: Option<&str>, preventer: Option<&str>, terms: &[String]) -> ChannelScore {
     let Some(block) = block else { return ChannelScore::miss() };
+    let Some(preventer) = preventer else {
+        // Silence scenario: injection_for_hook_json only returns Some when at
+        // least one real hit line was selected, so ANY block at all is noise
+        // by construction - there is no needle to look for.
+        return ChannelScore::hit(1, false);
+    };
     let needle = format!(" {} (", preventer);
     for (i, line) in block.lines().filter(|l| l.starts_with("- ")).enumerate() {
         if line.contains(&needle) {
@@ -122,8 +132,13 @@ fn score_courier(block: Option<&str>, preventer: &str, terms: &[String]) -> Chan
 
 /// A guard advisory is `...: [type] <entity_id>: <snippet>  ||  ...`; entries
 /// are `"  ||  "`-separated, the id is `": "`-terminated.
-fn score_guard(advisory: Option<&str>, preventer: &str, terms: &[String]) -> ChannelScore {
+fn score_guard(advisory: Option<&str>, preventer: Option<&str>, terms: &[String]) -> ChannelScore {
     let Some(adv) = advisory else { return ChannelScore::miss() };
+    let Some(preventer) = preventer else {
+        // Silence scenario: the guard returns None when nothing matched, so
+        // any advisory text at all is a false fire.
+        return ChannelScore::hit(1, false);
+    };
     let needle = format!("{}: ", preventer);
     for (i, entry) in adv.split("  ||  ").enumerate() {
         if entry.contains(&needle) {
@@ -145,7 +160,9 @@ fn non_global_owner(entity_id: &str) -> Option<String> {
 /// first project-scoped seed - so a global preventer still competes against the
 /// current project's chunks and memories, exactly like a real session.
 fn scenario_project(s: &Scenario) -> Option<String> {
-    non_global_owner(&s.preventer_id)
+    s.preventer_id
+        .as_deref()
+        .and_then(non_global_owner)
         .or_else(|| s.seed_facts.iter().find_map(|f| non_global_owner(&f.entity_id)))
         .or_else(|| s.seed_chunks.iter().find_map(|c| non_global_owner(&c.entity_id)))
 }
@@ -154,11 +171,25 @@ fn scenario_project(s: &Scenario) -> Option<String> {
 /// and read as a recall regression, so a broken line fails loudly instead.
 fn validate(s: &Scenario) -> anyhow::Result<()> {
     let fail = |msg: String| anyhow::bail!("scenario {}: {}", s.id, msg);
-    if s.match_terms.is_empty() {
+    let silence = s.channel_hint == "silence";
+    if silence {
+        // Authoring honesty: a silence scenario that names a preventer or
+        // match terms is a corpus bug, not a feature - there is nothing that
+        // SHOULD fire, so there is nothing to match.
+        if s.preventer_id.is_some() {
+            return fail("a silence scenario must not name a preventer_id".into());
+        }
+        if !s.match_terms.is_empty() {
+            return fail("a silence scenario must not carry match_terms".into());
+        }
+    } else if s.match_terms.is_empty() {
         return fail("match_terms must not be empty".into());
     }
     match s.channel_hint.as_str() {
         "courier" => {}
+        // A silence scenario may optionally set guard_file/guard_command to
+        // exercise the guard channel's silence too; neither is required.
+        "silence" => {}
         "guard" if s.guard_file.is_some() || s.guard_command.is_some() => {}
         "guard" => return fail("channel_hint guard requires guard_file or guard_command".into()),
         other => return fail(format!("unknown channel_hint '{}'", other)),
@@ -185,12 +216,15 @@ fn validate(s: &Scenario) -> anyhow::Result<()> {
             return fail(format!("duplicate seed id {}", c.entity_id));
         }
     }
-    if !seen.contains(s.preventer_id.as_str()) {
-        return fail(format!("preventer {} is not among the seeds", s.preventer_id));
+    if let Some(preventer) = s.preventer_id.as_deref() {
+        if !seen.contains(preventer) {
+            return fail(format!("preventer {} is not among the seeds", preventer));
+        }
     }
     // 5-15 distractors: enough that ranking is actually exercised, bounded so
-    // one scenario cannot dominate runtime.
-    let distractors = seen.len() - 1;
+    // one scenario cannot dominate runtime. A silence scenario has no
+    // preventer seed to subtract.
+    let distractors = seen.len() - if silence { 0 } else { 1 };
     if !(5..=15).contains(&distractors) {
         return fail(format!("{} distractors (must be 5-15)", distractors));
     }
@@ -231,7 +265,7 @@ fn run_scenario(s: &Scenario) -> anyhow::Result<ScenarioResult> {
     // Courier channel: the exact JSON the UserPromptSubmit hook receives.
     let raw = json!({ "prompt": s.task_prompt, "session_id": "eval", "cwd": cwd_str }).to_string();
     let block = thor::courier::injection_for_hook_json(&db, &raw);
-    let courier = score_courier(block.as_deref(), &s.preventer_id, &s.match_terms);
+    let courier = score_courier(block.as_deref(), s.preventer_id.as_deref(), &s.match_terms);
 
     // Guard channel: the first touch of the constrained file this session, OR
     // the Bash call carrying the risky command (PreToolUse hook JSON). The file
@@ -256,7 +290,7 @@ fn run_scenario(s: &Scenario) -> anyhow::Result<ScenarioResult> {
     } else {
         None
     };
-    let guard = advisory.map(|adv| score_guard(adv.as_deref(), &s.preventer_id, &s.match_terms));
+    let guard = advisory.map(|adv| score_guard(adv.as_deref(), s.preventer_id.as_deref(), &s.match_terms));
 
     Ok(ScenarioResult { id: s.id.clone(), hint: s.channel_hint.clone(), courier, guard })
 }
@@ -266,6 +300,54 @@ struct Tally {
     n: usize,
     surfaced: usize,
     full: usize,
+}
+
+/// Silence-scenario side of the confusion table: `noise` = fired when nothing
+/// should fire (injected-wrong), `quiet` = correctly stayed silent. Kept as a
+/// separate tally because `surfaced` means the OPPOSITE thing here - folding
+/// both scenario kinds into one Tally would silently corrupt the catch
+/// numbers.
+#[derive(Default)]
+struct SilenceTally {
+    n: usize,
+    noise: usize,
+}
+
+impl SilenceTally {
+    fn add(&mut self, fired: bool) {
+        self.n += 1;
+        self.noise += fired as usize;
+    }
+    fn quiet(&self) -> usize {
+        self.n - self.noise
+    }
+    fn json(&self) -> serde_json::Value {
+        json!({ "n": self.n, "noise": self.noise, "quiet": self.quiet() })
+    }
+}
+
+/// The one-directional noise ratchet: injected-wrong on silence scenarios may
+/// never exceed these counts. Nothing in code ever writes this file back -
+/// raising a value takes a deliberate reviewed commit (silence gates are never
+/// loosened to buy catch); lowering it after a reviewed reduction is welcome.
+#[derive(Deserialize, Default)]
+struct NoiseBaseline {
+    #[serde(default)]
+    courier: usize,
+    #[serde(default)]
+    guard: usize,
+    #[serde(default)]
+    either: usize,
+}
+
+fn load_noise_baseline() -> NoiseBaseline {
+    let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("eval").join("drift_noise_baseline.json");
+    // Fail-soft to the STRICTEST default: a missing or unparseable baseline
+    // means zero tolerated noise, never a silently disabled gate.
+    std::fs::read_to_string(&path)
+        .ok()
+        .and_then(|raw| serde_json::from_str(&raw).ok())
+        .unwrap_or_default()
 }
 
 impl Tally {
@@ -297,7 +379,7 @@ fn fmt_score(c: &ChannelScore) -> String {
     }
 }
 
-fn run_committed(json_out: bool) -> anyhow::Result<()> {
+fn run_committed(json_out: bool, max_noise: Option<usize>) -> anyhow::Result<()> {
     let corpus = Path::new(env!("CARGO_MANIFEST_DIR")).join("eval").join("drift_scenarios.jsonl");
     let raw = std::fs::read_to_string(&corpus)?;
     let scenarios: Vec<Scenario> = raw
@@ -315,10 +397,16 @@ fn run_committed(json_out: bool) -> anyhow::Result<()> {
         results.push(run_scenario(s)?);
     }
 
+    // Strictly partition catch-type from silence-type results BEFORE folding:
+    // `surfaced` means "caught" on one side and "noise" on the other, so a
+    // mixed fold would corrupt both.
+    let (catch, silence): (Vec<&ScenarioResult>, Vec<&ScenarioResult>) =
+        results.iter().partition(|r| r.hint != "silence");
+
     // Courier runs on every scenario; guard on those naming a file; "either"
     // is the union an actual session gets (both hooks are installed at once).
     let (mut courier, mut guard, mut either) = (Tally::default(), Tally::default(), Tally::default());
-    for r in &results {
+    for r in &catch {
         courier.add(r.courier.surfaced, r.courier.full);
         if let Some(g) = &r.guard {
             guard.add(g.surfaced, g.full);
@@ -329,12 +417,31 @@ fn run_committed(json_out: bool) -> anyhow::Result<()> {
             r.courier.full || g.map_or(false, |g| g.full),
         );
     }
+    let (mut s_courier, mut s_guard, mut s_either) =
+        (SilenceTally::default(), SilenceTally::default(), SilenceTally::default());
+    for r in &silence {
+        s_courier.add(r.courier.surfaced);
+        if let Some(g) = &r.guard {
+            s_guard.add(g.surfaced);
+        }
+        let g = r.guard.as_ref();
+        s_either.add(r.courier.surfaced || g.map_or(false, |g| g.surfaced));
+    }
+
+    let baseline = load_noise_baseline();
+    let allowed_either = max_noise.unwrap_or(baseline.either);
 
     if json_out {
         let out = json!({
             "mode": "committed",
             "n": results.len(),
             "channels": { "courier": courier.json(), "guard": guard.json(), "either": either.json() },
+            "confusion": {
+                "courier": { "catch": courier.full, "miss": courier.n - courier.full, "noise": s_courier.noise, "quiet": s_courier.quiet() },
+                "guard": { "catch": guard.full, "miss": guard.n - guard.full, "noise": s_guard.noise, "quiet": s_guard.quiet() },
+                "either": { "catch": either.full, "miss": either.n - either.full, "noise": s_either.noise, "quiet": s_either.quiet() },
+                "silence_n": s_either.n,
+            },
             "scenarios": results.iter().map(|r| json!({
                 "id": r.id,
                 "hint": r.hint,
@@ -343,27 +450,59 @@ fn run_committed(json_out: bool) -> anyhow::Result<()> {
             })).collect::<Vec<_>>(),
         });
         println!("{}", serde_json::to_string_pretty(&out)?);
-        return Ok(());
+    } else {
+        println!("THOR drift eval - committed corpus ({} scenarios, {} silence)", results.len(), silence.len());
+        println!("surfaced = preventer id in the injected block; FULL = its line carries every match_term\n");
+        println!("{:34} {:8} {:16} {:16}", "id", "hint", "courier", "guard");
+        for r in &results {
+            let (c, g) = if r.hint == "silence" {
+                (
+                    if r.courier.surfaced { "NOISE".to_string() } else { "quiet".to_string() },
+                    r.guard
+                        .as_ref()
+                        .map(|g| if g.surfaced { "NOISE".to_string() } else { "quiet".to_string() })
+                        .unwrap_or_else(|| "-".to_string()),
+                )
+            } else {
+                (
+                    fmt_score(&r.courier),
+                    r.guard.as_ref().map(|g| fmt_score(g)).unwrap_or_else(|| "-".to_string()),
+                )
+            };
+            println!("{:34} {:8} {:16} {:16}", r.id, r.hint, c, g);
+        }
+        println!();
+        println!("{:10} {:>10} {:>22} {:>16}", "channel", "scenarios", "preventer-surfaced", "full-catch");
+        for (name, t) in [("courier", &courier), ("guard", &guard), ("either", &either)] {
+            println!(
+                "{:10} {:>10} {:>15} {:4.1}% {:>10} {:4.1}%",
+                name, t.n, t.surfaced, pct(t.surfaced, t.n), t.full, pct(t.full, t.n)
+            );
+        }
+        println!();
+        println!("confusion (should-fire n={} / should-stay-silent n={}):", either.n, s_either.n);
+        println!("{:10} {:>8} {:>8} {:>8} {:>8}", "channel", "catch", "miss", "noise", "quiet");
+        for (name, t, s) in [
+            ("courier", &courier, &s_courier),
+            ("guard", &guard, &s_guard),
+            ("either", &either, &s_either),
+        ] {
+            println!("{:10} {:>8} {:>8} {:>8} {:>8}", name, t.full, t.n - t.full, s.noise, s.quiet());
+        }
     }
 
-    println!("THOR drift eval - committed corpus ({} scenarios)", results.len());
-    println!("surfaced = preventer id in the injected block; FULL = its line carries every match_term\n");
-    println!("{:26} {:8} {:16} {:16}", "id", "hint", "courier", "guard");
-    for r in &results {
-        println!(
-            "{:26} {:8} {:16} {:16}",
-            r.id,
-            r.hint,
-            fmt_score(&r.courier),
-            r.guard.as_ref().map(|g| fmt_score(g)).unwrap_or_else(|| "-".to_string()),
-        );
-    }
-    println!();
-    println!("{:10} {:>10} {:>22} {:>16}", "channel", "scenarios", "preventer-surfaced", "full-catch");
-    for (name, t) in [("courier", &courier), ("guard", &guard), ("either", &either)] {
-        println!(
-            "{:10} {:>10} {:>15} {:4.1}% {:>10} {:4.1}%",
-            name, t.n, t.surfaced, pct(t.surfaced, t.n), t.full, pct(t.full, t.n)
+    // The ratchet comes LAST so the numbers above always print first: a red
+    // gate with invisible evidence would be useless.
+    if s_either.noise > allowed_either || s_courier.noise > baseline.courier.max(allowed_either) || s_guard.noise > baseline.guard.max(allowed_either) {
+        anyhow::bail!(
+            "noise ratchet exceeded: courier {}/{} guard {}/{} either {}/{} (injected-wrong must never rise; \
+             lower the cause, never the gate)",
+            s_courier.noise,
+            baseline.courier.max(allowed_either),
+            s_guard.noise,
+            baseline.guard.max(allowed_either),
+            s_either.noise,
+            allowed_either
         );
     }
     Ok(())
@@ -532,6 +671,7 @@ fn main() -> anyhow::Result<()> {
     let mut json_out = false;
     let mut live: Option<PathBuf> = None;
     let mut cwd_override: Option<PathBuf> = None;
+    let mut max_noise: Option<usize> = None;
     let mut args = std::env::args().skip(1);
     while let Some(a) = args.next() {
         match a.as_str() {
@@ -544,11 +684,21 @@ fn main() -> anyhow::Result<()> {
                 let p = args.next().ok_or_else(|| anyhow::anyhow!("--cwd needs a directory"))?;
                 cwd_override = Some(PathBuf::from(p));
             }
-            other => anyhow::bail!("unknown argument '{}' (expected --json, --live <path>, --cwd <dir>)", other),
+            // Ad hoc override of the committed noise baseline (experiments,
+            // CI). Overrides the tolerated count for this run only; the
+            // committed baseline file is never written by code.
+            "--max-noise" => {
+                let n = args.next().ok_or_else(|| anyhow::anyhow!("--max-noise needs a count"))?;
+                max_noise = Some(n.parse()?);
+            }
+            other => anyhow::bail!(
+                "unknown argument '{}' (expected --json, --live <path>, --cwd <dir>, --max-noise <n>)",
+                other
+            ),
         }
     }
     match live {
         Some(corpus) => run_live(&corpus, cwd_override.as_deref(), json_out),
-        None => run_committed(json_out),
+        None => run_committed(json_out, max_noise),
     }
 }

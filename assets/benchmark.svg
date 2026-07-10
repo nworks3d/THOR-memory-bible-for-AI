@@ -1,24 +1,24 @@
-<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 860 1858" font-family="Segoe UI, Helvetica Neue, Arial, sans-serif">
-<rect x="0" y="0" width="860" height="1858" rx="10" fill="#0d1117"/>
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 860 1774" font-family="Segoe UI, Helvetica Neue, Arial, sans-serif">
+<rect x="0" y="0" width="860" height="1774" rx="10" fill="#0d1117"/>
 <text x="20" y="32" fill="#e6edf3" font-size="22" font-weight="800">THOR vs mimir - the honest picture</text>
 <text x="20" y="54" fill="#8b949e" font-size="12">Same machine, blind-judged, re-measured fresh in the V5 round + V6/V7 code re-judges (3-judge median, blind maps).</text>
 <text x="20" y="84" fill="#c9d1d9" font-size="12.5" font-weight="700" letter-spacing="0.4">TEST 1 - COVERAGE  (200 questions: 118 shared-knowledge + 82 stratified)</text>
 <text x="20" y="100" fill="#8b949e" font-size="11">deliberate recall over the live store . higher is better</text>
-<rect x="196" y="110" width="139.9" height="14" rx="7" fill="#22d3ee"/>
-<text x="342.92" y="121.5" fill="#e6edf3" font-size="11.5" font-weight="700">42%</text>
+<rect x="196" y="110" width="179.8" height="14" rx="7" fill="#22d3ee"/>
+<text x="382.85" y="121.5" fill="#e6edf3" font-size="11.5" font-weight="700">54%</text>
 <text x="184" y="121.5" fill="#22d3ee" font-size="10.5" font-weight="700" text-anchor="end">THOR</text>
-<text x="20" y="132" fill="#e6edf3" font-size="13" font-weight="700">Code structure</text>
-<text x="838" y="133" fill="#e3b341" font-size="15" font-weight="800" text-anchor="end">-21%</text>
-<rect x="196" y="130" width="209.9" height="14" rx="7" fill="#484f58"/>
-<text x="412.88" y="141.5" fill="#8b949e" font-size="11.5">64%</text>
+<text x="20" y="132" fill="#e6edf3" font-size="13" font-weight="700">Code structure (re-judged)</text>
+<text x="838" y="133" fill="#e3b341" font-size="15" font-weight="800" text-anchor="end">-2%</text>
+<rect x="196" y="130" width="185.1" height="14" rx="7" fill="#484f58"/>
+<text x="388.13" y="141.5" fill="#8b949e" font-size="11.5">56%</text>
 <text x="184" y="141.5" fill="#8b949e" font-size="10.5" text-anchor="end">mimir</text>
-<rect x="196" y="160" width="198.0" height="14" rx="7" fill="#22d3ee"/>
-<text x="401.00" y="171.5" fill="#e6edf3" font-size="11.5" font-weight="700">60%</text>
+<rect x="196" y="160" width="239.2" height="14" rx="7" fill="#22d3ee"/>
+<text x="442.25" y="171.5" fill="#e6edf3" font-size="11.5" font-weight="700">72%</text>
 <text x="184" y="171.5" fill="#22d3ee" font-size="10.5" font-weight="700" text-anchor="end">THOR</text>
-<text x="20" y="182" fill="#e6edf3" font-size="13" font-weight="700">Code behavior</text>
-<text x="838" y="183" fill="#e3b341" font-size="15" font-weight="800" text-anchor="end">-2%</text>
-<rect x="196" y="180" width="206.2" height="14" rx="7" fill="#484f58"/>
-<text x="409.25" y="191.5" fill="#8b949e" font-size="11.5">62%</text>
+<text x="20" y="182" fill="#e6edf3" font-size="13" font-weight="700">Code behavior (re-judged)</text>
+<text x="838" y="183" fill="#22d3ee" font-size="15" font-weight="800" text-anchor="end">+13%</text>
+<rect x="196" y="180" width="195.4" height="14" rx="7" fill="#484f58"/>
+<text x="398.36" y="191.5" fill="#8b949e" font-size="11.5">59%</text>
 <text x="184" y="191.5" fill="#8b949e" font-size="10.5" text-anchor="end">mimir</text>
 <rect x="196" y="210" width="231.0" height="14" rx="7" fill="#22d3ee"/>
 <text x="434.00" y="221.5" fill="#e6edf3" font-size="11.5" font-weight="700">70%</text>
@@ -53,148 +53,133 @@
 <text x="386.48" y="391.5" fill="#8b949e" font-size="11.5">56%</text>
 <text x="184" y="391.5" fill="#8b949e" font-size="10.5" text-anchor="end">mimir</text>
 <line x1="20" y1="410" x2="840" y2="410" stroke="#21262d" stroke-width="1"/>
-<text x="20" y="428" fill="#e6edf3" font-size="13" font-weight="700">Test 1 overall  <tspan fill="#22d3ee">THOR 63.8%</tspan> vs <tspan fill="#8b949e">mimir 64.0%</tspan>  (n=200) - a statistical tie</text>
-<text x="20" y="444" fill="#8b949e" font-size="11">Clean split: THOR leads every knowledge category (decision, gotcha, docs, config); mimir leads both code categories.</text>
-<text x="20" y="460" fill="#8b949e" font-size="11">Jury strictness moved the absolutes asymmetrically vs the previous round (THOR 68.5 -> 63.8, mimir 59.8 -> 64.0), same corpus.</text>
-<text x="20" y="490" fill="#c9d1d9" font-size="12.5" font-weight="700" letter-spacing="0.4">TEST 1 ADDENDUM - CODE RE-JUDGED (V6 + V7 rounds, same 93 items)</text>
-<text x="20" y="506" fill="#8b949e" font-size="11">serving parity + path affinity, then the derived symbol sidecar . fresh blind mini-juries</text>
-<rect x="196" y="516" width="239.2" height="14" rx="7" fill="#22d3ee"/>
-<text x="442.25" y="527.5" fill="#e6edf3" font-size="11.5" font-weight="700">72%</text>
-<text x="184" y="527.5" fill="#22d3ee" font-size="10.5" font-weight="700" text-anchor="end">THOR</text>
-<text x="20" y="538" fill="#e6edf3" font-size="13" font-weight="700">Code behavior (re-judge)</text>
-<text x="838" y="539" fill="#22d3ee" font-size="15" font-weight="800" text-anchor="end">+13%</text>
-<rect x="196" y="536" width="195.4" height="14" rx="7" fill="#484f58"/>
-<text x="398.36" y="547.5" fill="#8b949e" font-size="11.5">59%</text>
-<text x="184" y="547.5" fill="#8b949e" font-size="10.5" text-anchor="end">mimir</text>
-<rect x="196" y="566" width="179.8" height="14" rx="7" fill="#22d3ee"/>
-<text x="382.85" y="577.5" fill="#e6edf3" font-size="11.5" font-weight="700">54%</text>
-<text x="184" y="577.5" fill="#22d3ee" font-size="10.5" font-weight="700" text-anchor="end">THOR</text>
-<text x="20" y="588" fill="#e6edf3" font-size="13" font-weight="700">Code structure (re-judge)</text>
-<text x="838" y="589" fill="#e3b341" font-size="15" font-weight="800" text-anchor="end">-2%</text>
-<rect x="196" y="586" width="185.1" height="14" rx="7" fill="#484f58"/>
-<text x="388.13" y="597.5" fill="#8b949e" font-size="11.5">56%</text>
-<text x="184" y="597.5" fill="#8b949e" font-size="10.5" text-anchor="end">mimir</text>
-<text x="20" y="616" fill="#c9d1d9" font-size="11">Behavior flipped and held above 70 twice (60.0 -> 71.7 -> 72.5 vs mimir 62.5 -> 57.5 -> 59.2). Structure went</text>
-<text x="20" y="632" fill="#c9d1d9" font-size="11">42.4 -> 50.0 -> 54.5 while mimir fell 63.6 -> 57.6 -> 56.1: a 21-point gap closed to 1.6 - and excluding four</text>
-<text x="20" y="648" fill="#c9d1d9" font-size="11">dead-source items (files deliberately removed; both systems score zero) both judge at exactly 60.3% vs 60.3%.</text>
-<text x="20" y="664" fill="#c9d1d9" font-size="11">New agent tools from the same round: where_used / impact / outline on a derived, rebuildable symbol sidecar.</text>
-<text x="20" y="694" fill="#c9d1d9" font-size="12.5" font-weight="700" letter-spacing="0.4">TEST 2 - SAME KNOWLEDGE  (facts both systems verifiably hold)</text>
-<text x="20" y="710" fill="#8b949e" font-size="11">RE-MEASURED on a rebuilt shared subset . cuts over the judged Test 1 medians</text>
-<rect x="196" y="720" width="317.5" height="14" rx="7" fill="#22d3ee"/>
-<text x="520.46" y="731.5" fill="#e6edf3" font-size="11.5" font-weight="700">96%</text>
-<text x="184" y="731.5" fill="#22d3ee" font-size="10.5" font-weight="700" text-anchor="end">THOR</text>
-<text x="20" y="742" fill="#e6edf3" font-size="13" font-weight="700">Strict dual-written (n=53)</text>
-<text x="838" y="743" fill="#22d3ee" font-size="15" font-weight="800" text-anchor="end">+3%</text>
-<rect x="196" y="740" width="308.2" height="14" rx="7" fill="#484f58"/>
-<text x="511.22" y="751.5" fill="#8b949e" font-size="11.5">93%</text>
-<text x="184" y="751.5" fill="#8b949e" font-size="10.5" text-anchor="end">mimir</text>
-<rect x="196" y="770" width="254.1" height="14" rx="7" fill="#22d3ee"/>
-<text x="457.10" y="781.5" fill="#e6edf3" font-size="11.5" font-weight="700">77%</text>
-<text x="184" y="781.5" fill="#22d3ee" font-size="10.5" font-weight="700" text-anchor="end">THOR</text>
-<text x="20" y="792" fill="#e6edf3" font-size="13" font-weight="700">Broad shared (n=152)</text>
-<text x="838" y="793" fill="#e3b341" font-size="15" font-weight="800" text-anchor="end">-4%</text>
-<rect x="196" y="790" width="268.0" height="14" rx="7" fill="#484f58"/>
-<text x="470.96" y="801.5" fill="#8b949e" font-size="11.5">81%</text>
-<text x="184" y="801.5" fill="#8b949e" font-size="10.5" text-anchor="end">mimir</text>
-<text x="20" y="820" fill="#c9d1d9" font-size="11">THOR takes the strict dual-written cut FOR THE FIRST TIME (96.2% vs 93.4%) - pure memory recall was mimir's home</text>
-<text x="20" y="836" fill="#c9d1d9" font-size="11">turf across four earlier juries. mimir takes the broad cut, which is two-thirds code/doc-chunk questions.</text>
-<text x="20" y="866" fill="#c9d1d9" font-size="12.5" font-weight="700" letter-spacing="0.4">TEST 3 - MULTI-PROJECT  (three private project repos seeded)</text>
-<text x="20" y="882" fill="#8b949e" font-size="11">45 real questions from each repo, scoped per project, blind-judged by 3-judge median . top-5 full chunks</text>
-<rect x="196" y="892" width="297.0" height="14" rx="7" fill="#22d3ee"/>
-<text x="500.00" y="903.5" fill="#e6edf3" font-size="11.5" font-weight="700">90%</text>
-<text x="184" y="903.5" fill="#22d3ee" font-size="10.5" font-weight="700" text-anchor="end">THOR</text>
-<text x="20" y="914" fill="#e6edf3" font-size="13" font-weight="700">Project 1</text>
-<text x="838" y="915" fill="#e3b341" font-size="15" font-weight="800" text-anchor="end">-3%</text>
-<rect x="196" y="912" width="307.9" height="14" rx="7" fill="#484f58"/>
-<text x="510.89" y="923.5" fill="#8b949e" font-size="11.5">93%</text>
-<text x="184" y="923.5" fill="#8b949e" font-size="10.5" text-anchor="end">mimir</text>
-<rect x="196" y="942" width="330.0" height="14" rx="7" fill="#22d3ee"/>
-<text x="533.00" y="953.5" fill="#e6edf3" font-size="11.5" font-weight="700">100%</text>
-<text x="184" y="953.5" fill="#22d3ee" font-size="10.5" font-weight="700" text-anchor="end">THOR</text>
-<text x="20" y="964" fill="#e6edf3" font-size="13" font-weight="700">Project 2</text>
-<text x="838" y="965" fill="#22d3ee" font-size="15" font-weight="800" text-anchor="end">+13%</text>
-<rect x="196" y="962" width="286.1" height="14" rx="7" fill="#484f58"/>
-<text x="489.11" y="973.5" fill="#8b949e" font-size="11.5">87%</text>
-<text x="184" y="973.5" fill="#8b949e" font-size="10.5" text-anchor="end">mimir</text>
-<rect x="196" y="992" width="286.1" height="14" rx="7" fill="#22d3ee"/>
-<text x="489.11" y="1003.5" fill="#e6edf3" font-size="11.5" font-weight="700">87%</text>
-<text x="184" y="1003.5" fill="#22d3ee" font-size="10.5" font-weight="700" text-anchor="end">THOR</text>
-<text x="20" y="1014" fill="#e6edf3" font-size="13" font-weight="700">Project 3</text>
-<text x="838" y="1015" fill="#e3b341" font-size="15" font-weight="800" text-anchor="end">-10%</text>
-<rect x="196" y="1012" width="319.1" height="14" rx="7" fill="#484f58"/>
-<text x="522.11" y="1023.5" fill="#8b949e" font-size="11.5">97%</text>
-<text x="184" y="1023.5" fill="#8b949e" font-size="10.5" text-anchor="end">mimir</text>
-<line x1="20" y1="1042" x2="840" y2="1042" stroke="#21262d" stroke-width="1"/>
-<text x="20" y="1060" fill="#e6edf3" font-size="13" font-weight="700">Test 3 overall  <tspan fill="#22d3ee">THOR 92.2%</tspan> vs <tspan fill="#8b949e">mimir 92.2%</tspan>  (n=45) - a dead tie</text>
-<text x="20" y="1076" fill="#8b949e" font-size="11">mimir's previous outright lead (98.9% vs 92.2%) is gone. Per-project numbers on n=15 move with a single question</text>
-<text x="20" y="1092" fill="#8b949e" font-size="11">(6.7 points each): treat the project split as noisy and the overall tie as the takeaway.</text>
-<text x="20" y="1122" fill="#c9d1d9" font-size="12.5" font-weight="700" letter-spacing="0.4">SESSION DRIFT COMPENSATION  (73 fresh-session scenarios)</text>
-<text x="20" y="1138" fill="#8b949e" font-size="11">post-compaction, empty context: does the AS-DEPLOYED auto-injection surface the fact that stops the drift?</text>
-<rect x="196" y="1148" width="237.9" height="14" rx="7" fill="#22d3ee"/>
-<text x="440.93" y="1159.5" fill="#e6edf3" font-size="11.5" font-weight="700">72%</text>
-<text x="184" y="1159.5" fill="#22d3ee" font-size="10.5" font-weight="700" text-anchor="end">THOR</text>
-<text x="20" y="1170" fill="#e6edf3" font-size="13" font-weight="700">Preventer surfaced</text>
-<text x="838" y="1171" fill="#22d3ee" font-size="15" font-weight="800" text-anchor="end">+13%</text>
-<rect x="196" y="1168" width="194.4" height="14" rx="7" fill="#484f58"/>
-<text x="397.37" y="1179.5" fill="#8b949e" font-size="11.5">59%</text>
-<text x="184" y="1179.5" fill="#8b949e" font-size="10.5" text-anchor="end">mimir</text>
-<rect x="196" y="1198" width="184.5" height="14" rx="7" fill="#22d3ee"/>
-<text x="387.47" y="1209.5" fill="#e6edf3" font-size="11.5" font-weight="700">56%</text>
-<text x="184" y="1209.5" fill="#22d3ee" font-size="10.5" font-weight="700" text-anchor="end">THOR</text>
-<text x="20" y="1220" fill="#e6edf3" font-size="13" font-weight="700">Clear catch (full)</text>
-<text x="838" y="1221" fill="#22d3ee" font-size="15" font-weight="800" text-anchor="end">+8%</text>
-<rect x="196" y="1218" width="158.1" height="14" rx="7" fill="#484f58"/>
-<text x="361.07" y="1229.5" fill="#8b949e" font-size="11.5">48%</text>
-<text x="184" y="1229.5" fill="#8b949e" font-size="10.5" text-anchor="end">mimir</text>
-<text x="20" y="1248" fill="#c9d1d9" font-size="11">THOR's best drift numbers to date, judged THREE-WAY BLIND for the first time (courier / deliberate / mimir shuffled</text>
-<text x="20" y="1264" fill="#c9d1d9" font-size="11">onto anonymous sides in one jury pass). The as-deployed courier now also beats THOR's own deliberate recall</text>
-<text x="20" y="1280" fill="#c9d1d9" font-size="11">(62.5 / 48.6) - author-declared bilingual fires-when triggers fire on task prompts score-only ranking misses.</text>
-<text x="20" y="1296" fill="#c9d1d9" font-size="11">Pins + file/command guards cover the rest by construction: cargo run --example drift_eval, reproducible in-repo.</text>
-<text x="20" y="1326" fill="#c9d1d9" font-size="12.5" font-weight="700" letter-spacing="0.4">SPEED AND TOKENS  (per-prompt cost, lower is better)</text>
-<text x="20" y="1342" fill="#8b949e" font-size="11">THOR cold vs mimir's as-deployed cold path, median of 20, canonical fixed 20-prompt set</text>
-<rect x="196" y="1352" width="117.5" height="14" rx="7" fill="#22d3ee"/>
-<text x="320.52" y="1363.5" fill="#e6edf3" font-size="11.5" font-weight="700">207 ms</text>
-<text x="184" y="1363.5" fill="#22d3ee" font-size="10.5" font-weight="700" text-anchor="end">THOR</text>
-<text x="20" y="1374" fill="#e6edf3" font-size="13" font-weight="700">Latency (as-deployed)</text>
-<text x="838" y="1375" fill="#22d3ee" font-size="15" font-weight="800" text-anchor="end">2.8x faster</text>
-<rect x="196" y="1372" width="330.0" height="14" rx="7" fill="#484f58"/>
-<text x="533.00" y="1383.5" fill="#8b949e" font-size="11.5">581 ms</text>
-<text x="184" y="1383.5" fill="#8b949e" font-size="10.5" text-anchor="end">mimir</text>
-<rect x="196" y="1402" width="330.0" height="14" rx="7" fill="#22d3ee"/>
-<text x="533.00" y="1413.5" fill="#e6edf3" font-size="11.5" font-weight="700">784</text>
-<text x="184" y="1413.5" fill="#22d3ee" font-size="10.5" font-weight="700" text-anchor="end">THOR</text>
-<text x="20" y="1424" fill="#e6edf3" font-size="13" font-weight="700">Tokens injected</text>
-<text x="838" y="1425" fill="#e3b341" font-size="15" font-weight="800" text-anchor="end">3.3x MORE (not fewer)</text>
-<rect x="196" y="1422" width="99.8" height="14" rx="7" fill="#484f58"/>
-<text x="302.76" y="1433.5" fill="#8b949e" font-size="11.5">237</text>
-<text x="184" y="1433.5" fill="#8b949e" font-size="10.5" text-anchor="end">mimir</text>
-<text x="20" y="1452" fill="#c9d1d9" font-size="11">NEW: THOR's own opt-in warm inject daemon (idea credit mimir) serves the provably IDENTICAL decision at 192.7 ms.</text>
-<text x="20" y="1468" fill="#c9d1d9" font-size="11">mimir's opt-in warm daemon stays the fastest channel outright - 38.9 ms, ~32 tokens - but served NOTHING on 10 of</text>
-<text x="20" y="1484" fill="#c9d1d9" font-size="11">the 20 prompts (single floor-gated memory): faster and cheaper because it serves less. THOR's cold median is back</text>
-<text x="20" y="1500" fill="#c9d1d9" font-size="11">under its own 250 ms guardrail (253 -> 206.8 ms). Old '1.5x faster / 2.1x fewer tokens' headline stays retired.</text>
-<text x="20" y="1530" fill="#c9d1d9" font-size="12.5" font-weight="700" letter-spacing="0.4">HONEST DOWNSIDES</text>
-<text x="20" y="1546" fill="#8b949e" font-size="11">where THOR does not win, and the caveats</text>
+<text x="20" y="428" fill="#e6edf3" font-size="13" font-weight="700">Test 1 overall  <tspan fill="#22d3ee">THOR 63.8%</tspan> vs <tspan fill="#8b949e">mimir 64.0%</tspan>  (n=200, full V5 run) - a statistical tie</text>
+<text x="20" y="444" fill="#8b949e" font-size="11">The CODE rows show the current state: re-judged after the V6/V7 fixes (fresh dumps, fresh blind juries, same 93</text>
+<text x="20" y="460" fill="#8b949e" font-size="11">items). In the original full run they read 42.4 vs 63.6 and 60.0 vs 62.5 - the overall above still uses those, so</text>
+<text x="20" y="476" fill="#8b949e" font-size="11">it UNDERSTATES THOR's current position. Knowledge rows and the overall are the full V5 run, unchanged.</text>
+<text x="20" y="506" fill="#c9d1d9" font-size="12.5" font-weight="700" letter-spacing="0.4">HOW THE CODE CATEGORIES GOT THERE (V6 + V7 rounds)</text>
+<text x="20" y="522" fill="#8b949e" font-size="11">serving parity + path affinity, then the derived symbol sidecar . re-judged per round</text>
+<text x="20" y="532" fill="#c9d1d9" font-size="11">Behavior flipped and held above 70 twice (60.0 -> 71.7 -> 72.5 vs mimir 62.5 -> 57.5 -> 59.2). Structure went</text>
+<text x="20" y="548" fill="#c9d1d9" font-size="11">42.4 -> 50.0 -> 54.5 while mimir fell 63.6 -> 57.6 -> 56.1: a 21-point gap closed to 1.6 - and excluding four</text>
+<text x="20" y="564" fill="#c9d1d9" font-size="11">dead-source items (files deliberately removed; both systems score zero) both judge at exactly 60.3% vs 60.3%.</text>
+<text x="20" y="580" fill="#c9d1d9" font-size="11">New agent tools from the same round: where_used / impact / outline on a derived, rebuildable symbol sidecar.</text>
+<text x="20" y="610" fill="#c9d1d9" font-size="12.5" font-weight="700" letter-spacing="0.4">TEST 2 - SAME KNOWLEDGE  (facts both systems verifiably hold)</text>
+<text x="20" y="626" fill="#8b949e" font-size="11">RE-MEASURED on a rebuilt shared subset . cuts over the judged Test 1 medians</text>
+<rect x="196" y="636" width="317.5" height="14" rx="7" fill="#22d3ee"/>
+<text x="520.46" y="647.5" fill="#e6edf3" font-size="11.5" font-weight="700">96%</text>
+<text x="184" y="647.5" fill="#22d3ee" font-size="10.5" font-weight="700" text-anchor="end">THOR</text>
+<text x="20" y="658" fill="#e6edf3" font-size="13" font-weight="700">Strict dual-written (n=53)</text>
+<text x="838" y="659" fill="#22d3ee" font-size="15" font-weight="800" text-anchor="end">+3%</text>
+<rect x="196" y="656" width="308.2" height="14" rx="7" fill="#484f58"/>
+<text x="511.22" y="667.5" fill="#8b949e" font-size="11.5">93%</text>
+<text x="184" y="667.5" fill="#8b949e" font-size="10.5" text-anchor="end">mimir</text>
+<rect x="196" y="686" width="254.1" height="14" rx="7" fill="#22d3ee"/>
+<text x="457.10" y="697.5" fill="#e6edf3" font-size="11.5" font-weight="700">77%</text>
+<text x="184" y="697.5" fill="#22d3ee" font-size="10.5" font-weight="700" text-anchor="end">THOR</text>
+<text x="20" y="708" fill="#e6edf3" font-size="13" font-weight="700">Broad shared (n=152)</text>
+<text x="838" y="709" fill="#e3b341" font-size="15" font-weight="800" text-anchor="end">-4%</text>
+<rect x="196" y="706" width="268.0" height="14" rx="7" fill="#484f58"/>
+<text x="470.96" y="717.5" fill="#8b949e" font-size="11.5">81%</text>
+<text x="184" y="717.5" fill="#8b949e" font-size="10.5" text-anchor="end">mimir</text>
+<text x="20" y="736" fill="#c9d1d9" font-size="11">THOR takes the strict dual-written cut FOR THE FIRST TIME (96.2% vs 93.4%) - pure memory recall was mimir's home</text>
+<text x="20" y="752" fill="#c9d1d9" font-size="11">turf across four earlier juries. mimir takes the broad cut, which is two-thirds code/doc-chunk questions.</text>
+<text x="20" y="782" fill="#c9d1d9" font-size="12.5" font-weight="700" letter-spacing="0.4">TEST 3 - MULTI-PROJECT  (three private project repos seeded)</text>
+<text x="20" y="798" fill="#8b949e" font-size="11">45 real questions from each repo, scoped per project, blind-judged by 3-judge median . top-5 full chunks</text>
+<rect x="196" y="808" width="297.0" height="14" rx="7" fill="#22d3ee"/>
+<text x="500.00" y="819.5" fill="#e6edf3" font-size="11.5" font-weight="700">90%</text>
+<text x="184" y="819.5" fill="#22d3ee" font-size="10.5" font-weight="700" text-anchor="end">THOR</text>
+<text x="20" y="830" fill="#e6edf3" font-size="13" font-weight="700">Project 1</text>
+<text x="838" y="831" fill="#e3b341" font-size="15" font-weight="800" text-anchor="end">-3%</text>
+<rect x="196" y="828" width="307.9" height="14" rx="7" fill="#484f58"/>
+<text x="510.89" y="839.5" fill="#8b949e" font-size="11.5">93%</text>
+<text x="184" y="839.5" fill="#8b949e" font-size="10.5" text-anchor="end">mimir</text>
+<rect x="196" y="858" width="330.0" height="14" rx="7" fill="#22d3ee"/>
+<text x="533.00" y="869.5" fill="#e6edf3" font-size="11.5" font-weight="700">100%</text>
+<text x="184" y="869.5" fill="#22d3ee" font-size="10.5" font-weight="700" text-anchor="end">THOR</text>
+<text x="20" y="880" fill="#e6edf3" font-size="13" font-weight="700">Project 2</text>
+<text x="838" y="881" fill="#22d3ee" font-size="15" font-weight="800" text-anchor="end">+13%</text>
+<rect x="196" y="878" width="286.1" height="14" rx="7" fill="#484f58"/>
+<text x="489.11" y="889.5" fill="#8b949e" font-size="11.5">87%</text>
+<text x="184" y="889.5" fill="#8b949e" font-size="10.5" text-anchor="end">mimir</text>
+<rect x="196" y="908" width="286.1" height="14" rx="7" fill="#22d3ee"/>
+<text x="489.11" y="919.5" fill="#e6edf3" font-size="11.5" font-weight="700">87%</text>
+<text x="184" y="919.5" fill="#22d3ee" font-size="10.5" font-weight="700" text-anchor="end">THOR</text>
+<text x="20" y="930" fill="#e6edf3" font-size="13" font-weight="700">Project 3</text>
+<text x="838" y="931" fill="#e3b341" font-size="15" font-weight="800" text-anchor="end">-10%</text>
+<rect x="196" y="928" width="319.1" height="14" rx="7" fill="#484f58"/>
+<text x="522.11" y="939.5" fill="#8b949e" font-size="11.5">97%</text>
+<text x="184" y="939.5" fill="#8b949e" font-size="10.5" text-anchor="end">mimir</text>
+<line x1="20" y1="958" x2="840" y2="958" stroke="#21262d" stroke-width="1"/>
+<text x="20" y="976" fill="#e6edf3" font-size="13" font-weight="700">Test 3 overall  <tspan fill="#22d3ee">THOR 92.2%</tspan> vs <tspan fill="#8b949e">mimir 92.2%</tspan>  (n=45) - a dead tie</text>
+<text x="20" y="992" fill="#8b949e" font-size="11">mimir's previous outright lead (98.9% vs 92.2%) is gone. Per-project numbers on n=15 move with a single question</text>
+<text x="20" y="1008" fill="#8b949e" font-size="11">(6.7 points each): treat the project split as noisy and the overall tie as the takeaway.</text>
+<text x="20" y="1038" fill="#c9d1d9" font-size="12.5" font-weight="700" letter-spacing="0.4">SESSION DRIFT COMPENSATION  (73 fresh-session scenarios)</text>
+<text x="20" y="1054" fill="#8b949e" font-size="11">post-compaction, empty context: does the AS-DEPLOYED auto-injection surface the fact that stops the drift?</text>
+<rect x="196" y="1064" width="237.9" height="14" rx="7" fill="#22d3ee"/>
+<text x="440.93" y="1075.5" fill="#e6edf3" font-size="11.5" font-weight="700">72%</text>
+<text x="184" y="1075.5" fill="#22d3ee" font-size="10.5" font-weight="700" text-anchor="end">THOR</text>
+<text x="20" y="1086" fill="#e6edf3" font-size="13" font-weight="700">Preventer surfaced</text>
+<text x="838" y="1087" fill="#22d3ee" font-size="15" font-weight="800" text-anchor="end">+13%</text>
+<rect x="196" y="1084" width="194.4" height="14" rx="7" fill="#484f58"/>
+<text x="397.37" y="1095.5" fill="#8b949e" font-size="11.5">59%</text>
+<text x="184" y="1095.5" fill="#8b949e" font-size="10.5" text-anchor="end">mimir</text>
+<rect x="196" y="1114" width="184.5" height="14" rx="7" fill="#22d3ee"/>
+<text x="387.47" y="1125.5" fill="#e6edf3" font-size="11.5" font-weight="700">56%</text>
+<text x="184" y="1125.5" fill="#22d3ee" font-size="10.5" font-weight="700" text-anchor="end">THOR</text>
+<text x="20" y="1136" fill="#e6edf3" font-size="13" font-weight="700">Clear catch (full)</text>
+<text x="838" y="1137" fill="#22d3ee" font-size="15" font-weight="800" text-anchor="end">+8%</text>
+<rect x="196" y="1134" width="158.1" height="14" rx="7" fill="#484f58"/>
+<text x="361.07" y="1145.5" fill="#8b949e" font-size="11.5">48%</text>
+<text x="184" y="1145.5" fill="#8b949e" font-size="10.5" text-anchor="end">mimir</text>
+<text x="20" y="1164" fill="#c9d1d9" font-size="11">THOR's best drift numbers to date, judged THREE-WAY BLIND for the first time (courier / deliberate / mimir shuffled</text>
+<text x="20" y="1180" fill="#c9d1d9" font-size="11">onto anonymous sides in one jury pass). The as-deployed courier now also beats THOR's own deliberate recall</text>
+<text x="20" y="1196" fill="#c9d1d9" font-size="11">(62.5 / 48.6) - author-declared bilingual fires-when triggers fire on task prompts score-only ranking misses.</text>
+<text x="20" y="1212" fill="#c9d1d9" font-size="11">Pins + file/command guards cover the rest by construction: cargo run --example drift_eval, reproducible in-repo.</text>
+<text x="20" y="1242" fill="#c9d1d9" font-size="12.5" font-weight="700" letter-spacing="0.4">SPEED AND TOKENS  (per-prompt cost, lower is better)</text>
+<text x="20" y="1258" fill="#8b949e" font-size="11">THOR cold vs mimir's as-deployed cold path, median of 20, canonical fixed 20-prompt set</text>
+<rect x="196" y="1268" width="117.5" height="14" rx="7" fill="#22d3ee"/>
+<text x="320.52" y="1279.5" fill="#e6edf3" font-size="11.5" font-weight="700">207 ms</text>
+<text x="184" y="1279.5" fill="#22d3ee" font-size="10.5" font-weight="700" text-anchor="end">THOR</text>
+<text x="20" y="1290" fill="#e6edf3" font-size="13" font-weight="700">Latency (as-deployed)</text>
+<text x="838" y="1291" fill="#22d3ee" font-size="15" font-weight="800" text-anchor="end">2.8x faster</text>
+<rect x="196" y="1288" width="330.0" height="14" rx="7" fill="#484f58"/>
+<text x="533.00" y="1299.5" fill="#8b949e" font-size="11.5">581 ms</text>
+<text x="184" y="1299.5" fill="#8b949e" font-size="10.5" text-anchor="end">mimir</text>
+<rect x="196" y="1318" width="330.0" height="14" rx="7" fill="#22d3ee"/>
+<text x="533.00" y="1329.5" fill="#e6edf3" font-size="11.5" font-weight="700">784</text>
+<text x="184" y="1329.5" fill="#22d3ee" font-size="10.5" font-weight="700" text-anchor="end">THOR</text>
+<text x="20" y="1340" fill="#e6edf3" font-size="13" font-weight="700">Tokens injected</text>
+<text x="838" y="1341" fill="#e3b341" font-size="15" font-weight="800" text-anchor="end">3.3x MORE (not fewer)</text>
+<rect x="196" y="1338" width="99.8" height="14" rx="7" fill="#484f58"/>
+<text x="302.76" y="1349.5" fill="#8b949e" font-size="11.5">237</text>
+<text x="184" y="1349.5" fill="#8b949e" font-size="10.5" text-anchor="end">mimir</text>
+<text x="20" y="1368" fill="#c9d1d9" font-size="11">NEW: THOR's own opt-in warm inject daemon (idea credit mimir) serves the provably IDENTICAL decision at 192.7 ms.</text>
+<text x="20" y="1384" fill="#c9d1d9" font-size="11">mimir's opt-in warm daemon stays the fastest channel outright - 38.9 ms, ~32 tokens - but served NOTHING on 10 of</text>
+<text x="20" y="1400" fill="#c9d1d9" font-size="11">the 20 prompts (single floor-gated memory): faster and cheaper because it serves less. THOR's cold median is back</text>
+<text x="20" y="1416" fill="#c9d1d9" font-size="11">under its own 250 ms guardrail (253 -> 206.8 ms). Old '1.5x faster / 2.1x fewer tokens' headline stays retired.</text>
+<text x="20" y="1446" fill="#c9d1d9" font-size="12.5" font-weight="700" letter-spacing="0.4">HONEST DOWNSIDES</text>
+<text x="20" y="1462" fill="#8b949e" font-size="11">where THOR does not win, and the caveats</text>
+<circle cx="26" cy="1480" r="3" fill="#e3b341"/>
+<text x="38" y="1484" fill="#e6edf3" font-size="11.5">Test 1 overall is a tie now, not a THOR lead - and the movement was asymmetric (THOR down, mimir up, same corpus)</text>
+<circle cx="26" cy="1501" r="3" fill="#e3b341"/>
+<text x="38" y="1505" fill="#e6edf3" font-size="11.5">Code-structure: level but not won (54.5 vs 56.1 re-judged; 60.3-60.3 excl. dead sources) - 70% target unmet</text>
+<circle cx="26" cy="1522" r="3" fill="#e3b341"/>
+<text x="38" y="1526" fill="#e6edf3" font-size="11.5">mimir wins the broad shared cut (81.2% vs 77.0%) - two-thirds code questions, same weakness on an equal corpus</text>
+<circle cx="26" cy="1543" r="3" fill="#e3b341"/>
+<text x="38" y="1547" fill="#e6edf3" font-size="11.5">The 80%-everywhere goal still does not stand: 0 of 8 v4 gates (config how-to closest at 79.4%, drift surfaced 72.1%)</text>
 <circle cx="26" cy="1564" r="3" fill="#e3b341"/>
-<text x="38" y="1568" fill="#e6edf3" font-size="11.5">Test 1 overall is a tie now, not a THOR lead - and the movement was asymmetric (THOR down, mimir up, same corpus)</text>
+<text x="38" y="1568" fill="#e6edf3" font-size="11.5">mimir's warm daemon stays fastest outright (38.9 vs 192.7 ms warm); THOR injects ~3.3x more tokens than mimir cold</text>
 <circle cx="26" cy="1585" r="3" fill="#e3b341"/>
-<text x="38" y="1589" fill="#e6edf3" font-size="11.5">Code-structure: level but not won (54.5 vs 56.1 re-judged; 60.3-60.3 excl. dead sources) - 70% target unmet</text>
+<text x="38" y="1589" fill="#e6edf3" font-size="11.5">Three drift golds stay honest misses (deep drift, zero shared vocabulary) - left as gaps, not trigger-stuffed</text>
 <circle cx="26" cy="1606" r="3" fill="#e3b341"/>
-<text x="38" y="1610" fill="#e6edf3" font-size="11.5">mimir wins the broad shared cut (81.2% vs 77.0%) - two-thirds code questions, same weakness on an equal corpus</text>
+<text x="38" y="1610" fill="#e6edf3" font-size="11.5">mimir has a code-symbol graph (graph/outline/peek) that THOR deliberately does NOT - for 'which functions call X'</text>
 <circle cx="26" cy="1627" r="3" fill="#e3b341"/>
-<text x="38" y="1631" fill="#e6edf3" font-size="11.5">The 80%-everywhere goal still does not stand: 0 of 8 v4 gates (config how-to closest at 79.4%, drift surfaced 72.1%)</text>
+<text x="38" y="1631" fill="#e6edf3" font-size="11.5">Semantic mode needs a ~235 MB model + a warm embed-daemon resident (off by default; degrades cleanly to bm25)</text>
 <circle cx="26" cy="1648" r="3" fill="#e3b341"/>
-<text x="38" y="1652" fill="#e6edf3" font-size="11.5">mimir's warm daemon stays fastest outright (38.9 vs 192.7 ms warm); THOR injects ~3.3x more tokens than mimir cold</text>
+<text x="38" y="1652" fill="#e6edf3" font-size="11.5">Newer and far less battle-tested than mimir's daily use</text>
 <circle cx="26" cy="1669" r="3" fill="#e3b341"/>
-<text x="38" y="1673" fill="#e6edf3" font-size="11.5">Three drift golds stay honest misses (deep drift, zero shared vocabulary) - left as gaps, not trigger-stuffed</text>
-<circle cx="26" cy="1690" r="3" fill="#e3b341"/>
-<text x="38" y="1694" fill="#e6edf3" font-size="11.5">mimir has a code-symbol graph (graph/outline/peek) that THOR deliberately does NOT - for 'which functions call X'</text>
-<circle cx="26" cy="1711" r="3" fill="#e3b341"/>
-<text x="38" y="1715" fill="#e6edf3" font-size="11.5">Semantic mode needs a ~235 MB model + a warm embed-daemon resident (off by default; degrades cleanly to bm25)</text>
-<circle cx="26" cy="1732" r="3" fill="#e3b341"/>
-<text x="38" y="1736" fill="#e6edf3" font-size="11.5">Newer and far less battle-tested than mimir's daily use</text>
-<circle cx="26" cy="1753" r="3" fill="#e3b341"/>
-<text x="38" y="1757" fill="#e6edf3" font-size="11.5">One machine, private corpus, LLM-judged - only drift is repo-reproducible (examples/drift_eval.rs)</text>
-<line x1="20" y1="1786" x2="840" y2="1786" stroke="#21262d" stroke-width="1"/>
-<text x="20" y="1806" fill="#e6edf3" font-size="13.5" font-weight="700">Bottom line <tspan fill="#c9d1d9">coverage tie (63.8 vs 64.0)</tspan> . <tspan fill="#22d3ee">strict dual-written 96.2 vs 93.4, 1st win</tspan> . <tspan fill="#c9d1d9">multi-project tie</tspan></text>
-<text x="20" y="1826" fill="#e6edf3" font-size="13.5" font-weight="700"><tspan fill="#22d3ee">drift 72 vs 59</tspan> . <tspan fill="#22d3ee">code re-judge: behavior 72.5 vs 59.2, structure level</tspan> . <tspan fill="#22d3ee">2.8x faster than mimir cold</tspan></text>
+<text x="38" y="1673" fill="#e6edf3" font-size="11.5">One machine, private corpus, LLM-judged - only drift is repo-reproducible (examples/drift_eval.rs)</text>
+<line x1="20" y1="1702" x2="840" y2="1702" stroke="#21262d" stroke-width="1"/>
+<text x="20" y="1722" fill="#e6edf3" font-size="13.5" font-weight="700">Bottom line <tspan fill="#c9d1d9">coverage tie (63.8 vs 64.0)</tspan> . <tspan fill="#22d3ee">strict dual-written 96.2 vs 93.4, 1st win</tspan> . <tspan fill="#c9d1d9">multi-project tie</tspan></text>
+<text x="20" y="1742" fill="#e6edf3" font-size="13.5" font-weight="700"><tspan fill="#22d3ee">drift 72 vs 59</tspan> . <tspan fill="#22d3ee">code re-judge: behavior 72.5 vs 59.2, structure level</tspan> . <tspan fill="#22d3ee">2.8x faster than mimir cold</tspan></text>
 </svg>

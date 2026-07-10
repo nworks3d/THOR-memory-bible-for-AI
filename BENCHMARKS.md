@@ -85,11 +85,13 @@ earlier 504-question set that was dominated by code-only questions.
 **A statistical tie overall (63.8% vs 64.0%), and the first round mimir's
 overall is not behind.** The split is clean: THOR leads every knowledge-shaped
 category (decision +16.6, gotcha +6.5, doc-reference +3.8, config how-to
-+2.9), mimir leads both code categories, code-structure now decisively (63.6%
-vs 42.4% - its tree-sitter `CodeChunk` indexing plus this round's fresh
-re-index of THOR's own changed source tree; THOR's dependency-free
-symbol-boundary chunker and the new same-file sibling vote did not close that
-gap on the judged score). Note the corpus includes 44 questions whose source
++2.9), and in THIS run mimir led both code categories, code-structure
+decisively (63.6% vs 42.4% - its tree-sitter `CodeChunk` indexing plus this
+round's fresh re-index of THOR's own changed source tree). **The two code
+rows were superseded the same evening by the V6/V7 re-judges below** -
+behavior flipped to a THOR win and structure closed to parity; the table
+above keeps this run's numbers for run-consistency, so its overall
+understates THOR's current position. Note the corpus includes 44 questions whose source
 docs were deliberately removed from the repo since the corpus was authored -
 both systems score near zero on those, which drags both overalls down
 equally; see Test 2 for the cuts that exclude them. No category clears an 80%
@@ -328,12 +330,14 @@ not. What THOR wins, and why:
 - **It degrades cleanly.** Semantic off, model missing, sidecar deleted,
   daemon down - each path falls back to bm25 and can never make recall worse.
 
-What mimir wins, and why: **both code categories on Test 1** (code-structure
-decisively, 63.6% vs 42.4%) and with them **the broad shared cut (81.2% vs
-77.0%)** - its tree-sitter `CodeChunk` indexing produces better-ranked code
-answers than THOR's dependency-free chunker; and **the warm-daemon latency
-class** (38.9 ms), by serving a single floor-gated memory instead of a full
-injection block.
+What mimir wins, and why: **the broad shared cut (81.2% vs 77.0%,
+two-thirds code/doc-chunk questions, measured before the V6/V7 code fixes)**
+and **the warm-daemon latency class** (38.9 ms), by serving a single
+floor-gated memory instead of a full injection block. Its former code-category
+lead did not survive the V6/V7 re-judges: code-behavior flipped to a clear
+THOR win (72.5% vs 59.2%) and code-structure sits at parity (54.5% vs 56.1%;
+60.3%-60.3% excluding dead sources) - though a structure WIN remains
+unclaimed, and mimir's tree-sitter symbol retrieval is why.
 
 ## Honest weaknesses
 
@@ -351,8 +355,9 @@ injection block.
   four dead-source questions both systems score zero on. The judged 70%
   target for this category was not reached on the all-93 basis.
 - **mimir wins the broad shared cut (81.2% vs 77.0%)** - two-thirds of that
-  cut is code/doc-chunk questions, the same weakness as above on an equal
-  corpus.
+  cut is code/doc-chunk questions. Measured on the V5 run, BEFORE the V6/V7
+  serving and ranking fixes landed; not re-measured since (re-judging it
+  would require a fresh jury pass over the full cut).
 - **The "80%-everywhere" goal still does not stand: 0 of 8 v4 gates.** No
   Test 1 category clears 80% (config how-to closest at 79.4%) and no drift
   metric does either (courier surfaced 72.1% is the closest any channel has

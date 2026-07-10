@@ -17,11 +17,14 @@ one thing the agent can search automatically. Measured against
 [mimir](https://github.com/MakerViking/mimir) on the same machine
 ([full method + weaknesses](BENCHMARKS.md)):
 
-- **It wins where knowledge lives.** On the 200-question as-deployed set the
-  overall is a statistical tie this round (**63.8% vs 64.0%**), but the split
-  is clean: THOR leads every knowledge category (decisions +17, gotchas +7,
-  docs +4, config +3) and mimir leads both code categories on the strength of
-  its code-content indexing.
+- **It wins where knowledge lives - and, since the V6/V7 code rounds, on code
+  behavior too.** On the 200-question as-deployed set the overall was a
+  statistical tie (**63.8% vs 64.0%**) with THOR leading every knowledge
+  category (decisions +17, gotchas +7, docs +4, config +3). The two code
+  categories were then fixed and re-judged on the same items: **code behavior
+  flipped to a clear THOR win (72.5% vs 59.2%)** and code structure closed a
+  21-point deficit to parity (54.5% vs 56.1%; exactly level excluding
+  dead-source questions).
 - **It wins the cleanest equal-corpus test - for the first time.** On the
   strict dual-written cut (facts both stores verifiably hold, n=53) THOR now
   leads **96.2% vs 93.4%** - pure memory recall was mimir's home turf across
@@ -122,8 +125,9 @@ every test, fresh random blind maps and one-run-no-re-rolls, against mimir's
 strongest opponent build to date (unreleased main, code-content indexing,
 index refreshed before the run) - wins and losses on a level playing field:
 **coverage** a statistical tie, 63.8% vs 64.0% on the 200-question balanced
-set (THOR leads all four knowledge categories, mimir both code categories;
-jury strictness moved the absolutes asymmetrically this round),
+set (THOR leads all four knowledge categories; the code categories were
+subsequently fixed and re-judged in the V6/V7 rounds: behavior 72.5% vs
+59.2% THOR, structure 54.5% vs 56.1% - parity excluding dead sources),
 **same-knowledge quality** re-measured on a rebuilt subset: THOR takes the
 strict dual-written cut for the first time (96.2% vs 93.4%), mimir the broad
 shared cut (81.2% vs 77.0%), **multi-project** a dead tie, 92.2% vs 92.2%

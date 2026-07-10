@@ -70,8 +70,8 @@ y += 30
 # ---- test 1 ----
 header("TEST 1 - COVERAGE  (200 questions: 118 shared-knowledge + 82 stratified)", "deliberate recall over the live store . higher is better")
 for label, t, m in [
-    ("Code structure", 42.4, 63.6),
-    ("Code behavior", 60.0, 62.5),
+    ("Code structure (re-judged)", 54.5, 56.1),
+    ("Code behavior (re-judged)", 72.5, 59.2),
     ("Doc reference", 70.0, 66.2),
     ("Config how-to", 79.4, 76.5),
     ("Gotcha", 71.7, 65.2),
@@ -81,15 +81,14 @@ for label, t, m in [
     delta = f"+{d}%" if d > 0 else (f"{d}%" if d < 0 else "tie")
     pair(label, t, m, delta, delta_color=SOFT if d == 0 else None)
 rule()
-note(f'Test 1 overall  <tspan fill="{CYAN}">THOR 63.8%</tspan> vs <tspan fill="{MUT}">mimir 64.0%</tspan>  (n=200) - a statistical tie', color=FG, size=13, bold=True)
-note("Clean split: THOR leads every knowledge category (decision, gotcha, docs, config); mimir leads both code categories.")
-note("Jury strictness moved the absolutes asymmetrically vs the previous round (THOR 68.5 -> 63.8, mimir 59.8 -> 64.0), same corpus.")
+note(f'Test 1 overall  <tspan fill="{CYAN}">THOR 63.8%</tspan> vs <tspan fill="{MUT}">mimir 64.0%</tspan>  (n=200, full V5 run) - a statistical tie', color=FG, size=13, bold=True)
+note("The CODE rows show the current state: re-judged after the V6/V7 fixes (fresh dumps, fresh blind juries, same 93")
+note("items). In the original full run they read 42.4 vs 63.6 and 60.0 vs 62.5 - the overall above still uses those, so")
+note("it UNDERSTATES THOR's current position. Knowledge rows and the overall are the full V5 run, unchanged.")
 y += 14
 
 # ---- test 1 addendum: the V6/V7 code re-judges ----
-header("TEST 1 ADDENDUM - CODE RE-JUDGED (V6 + V7 rounds, same 93 items)", "serving parity + path affinity, then the derived symbol sidecar . fresh blind mini-juries")
-pair("Code behavior (re-judge)", 72.5, 59.2, "+13%")
-pair("Code structure (re-judge)", 54.5, 56.1, "-2%")
+header("HOW THE CODE CATEGORIES GOT THERE (V6 + V7 rounds)", "serving parity + path affinity, then the derived symbol sidecar . re-judged per round")
 note("Behavior flipped and held above 70 twice (60.0 -> 71.7 -> 72.5 vs mimir 62.5 -> 57.5 -> 59.2). Structure went", color=SOFT)
 note("42.4 -> 50.0 -> 54.5 while mimir fell 63.6 -> 57.6 -> 56.1: a 21-point gap closed to 1.6 - and excluding four", color=SOFT)
 note("dead-source items (files deliberately removed; both systems score zero) both judge at exactly 60.3% vs 60.3%.", color=SOFT)

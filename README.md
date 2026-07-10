@@ -286,6 +286,16 @@ thor/
   *.example.json  guard rulebook templates (copy + fill in)
 ```
 
+## Acknowledgments
+
+- **MakerViking** - for the inspiration and the great fight. This project would
+  not exist without the spark, and it would not be half as good without a worthy
+  rival to measure against. Skål!
+- **mimir** - the wise opponent in every benchmark in this repo. In the sagas,
+  Mimir guards the well of knowledge; here it set the bar THOR had to clear. The
+  scoreboard shows real wins and real losses on purpose: a rival this good
+  deserves honest numbers.
+
 ## License
 
 GPLv3.

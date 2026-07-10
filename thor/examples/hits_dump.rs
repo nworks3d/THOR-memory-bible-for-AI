@@ -181,8 +181,9 @@ fn main() -> anyhow::Result<()> {
                             // surface serves (memories full-body, chunks a wide
                             // window) - the benchmark measures production, not
                             // a third serving configuration.
-                            let (_, snip) =
-                                thor::courier::serve_deliberate(&h.entity_id, &h.body, query, None, None);
+                            let (_, snip) = thor::courier::serve_deliberate(
+                                &store, &h.entity_id, &h.body, query, None, None,
+                            );
                             format!("{}: {}", h.entity_id, snip)
                         }
                     })

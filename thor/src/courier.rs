@@ -493,25 +493,84 @@ pub(crate) fn fresh_snippet(
 /// recall): matches what the benchmark's fused channel measures, so the
 /// harness and production serve the same thing.
 pub(crate) const DELIBERATE_CHUNK_CAP: usize = 500;
+/// Window budget once neighbor chunks are stitched in: the dominant TEST1
+/// failure mode is an answer SPLIT across a chunk boundary, so the joined text
+/// gets room for a window that spans the seam.
+pub(crate) const DELIBERATE_STITCHED_CAP: usize = 900;
 
-/// Deliberate-path serving (MCP recall, CLI recall): a memory fact is served
-/// FULL-BODY (footer stripped, whitespace collapsed) - multi-project measured
-/// 96.7% on full bodies while capped snippets measured ~70%, and the agent
-/// asked for this hit explicitly. Repo chunks keep a wide window plus the
-/// freshness re-read. This replaces the old flat 220-char cap, the single
-/// largest gap between what the benchmark measured and production served.
+/// The current live single-head body of an entity: None when absent, diverged
+/// (a contested neighbor is not safe stitching material) or retracted.
+fn live_head_body(store: &EventStore, entity_id: &str) -> Option<String> {
+    let events = store.get_events_by_entity(entity_id).ok()?;
+    if events.is_empty() {
+        return None;
+    }
+    let heads = crate::cas::compute_head_sets(&events);
+    let hs = heads.get(entity_id)?;
+    if hs.heads.len() != 1 {
+        return None;
+    }
+    let rev = hs.heads.iter().next()?;
+    let ev = events.iter().find(|e| &e.this_hash == rev)?;
+    if matches!(ev.kind, crate::event_store::EventKind::FactRetracted) {
+        return None;
+    }
+    Some(ev.body.clone())
+}
+
+/// The `<prefix>#<n-1>` / `<prefix>#<n+1>` sibling ids of a chunk id.
+fn neighbor_ids(entity_id: &str) -> Option<(Option<String>, String)> {
+    let (prefix, n) = entity_id.rsplit_once('#')?;
+    let n: usize = n.parse().ok()?;
+    let prev = n.checked_sub(1).map(|p| format!("{prefix}#{p}"));
+    Some((prev, format!("{prefix}#{}", n + 1)))
+}
+
+/// Deliberate-path serving (MCP recall, CLI recall, benchmark harness): a
+/// memory fact is served FULL-BODY (footer stripped, whitespace collapsed) -
+/// multi-project measured 96.7% on full bodies while capped snippets measured
+/// ~70%, and the agent asked for this hit explicitly. A repo chunk is
+/// NEIGHBOR-STITCHED: the adjacent chunks of the same file are joined around
+/// the (freshness-checked) hit so an answer spanning a chunk boundary serves
+/// as one window instead of a truncated half. This replaces the old flat
+/// 220-char cap, the single largest gap between what the benchmark measured
+/// and what production served.
 pub fn serve_deliberate(
+    store: &EventStore,
     entity_id: &str,
     body: &str,
     query: &str,
     project: Option<&str>,
     cwd: Option<&str>,
 ) -> (String, String) {
-    if crate::repo::is_chunk_id(entity_id) {
-        return fresh_snippet(entity_id, body, query, DELIBERATE_CHUNK_CAP, project, cwd);
+    if !crate::repo::is_chunk_id(entity_id) {
+        let full = crate::footer::strip(body).split_whitespace().collect::<Vec<_>>().join(" ");
+        return (String::new(), full);
     }
-    let full = crate::footer::strip(body).split_whitespace().collect::<Vec<_>>().join(" ");
-    (String::new(), full)
+    // Center chunk honors the freshness re-read exactly like fresh_snippet.
+    let (tag, center) = match freshness(entity_id, body, project, cwd) {
+        Freshness::Current => (String::new(), body.to_string()),
+        Freshness::Refreshed(live) => (" [refreshed]".to_string(), live),
+        Freshness::Stale => (" [stale?]".to_string(), body.to_string()),
+    };
+    // Stitch stored neighbors (live heads only; fail-open to the bare chunk).
+    // Neighbors come from the store, not the live file, so the benchmark and
+    // the MCP surface serve identically; a refreshed center with stored
+    // neighbors is the accepted, documented asymmetry.
+    let mut joined = crate::footer::strip(&center).trim().to_string();
+    let mut stitched = false;
+    if let Some((prev, next)) = neighbor_ids(entity_id) {
+        if let Some(p) = prev.and_then(|id| live_head_body(store, &id)) {
+            joined = format!("{} {}", crate::footer::strip(&p).trim(), joined);
+            stitched = true;
+        }
+        if let Some(n) = live_head_body(store, &next) {
+            joined = format!("{} {}", joined, crate::footer::strip(&n).trim());
+            stitched = true;
+        }
+    }
+    let cap = if stitched { DELIBERATE_STITCHED_CAP } else { DELIBERATE_CHUNK_CAP };
+    (tag, crate::recall::snippet(&joined, cap, query))
 }
 
 pub(crate) enum Freshness {
@@ -690,6 +749,38 @@ mod tests {
         store
             .append_event("s", "l", "a", EventKind::FactCreated, "e1", None, "the deploy watcher gotcha lives here")
             .unwrap();
+    }
+
+    #[test]
+    fn test_serve_deliberate_stitches_neighbors_and_serves_memories_full() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("st.db");
+        let mut store = EventStore::new(&db).unwrap();
+        let mk = |i: usize, text: &str| {
+            format!("{}\n\n[repo file | P/src/a.rs | chunk {}/3]", text, i + 1)
+        };
+        store.append_event("s", "l", "a", EventKind::FactCreated, "P:src/a.rs#0",
+            None, &mk(0, "fn alpha() { begin_processing(); }")).unwrap();
+        store.append_event("s", "l", "a", EventKind::FactCreated, "P:src/a.rs#1",
+            None, &mk(1, "fn beta() { let matrix_cache = build(); }")).unwrap();
+        store.append_event("s", "l", "a", EventKind::FactCreated, "P:src/a.rs#2",
+            None, &mk(2, "fn gamma() { matrix_ensure_rebuild(); }")).unwrap();
+        // Query terms split across the #1/#2 boundary: the stitched window must
+        // span the seam that a bare-chunk snippet could never cover.
+        let (_, snip) = serve_deliberate(
+            &store, "P:src/a.rs#1",
+            &mk(1, "fn beta() { let matrix_cache = build(); }"),
+            "matrix_cache ensure rebuild", None, None,
+        );
+        assert!(snip.contains("matrix_cache"), "center content served: {snip}");
+        assert!(snip.contains("matrix_ensure_rebuild"), "next-chunk content stitched in: {snip}");
+        assert!(!snip.contains("[repo file"), "footers never reach the served window: {snip}");
+        // A memory fact is served full-body, footer stripped, uncapped.
+        let long = format!("GOTCHA: {}\n\n[memory/gotcha | tags: x | project: P]", "detail ".repeat(120));
+        let (tag, full) = serve_deliberate(&store, "P:mem-x", &long, "detail", None, None);
+        assert!(tag.is_empty());
+        assert!(full.len() > 700, "memory body not truncated: {}", full.len());
+        assert!(!full.contains("[memory/"), "footer stripped from the served body");
     }
 
     #[test]

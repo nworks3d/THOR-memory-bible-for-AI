@@ -276,7 +276,7 @@ impl ThorServer {
                 crate::ledger::increment(&db, "access", &hit.entity_id);
                 let short = &hit.rev[..hit.rev.len().min(8)];
                 let (fresh_tag, snip) = crate::courier::serve_deliberate(
-                    &hit.entity_id, &hit.body, &args.query, fresh_project.as_deref(), cwd.as_deref(),
+                    s, &hit.entity_id, &hit.body, &args.query, fresh_project.as_deref(), cwd.as_deref(),
                 );
                 let diverged = if hit.is_diverged { " [DIVERGED]" } else { "" };
                 let ty = hit.fact_type.map(|t| format!(" [{}]", t.as_str())).unwrap_or_default();

@@ -80,17 +80,31 @@ fn build_injection(db: &Path) -> Option<String> {
     if std::io::stdin().read_to_string(&mut raw).is_err() {
         return None;
     }
+    // Warm-first: a running `thor daemon` answers with the IDENTICAL decision
+    // (shared core) while skipping process/store/model startup. Any daemon
+    // failure falls back to the in-process cold path - exactly the previous
+    // behavior plus a bounded probe.
+    match crate::daemon_client::try_inject(db, &raw) {
+        Some(crate::daemon_client::DaemonReply::Inject(block)) => return Some(block),
+        Some(crate::daemon_client::DaemonReply::Silent) => return None,
+        None => {}
+    }
     injection_for_hook_json(db, &raw)
 }
 
-/// Given the raw hook JSON and a db path, produce the injection block (or None).
-/// Applies the same gates as the mimir hook: min length, whole-prompt-trivial,
-/// prompt truncation, dedup, and a hard cap.
-/// Public so the drift-eval harness (examples/drift_eval.rs) drives the REAL path.
-pub fn injection_for_hook_json(db: &Path, raw: &str) -> Option<String> {
+/// The store-independent half of the courier gates: everything that can say
+/// "silent" WITHOUT opening the store. Shared verbatim by the cold path and
+/// the warm daemon so both stay behaviorally identical by construction.
+struct PreCheck {
+    query: String,
+    cwd: Option<String>,
+    session_id: String,
+}
+
+fn precheck(db: &Path, raw: &str) -> Option<PreCheck> {
     // Flip valve: THOR-SILENT.flag silences THOR entirely (its own kill-switch).
     // Checked first, so a silenced courier does nothing else. Flipping is a file,
-    // never a code change.
+    // never a code change - and the daemon re-reads it per request, never caches.
     if flag_present(db, "THOR-SILENT.flag") {
         return None;
     }
@@ -119,17 +133,42 @@ pub fn injection_for_hook_json(db: &Path, raw: &str) -> Option<String> {
     if !crate::recall::has_content_terms(&query) {
         return None;
     }
+    let cwd = data.get("cwd").and_then(|v| v.as_str()).map(str::to_string);
+    let session_id =
+        data.get("session_id").and_then(|v| v.as_str()).unwrap_or("").to_string();
+    Some(PreCheck { query, cwd, session_id })
+}
 
+/// Given the raw hook JSON and a db path, produce the injection block (or None).
+/// Applies the same gates as the mimir hook: min length, whole-prompt-trivial,
+/// prompt truncation, dedup, and a hard cap.
+/// Public so the drift-eval harness (examples/drift_eval.rs) drives the REAL path.
+pub fn injection_for_hook_json(db: &Path, raw: &str) -> Option<String> {
+    let pre = precheck(db, raw)?;
     // Store unreachable -> silent (the "hub-down -> exit 0" contract). Opening
     // creates an empty store if none exists, which simply yields no hits.
     let store = EventStore::new(db).ok()?;
+    injection_with_store(&store, db, &pre)
+}
+
+/// Warm entry point for the daemon's /inject handler: the caller supplies an
+/// already-open store. Same precheck, same core - warm and cold are identical
+/// by construction (flags and the session ledger are files/sidecars re-read
+/// fresh on every call, never cached in the daemon).
+pub fn injection_for_hook_json_warm(store: &EventStore, db: &Path, raw: &str) -> Option<String> {
+    let pre = precheck(db, raw)?;
+    injection_with_store(store, db, &pre)
+}
+
+fn injection_with_store(store: &EventStore, db: &Path, pre: &PreCheck) -> Option<String> {
+    let query = pre.query.clone();
     // Project isolation: recall inside project A must not surface project B's code
     // OR its memories. Derive the project from the hook cwd (a `.thor` marker or git
     // walk-up, no subprocess); the CORE recall then scopes to that project + the
     // always-in-scope global tier. A projectless cwd (scratch dir) -> global-only,
     // so auto-injection never re-imports another project's clutter.
-    let cwd = data.get("cwd").and_then(|v| v.as_str()).map(str::to_string);
-    let session_id = data.get("session_id").and_then(|v| v.as_str()).unwrap_or("");
+    let cwd = pre.cwd.clone();
+    let session_id = pre.session_id.as_str();
     let project = cwd.as_deref().and_then(|c| crate::repo::project_key(Path::new(c)));
     let scope = RecallScope::current(project.clone());
     let pool = recall_for(db, &store, &query, &scope, POOL_HITS);
@@ -809,6 +848,33 @@ mod tests {
         store
             .append_event("s", "l", "a", EventKind::FactCreated, "e1", None, "the deploy watcher gotcha lives here")
             .unwrap();
+    }
+
+    #[test]
+    fn test_warm_path_matches_cold_path_and_shares_the_ledger() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("wp.db");
+        seed(&db);
+        let raw = r#"{"prompt":"how does the deploy watcher work","cwd":"x","session_id":""}"#;
+        // Stateless (no session): warm and cold must agree byte-for-byte.
+        let store = EventStore::new(&db).unwrap();
+        let warm = injection_for_hook_json_warm(&store, &db, raw);
+        let cold = injection_for_hook_json(&db, raw);
+        assert_eq!(warm, cold, "warm and cold must be identical by construction");
+        assert!(warm.is_some());
+        // Ledger shared: a WARM call with a session id suppresses the COLD
+        // repeat, proving both paths read/write the same thor-ledger.db.
+        let raw_s = r#"{"prompt":"how does the deploy watcher work","cwd":"x","session_id":"ws1"}"#;
+        let first = injection_for_hook_json_warm(&store, &db, raw_s);
+        assert!(first.is_some(), "first injection fires");
+        let second = injection_for_hook_json(&db, raw_s);
+        assert!(
+            second.map_or(true, |b| !b.contains("e1 (")),
+            "the cold repeat within the suppression window must not re-inject the same rev"
+        );
+        // Fallback wrapper: with no daemon flag, the warm probe is a no-op and
+        // the cold result is served unchanged.
+        assert!(crate::daemon_client::try_inject(&db, raw).is_none());
     }
 
     #[test]

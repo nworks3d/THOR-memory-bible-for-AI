@@ -18,6 +18,8 @@ pub mod embed_daemon;
 #[cfg(feature = "semantic")]
 pub mod rerank;
 pub mod courier;
+pub mod daemon_client;
+pub mod doctor;
 pub mod importer;
 pub mod mcp;
 pub mod sync;

@@ -27,6 +27,7 @@ pub fn run_install(
     settings: &Path,
     with_guard: bool,
     with_courier: bool,
+    with_daemon: bool,
     backup_repo: Option<&Path>,
 ) -> anyhow::Result<()> {
     let exe = std::env::current_exe()?.to_string_lossy().replace('\\', "\\\\");
@@ -143,6 +144,21 @@ pub fn run_install(
         }
     }
 
+    if with_daemon {
+        // Opt-in: ensure the warm injection daemon at session start. Debounced
+        // and detached inside ensure-daemon; without the daemon the courier
+        // falls back to its cold path unchanged.
+        let daemon_cmd = cmd("ensure-daemon");
+        if add(
+            hooks,
+            "SessionStart",
+            json!({ "hooks": [ { "type": "command", "command": daemon_cmd } ] }),
+            &daemon_cmd,
+        ) {
+            added.push("SessionStart (warm injection daemon ensure-start)");
+        }
+    }
+
     if let Some(repo) = backup_repo {
         let backup_cmd = cmd(&format!("backup --repo \"{}\"", repo.display()));
         if add(
@@ -185,12 +201,12 @@ mod tests {
         std::env::temp_dir().join(format!("thor-{}-{}-{}", tag, std::process::id(), n))
     }
 
-    fn install_into(json_in: &str, with_guard: bool, with_courier: bool) -> Value {
+    fn install_into(json_in: &str, with_guard: bool, with_courier: bool, with_daemon: bool) -> Value {
         let dir = unique_dir("install");
         std::fs::create_dir_all(&dir).unwrap();
         let p = dir.join("settings.json");
         std::fs::write(&p, json_in).unwrap();
-        run_install(&p, with_guard, with_courier, None).unwrap();
+        run_install(&p, with_guard, with_courier, with_daemon, None).unwrap();
         let out: Value = serde_json::from_str(&std::fs::read_to_string(&p).unwrap()).unwrap();
         let _ = std::fs::remove_dir_all(&dir);
         out
@@ -216,7 +232,7 @@ mod tests {
                 "Stop": [ { "hooks": [ { "type": "command", "command": "mimir-checkpoint.ps1" } ] } ]
             }
         }"#;
-        let out = install_into(input, true, false);
+        let out = install_into(input, true, false, false);
         // mimir's Stop hook survives
         let stops = stop_cmds(&out);
         assert!(stops.iter().any(|c| c.contains("mimir-checkpoint")), "mimir Stop hook preserved");
@@ -234,13 +250,13 @@ mod tests {
     #[test]
     fn test_idempotent_no_duplicates() {
         let input = r#"{"hooks":{}}"#;
-        let once = install_into(input, true, true);
+        let once = install_into(input, true, true, true);
         // re-run on the once-installed output
         let dir = unique_dir("idem");
         std::fs::create_dir_all(&dir).unwrap();
         let p = dir.join("settings.json");
         std::fs::write(&p, serde_json::to_string(&once).unwrap()).unwrap();
-        run_install(&p, true, true, None).unwrap();
+        run_install(&p, true, true, true, None).unwrap();
         let twice: Value = serde_json::from_str(&std::fs::read_to_string(&p).unwrap()).unwrap();
         let _ = std::fs::remove_dir_all(&dir);
         // exactly one thor stop-guard, not two
@@ -256,11 +272,12 @@ mod tests {
             .collect();
         assert_eq!(ss.iter().filter(|c| c.ends_with("warm")).count(), 1, "one warm hook");
         assert_eq!(ss.iter().filter(|c| c.contains("session-start")).count(), 1, "one session-start hook");
+        assert_eq!(ss.iter().filter(|c| c.contains("ensure-daemon")).count(), 1, "one ensure-daemon hook");
     }
 
     #[test]
     fn test_starts_from_empty_settings() {
-        let out = install_into("", true, false);
+        let out = install_into("", true, false, false);
         assert!(stop_cmds(&out).iter().any(|c| c.contains("stop-guard")));
         assert!(out["hooks"]["PreToolUse"].is_array());
     }
@@ -268,9 +285,10 @@ mod tests {
     #[test]
     fn test_default_installs_only_the_response_guard() {
         // no flags: Stop response guard only, no PreToolUse, no courier changes
-        let out = install_into(r#"{}"#, false, false);
+        let out = install_into(r#"{}"#, false, false, false);
         assert!(stop_cmds(&out).iter().any(|c| c.contains("stop-guard")), "response guard installed");
         assert!(out["hooks"].get("PreToolUse").is_none(), "command guard NOT installed by default");
         assert!(out["hooks"].get("UserPromptSubmit").is_none(), "courier NOT installed by default");
+        assert!(out["hooks"].get("SessionStart").is_none(), "daemon hook NOT installed by default");
     }
 }

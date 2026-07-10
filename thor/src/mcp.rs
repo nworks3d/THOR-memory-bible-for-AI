@@ -758,16 +758,109 @@ fn run(db: &Path, http: Option<String>) -> anyhow::Result<()> {
     })
 }
 
-/// Serve the tools over Streamable-HTTP at /mcp. This transport carries NO auth -
-/// bind to localhost on the NAS and front it with the Cloudflare Access gate,
-/// exactly like mimir's remote MCP.
+/// Default bind for the discoverable `thor daemon` alias - loopback only.
+/// `thor mcp --http <bind>` still accepts any explicit bind (unchanged
+/// contract for the NAS remote-MCP deployment); this constant only supplies
+/// the zero-config default when no bind is given.
+pub const DEFAULT_DAEMON_BIND: &str = "127.0.0.1:8765";
+
+#[derive(Clone)]
+struct InjectState {
+    store: Arc<Mutex<EventStore>>,
+    db: PathBuf,
+    bind: String,
+}
+
+/// Warm per-prompt injection: same gates, ledger and freshness as the cold
+/// courier (shared core, courier::injection_for_hook_json_warm). Fail-open:
+/// anything unexpected answers 204 (silence), never a 5xx that could confuse
+/// the hook-side client into odd states.
+async fn inject_handler(
+    axum::extract::State(state): axum::extract::State<InjectState>,
+    body: axum::body::Bytes,
+) -> axum::response::Response {
+    use axum::response::IntoResponse;
+    let Ok(raw) = String::from_utf8(body.to_vec()) else {
+        return axum::http::StatusCode::NO_CONTENT.into_response();
+    };
+    let store = state.store.clone();
+    let db = state.db.clone();
+    let result = tokio::task::spawn_blocking(move || {
+        let s = store.lock().unwrap_or_else(|p| p.into_inner());
+        crate::courier::injection_for_hook_json_warm(&s, &db, &raw)
+    })
+    .await;
+    match result {
+        Ok(Some(block)) => (axum::http::StatusCode::OK, block).into_response(),
+        _ => axum::http::StatusCode::NO_CONTENT.into_response(),
+    }
+}
+
+async fn health_handler(
+    axum::extract::State(state): axum::extract::State<InjectState>,
+) -> axum::Json<serde_json::Value> {
+    axum::Json(serde_json::json!({
+        "status": "ok",
+        "pid": std::process::id(),
+        "bind": state.bind,
+        "db": state.db.display().to_string(),
+    }))
+}
+
+/// Serve the tools over Streamable-HTTP at /mcp, plus the warm courier at
+/// /inject and a /health probe. The MCP transport carries NO auth - bind to
+/// localhost on the NAS and front it with the Cloudflare Access gate, exactly
+/// like mimir's remote MCP; /inject carries prompt text and must never be
+/// exposed beyond loopback.
 async fn serve_http(store: Arc<Mutex<EventStore>>, db: PathBuf, bind: &str) -> anyhow::Result<()> {
     // HTTP/remote has no cwd: unscoped by default (a cwd-less remote consumer is
     // cross-project by nature), honoring an explicit `project` arg per call.
-    let app = mcp_http_router(move || Ok(ThorServer::from_shared(store.clone(), None, db.clone())));
-    let listener = tokio::net::TcpListener::bind(bind).await?;
-    println!("thor MCP (streamable-http) listening on http://{bind}/mcp");
-    axum::serve(listener, app).await?;
+    let mcp_router = {
+        let store = store.clone();
+        let db = db.clone();
+        mcp_http_router(move || Ok(ThorServer::from_shared(store.clone(), None, db.clone())))
+    };
+    let listener = match tokio::net::TcpListener::bind(bind).await {
+        Ok(l) => l,
+        Err(e) => {
+            // Bind already held: if it is a healthy THOR daemon on the SAME
+            // store, adopt it - republish the discovery flag it may have lost
+            // (a client timeout self-heals by deleting the flag, but the
+            // process can still be alive) and exit cleanly instead of failing.
+            if let Some(h) = crate::daemon_client::health_at(bind) {
+                if h.get("db").and_then(|v| v.as_str()) == Some(db.display().to_string().as_str()) {
+                    let pid = h.get("pid").and_then(|v| v.as_u64()).unwrap_or(0);
+                    let _ = crate::daemon_client::publish_daemon_flag_as(&db, bind, pid);
+                    println!(
+                        "thor daemon: already running on {bind} (pid {pid}); flag republished, nothing to do"
+                    );
+                    return Ok(());
+                }
+            }
+            return Err(e.into());
+        }
+    };
+    let actual = listener.local_addr()?.to_string();
+    if !actual.starts_with("127.") && !actual.starts_with("[::1]") {
+        eprintln!(
+            "thor daemon: WARNING - /inject is bound beyond loopback ({actual}); it carries \
+             prompt text with no auth. Front it with an auth gate or bind 127.0.0.1."
+        );
+    }
+    let inject_state = InjectState { store, db: db.clone(), bind: actual.clone() };
+    let inject_router = axum::Router::new()
+        .route("/inject", axum::routing::post(inject_handler))
+        .route("/health", axum::routing::get(health_handler))
+        .with_state(inject_state);
+    // Publish the discovery flag AFTER the bind succeeded, so a failed start
+    // never leaves a flag pointing at nothing.
+    if let Err(e) = crate::daemon_client::publish_daemon_flag(&db, &actual) {
+        eprintln!("thor daemon: could not write THOR-DAEMON.flag: {e}");
+    }
+    println!(
+        "thor MCP (streamable-http) listening on http://{actual}/mcp (warm inject at http://{actual}/inject)"
+    );
+    axum::serve(listener, mcp_router.merge(inject_router)).await?;
     Ok(())
 }
 

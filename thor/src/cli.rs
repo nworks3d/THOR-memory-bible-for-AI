@@ -188,6 +188,21 @@ enum Commands {
         #[arg(long)]
         http: Option<String>,
     },
+    /// Run the warm per-prompt injection daemon: the same HTTP server as
+    /// `mcp --http`, on a zero-config loopback bind. While it runs, the
+    /// courier hook answers from the warm store in single-digit ms instead of
+    /// paying a cold process start; without it nothing changes (fail-open).
+    Daemon {
+        /// Bind address (loopback only - /inject carries prompt text, no auth).
+        #[arg(long, default_value_t = crate::mcp::DEFAULT_DAEMON_BIND.to_string())]
+        bind: String,
+    },
+    /// SessionStart-safe warm start: when the daemon's /health does not
+    /// answer, spawn `thor daemon` detached (debounced) and return at once.
+    EnsureDaemon,
+    /// Read-only health check across THOR's surfaces: store, semantic
+    /// model/sidecar, injection daemon warm/cold, and any flags present.
+    Doctor,
     /// Moment-of-action Guard: reads a PreToolUse hook JSON on stdin and, if a
     /// rulebook rule matches the tool call, emits an advisory additionalContext.
     /// Hard fail-open, always exit 0.
@@ -217,6 +232,11 @@ enum Commands {
         /// Also install the UserPromptSubmit recall courier (runs alongside mimir).
         #[arg(long)]
         with_courier: bool,
+        /// Also install a SessionStart hook that ensures the warm injection
+        /// daemon is running (`thor ensure-daemon`). Without it the courier
+        /// simply uses its cold path; the daemon only makes prompts faster.
+        #[arg(long)]
+        with_daemon: bool,
         /// Also install a SessionStart hook that runs `thor backup --repo <path>`
         /// (daily GitHub backup, debounced 20h). Point it at a clone of the repo.
         #[arg(long)]
@@ -766,6 +786,18 @@ pub fn run() -> Result<()> {
         Commands::Mcp { http } => {
             crate::mcp::run_mcp(&db, http);
         }
+        Commands::Daemon { bind } => {
+            // Discoverable alias for the warm injection daemon: the same
+            // HTTP server as `thor mcp --http`, with a zero-config loopback
+            // default. Publishes THOR-DAEMON.flag for courier/doctor.
+            crate::mcp::run_mcp(&db, Some(bind));
+        }
+        Commands::EnsureDaemon => {
+            crate::daemon_client::ensure_daemon(&db);
+        }
+        Commands::Doctor => {
+            crate::doctor::print_doctor(&db);
+        }
         Commands::Guard { rulebook } => {
             let path = rulebook.unwrap_or_else(crate::guard::default_rulebook_path);
             crate::guard::run_guard(&db, &path);
@@ -774,9 +806,9 @@ pub fn run() -> Result<()> {
             let path = rulebook.unwrap_or_else(crate::guard::default_response_rulebook_path);
             crate::guard::run_stop_guard(&db, &path);
         }
-        Commands::Install { settings, with_guard, with_courier, backup_repo } => {
+        Commands::Install { settings, with_guard, with_courier, with_daemon, backup_repo } => {
             let path = settings.unwrap_or_else(crate::install::default_settings_path);
-            crate::install::run_install(&path, with_guard, with_courier, backup_repo.as_deref())?;
+            crate::install::run_install(&path, with_guard, with_courier, with_daemon, backup_repo.as_deref())?;
         }
         Commands::Export { out } => {
             let store = EventStore::new(&db)?;

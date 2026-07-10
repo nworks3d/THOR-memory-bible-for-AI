@@ -14,23 +14,43 @@ use crate::repo::FactType;
 /// remember). Fields are sanitized here so a caller can never corrupt the
 /// format: see field_safe. `project_label` is a project key or "global".
 /// `triggers` is the author-declared firing vocabulary ("when should this
-/// fact surface?" - commands, file names, error strings); empty = no field,
-/// so every pre-existing footer stays byte-identical.
-pub fn compose(fact_type: &str, tags: &[String], project_label: &str, triggers: &[String]) -> String {
+/// fact surface?" - single task words, space-joined); `anchors` are exact
+/// file paths / command strings the guard matches verbatim (comma-joined:
+/// an anchor may contain spaces). Empty lists = no field, so every
+/// pre-existing footer stays byte-identical.
+pub fn compose(
+    fact_type: &str,
+    tags: &[String],
+    project_label: &str,
+    triggers: &[String],
+    anchors: &[String],
+) -> String {
     let ty = {
         let t = field_safe(fact_type).to_lowercase();
         if t.is_empty() { "note".to_string() } else { t }
     };
-    let join_safe = |xs: &[String]| {
-        xs.iter().map(|t| field_safe(t)).filter(|t| !t.is_empty()).collect::<Vec<_>>().join(" ")
+    let clean = |xs: &[String]| -> Vec<String> {
+        xs.iter().map(|t| field_safe(t)).filter(|t| !t.is_empty()).collect()
     };
-    let tags = join_safe(tags);
-    let fires = join_safe(triggers);
-    if fires.is_empty() {
-        format!("[memory/{} | tags: {} | project: {}]", ty, tags, project_label)
-    } else {
-        format!("[memory/{} | tags: {} | fires-when: {} | project: {}]", ty, tags, fires, project_label)
+    let tags = clean(tags).join(" ");
+    let fires = clean(triggers).join(" ");
+    // an anchor may contain spaces (a command phrase), so entries are
+    // comma-separated; commas inside an anchor would split it - strip them
+    let anchors = clean(anchors)
+        .into_iter()
+        .map(|a| a.replace(',', " ").split_whitespace().collect::<Vec<_>>().join(" "))
+        .filter(|a| !a.is_empty())
+        .collect::<Vec<_>>()
+        .join(", ");
+    let mut out = format!("[memory/{} | tags: {}", ty, tags);
+    if !fires.is_empty() {
+        out.push_str(&format!(" | fires-when: {}", fires));
     }
+    if !anchors.is_empty() {
+        out.push_str(&format!(" | anchors: {}", anchors));
+    }
+    out.push_str(&format!(" | project: {}]", project_label));
+    out
 }
 
 /// Strip characters that would corrupt the footer's field structure - including
@@ -132,6 +152,21 @@ pub fn fires_when(body: &str) -> Option<String> {
     (!words.is_empty()).then(|| words.to_string())
 }
 
+/// Parse the footer's `| anchors: <a1, a2> |` field: the exact file paths /
+/// command strings the guard matches verbatim. Empty when absent.
+pub fn anchors(body: &str) -> Vec<String> {
+    let Some(idx) = body.find("| anchors: ") else { return Vec::new() };
+    let rest = &body[idx + "| anchors: ".len()..];
+    let Some(field) = rest.split(" |").next() else { return Vec::new() };
+    field
+        .trim()
+        .trim_end_matches(']')
+        .split(',')
+        .map(|a| a.trim().to_string())
+        .filter(|a| !a.is_empty())
+        .collect()
+}
+
 /// True when the TRAILING footer carries a source-store reference (`mimir:<id>`):
 /// the fact is the import-synced copy of an external source of truth, so its
 /// lifecycle (revision, decay) is decided THERE and flows in via the importer.
@@ -157,7 +192,7 @@ mod tests {
     fn compose_parse_roundtrip() {
         // The property the module exists for: whatever compose writes, every
         // parser reads back - writer and parsers can no longer drift apart.
-        let footer = compose("gotcha", &["db".into(), "wal".into()], "ProjA", &[]);
+        let footer = compose("gotcha", &["db".into(), "wal".into()], "ProjA", &[], &[]);
         let body = format!("never open the db over SMB\n\n{}", footer);
         assert_eq!(fact_type(&body), Some(FactType::Gotcha));
         assert_eq!(project(&body).as_deref(), Some("ProjA"));
@@ -173,6 +208,7 @@ mod tests {
             &["deploy".into()],
             "ProjA",
             &["docker compose".into(), "deploy.flag".into()],
+            &[],
         );
         let body = format!("the deploy rule\n\n{}", footer);
         assert_eq!(fires_when(&body).as_deref(), Some("docker compose deploy.flag"));
@@ -181,7 +217,7 @@ mod tests {
         assert_eq!(project(&body).as_deref(), Some("ProjA"));
         assert_eq!(strip(&body), "the deploy rule");
         // hostile trigger content cannot corrupt the footer structure
-        let hostile = compose("note", &[], "global", &["a|b\n[x]".into()]);
+        let hostile = compose("note", &[], "global", &["a|b\n[x]".into()], &[]);
         assert!(!hostile.contains('\n'), "single line survives: {hostile}");
         let body2 = format!("f\n\n{}", hostile);
         assert_eq!(project(&body2).as_deref(), Some("global"));
@@ -200,7 +236,7 @@ mod tests {
     fn compose_sanitizes_hostile_fields() {
         // A newline or bracket in a field must never produce a multi-line or
         // structurally broken footer.
-        let footer = compose("gotcha\nweird", &["a|b".into(), "[x]".into()], "global", &[]);
+        let footer = compose("gotcha\nweird", &["a|b".into(), "[x]".into()], "global", &[], &[]);
         assert!(!footer.contains('\n'), "footer stays single-line: {footer}");
         let body = format!("fact\n\n{}", footer);
         assert_eq!(fact_type(&body), Some(FactType::Gotcha), "type survives sanitizing: {footer}");
@@ -209,9 +245,31 @@ mod tests {
 
     #[test]
     fn empty_type_defaults_to_note() {
-        let footer = compose("", &[], "global", &[]);
+        let footer = compose("", &[], "global", &[], &[]);
         assert!(footer.starts_with("[memory/note "), "{footer}");
         assert_eq!(fact_type(&format!("x\n\n{}", footer)), None, "note is untyped by design");
+    }
+
+    #[test]
+    fn compose_parse_roundtrip_with_anchors() {
+        let footer = compose(
+            "gotcha",
+            &[],
+            "ProjA",
+            &["deploy".into()],
+            &["deploy/watcher.sh".into(), "docker compose up".into(), "a,b".into()],
+        );
+        let body = format!("the rule\n\n{}", footer);
+        assert_eq!(
+            anchors(&body),
+            vec!["deploy/watcher.sh".to_string(), "docker compose up".to_string(), "a b".to_string()],
+            "multi-word anchors survive; a comma inside an anchor is folded, never a split"
+        );
+        // every other parser still reads its own field through the new one
+        assert_eq!(fires_when(&body).as_deref(), Some("deploy"));
+        assert_eq!(project(&body).as_deref(), Some("ProjA"));
+        assert_eq!(strip(&body), "the rule");
+        assert!(anchors("no footer here").is_empty());
     }
 
     #[test]

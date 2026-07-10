@@ -113,6 +113,13 @@ pub struct RememberArgs {
     /// deliberate ranking boost toward this fact.
     #[serde(default)]
     pub triggers: Option<Vec<String>>,
+    /// Exact file paths or command strings this fact GOVERNS (e.g.
+    /// "deploy/watcher.sh", "docker compose up"). The moment-of-action guard
+    /// surfaces the fact verbatim when a tool call touches one - exact match,
+    /// no ranking involved. Use for hard constraints tied to a specific file
+    /// or command.
+    #[serde(default)]
+    pub anchors: Option<Vec<String>>,
 }
 
 #[derive(Deserialize, schemars::JsonSchema)]
@@ -356,9 +363,11 @@ impl ThorServer {
             let clean_body = body.to_string();
             let mut body = body.to_string();
             let triggers = args.triggers.unwrap_or_default();
+            let anchors = args.anchors.unwrap_or_default();
             if args.fact_type.is_some()
                 || args.tags.as_deref().is_some_and(|t| !t.is_empty())
                 || !triggers.is_empty()
+                || !anchors.is_empty()
             {
                 let scope_label = crate::repo::owner_project(&entity_id)
                     .map(str::to_string)
@@ -368,6 +377,7 @@ impl ThorServer {
                     &args.tags.unwrap_or_default(),
                     &scope_label,
                     &triggers,
+                    &anchors,
                 );
                 body.push_str("\n\n");
                 body.push_str(&footer);
@@ -812,6 +822,7 @@ mod tests {
             fact_type: None,
             tags: None,
             triggers: None,
+            anchors: None,
         }
     }
 
@@ -866,6 +877,7 @@ mod tests {
                 fact_type: Some("decision".into()),
                 tags: Some(vec!["zephyr".into(), "test".into()]),
                 triggers: None,
+                anchors: None,
             }))
             .await;
         assert!(stored.starts_with("stored entity mcp-"), "got: {stored}");
@@ -900,6 +912,7 @@ mod tests {
                 fact_type: Some("gotcha".into()),
                 tags: Some(vec!["db".into()]),
                 triggers: None,
+                anchors: None,
             }))
             .await;
         assert!(first.starts_with("stored entity"), "{first}");
@@ -912,6 +925,7 @@ mod tests {
                 fact_type: Some("gotcha".into()),
                 tags: None,
                 triggers: None,
+                anchors: None,
             }))
             .await;
         assert!(dup.contains("NOT stored"), "typed footer must not defeat dup detection: {dup}");
@@ -926,6 +940,7 @@ mod tests {
                 fact_type: None,
                 tags: None,
                 triggers: None,
+                anchors: None,
             }))
             .await;
         assert!(a.starts_with("stored entity"), "{a}");
@@ -937,6 +952,7 @@ mod tests {
                 fact_type: None,
                 tags: None,
                 triggers: None,
+                anchors: None,
             }))
             .await;
         assert!(
@@ -956,6 +972,7 @@ mod tests {
                 fact_type: None,
                 tags: None,
                 triggers: None,
+                anchors: None,
             }))
             .await;
         assert!(
@@ -977,6 +994,7 @@ mod tests {
                 fact_type: None,
                 tags: None,
                 triggers: None,
+                anchors: None,
             }))
             .await;
         assert!(out.contains("NOT stored"), "{out}");
@@ -992,6 +1010,7 @@ mod tests {
                 fact_type: None,
                 tags: None,
                 triggers: None,
+                anchors: None,
             }))
             .await;
         assert!(chunk.contains("chunk"), "{chunk}");

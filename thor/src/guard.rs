@@ -269,20 +269,31 @@ fn file_memory_advisory(db: &Path, hook: &Value) -> Option<String> {
         .and_then(|c| crate::repo::project_key(Path::new(c)));
     let scope = crate::recall::RecallScope::current(project);
     let store = crate::event_store::EventStore::new(db).ok()?;
+
+    // Anchor pass FIRST: a fact whose author declared this exact path (full
+    // path, path suffix, or bare file name; slashes normalized) surfaces
+    // regardless of the name heuristics below.
+    let name_l = name.to_lowercase();
+    let path_norm = file_path.replace('\\', "/").to_lowercase();
+    let anchored = anchored_memories(&store, &scope, &|a| {
+        let a = a.replace('\\', "/").to_lowercase();
+        !a.is_empty()
+            && (a == path_norm || a == name_l || path_norm.ends_with(&format!("/{a}")))
+    });
+
     let hits = crate::recall::recall_memories_scoped(&store, &query, 6, &scope).ok()?;
 
     // Keep only memories that literally NAME the file (full name, or a stem of
     // >= 3 chars) - "mentions the directory" is not "about this file".
-    let name_l = name.to_lowercase();
     let stem_l = stem.to_lowercase();
-    let named: Vec<_> = hits
+    let heuristic: Vec<_> = hits
         .into_iter()
         .filter(|h| {
             let b = h.body.to_lowercase();
             b.contains(&name_l) || (stem_l.chars().count() >= 3 && b.contains(&stem_l))
         })
-        .take(FILE_MEMORY_HITS)
         .collect();
+    let named = merge_anchored(anchored, heuristic, FILE_MEMORY_HITS);
     if named.is_empty() {
         // Cache the miss briefly (NEG_CACHE_SECS) so repeated touches of a
         // memory-less file stop re-paying the recall; a memory stored later
@@ -308,6 +319,71 @@ fn file_memory_advisory(db: &Path, hook: &Value) -> Option<String> {
         "stored memory about this file (verify before relying): {}",
         lines.join("  ||  ")
     ))
+}
+
+/// Live, in-scope, single-headed memories whose author-declared anchors
+/// (remember's `anchors` param, footer field) match `pred`. The anchor pass
+/// runs BEFORE the lexical heuristics: an anchor is exact declared intent and
+/// must never depend on bm25 reaching the fact or on the fact being typed.
+fn anchored_memories(
+    store: &crate::event_store::EventStore,
+    scope: &crate::recall::RecallScope,
+    pred: &dyn Fn(&str) -> bool,
+) -> Vec<crate::recall::RecallHit> {
+    let Ok(events) = store.get_all_events() else { return Vec::new() };
+    let heads = crate::cas::compute_head_sets(&events);
+    let projects = crate::cas::compute_projects(&events);
+    let by_hash: std::collections::HashMap<&str, &crate::event_store::Event> =
+        events.iter().map(|e| (e.this_hash.as_str(), e)).collect();
+    let mut out = Vec::new();
+    for (id, hs) in &heads {
+        if crate::repo::is_chunk_id(id) || hs.heads.len() != 1 {
+            continue;
+        }
+        let Some(head) = by_hash.get(hs.heads.iter().next().expect("len checked").as_str())
+        else {
+            continue;
+        };
+        if matches!(head.kind, crate::event_store::EventKind::FactRetracted) {
+            continue;
+        }
+        let effective = projects.get(id).and_then(|o| o.as_deref());
+        if !scope.allows(effective) {
+            continue;
+        }
+        if crate::footer::anchors(&head.body).iter().any(|a| pred(a)) {
+            out.push(crate::recall::RecallHit {
+                entity_id: id.clone(),
+                rev: head.this_hash.clone(),
+                body: head.body.clone(),
+                kind: head.kind,
+                is_diverged: hs.is_diverged,
+                rank: 0.0,
+                project: effective.map(str::to_string),
+                fact_type: crate::repo::fact_type(&head.body),
+                matched_and: true,
+            });
+        }
+    }
+    out.sort_by(|a, b| a.entity_id.cmp(&b.entity_id));
+    out
+}
+
+/// Anchored hits first, then the heuristic hits that are not already among
+/// them, capped - the shared merge for both advisories.
+fn merge_anchored(
+    anchored: Vec<crate::recall::RecallHit>,
+    heuristic: Vec<crate::recall::RecallHit>,
+    cap: usize,
+) -> Vec<crate::recall::RecallHit> {
+    let mut out = anchored;
+    for h in heuristic {
+        if !out.iter().any(|a| a.entity_id == h.entity_id) {
+            out.push(h);
+        }
+    }
+    out.truncate(cap);
+    out
 }
 
 /// Eval seam: lets the drift-eval harness (examples/drift_eval.rs) drive the
@@ -405,14 +481,20 @@ fn command_memory_advisory(db: &Path, hook: &Value) -> Option<String> {
         return None; // no debounce identity -> stay silent (match the file guard)
     }
     let tokens = salient_command_tokens(command);
-    if tokens.is_empty() {
-        return None;
-    }
     // Debounce on the token SET, not the raw command: trivially-different
-    // invocations (an extra flag value, another filename) share the key.
+    // invocations (an extra flag value, another filename) share the key. A
+    // token-less command (all shell noise, e.g. "docker compose up") still
+    // gets the ANCHOR pass below - an author-declared anchor is exactly the
+    // kind of constraint that hides behind noise words - debounced on the raw
+    // command instead.
     let mut sorted = tokens.clone();
     sorted.sort();
-    let key = format!("{}|cmd:{}", session_id, sorted.join(","));
+    let key = if sorted.is_empty() {
+        let raw: String = command.trim().to_lowercase().chars().take(80).collect();
+        format!("{}|cmd-raw:{}", session_id, raw)
+    } else {
+        format!("{}|cmd:{}", session_id, sorted.join(","))
+    };
     match crate::ledger::get(db, "guard-seen", &key) {
         Some(v) if v.is_u64() => return None,
         Some(v) => {
@@ -430,29 +512,47 @@ fn command_memory_advisory(db: &Path, hook: &Value) -> Option<String> {
         .and_then(|c| crate::repo::project_key(Path::new(c)));
     let scope = crate::recall::RecallScope::current(project);
     let store = crate::event_store::EventStore::new(db).ok()?;
-    let query = tokens.join(" ");
-    let hits = crate::recall::recall_memories_scoped(&store, &query, 6, &scope).ok()?;
 
-    // Precision filter: TYPED constraints only, and the match must be more
-    // than one shared plain word - "same topic" is not "about this command".
-    // Measured against the live store: single generic-word matches ("semantic",
-    // "origin", "upload") fired on loosely-related decisions on 4 of 12 benign
-    // commands. A hit qualifies only via a STRUCTURED token (a composite like
+    // Anchor pass FIRST: a fact whose author declared an exact command string
+    // ("docker compose up") surfaces the moment that string appears in the
+    // command - no typed requirement, no token heuristics.
+    let cmd_l = command.to_lowercase();
+    let anchored = anchored_memories(&store, &scope, &|a| {
+        let a = a.to_lowercase();
+        a.chars().count() >= 3 && cmd_l.contains(&a)
+    });
+
+    let query = tokens.join(" ");
+    // Precision filter (heuristic leg; token-less commands skip it): TYPED
+    // constraints only, and the match must be more than one shared plain word
+    // - "same topic" is not "about this command". Measured against the live
+    // store: single generic-word matches ("semantic", "origin", "upload")
+    // fired on loosely-related decisions on 4 of 12 benign commands. A hit
+    // qualifies only via a STRUCTURED token (a composite like
     // "force-recreate", a host, a path leaf - near-unique by construction) or
     // via >= 2 distinct shared tokens.
-    let structured = |t: &str| {
-        t.contains('-') || t.contains('.') || t.contains(':') || t.contains('/') || t.contains('@')
+    let heuristic: Vec<_> = if tokens.is_empty() {
+        Vec::new()
+    } else {
+        let hits = crate::recall::recall_memories_scoped(&store, &query, 6, &scope).ok()?;
+        let structured = |t: &str| {
+            t.contains('-')
+                || t.contains('.')
+                || t.contains(':')
+                || t.contains('/')
+                || t.contains('@')
+        };
+        hits.into_iter()
+            .filter(|h| h.fact_type.is_some())
+            .filter(|h| {
+                let b = h.body.to_lowercase();
+                let matched: Vec<&String> =
+                    tokens.iter().filter(|t| b.contains(t.as_str())).collect();
+                matched.iter().any(|t| structured(t)) || matched.len() >= 2
+            })
+            .collect()
     };
-    let named: Vec<_> = hits
-        .into_iter()
-        .filter(|h| h.fact_type.is_some())
-        .filter(|h| {
-            let b = h.body.to_lowercase();
-            let matched: Vec<&String> = tokens.iter().filter(|t| b.contains(t.as_str())).collect();
-            matched.iter().any(|t| structured(t)) || matched.len() >= 2
-        })
-        .take(FILE_MEMORY_HITS)
-        .collect();
+    let named = merge_anchored(anchored, heuristic, FILE_MEMORY_HITS);
     let now = crate::review::now_secs();
     if named.is_empty() {
         crate::ledger::upsert(db, "guard-seen", &key, &serde_json::json!({ "ts": now, "neg": true }));
@@ -866,6 +966,79 @@ mod tests {
         // the THOR kill switch silences the nudge
         std::fs::write(dir.path().join("THOR-SILENT.flag"), "").unwrap();
         assert!(capture_nudge(&db, &hook("s6"), &hay).is_none(), "THOR-SILENT.flag silences capture");
+    }
+
+    #[test]
+    fn test_anchored_fact_beats_every_heuristic_on_both_advisories() {
+        use crate::event_store::{EventKind, EventStore};
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("thor.db");
+        {
+            let mut store = EventStore::new(&db).unwrap();
+            // FILE anchor: the body never NAMES the file (the heuristic can
+            // never match it) - only the anchors field ties it to the path
+            store
+                .append_event(
+                    "s", "l", "a", EventKind::FactCreated, "Proj:mem-anch-f", None,
+                    "always validate with sh -n after editing; a syntax error makes the watcher silently do nothing\n\n[memory/gotcha | tags: deploy | anchors: deploy/watcher.sh | project: Proj]",
+                )
+                .unwrap();
+            // COMMAND anchor: an UNTYPED note (the heuristic leg requires
+            // typed) anchored on a phrase made of pure shell-noise words
+            store
+                .append_event(
+                    "s", "l", "a", EventKind::FactCreated, "Proj:mem-anch-c", None,
+                    "bring the stack up only after the config check has passed\n\n[memory/note | tags: | anchors: docker compose up | project: Proj]",
+                )
+                .unwrap();
+            // control twins: same texts, same words as TAGS, no anchors field
+            store
+                .append_event(
+                    "s", "l", "a", EventKind::FactCreated, "Proj:mem-ctrl-f", None,
+                    "always validate with sh -n after edits; syntax errors make watchers silently do nothing\n\n[memory/gotcha | tags: watcher.sh deploy | project: Proj]",
+                )
+                .unwrap();
+        }
+        let proj = dir.path().join("Proj");
+        std::fs::create_dir_all(proj.join(".git")).unwrap();
+
+        // file advisory: the anchored fact surfaces on its exact path...
+        let hook = json!({
+            "session_id": "s1",
+            "cwd": proj.to_string_lossy(),
+            "tool_name": "Edit",
+            "tool_input": { "file_path": proj.join("deploy/watcher.sh").to_string_lossy() }
+        });
+        let adv = file_memory_advisory(&db, &hook).expect("anchored fact must advise");
+        assert!(adv.contains("Proj:mem-anch-f"), "anchored fact first: {adv}");
+        // ...and an unrelated file stays silent (anchors are exact, not fuzzy)
+        let other = json!({
+            "session_id": "s1",
+            "cwd": proj.to_string_lossy(),
+            "tool_name": "Edit",
+            "tool_input": { "file_path": proj.join("deploy/other.sh").to_string_lossy() }
+        });
+        assert!(file_memory_advisory(&db, &other).is_none(), "no anchor, no name match = silent");
+
+        // command advisory: all-noise command, untyped fact - only the anchor fires
+        let cmd = json!({
+            "session_id": "s2",
+            "cwd": proj.to_string_lossy(),
+            "tool_name": "Bash",
+            "tool_input": { "command": "docker compose up -d" }
+        });
+        let adv = command_memory_advisory(&db, &cmd).expect("anchored command must advise");
+        assert!(adv.contains("Proj:mem-anch-c"), "untyped anchored fact surfaces: {adv}");
+        // same session, same command: debounced
+        assert!(command_memory_advisory(&db, &cmd).is_none(), "raw-command debounce holds");
+        // an unanchored noise-only command stays silent
+        let bare = json!({
+            "session_id": "s2",
+            "cwd": proj.to_string_lossy(),
+            "tool_name": "Bash",
+            "tool_input": { "command": "docker compose down" }
+        });
+        assert!(command_memory_advisory(&db, &bare).is_none(), "no anchor in it = silent");
     }
 
     #[test]

@@ -116,6 +116,22 @@ the symbol-graph route (see SIMILAR-PROJECTS.md R2), not chunk-shuffling.
 Note: 4 of the 33 structure items reference repo-removed sources on which both
 systems score zero, capping the reachable maximum at ~88%.
 
+**V7 symbol-sidecar addendum.** The symbol-graph route was then built and
+re-judged under the same protocol (fresh dumps both systems, fresh blind maps,
+3-lens median): a DERIVED `thor-symbols.db` sidecar outside the hash-chained
+log (heuristic, dependency-free def/call extraction from the store's own chunk
+bodies - including nested and destructured declarations, so React state names
+resolve to their defining chunk), a symbol-definition ranking bonus on the
+deliberate path (identifier-shaped names only - a length-based specificity
+rule measurably false-fired on ordinary long words and was dropped), and
+`where_used`/`impact`/`outline` tools (idea credit mimir +
+codebase-memory-mcp). Re-judged on the same 93 items: **code-behavior 72.5%
+vs 57.5%** (second consecutive judged win above 70) and **code-structure
+54.5% vs 56.1%** - the gap shrank from 21.2 points (v6 full run) through 7.6
+(V6 re-judge) to 1.6, and excluding the four dead-source items both systems
+judge at exactly **60.3% vs 60.3%**: parity on the live set. Three-measurement
+trend: THOR 42.4 -> 50.0 -> 54.5 while mimir moved 63.6 -> 57.6 -> 56.1.
+
 ## Test 2 - Same knowledge (cuts over the judged Test 1 set)
 
 The fair, apples-to-apples comparison: only questions whose source fact
@@ -328,13 +344,12 @@ injection block.
   fresh re-index (including THOR's own fast-moving source tree) is the
   plausible driver, and the honest reading is that mimir's code-content
   indexing keeps compounding.
-- **mimir still wins code-structure (57.6% vs 50.0% on the V6 re-judge; was
-  63.6% vs 42.4%).** The V6 serving-parity + path-affinity round halved the
-  gap and flipped code-behavior outright, but structure-shaped questions
-  ("what is the shape of X's state") keep favoring mimir's symbol-level
-  retrieval; the chunking A-B that targeted it came out net negative and was
-  rejected. The symbol-graph sidecar (SIMILAR-PROJECTS.md, R2) is the open
-  route.
+- **Code-structure is now statistically level but not won (54.5% vs 56.1%
+  on the V7 re-judge; 60.3% vs 60.3% excluding dead sources).** Two rounds
+  (serving parity + path affinity, then the symbol sidecar) closed a
+  21-point gap to parity on live items; the all-93 number stays capped by
+  four dead-source questions both systems score zero on. The judged 70%
+  target for this category was not reached on the all-93 basis.
 - **mimir wins the broad shared cut (81.2% vs 77.0%)** - two-thirds of that
   cut is code/doc-chunk questions, the same weakness as above on an equal
   corpus.

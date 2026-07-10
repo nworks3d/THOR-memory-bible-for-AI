@@ -557,6 +557,7 @@ fn run_live(corpus: &Path, cwd_override: Option<&Path>, json_out: bool) -> anyho
         seq: i64,
         category: String,
         surfaced: bool,
+        content_surfaced: bool,
         coverage: f64,
     }
     let mut rows: Vec<Row> = Vec::new();
@@ -593,7 +594,17 @@ fn run_live(corpus: &Path, cwd_override: Option<&Path>, json_out: bool) -> anyho
         let lower = block.to_lowercase();
         let hit = terms.iter().filter(|t| lower.contains(t.as_str())).count();
         let coverage = if terms.is_empty() { 0.0 } else { hit as f64 / terms.len() as f64 };
-        rows.push(Row { seq: s.seq, category: s.category.clone(), surfaced, coverage });
+        // Content-addressed surfaced: ONE served hit (not the whole injection)
+        // carries >= half of the gold's key terms. Survives store metabolism -
+        // a distilled/revised successor of the gold still counts, a spread of
+        // fragments across unrelated hits does not. The entity metric stays
+        // reported for continuity; ids are informative, content is the truth.
+        let content_surfaced = !terms.is_empty()
+            && lower.split("\n- ").any(|segment| {
+                let got = terms.iter().filter(|t| segment.contains(t.as_str())).count();
+                got as f64 / terms.len() as f64 >= 0.5
+            });
+        rows.push(Row { seq: s.seq, category: s.category.clone(), surfaced, content_surfaced, coverage });
     }
 
     let mut cats: Vec<String> = rows.iter().map(|r| r.category.clone()).collect();
@@ -602,12 +613,17 @@ fn run_live(corpus: &Path, cwd_override: Option<&Path>, json_out: bool) -> anyho
     let summarize = |rows: &[&Row]| -> serde_json::Value {
         let n = rows.len();
         let surfaced = rows.iter().filter(|r| r.surfaced).count();
+        let content = rows.iter().filter(|r| r.content_surfaced).count();
+        let either = rows.iter().filter(|r| r.surfaced || r.content_surfaced).count();
         let half = rows.iter().filter(|r| r.coverage >= 0.5).count();
         let mean = if n == 0 { 0.0 } else { rows.iter().map(|r| r.coverage).sum::<f64>() / n as f64 };
         json!({
             "n": n,
             "entity_surfaced": surfaced,
             "entity_surfaced_pct": pct(surfaced, n),
+            "content_surfaced": content,
+            "content_surfaced_pct": pct(content, n),
+            "either_surfaced_pct": pct(either, n),
             "gold_terms_half_pct": pct(half, n),
             "gold_terms_mean_coverage": (mean * 1000.0).round() / 1000.0,
         })
@@ -635,6 +651,7 @@ fn run_live(corpus: &Path, cwd_override: Option<&Path>, json_out: bool) -> anyho
                 "scenarios": rows.iter().map(|r| json!({
                     "seq": r.seq, "category": r.category,
                     "surfaced": r.surfaced,
+                    "content_surfaced": r.content_surfaced,
                     "coverage": (r.coverage * 1000.0).round() / 1000.0,
                 })).collect::<Vec<_>>(),
             }))?
@@ -643,16 +660,23 @@ fn run_live(corpus: &Path, cwd_override: Option<&Path>, json_out: bool) -> anyho
     }
 
     println!("THOR drift eval - LIVE store ({} scenarios, {} skipped: seq not in store)", rows.len(), skipped);
-    println!("entity-surfaced = the gold fact's entity id is in the injection (mechanical);");
-    println!("gold-term metrics proxy the judged score. Published (judged): surfaced 54.8%, full-catch 39.7%.\n");
-    println!("{:10} {:>4} {:>18} {:>16} {:>14}", "category", "n", "entity-surfaced", "terms>=50%", "mean coverage");
+    println!("entity-surfaced = the gold's entity id is in the injection (mechanical, undercounts after");
+    println!("store metabolism); content-surfaced = one served hit carries >= 50% of the gold's key terms");
+    println!("(metabolism-proof); gold-term metrics proxy the judged score.\n");
+    println!(
+        "{:10} {:>4} {:>16} {:>17} {:>8} {:>11} {:>9}",
+        "category", "n", "entity-surfaced", "content-surfaced", "either", "terms>=50%", "mean cov"
+    );
     let print_row = |name: &str, v: &serde_json::Value| {
         println!(
-            "{:10} {:>4} {:>12} {:4.1}% {:>10.1}% {:>13.3}",
+            "{:10} {:>4} {:>10} {:4.1}% {:>11} {:4.1}% {:>7.1}% {:>10.1}% {:>9.3}",
             name,
             v["n"],
             v["entity_surfaced"],
             v["entity_surfaced_pct"].as_f64().unwrap_or(0.0),
+            v["content_surfaced"],
+            v["content_surfaced_pct"].as_f64().unwrap_or(0.0),
+            v["either_surfaced_pct"].as_f64().unwrap_or(0.0),
             v["gold_terms_half_pct"].as_f64().unwrap_or(0.0),
             v["gold_terms_mean_coverage"].as_f64().unwrap_or(0.0),
         );

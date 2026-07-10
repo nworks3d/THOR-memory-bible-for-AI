@@ -413,6 +413,12 @@ const MIN_TRIGGER_TERM_LEN: usize = 3;
 /// short structured fragment like "a.b" appears by coincidence inside URLs and
 /// version strings. Load-bearing, not decorative.
 const MIN_IDENTIFIER_PHRASE_LEN: usize = 5;
+/// A generic trigger term at least this long also matches a query token it
+/// PREFIXES ("build" -> "buildup", "valid" -> "validation"). Shorter terms
+/// stay exact-only: 3-4 char prefixes ("pro", "test") match far too much.
+/// Measured on the frozen drift corpus + live replay before adoption (see
+/// trigger_evidence): catch up, noise unchanged at the ratchet.
+const MIN_PREFIX_STEM_LEN: usize = 5;
 
 /// True when `s` looks like an identifier or path rather than a plain word: a
 /// `::` scope, a slash/dot/underscore/hyphen-separated form, or a genuine
@@ -438,22 +444,38 @@ fn trigger_evidence(body: &str, query: &str, qterms: &[String]) -> (usize, usize
     let Some(fires) = crate::footer::fires_when(body) else {
         return (0, 0, 0);
     };
-    let tterms: Vec<String> =
-        fires.split_whitespace().map(|t| fold_diacritics(&t.to_lowercase())).collect();
+    // Keep the RAW token next to its folded form: acronym detection needs the
+    // author's casing, which lowercasing would erase.
+    let tterms: Vec<(String, String)> = fires
+        .split_whitespace()
+        .map(|t| (t.to_string(), fold_diacritics(&t.to_lowercase())))
+        .collect();
     if tterms.is_empty() {
         return (0, 0, 0);
     }
     let folded_query = fold_diacritics(&query.to_lowercase());
     let (mut generic, mut identifier) = (0usize, 0usize);
-    for t in &tterms {
+    for (raw, t) in &tterms {
         if t.chars().count() < MIN_TRIGGER_TERM_LEN {
             continue; // too generic to count - but stays in the denominator
         }
-        if is_identifier_shaped(t) {
+        // An author-declared ALL-CAPS acronym (VAT, VIES, GDPR) is deliberate,
+        // high-information evidence: one exact word match authorizes, like an
+        // identifier. Matched at TOKEN level, never containment - "vat" hides
+        // inside "private", a token does not.
+        let is_acronym = raw.chars().count() >= MIN_TRIGGER_TERM_LEN
+            && raw.chars().all(|c| c.is_ascii_uppercase());
+        if is_acronym {
+            if qterms.iter().any(|q| q == t) {
+                identifier += 1;
+            }
+        } else if is_identifier_shaped(t) {
             if t.chars().count() >= MIN_IDENTIFIER_PHRASE_LEN && folded_query.contains(t.as_str()) {
                 identifier += 1;
             }
-        } else if qterms.iter().any(|q| q == t) {
+        } else if qterms.iter().any(|q| {
+            q == t || (t.chars().count() >= MIN_PREFIX_STEM_LEN && q.starts_with(t.as_str()))
+        }) {
             generic += 1;
         }
     }
@@ -1805,6 +1827,43 @@ mod fused_tests {
         let tagged = "short rule\n\n[memory/note | tags: | fires-when: a.b | project: P]";
         let raw = "config a.b staat in de repo";
         assert_eq!(trigger_bonus(tagged, raw, &tokens(raw)), 0.0);
+    }
+
+    #[test]
+    fn test_trigger_acronym_authorizes_on_one_exact_token() {
+        // An author-declared ALL-CAPS acronym is identifier-class evidence:
+        // one exact token match authorizes the courier gate on its own.
+        let tagged = "btw rule\n\n[memory/decision | tags: | fires-when: BTW VAT factuur invoice | project: P]";
+        let raw = "add a per-order field for the customer's VAT exemption note";
+        assert!(
+            trigger_authorizes(tagged, raw),
+            "one matched acronym must authorize like an identifier"
+        );
+        // Token-level only: 'vat' hiding inside 'private' must NOT match.
+        let sneaky = "keep the private key out of the repo";
+        assert!(!trigger_authorizes(tagged, sneaky), "containment inside a word must not fire");
+        // The acronym class needs the AUTHOR's casing: a lowercase 'vat' in
+        // fires-when stays a generic term (1 match = no authorization).
+        let lower = "btw rule\n\n[memory/decision | tags: | fires-when: vat factuur invoice | project: P]";
+        assert!(!trigger_authorizes(lower, raw), "lowercase trigger is generic, not acronym");
+    }
+
+    #[test]
+    fn test_trigger_generic_prefix_stem_matches_but_only_from_five_chars() {
+        // 'build' (5 chars) prefixes 'buildup'; 'wall' matches exactly - two
+        // generic evidence points, enough to authorize.
+        let tagged = "wall rule\n\n[memory/decision | tags: | fires-when: wand wall bouwen build ontwerp | project: P]";
+        let raw = "spec the wall layer buildup between the frames";
+        assert!(trigger_authorizes(tagged, raw), "exact + prefix-stem = 2 generic matches");
+        // A 4-char term must NOT prefix-match ('prod' -> 'production' stays out).
+        let short = "ship rule\n\n[memory/decision | tags: | fires-when: prod ship | project: P]";
+        let prompt = "move the production estimator forward and ship it";
+        let q = tokens(prompt);
+        let bonus = trigger_bonus(short, prompt, &q);
+        assert!(
+            (bonus - TRIGGER_WEIGHT / 3.0).abs() < 1e-9,
+            "only 'ship' matches exactly; 'prod' must not stem onto 'production': {bonus}"
+        );
     }
 
     #[test]

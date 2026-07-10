@@ -27,6 +27,18 @@ fn local(sub: &[&str]) -> PathBuf {
     p
 }
 
+/// Key terms of a gold text: lowercase alphanumeric tokens >= 4 chars, deduped
+/// (same recipe as drift_eval's). Content match = a hit body carrying >= half
+/// of them - survives revision/distillation of the gold, unlike the entity id.
+fn key_terms(text: &str) -> Vec<String> {
+    let mut seen = std::collections::HashSet::new();
+    text.split(|c: char| !c.is_alphanumeric())
+        .filter(|t| t.chars().count() >= 4)
+        .map(|t| t.to_lowercase())
+        .filter(|t| seen.insert(t.clone()))
+        .collect()
+}
+
 fn main() -> anyhow::Result<()> {
     let queries: Vec<Value> =
         serde_json::from_reader(std::fs::File::open(local(&["eval", "percategory_queries.json"]))?)?;
@@ -34,6 +46,22 @@ fn main() -> anyhow::Result<()> {
         serde_json::from_reader(std::fs::File::open(local(&["eval", "golds52.json"]))?)?;
     let golds: HashMap<String, i64> =
         golds_raw.into_iter().filter_map(|(k, v)| v.as_i64().map(|s| (k, s))).collect();
+    // Content-addressed golds (optional sidecar): id -> frozen gold TEXT. When
+    // present, a hit counts if its entity matches OR its body carries >= half
+    // of the gold's key terms - the metabolism-proof measure; ids stay the
+    // continuity measure.
+    let gold_terms: HashMap<String, Vec<String>> =
+        match std::fs::File::open(local(&["eval", "golds_content52.json"])) {
+            Ok(f) => {
+                let raw: HashMap<String, Value> = serde_json::from_reader(f)?;
+                raw.into_iter()
+                    .filter_map(|(k, v)| {
+                        v.get("gold_text").and_then(|t| t.as_str()).map(|t| (k, key_terms(t)))
+                    })
+                    .collect()
+            }
+            Err(_) => HashMap::new(),
+        };
 
     let db = local(&["thor.db"]);
     let store = EventStore::new(&db)?;
@@ -75,8 +103,19 @@ fn main() -> anyhow::Result<()> {
         };
 
         let qvec = emb.embed_one(query)?;
-        let count = |hits: &[thor::recall::RecallHit], k: usize| -> bool {
-            hits.iter().take(k).any(|h| h.entity_id == gent)
+        let terms = gold_terms.get(&id).cloned().unwrap_or_default();
+        let count = move |hits: &[thor::recall::RecallHit], k: usize| -> bool {
+            hits.iter().take(k).any(|h| {
+                if h.entity_id == gent {
+                    return true;
+                }
+                if terms.is_empty() {
+                    return false;
+                }
+                let lower = h.body.to_lowercase();
+                let got = terms.iter().filter(|t| lower.contains(t.as_str())).count();
+                got as f64 / terms.len() as f64 >= 0.5
+            })
         };
 
         // bm25 baseline: a zero query vector -> cosine 0 -> pure bm25 order.

@@ -19,17 +19,18 @@ one thing the agent can search automatically. Measured against
 
 - **It has the answer, automatically.** THOR chunks your source, docs and memories
   into one index that auto-recall searches every prompt - so a code question is
-  answered without the agent doing anything. As deployed, **67% vs 38%** on 504
-  real questions.
+  answered without the agent doing anything. As deployed, **67% vs 57%** on a
+  200-question balanced set.
 - **It ranks better on the broad shared set.** On facts both systems have, THOR
-  leads **61% vs 56%** thanks to a dense score-fusion layer that catches paraphrases
+  leads **61% vs 54%** thanks to a dense score-fusion layer that catches paraphrases
   keyword search misses - though on the strictest dual-written-only cut mimir wins
-  (90% vs 82%), pure memory recall being its home turf.
+  (94% vs 92%), pure memory recall being its home turf.
 - **It compensates for session drift.** After a compaction the agent starts blank;
   THOR puts the governing gotcha/decision back in front of it more often than mimir
-  at its best (**55% vs 48%**). This is what the tool is *for*.
-- **It is faster and lighter.** ~**3.1x** lower per-prompt latency (83 ms vs
-  254 ms) as a single native binary; the default mode holds no resident process.
+  at its best (surfaced **66% vs 53%**, full catch **45% vs 41%**). This is what
+  the tool is *for*.
+- **It is faster and lighter.** ~**1.5x** lower per-prompt latency (163 ms vs
+  246 ms) as a single native binary; the default mode holds no resident process.
 - **It never loses a write.** Every fact is an event in a hash-chained append-only
   log; a conflicting edit *branches* (both heads kept) instead of overwriting, and
   `fsck` recomputes the chain so tampering is detectable.
@@ -109,25 +110,25 @@ for "which functions call X". THOR chunks source into recall instead. See
 ## Benchmarks
 
 A blind, judged head-to-head against [mimir](https://github.com/MakerViking/mimir),
-re-measured fresh on 2026-07-10 with an independent jury, after a store-hygiene
-pass on THOR and after deliberately giving mimir the one project it lacked
-documentation for: **coverage** 70.2% vs 59.2% on a 200-question balanced set,
-**same-knowledge quality** 63.6% vs 57.6% on the 118 facts both stores hold
-(mimir keeps the strict dual-written cut, 94.3% vs 87.7% - its home turf),
-**multi-project** 96.7% vs 88.9% on the level playing field (mimir's curated
-docs still edge one project, 97% vs 93%), **session drift** now THOR-led on
-both metrics (as-deployed injection surfaces the preventing fact 72.6% vs
-58.9%, full catch 53.4% vs 43.8%), at ~1.6x lower latency and ~2.4x fewer
-injected tokens. Full method, per-category tables and honest weaknesses in
-[BENCHMARKS.md](BENCHMARKS.md).
+re-measured fresh on 2026-07-10 with an independent jury, after the v3
+"metabolism" round and a `thor consolidate` hygiene pass, on a level playing
+field: **coverage** 67.0% vs 57.2% on a 200-question balanced set,
+**same-knowledge quality** 61.4% vs 53.8% on the 118 facts both stores hold
+(mimir keeps the strict dual-written cut, 94.3% vs 91.5% - its home turf,
+though the gap narrowed from ~7 to ~3 points), **multi-project** 93.3% vs
+88.9% (mimir's curated docs still edge one project, 97% vs 90%), **session
+drift** THOR-led on both metrics (as-deployed injection surfaces the
+preventing fact 65.8% vs 53.4%, full catch 45.2% vs 41.1%), at ~1.5x lower
+latency and ~2.1x fewer injected tokens. Full method, per-category tables and
+honest weaknesses in [BENCHMARKS.md](BENCHMARKS.md).
 
 Drift compensation is also measurable IN-REPO, no judge needed: `cargo run
 --example drift_eval` replays a committed synthetic corpus
-([eval/drift_scenarios.jsonl](thor/eval/drift_scenarios.jsonl), 32 scenarios,
+([eval/drift_scenarios.jsonl](thor/eval/drift_scenarios.jsonl), 43 scenarios,
 EN/NL, distractors included) through the REAL courier and guard hook paths and
 scores whether the mistake-preventing fact actually surfaces (current build:
-courier 84%, guard channel 8/8, either-channel 94%). `--live <corpus>` replays a
-private prompt set against your live store read-only.
+courier 74%, guard channel 16/16, either-channel 95%). `--live <corpus>` replays
+a private prompt set against your live store read-only.
 
 ## Quick start
 

@@ -321,9 +321,6 @@ impl SilenceTally {
     fn quiet(&self) -> usize {
         self.n - self.noise
     }
-    fn json(&self) -> serde_json::Value {
-        json!({ "n": self.n, "noise": self.noise, "quiet": self.quiet() })
-    }
 }
 
 /// The one-directional noise ratchet: injected-wrong on silence scenarios may

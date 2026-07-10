@@ -19,6 +19,14 @@ const ECHO_RANK_SLACK: f64 = 1.5;
 const MIN_CHARS: usize = 4;
 /// Cap the query length fed to recall.
 const MAX_PROMPT_CHARS: usize = 500;
+/// Per-prompt injection budget in chars (~4 chars/token: ~8000 chars is the
+/// chosen ~2000-token ceiling). A hard ceiling, never a target - typical
+/// prompts stay in the hundreds; report the measured average alongside it.
+const PROMPT_BUDGET_CHARS: usize = 8000;
+/// Per-fact ceiling for full-body typed serving: one long fact must never eat
+/// the whole prompt budget - fragmentation is exactly the case where MULTIPLE
+/// facts need to surface together. Distillation keeps typed facts under this.
+const TYPED_FULL_BODY_CAP_CHARS: usize = 1200;
 
 /// Words that, when they make up the WHOLE prompt, mean "no recall worth doing"
 /// (acks / git verbs / greetings). Ported 1:1 from hook_recall.ps1 so THOR's
@@ -233,20 +241,29 @@ pub fn injection_for_hook_json(db: &Path, raw: &str) -> Option<String> {
     } else {
         None
     };
+    // Running per-prompt budget in chars (~4 chars/token: ~8000 chars is the
+    // ~2000-token ceiling the owner chose). A CEILING, not a target: slots
+    // only spend what their content needs, and most prompts stay far below it.
+    let mut remaining = PROMPT_BUDGET_CHARS;
     for (slot, hit) in selected.iter().enumerate() {
         let short = &hit.rev[..hit.rev.len().min(8)];
-        // A memory/decision/gotcha is short and its actionable half must not be cut;
-        // a code chunk is long and a preview suffices. So give memories a wider
-        // window - and give the TOP hit the widest one: the measured drift-miss
-        // mode is "right chunk injected, actionable details cut from the snippet"
-        // (partial-catch 23/73 on the judged corpus), and slot 1 is where the
-        // preventer usually sits when it surfaces at all. Bounded: one wide
-        // snippet per prompt, slots 2-3 stay cheap.
-        let cap = match (slot, crate::repo::is_chunk_id(&hit.entity_id)) {
-            (0, _) => 700,
-            (_, true) => 220,
-            (_, false) => 500,
+        // A typed constraint (gotcha/decision/preference) is served FULL-BODY
+        // up to a per-fact cap: the measured drift-miss mode is "right fact
+        // injected, actionable details cut from the snippet", and the catch
+        // metric lives or dies on those details. Chunks and untyped notes keep
+        // the cheap windowed caps; slot order is untouched (a typed fact is
+        // never promoted here - rank decides slots, the budget only decides
+        // how much of the winning fact is shown).
+        let cap = if hit.fact_type.is_some() {
+            TYPED_FULL_BODY_CAP_CHARS
+        } else {
+            match (slot, crate::repo::is_chunk_id(&hit.entity_id)) {
+                (0, _) => 700,
+                (_, true) => 220,
+                (_, false) => 500,
+            }
         };
+        let cap = cap.min(remaining.max(220)); // budget floor: never serve less than the old minimum
         let diverged = if hit.is_diverged { " [DIVERGED]" } else { "" };
         // Freshness: a chunk of the CURRENT project is re-read from disk, so the
         // agent sees today's code (tagged [refreshed]) - or a warning when the
@@ -263,6 +280,7 @@ pub fn injection_for_hook_json(db: &Path, raw: &str) -> Option<String> {
         } else {
             format!("[proj:{}]", hit.project.as_deref().unwrap_or("?"))
         };
+        remaining = remaining.saturating_sub(snip.chars().count());
         out.push_str(&format!(
             "- {}{} {} ({}{}{}): {}\n",
             scope_tag, type_tag, hit.entity_id, short, diverged, fresh_tag, snip

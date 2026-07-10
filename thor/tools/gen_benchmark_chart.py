@@ -64,7 +64,7 @@ def bullet(text):
 y = 32
 out.append(f'<text x="20" y="{y}" fill="{FG}" font-size="22" font-weight="800">THOR vs mimir - the honest picture</text>')
 y += 22
-out.append(f'<text x="20" y="{y}" fill="{MUT}" font-size="12">Same machine, blind-judged, every test re-measured fresh in the V5 round (3-judge median, fresh blind maps, one run no re-rolls). Wins and losses.</text>')
+out.append(f'<text x="20" y="{y}" fill="{MUT}" font-size="12">Same machine, blind-judged, re-measured fresh in the V5 round + V6/V7 code re-judges (3-judge median, blind maps).</text>')
 y += 30
 
 # ---- test 1 ----
@@ -84,6 +84,16 @@ rule()
 note(f'Test 1 overall  <tspan fill="{CYAN}">THOR 63.8%</tspan> vs <tspan fill="{MUT}">mimir 64.0%</tspan>  (n=200) - a statistical tie', color=FG, size=13, bold=True)
 note("Clean split: THOR leads every knowledge category (decision, gotcha, docs, config); mimir leads both code categories.")
 note("Jury strictness moved the absolutes asymmetrically vs the previous round (THOR 68.5 -> 63.8, mimir 59.8 -> 64.0), same corpus.")
+y += 14
+
+# ---- test 1 addendum: the V6/V7 code re-judges ----
+header("TEST 1 ADDENDUM - CODE RE-JUDGED (V6 + V7 rounds, same 93 items)", "serving parity + path affinity, then the derived symbol sidecar . fresh blind mini-juries")
+pair("Code behavior (re-judge)", 72.5, 59.2, "+13%")
+pair("Code structure (re-judge)", 54.5, 56.1, "-2%")
+note("Behavior flipped and held above 70 twice (60.0 -> 71.7 -> 72.5 vs mimir 62.5 -> 57.5 -> 59.2). Structure went", color=SOFT)
+note("42.4 -> 50.0 -> 54.5 while mimir fell 63.6 -> 57.6 -> 56.1: a 21-point gap closed to 1.6 - and excluding four", color=SOFT)
+note("dead-source items (files deliberately removed; both systems score zero) both judge at exactly 60.3% vs 60.3%.", color=SOFT)
+note("New agent tools from the same round: where_used / impact / outline on a derived, rebuildable symbol sidecar.", color=SOFT)
 y += 14
 
 # ---- test 2 ----
@@ -130,25 +140,41 @@ header("HONEST DOWNSIDES", "where THOR does not win, and the caveats")
 y += 12
 for b in [
     "Test 1 overall is a tie now, not a THOR lead - and the movement was asymmetric (THOR down, mimir up, same corpus)",
-    "mimir wins code-structure decisively, 64% vs 42% - code ranking is the clearest open problem in THOR's recall",
+    "Code-structure: level but not won (54.5 vs 56.1 re-judged; 60.3-60.3 excl. dead sources) - 70% target unmet",
     "mimir wins the broad shared cut (81.2% vs 77.0%) - two-thirds code questions, same weakness on an equal corpus",
     "The 80%-everywhere goal still does not stand: 0 of 8 v4 gates (config how-to closest at 79.4%, drift surfaced 72.1%)",
-    "mimir's warm daemon beats THOR's latency class outright (38.9 vs 192.7 ms warm), THOR injects ~3.3x more tokens than mimir cold",
-    "Three drift golds stay honest misses: deep-drift prompts share no vocabulary with the fact; left as gaps, not trigger-stuffed",
+    "mimir's warm daemon stays fastest outright (38.9 vs 192.7 ms warm); THOR injects ~3.3x more tokens than mimir cold",
+    "Three drift golds stay honest misses (deep drift, zero shared vocabulary) - left as gaps, not trigger-stuffed",
     "mimir has a code-symbol graph (graph/outline/peek) that THOR deliberately does NOT - for 'which functions call X'",
     "Semantic mode needs a ~235 MB model + a warm embed-daemon resident (off by default; degrades cleanly to bm25)",
     "Newer and far less battle-tested than mimir's daily use",
-    "One machine, private corpus, LLM-judged - only the drift mechanism is reproducible from this repo (examples/drift_eval.rs)",
+    "One machine, private corpus, LLM-judged - only drift is repo-reproducible (examples/drift_eval.rs)",
 ]:
     bullet(b)
 y += 8
 rule()
 y += 2
 note(
-    f'Bottom line  <tspan fill="{SOFT}">coverage 63.8% vs 64.0% (tie)</tspan>  .  <tspan fill="{CYAN}">strict dual-written 96.2% vs 93.4% (first THOR win)</tspan>  .  '
-    f'<tspan fill="{SOFT}">multi-project tie</tspan>  .  <tspan fill="{CYAN}">drift 72% vs 59%, latency 2.8x faster than mimir cold</tspan>',
+    f'Bottom line <tspan fill="{SOFT}">coverage tie (63.8 vs 64.0)</tspan> . <tspan fill="{CYAN}">strict dual-written 96.2 vs 93.4, 1st win</tspan> . <tspan fill="{SOFT}">multi-project tie</tspan>',
     color=FG, size=13.5, bold=True,
 )
+y += 4
+note(
+    f'<tspan fill="{CYAN}">drift 72 vs 59</tspan> . <tspan fill="{CYAN}">code re-judge: behavior 72.5 vs 59.2, structure level</tspan> . <tspan fill="{CYAN}">2.8x faster than mimir cold</tspan>',
+    color=FG, size=13.5, bold=True,
+)
+
+# Width guard: estimate every left-anchored text line's rendered width and
+# fail LOUDLY on overflow - overlapping/clipped text shipped once; never again.
+import re as _re
+for line in out:
+    m = _re.match(r'<text x="([\d.]+)" y="([\d.]+)"[^>]*font-size="([\d.]+)"[^>]*>(.*)</text>', line)
+    if not m or 'text-anchor="end"' in line:
+        continue
+    _x, _y, _fs, _content = float(m.group(1)), m.group(2), float(m.group(3)), m.group(4)
+    _plain = _re.sub(r'<[^>]+>', '', _content)
+    _est = _x + len(_plain) * 0.58 * _fs
+    assert _est <= 852, f"text overflows the 860 canvas (~{_est:.0f}px) at y={_y}: {_plain[:70]}"
 
 H = y + 16
 svg = (

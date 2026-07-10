@@ -310,8 +310,13 @@ overwrites your live compose file and never touches the data volume.
 | `thor ship` / `recv` / `status` | cross-machine log-shipping sync |
 | `thor fsck` | verify chain integrity + FTS projection |
 | `thor consolidate [--apply-dedup]` | metabolism report: duplicate twins, decay candidates, same-topic clusters (exit 1 when anything needs digesting; only the dedup pass is ever applied mechanically) |
+| `thor steward` | prepare a stewardship review: the consolidate report + the proven conservative rubric written to a file an agent session works through with the MCP tools (no writes itself) |
+| `thor symbols` | (re)build the derived symbol sidecar (`thor-symbols.db`): which names every code chunk defines and calls - powers `where_used`/`impact` and a deliberate-recall ranking bonus; refreshed automatically after `thor ingest`, safe to delete and rebuild |
+| `thor daemon` / `thor ensure-daemon` | warm injection daemon: `/inject` + `/health` on the HTTP server, discovered via a flag file; the courier answers warm and falls back cold on any failure (`ensure-daemon` is the SessionStart form, opt-in via `thor install --with-daemon`) |
+| `thor doctor` | one-line health per surface: store, semantic model + sidecars, injection daemon warm/cold, flags |
+| `thor pre-compact` | PreCompact hook: one advisory per session, right before a compaction, to persist durable decisions via remember (installed by `--with-courier`) |
 | `thor recall --rerank` | rescore the top hits with the local cross-encoder (feature `semantic` + downloaded reranker model; MCP recall takes `rerank: true`) |
-| `thor mcp [--http <bind>]` | run as an MCP server (stdio or Streamable-HTTP) exposing the full stewardship toolset: recall (`kind:"memory"` filter) / get / history / remember (typed, duplicate-refusing) / revise / retract / resolve / mark / pin / unpin / reproject / brief |
+| `thor mcp [--http <bind>]` | run as an MCP server (stdio or Streamable-HTTP) exposing the full stewardship toolset: recall (`kind:"memory"` filter, `detail:"index"` for a compact id list) / get / history / remember (typed, duplicate-refusing, optional `expires: YYYY-MM-DD` after which a fact stops surfacing - history keeps it) / revise / retract / resolve / mark / pin / unpin / reproject / brief / outline (a file's signature map) / where_used / impact (symbol callers + change blast-radius on the derived sidecar) |
 
 ## Build features
 

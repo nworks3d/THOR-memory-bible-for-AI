@@ -257,9 +257,14 @@ pub fn injection_for_hook_json(db: &Path, raw: &str) -> Option<String> {
         let cap = if hit.fact_type.is_some() {
             TYPED_FULL_BODY_CAP_CHARS
         } else {
+            // Chunk caps widened for the drift-catch class: 28 of 40 live
+            // replay misses were CHUNK golds whose decisive lines fell outside
+            // the old 700/220 windows. The per-prompt budget (8000 chars)
+            // stays the hard ceiling; slots only spend what content needs.
             match (slot, crate::repo::is_chunk_id(&hit.entity_id)) {
-                (0, _) => 700,
-                (_, true) => 220,
+                (0, true) => 1200,
+                (0, false) => 700,
+                (_, true) => 500,
                 (_, false) => 500,
             }
         };

@@ -556,6 +556,13 @@ pub(crate) fn fresh_snippet(
 /// recall): matches what the benchmark's fused channel measures, so the
 /// harness and production serve the same thing.
 pub(crate) const DELIBERATE_CHUNK_CAP: usize = 500;
+/// Full-body ceiling on the deliberate path: a served text at or under this
+/// passes through VERBATIM instead of being query-windowed. Measured (v6 A-B,
+/// 93 code questions): windowed snippets cut the answer out of the already-
+/// found chunk (best-hit gold coverage 0.504/0.529 struct/behavior) while the
+/// full chunk body reaches 0.531/0.577 - at or above the rival's full-body
+/// serving. Sits above MAX_CHUNK_CHARS (1800) so every single chunk fits.
+pub(crate) const DELIBERATE_FULL_BODY_CAP: usize = 2000;
 /// Window budget once neighbor chunks are stitched in: the dominant TEST1
 /// failure mode is an answer SPLIT across a chunk boundary, so the joined text
 /// gets room for a window that spans the seam.
@@ -659,6 +666,17 @@ pub fn serve_deliberate(
                 None => break,
             }
         }
+    }
+    // Full-body first (the measured v6 lever): the whole stitched text when it
+    // fits, else the complete CENTER chunk - the ranker chose it, and a window
+    // that cuts the answer out of it was the dominant judged code loss. Only a
+    // pathologically oversized single chunk still gets the query window.
+    if joined.chars().count() <= DELIBERATE_FULL_BODY_CAP {
+        return (tag, joined);
+    }
+    let center_full = crate::footer::strip(&center).trim().to_string();
+    if center_full.chars().count() <= DELIBERATE_FULL_BODY_CAP {
+        return (tag, center_full);
     }
     let cap = match (stitched, depth) {
         (false, _) => DELIBERATE_CHUNK_CAP,
@@ -907,6 +925,43 @@ mod tests {
         assert!(tag.is_empty());
         assert!(full.len() > 700, "memory body not truncated: {}", full.len());
         assert!(!full.contains("[memory/"), "footer stripped from the served body");
+    }
+
+    #[test]
+    fn test_serve_deliberate_full_body_first_windows_only_when_oversized() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("fb.db");
+        let mut store = EventStore::new(&db).unwrap();
+        // A lone chunk under the cap serves VERBATIM: head and tail both
+        // present even when the query only matches the middle (a window
+        // would have cut them off).
+        let body = format!(
+            "fn head_marker() {{}}\n{}\nfn needle_fn() {{ special_needle(); }}\n{}\nfn tail_marker() {{}}\n\n[repo file | P/src/big.rs | chunk 1/1]",
+            "// filler\n".repeat(30),
+            "// filler\n".repeat(30),
+        );
+        store
+            .append_event("s", "l", "a", EventKind::FactCreated, "P:src/big.rs#0", None, &body)
+            .unwrap();
+        let (_, served) = serve_deliberate(&store, "P:src/big.rs#0", &body, "special_needle", None, None);
+        assert!(served.contains("head_marker") && served.contains("tail_marker"),
+            "chunk under the full-body cap serves complete: {} chars", served.len());
+        // An OVERSIZED stitched join falls back to the complete CENTER chunk,
+        // never a window that could cut the ranked answer out.
+        let huge = |name: &str| format!(
+            "fn {name}() {{}}\n{}\n\n[repo file | P/src/wide.rs | chunk n/3]",
+            "// pad\n".repeat(400),
+        );
+        for (i, name) in ["left", "center_answer", "right"].iter().enumerate() {
+            store
+                .append_event("s", "l", "a", EventKind::FactCreated,
+                    &format!("P:src/wide.rs#{i}"), None, &huge(name))
+                .unwrap();
+        }
+        let (_, served) = serve_deliberate(&store, "P:src/wide.rs#1", &huge("center_answer"), "center_answer", None, None);
+        assert!(served.contains("center_answer"), "center content survives: {served}");
+        assert!(served.chars().count() <= DELIBERATE_FULL_BODY_CAP,
+            "oversized join stays bounded: {}", served.chars().count());
     }
 
     #[test]

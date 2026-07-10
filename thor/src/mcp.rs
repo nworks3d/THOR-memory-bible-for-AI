@@ -80,6 +80,21 @@ pub struct RecallArgs {
     /// reranker model is not installed.
     #[serde(default)]
     pub rerank: bool,
+    /// "index" = a compact one-line-per-hit listing (id | kind | first line)
+    /// at a fraction of the tokens; follow up with `get` on the ids you need.
+    /// Omit for full served bodies.
+    #[serde(default)]
+    pub detail: Option<String>,
+}
+
+#[derive(Deserialize, schemars::JsonSchema)]
+pub struct OutlineArgs {
+    /// File path (or unambiguous path suffix) to outline, e.g.
+    /// "src/recall.rs" or "web/client/src/pages/Fleet.jsx".
+    pub path: String,
+    /// Project key holding the file. Omitted = the server's current project.
+    #[serde(default)]
+    pub project: Option<String>,
 }
 
 #[derive(Deserialize, schemars::JsonSchema)]
@@ -264,6 +279,24 @@ impl ThorServer {
                 }
             }
             hits.truncate(limit);
+            // Index mode: one compact line per hit at a fraction of the full
+            // serving cost - the agent gets the map and `get`s what it needs.
+            if args.detail.as_deref().is_some_and(|d| d.eq_ignore_ascii_case("index")) {
+                let mut out = String::from(rerank_note);
+                for hit in hits {
+                    crate::ledger::increment(&db, "access", &hit.entity_id);
+                    let ty = hit.fact_type.map(|t| format!(" [{}]", t.as_str())).unwrap_or_default();
+                    let tag = if crate::repo::is_global(hit.project.as_deref()) {
+                        "[global]".to_string()
+                    } else {
+                        format!("[proj:{}]", hit.project.as_deref().unwrap_or("?"))
+                    };
+                    let first = first_line(&hit.body, 100);
+                    out.push_str(&format!("{}{} {} | {}\n", tag, ty, hit.entity_id, first));
+                }
+                out.push_str("(full body: get <entity_id>)\n");
+                return Ok(out);
+            }
             // Freshness context: the stdio server's launch cwd (the project the
             // agent is working in). The HTTP server has no meaningful cwd and
             // freshness passes through - it never re-reads another machine's disk.
@@ -307,6 +340,77 @@ impl ThorServer {
                 crate::ledger::increment(&db, "access", &args.entity_id);
             }
             Ok(render_get(&args.entity_id, &events))
+        })
+        .await
+    }
+
+    #[tool(description = "Signature map of one indexed file: per chunk its id and first line - a file overview at a fraction of Read's tokens. Follow with `get <chunk id>` (peek) for one chunk's full body. Idea credit: mimir's outline/peek.")]
+    async fn outline(&self, Parameters(args): Parameters<OutlineArgs>) -> String {
+        let server_project = self.project.clone();
+        self.blocking(move |s| {
+            let events = s.get_all_events().map_err(|e| format!("error: {e}"))?;
+            let heads = crate::cas::compute_head_sets(&events);
+            let by_hash: std::collections::HashMap<&str, &crate::event_store::Event> =
+                events.iter().map(|e| (e.this_hash.as_str(), e)).collect();
+            let want = {
+                let w = args.path.replace('\\', "/").to_lowercase();
+                w.trim_matches('/').to_string()
+            };
+            let proj_filter = args.project.or(server_project);
+            // (file rel, ordinal, entity id, first line, chars)
+            let mut rows: Vec<(String, usize, String, String, usize)> = Vec::new();
+            for (id, hs) in &heads {
+                if !crate::repo::is_chunk_id(id) {
+                    continue;
+                }
+                let Some((proj, rest)) = id.split_once(':') else { continue };
+                if proj_filter.as_deref().is_some_and(|p| p != proj) {
+                    continue;
+                }
+                let Some((rel, ord)) = rest.rsplit_once('#') else { continue };
+                let rl = rel.replace('\\', "/").to_lowercase();
+                // full path or a clean suffix ("pages/Fleet.jsx" matches, "eet.jsx" does not)
+                if !(rl == want || rl.ends_with(&format!("/{want}"))) {
+                    continue;
+                }
+                let Ok(ord) = ord.parse::<usize>() else { continue };
+                let mut live: Option<&crate::event_store::Event> = None;
+                for rev in &hs.heads {
+                    if let Some(ev) = by_hash.get(rev.as_str()) {
+                        if !matches!(ev.kind, EventKind::FactRetracted)
+                            && ev.seq > live.map_or(i64::MIN, |l| l.seq)
+                        {
+                            live = Some(ev);
+                        }
+                    }
+                }
+                let Some(ev) = live else { continue };
+                let body = crate::footer::strip(&ev.body);
+                rows.push((
+                    format!("{proj}:{rel}"),
+                    ord,
+                    id.clone(),
+                    first_line(&body, 110),
+                    body.chars().count(),
+                ));
+            }
+            if rows.is_empty() {
+                return Ok(format!("No indexed chunks match path '{}'.", args.path));
+            }
+            rows.sort();
+            let mut out = String::new();
+            let mut current_file = String::new();
+            for (file, ord, id, first, chars) in &rows {
+                if *file != current_file {
+                    let n = rows.iter().filter(|r| &r.0 == file).count();
+                    let total: usize = rows.iter().filter(|r| &r.0 == file).map(|r| r.4).sum();
+                    out.push_str(&format!("{file} ({n} chunks, {total} chars)\n"));
+                    current_file = file.clone();
+                }
+                out.push_str(&format!("  #{ord} ({chars} ch): {first}\n"));
+            }
+            out.push_str(&format!("(peek one chunk: get <id>, e.g. get {})\n", rows[0].2));
+            Ok(out)
         })
         .await
     }
@@ -631,6 +735,19 @@ fn render_mutate_err(e: anyhow::Error) -> String {
     }
 }
 
+/// First non-empty line of a body, whitespace-collapsed and truncated: the
+/// one-line signature used by recall's index mode and the outline tool.
+fn first_line(body: &str, max: usize) -> String {
+    let line = body.lines().find(|l| !l.trim().is_empty()).unwrap_or("");
+    let collapsed = line.split_whitespace().collect::<Vec<_>>().join(" ");
+    if collapsed.chars().count() > max {
+        let cut: String = collapsed.chars().take(max).collect();
+        format!("{cut}...")
+    } else {
+        collapsed
+    }
+}
+
 /// The brief tool's body: counts, recent memories, pins, diverged - the
 /// orientation an agent needs to decide whether memory is worth interrogating.
 fn render_overview(events: &[crate::event_store::Event], db: &Path, project: Option<&str>) -> String {
@@ -906,7 +1023,54 @@ mod tests {
             project: None,
             kind: None,
             rerank: false,
+            detail: None,
         }
+    }
+
+    #[tokio::test]
+    async fn test_recall_detail_index_lists_ids_without_bodies() {
+        let mut store = seed();
+        store
+            .append_event("s", "l", "a", EventKind::FactCreated, "e2", None,
+                &format!("the deploy watcher unpacks the tarball\n{}", "detail line\n".repeat(40)))
+            .unwrap();
+        let (server, _d) = server_with(store);
+        let mut args = recall_args("deploy watcher");
+        args.detail = Some("index".into());
+        let out = server.recall(Parameters(args)).await;
+        assert!(out.contains("e2 |"), "index line per hit: {out}");
+        assert!(!out.contains("detail line"), "index mode serves the first line only: {out}");
+        assert!(out.len() < 600, "index mode stays compact: {} chars", out.len());
+    }
+
+    #[tokio::test]
+    async fn test_outline_maps_a_files_chunks_and_peek_hint() {
+        let mut store = EventStore::in_memory().unwrap();
+        for (i, sig) in ["pub fn alpha() {", "pub fn beta() {"].iter().enumerate() {
+            store
+                .append_event("s", "l", "a", EventKind::FactCreated,
+                    &format!("P:src/lib.rs#{i}"), None,
+                    &format!("{sig}\n    body();\n}}\n\n[repo file | P/src/lib.rs | chunk {}/2]", i + 1))
+                .unwrap();
+        }
+        // an unrelated file must not leak into the outline
+        store
+            .append_event("s", "l", "a", EventKind::FactCreated, "P:src/other.rs#0", None,
+                "pub fn gamma() {}\n\n[repo file | P/src/other.rs | chunk 1/1]")
+            .unwrap();
+        let (server, _d) = server_with(store);
+        let out = server
+            .outline(Parameters(OutlineArgs { path: "src/lib.rs".into(), project: None }))
+            .await;
+        assert!(out.contains("#0") && out.contains("pub fn alpha()"), "chunk 0 signature: {out}");
+        assert!(out.contains("#1") && out.contains("pub fn beta()"), "chunk 1 signature: {out}");
+        assert!(!out.contains("gamma"), "other file stays out: {out}");
+        assert!(out.contains("get P:src/lib.rs#0"), "peek hint present: {out}");
+        // suffix matching is boundary-safe: "ib.rs" must not match lib.rs
+        let miss = server
+            .outline(Parameters(OutlineArgs { path: "ib.rs".into(), project: None }))
+            .await;
+        assert!(miss.contains("No indexed chunks"), "no sloppy suffix match: {miss}");
     }
 
     #[tokio::test]

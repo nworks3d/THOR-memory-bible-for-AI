@@ -7,6 +7,7 @@ pub mod repo;
 pub mod ingest;
 pub mod ledger;
 pub mod review;
+pub mod consolidate;
 #[cfg(feature = "semantic")]
 pub mod embed;
 #[cfg(feature = "semantic")]

@@ -72,6 +72,7 @@ fn main() -> anyhow::Result<()> {
     let store = EventStore::new(&db)?;
     #[cfg(feature = "semantic")]
     let mut embedder = thor::embed::Embedder::load_default().ok();
+    #[cfg_attr(not(feature = "semantic"), allow(unused_variables))]
     let vecs = {
         #[cfg(feature = "semantic")]
         {

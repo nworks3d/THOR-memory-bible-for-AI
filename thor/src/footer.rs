@@ -117,6 +117,23 @@ pub fn has_project_field(body: &str) -> bool {
     body.contains("| project: ")
 }
 
+/// True when the TRAILING footer carries a source-store reference (`mimir:<id>`):
+/// the fact is the import-synced copy of an external source of truth, so its
+/// lifecycle (revision, decay) is decided THERE and flows in via the importer.
+/// Anchored to the same footer shape strip() owns (blank-line-separated single
+/// bracketed trailing line): prose that merely QUOTES the footer syntax
+/// mid-body must never classify a native fact as imported.
+pub fn has_source_ref(body: &str) -> bool {
+    let trimmed = body.trim_end();
+    if !trimmed.ends_with(']') {
+        return false;
+    }
+    match trimmed.rfind("\n\n[") {
+        Some(i) if !trimmed[i + 2..].contains('\n') => trimmed[i + 2..].contains("| mimir:"),
+        _ => false,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -158,6 +175,23 @@ mod tests {
         let footer = compose("", &[], "global");
         assert!(footer.starts_with("[memory/note "), "{footer}");
         assert_eq!(fact_type(&format!("x\n\n{}", footer)), None, "note is untyped by design");
+    }
+
+    #[test]
+    fn has_source_ref_only_matches_a_real_trailing_footer() {
+        // the import-synced shape
+        assert!(has_source_ref("a fact\n\n[memory/note | tags: | project: global | mimir:01KFOOT]"));
+        // native compose() footer: no mimir field
+        assert!(!has_source_ref("a fact\n\n[memory/gotcha | tags: x | project: P]"));
+        // prose that merely QUOTES the footer syntax mid-body must not count
+        assert!(!has_source_ref(
+            "reminder: an imported footer looks like [memory/note | project: global | mimir:01EX] - quote it exactly"
+        ));
+        // a quoted footer with real text after it is not a trailing footer
+        assert!(!has_source_ref(
+            "the line\n\n[memory/note | mimir:01EX]\nwas an example, not a footer"
+        ));
+        assert!(!has_source_ref("no footer at all"));
     }
 
     #[test]

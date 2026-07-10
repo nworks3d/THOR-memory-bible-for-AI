@@ -330,6 +330,23 @@ enum Commands {
     },
     /// Remove a pinned fact from the session-start brief.
     Unpin { entity_id: String },
+    /// Metabolism report: duplicate twins (same normalized prefix the
+    /// remember/import gates refuse on), decay candidates (untyped, never
+    /// marked, never read, long inactive) and same-topic clusters for agent
+    /// review. Report-only by default; exits 1 when anything is found (CI
+    /// gate), 0 when clean. Lossless: nothing is ever deleted.
+    Consolidate {
+        /// Retract the duplicate twins from the report (keeps the pinned /
+        /// import-synced / oldest copy). Decay and cluster candidates are
+        /// NEVER applied mechanically - confirm those one by one via
+        /// retract/revise/supersede.
+        #[arg(long)]
+        apply_dedup: bool,
+        /// Decay age floor in EVENTS behind the log tip (the hash-chained log
+        /// carries no wall clock, so age is measured in activity).
+        #[arg(long, default_value_t = crate::consolidate::DEFAULT_MIN_AGE_EVENTS)]
+        min_age_events: i64,
+    },
 }
 
 /// Render the authoritative answer for one entity: its full head-set. A
@@ -992,6 +1009,30 @@ pub fn run() -> Result<()> {
                 println!("unpinned {}", entity_id);
             } else {
                 println!("not pinned: {}", entity_id);
+            }
+        }
+        Commands::Consolidate { apply_dedup, min_age_events } => {
+            let mut store = EventStore::new(&db)?;
+            let events = store.get_all_events()?;
+            let report = crate::consolidate::build_report(
+                &db,
+                &events,
+                &crate::consolidate::Options { min_age_events },
+            );
+            crate::consolidate::print_report(&report);
+            if apply_dedup {
+                if report.dups.is_empty() {
+                    println!("\nnothing to apply: no duplicate twins in the report");
+                } else {
+                    let stats = crate::consolidate::apply_dedup(&db, &mut store, &report)?;
+                    println!(
+                        "\nretracted {} duplicate twin(s), {} skipped; re-run for the post-apply report",
+                        stats.retracted, stats.skipped
+                    );
+                }
+            } else if !report.is_clean() {
+                // CI contract: a store with anything to digest exits nonzero.
+                std::process::exit(1);
             }
         }
         Commands::ReviewScope { mark } => {

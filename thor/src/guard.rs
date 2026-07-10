@@ -343,7 +343,7 @@ const COMMAND_NOISE: &[&str] = &[
 fn salient_command_tokens(command: &str) -> Vec<String> {
     let mut seen = HashSet::new();
     let mut out: Vec<String> = Vec::new();
-    let mut push = |t: String, seen: &mut HashSet<String>, out: &mut Vec<String>| {
+    let push = |t: String, seen: &mut HashSet<String>, out: &mut Vec<String>| {
         let ok = t.chars().count() >= 5
             && t.chars().any(|c| c.is_alphabetic())
             && !COMMAND_NOISE.contains(&t.as_str())

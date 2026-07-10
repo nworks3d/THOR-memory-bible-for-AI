@@ -265,6 +265,7 @@ overwrites your live compose file and never touches the data volume.
 | `thor export` / `restore` / `backup` | JSONL backup + verified restore |
 | `thor ship` / `recv` / `status` | cross-machine log-shipping sync |
 | `thor fsck` | verify chain integrity + FTS projection |
+| `thor consolidate [--apply-dedup]` | metabolism report: duplicate twins, decay candidates, same-topic clusters (exit 1 when anything needs digesting; only the dedup pass is ever applied mechanically) |
 | `thor mcp [--http <bind>]` | run as an MCP server (stdio or Streamable-HTTP) exposing the full stewardship toolset: recall (`kind:"memory"` filter) / get / history / remember (typed, duplicate-refusing) / revise / retract / resolve / mark / pin / unpin / reproject / brief |
 
 ## Build features

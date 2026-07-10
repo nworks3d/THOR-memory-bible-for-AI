@@ -73,6 +73,13 @@ pub struct RecallArgs {
     /// code chunks. Omit for everything.
     #[serde(default)]
     pub kind: Option<String>,
+    /// true = rescore the top of the result pool with the local cross-encoder
+    /// before returning (slower - one transformer pass per hit - but much
+    /// better paraphrase ordering). Use it as a deliberate second try when the
+    /// normal order looks wrong. Silently keeps the normal order when the
+    /// reranker model is not installed.
+    #[serde(default)]
+    pub rerank: bool,
 }
 
 #[derive(Deserialize, schemars::JsonSchema)]
@@ -196,24 +203,48 @@ impl ThorServer {
                 RecallScope::current(server_project.clone())
             };
             let limit = args.limit.unwrap_or(8);
+            // A rerank pass rescoring only `limit` hits could never RESCUE a
+            // gold buried just below it - fetch the rescore pool size instead,
+            // reorder, then cut back to the requested limit.
+            #[cfg(feature = "semantic")]
+            let fetch = if args.rerank { limit.max(crate::rerank::RERANK_TOP_N) } else { limit };
+            #[cfg(not(feature = "semantic"))]
+            let fetch = limit;
             let memories_only = args.kind.as_deref().is_some_and(|k| k.eq_ignore_ascii_case("memory"));
-            let hits = if memories_only {
-                recall_memories_scoped(s, &args.query, limit, &scope).map_err(|e| format!("error: {e}"))?
+            #[allow(unused_mut)]
+            let mut hits = if memories_only {
+                recall_memories_scoped(s, &args.query, fetch, &scope).map_err(|e| format!("error: {e}"))?
             } else {
                 // Fused parity with the courier: a deliberate agent query gets
                 // the same semantic score-fusion path (bm25 on non-semantic
                 // builds or any semantic failure - recall_for degrades itself).
-                crate::courier::recall_for(&db, s, &args.query, &scope, limit)
+                crate::courier::recall_for(&db, s, &args.query, &scope, fetch)
             };
             if hits.is_empty() {
                 return Ok(format!("No THOR hits for: {}", args.query));
             }
+            let mut rerank_note = "";
+            if args.rerank {
+                #[cfg(feature = "semantic")]
+                {
+                    let (reordered, applied) = crate::rerank::rerank_hits(&args.query, hits);
+                    hits = reordered;
+                    if !applied {
+                        rerank_note = "(rerank skipped: reranker model unavailable or nothing to reorder - fused order)\n";
+                    }
+                }
+                #[cfg(not(feature = "semantic"))]
+                {
+                    rerank_note = "(rerank unavailable: non-semantic build - fused order)\n";
+                }
+            }
+            hits.truncate(limit);
             // Freshness context: the stdio server's launch cwd (the project the
             // agent is working in). The HTTP server has no meaningful cwd and
             // freshness passes through - it never re-reads another machine's disk.
             let cwd = std::env::current_dir().ok().map(|c| c.display().to_string());
             let fresh_project = cwd.as_deref().and_then(|c| crate::repo::project_key(Path::new(c)));
-            let mut out = String::new();
+            let mut out = String::from(rerank_note);
             for hit in hits {
                 // A served hit is an access: counted in the LOCAL ledger (decay
                 // signal for consolidate), never in the synced hash-chained log.
@@ -719,7 +750,27 @@ mod tests {
     }
 
     fn recall_args(query: &str) -> RecallArgs {
-        RecallArgs { query: query.into(), limit: None, all_projects: false, project: None, kind: None }
+        RecallArgs {
+            query: query.into(),
+            limit: None,
+            all_projects: false,
+            project: None,
+            kind: None,
+            rerank: false,
+        }
+    }
+
+    #[tokio::test]
+    async fn test_recall_rerank_without_model_keeps_fused_order_with_note() {
+        // No reranker model in the test environment: the fused hit must still
+        // be served, with an honest note instead of an error.
+        let (server, _d) = server_with(seed());
+        let mut args = recall_args("deploy watcher");
+        args.rerank = true;
+        let out = server.recall(Parameters(args)).await;
+        assert!(out.contains("e1"), "hit still served: {out}");
+        assert!(out.contains("rerank skipped") || out.contains("rerank unavailable"),
+            "honest degradation note: {out}");
     }
 
     fn remember_args(body: &str) -> RememberArgs {

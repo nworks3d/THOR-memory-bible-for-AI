@@ -214,6 +214,25 @@ cargo build --release --features semantic
 The dense sidecar (`thor-vectors.db`) is derived and deletable: remove it and
 recall silently returns to bm25.
 
+### Cross-encoder rerank (optional, opt-in per call)
+
+A cross-encoder scores each (query, hit) pair through a full transformer pass -
+much better paraphrase ordering than vector cosines, but one forward pass per
+document (~1s median for a 12-hit pool on CPU), so it NEVER runs by default and
+never touches the per-prompt courier. Use it as a deliberate second try when
+the normal order looks wrong: MCP recall takes `rerank: true`, the CLI takes
+`thor recall --rerank`.
+
+- Put a reranker model (ONNX + tokenizer, five files, onnx named `model.onnx`)
+  under `%LOCALAPPDATA%\thor\reranker\`; a multilingual base reranker is a good
+  default. Nothing auto-downloads.
+- Contract mirrors the semantic layer: model missing or any failure = the
+  normal order is returned with an explicit note, never an error.
+- Measured on a 53-question same-knowledge set (gold-term coverage): top-1
+  +3pp with 16 wins / 7 losses, top-3 flat, top-5 slightly negative - and
+  exact-lookup questions (doc references) can get WORSE while paraphrase-heavy
+  ones improve. That trade-off is WHY it is opt-in rather than default.
+
 ## Sync (optional)
 
 Replicate the log to another machine over the LAN/tailnet, bearer-token gated:
@@ -266,6 +285,7 @@ overwrites your live compose file and never touches the data volume.
 | `thor ship` / `recv` / `status` | cross-machine log-shipping sync |
 | `thor fsck` | verify chain integrity + FTS projection |
 | `thor consolidate [--apply-dedup]` | metabolism report: duplicate twins, decay candidates, same-topic clusters (exit 1 when anything needs digesting; only the dedup pass is ever applied mechanically) |
+| `thor recall --rerank` | rescore the top hits with the local cross-encoder (feature `semantic` + downloaded reranker model; MCP recall takes `rerank: true`) |
 | `thor mcp [--http <bind>]` | run as an MCP server (stdio or Streamable-HTTP) exposing the full stewardship toolset: recall (`kind:"memory"` filter) / get / history / remember (typed, duplicate-refusing) / revise / retract / resolve / mark / pin / unpin / reproject / brief |
 
 ## Build features

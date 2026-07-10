@@ -99,6 +99,11 @@ enum Commands {
         /// Scope to a specific project key (default: the current directory's project).
         #[arg(long)]
         project: Option<String>,
+        /// Rescore the top hits with the local cross-encoder (semantic build +
+        /// downloaded reranker model; slower, better paraphrase ordering).
+        /// Keeps the normal order when the model is unavailable.
+        #[arg(long)]
+        rerank: bool,
     },
     /// Ingest a folder's text files into the store as recall chunks, incrementally
     /// (new -> create, changed -> revise, deleted -> retract). No path = the current
@@ -601,7 +606,7 @@ pub fn run() -> Result<()> {
             let events = store.get_events_by_entity(&entity_id)?;
             print!("{}", render_history(&entity_id, &events));
         }
-        Commands::Recall { query, all_projects, project } => {
+        Commands::Recall { query, all_projects, project, rerank } => {
             let store = EventStore::new(&db)?;
             // Scope: --all-projects = everything; --project <key> = that project +
             // global; default = the current directory's project + global.
@@ -614,7 +619,28 @@ pub fn run() -> Result<()> {
                     std::env::current_dir().ok().and_then(|c| crate::repo::project_key(&c)),
                 )
             };
-            let hits = crate::recall::recall_scoped(&store, &query, 8, &scope)?;
+            let limit = 8;
+            // Rerank rescoring only `limit` hits could never rescue a gold
+            // buried just below it: fetch the rescore pool, reorder, cut back.
+            #[cfg(feature = "semantic")]
+            let fetch = if rerank { limit.max(crate::rerank::RERANK_TOP_N) } else { limit };
+            #[cfg(not(feature = "semantic"))]
+            let fetch = limit;
+            #[allow(unused_mut)]
+            let mut hits = crate::recall::recall_scoped(&store, &query, fetch, &scope)?;
+            if rerank {
+                #[cfg(feature = "semantic")]
+                {
+                    let (reordered, applied) = crate::rerank::rerank_hits(&query, hits);
+                    hits = reordered;
+                    if !applied {
+                        println!("(rerank skipped: reranker model unavailable or nothing to reorder)");
+                    }
+                }
+                #[cfg(not(feature = "semantic"))]
+                println!("(rerank unavailable: non-semantic build)");
+            }
+            hits.truncate(limit);
             if hits.is_empty() {
                 println!("No recall hits for: {}", query);
             } else {

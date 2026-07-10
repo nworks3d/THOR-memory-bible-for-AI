@@ -14,6 +14,8 @@ pub mod embed;
 pub mod vectors;
 #[cfg(feature = "semantic")]
 pub mod embed_daemon;
+#[cfg(feature = "semantic")]
+pub mod rerank;
 pub mod courier;
 pub mod importer;
 pub mod mcp;

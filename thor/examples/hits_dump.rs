@@ -10,7 +10,11 @@
 //!   cargo run --release --features semantic --example hits_dump -- \
 //!     --queries <in.json> --out <out.json> \
 //!     [--limit 5] [--scope all|global|project:<key>] [--full] \
-//!     [--channel fused|courier] [--cwd <dir>]
+//!     [--channel fused|courier] [--cwd <dir>] [--rerank]
+//!
+//! `--rerank` (fused channel, semantic build): rescores the fused top pool
+//! with the local cross-encoder before cutting to --limit, and prints the
+//! per-query rerank latency at the end - the A/B gate for the opt-in flag.
 //!
 //! Channels:
 //! - `fused` (default): the deliberate-recall path (`recall_fused_scoped`,
@@ -36,6 +40,7 @@ fn main() -> anyhow::Result<()> {
     let mut full = false;
     let mut channel = "fused".to_string();
     let mut cwd: Option<String> = None;
+    let mut rerank = false;
 
     let mut args = std::env::args().skip(1);
     while let Some(a) = args.next() {
@@ -48,6 +53,7 @@ fn main() -> anyhow::Result<()> {
             "--full" => full = true,
             "--channel" => channel = args.next().unwrap_or_else(|| "fused".into()),
             "--cwd" => cwd = args.next(),
+            "--rerank" => rerank = true,
             other => anyhow::bail!("unknown argument '{}'", other),
         }
     }
@@ -85,6 +91,8 @@ fn main() -> anyhow::Result<()> {
     };
 
     let mut out: Vec<serde_json::Value> = Vec::with_capacity(items.len());
+    #[cfg_attr(not(feature = "semantic"), allow(unused_mut, unused_variables))]
+    let mut rerank_ms: Vec<u64> = Vec::new();
     for (i, item) in items.iter().enumerate() {
         let mut fields: Vec<&str> = Vec::new();
         if let Some(f) = query_field.as_deref() {
@@ -114,7 +122,16 @@ fn main() -> anyhow::Result<()> {
                     .unwrap_or_default()
             }
             _ => {
-                let hits = {
+                // With --rerank: fetch the rescore pool, reorder, cut back to
+                // --limit (a pass over only `limit` hits could never rescue a
+                // gold buried just below it). Timing covers ONLY the rerank
+                // call, so latency lands next to the A/B ordering delta.
+                #[cfg(feature = "semantic")]
+                let fetch = if rerank { limit.max(thor::rerank::RERANK_TOP_N) } else { limit };
+                #[cfg(not(feature = "semantic"))]
+                let fetch = limit;
+                #[allow(unused_mut)]
+                let mut hits = {
                     #[cfg(feature = "semantic")]
                     {
                         match (embedder.as_mut(), vecs.as_ref()) {
@@ -125,19 +142,36 @@ fn main() -> anyhow::Result<()> {
                                     query,
                                     &qvec,
                                     v,
-                                    limit,
+                                    fetch,
                                     thor::recall::FUSION_LAMBDA,
                                     &scope,
                                 )?
                             }
-                            _ => thor::recall::recall_scoped(&store, query, limit, &scope)?,
+                            _ => thor::recall::recall_scoped(&store, query, fetch, &scope)?,
                         }
                     }
                     #[cfg(not(feature = "semantic"))]
                     {
-                        thor::recall::recall_scoped(&store, query, limit, &scope)?
+                        thor::recall::recall_scoped(&store, query, fetch, &scope)?
                     }
                 };
+                if rerank {
+                    #[cfg(feature = "semantic")]
+                    {
+                        let t0 = std::time::Instant::now();
+                        let (reordered, applied) = thor::rerank::rerank_hits(query, hits);
+                        hits = reordered;
+                        rerank_ms.push(t0.elapsed().as_millis() as u64);
+                        if !applied {
+                            anyhow::bail!(
+                                "--rerank requested but the reranker did not run (model missing?)"
+                            );
+                        }
+                    }
+                    #[cfg(not(feature = "semantic"))]
+                    anyhow::bail!("--rerank needs the semantic build");
+                }
+                hits.truncate(limit);
                 hits.iter()
                     .map(|h| {
                         if full {
@@ -162,5 +196,16 @@ fn main() -> anyhow::Result<()> {
 
     std::fs::write(&out_path, serde_json::to_string_pretty(&out)?)?;
     eprintln!("wrote {} rows to {}", out.len(), out_path.display());
+    #[cfg(feature = "semantic")]
+    if !rerank_ms.is_empty() {
+        rerank_ms.sort_unstable();
+        eprintln!(
+            "rerank latency ms: median {} / p90 {} / max {} (n={})",
+            rerank_ms[rerank_ms.len() / 2],
+            rerank_ms[(rerank_ms.len() * 9 / 10).min(rerank_ms.len() - 1)],
+            rerank_ms[rerank_ms.len() - 1],
+            rerank_ms.len()
+        );
+    }
     Ok(())
 }

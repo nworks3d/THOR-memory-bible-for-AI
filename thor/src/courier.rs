@@ -132,7 +132,15 @@ pub fn injection_for_hook_json(db: &Path, raw: &str) -> Option<String> {
     // (matched_and) pass as-is.
     let pool: Vec<RecallHit> = pool
         .into_iter()
-        .filter(|h| h.matched_and || crate::recall::covers_query(&h.body, &query))
+        .filter(|h| {
+            h.matched_and
+                || crate::recall::covers_query(&h.body, &query)
+                // Author-declared triggers live in the footer, which the
+                // coverage gate deliberately no longer reads - specific
+                // trigger evidence (two terms, or one identifier/path) is its
+                // own authorization, same rule as the below-floor rescue.
+                || crate::recall::trigger_authorizes(&h.body, &query)
+        })
         .collect();
 
     // Per-session injection ledger: never re-inject a rev shown within the last
@@ -479,6 +487,31 @@ pub(crate) fn fresh_snippet(
         }
         Freshness::Stale => (" [stale?]".to_string(), crate::recall::snippet(body, cap, query)),
     }
+}
+
+/// Wide query-focused window for repo chunks on the deliberate path (MCP/CLI
+/// recall): matches what the benchmark's fused channel measures, so the
+/// harness and production serve the same thing.
+pub(crate) const DELIBERATE_CHUNK_CAP: usize = 500;
+
+/// Deliberate-path serving (MCP recall, CLI recall): a memory fact is served
+/// FULL-BODY (footer stripped, whitespace collapsed) - multi-project measured
+/// 96.7% on full bodies while capped snippets measured ~70%, and the agent
+/// asked for this hit explicitly. Repo chunks keep a wide window plus the
+/// freshness re-read. This replaces the old flat 220-char cap, the single
+/// largest gap between what the benchmark measured and production served.
+pub fn serve_deliberate(
+    entity_id: &str,
+    body: &str,
+    query: &str,
+    project: Option<&str>,
+    cwd: Option<&str>,
+) -> (String, String) {
+    if crate::repo::is_chunk_id(entity_id) {
+        return fresh_snippet(entity_id, body, query, DELIBERATE_CHUNK_CAP, project, cwd);
+    }
+    let full = crate::footer::strip(body).split_whitespace().collect::<Vec<_>>().join(" ");
+    (String::new(), full)
 }
 
 pub(crate) enum Freshness {

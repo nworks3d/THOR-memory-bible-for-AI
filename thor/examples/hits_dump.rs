@@ -177,7 +177,13 @@ fn main() -> anyhow::Result<()> {
                         if full {
                             format!("{}\n{}", h.entity_id, h.body)
                         } else {
-                            format!("{}: {}", h.entity_id, thor::recall::snippet(&h.body, 500, query))
+                            // Harness parity: exactly what the MCP/CLI recall
+                            // surface serves (memories full-body, chunks a wide
+                            // window) - the benchmark measures production, not
+                            // a third serving configuration.
+                            let (_, snip) =
+                                thor::courier::serve_deliberate(&h.entity_id, &h.body, query, None, None);
+                            format!("{}: {}", h.entity_id, snip)
                         }
                     })
                     .collect()

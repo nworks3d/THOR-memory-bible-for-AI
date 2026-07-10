@@ -658,8 +658,8 @@ pub fn run() -> Result<()> {
                     cwd.as_deref().and_then(|c| crate::repo::project_key(Path::new(c)));
                 for hit in hits {
                     let short = &hit.rev[..hit.rev.len().min(8)];
-                    let (fresh_tag, snip) = crate::courier::fresh_snippet(
-                        &hit.entity_id, &hit.body, &query, 220, fresh_project.as_deref(), cwd.as_deref(),
+                    let (fresh_tag, snip) = crate::courier::serve_deliberate(
+                        &hit.entity_id, &hit.body, &query, fresh_project.as_deref(), cwd.as_deref(),
                     );
                     let diverged = if hit.is_diverged { " [DIVERGED]" } else { "" };
                     let tag = if crate::repo::is_global(hit.project.as_deref()) {

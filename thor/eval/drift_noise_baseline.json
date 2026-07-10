@@ -1,6 +1,6 @@
 {
   "_note": "One-directional noise ratchet: injected-wrong on silence scenarios must never exceed these counts. Lower by hand after a reviewed reduction; raising requires a deliberate reviewed commit - silence gates are never loosened to buy catch.",
-  "courier": 2,
+  "courier": 1,
   "guard": 0,
-  "either": 2
+  "either": 1
 }

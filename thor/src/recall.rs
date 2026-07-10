@@ -37,6 +37,13 @@ pub struct RecallHit {
 /// Falls back to head-truncation when no query term is found (or the best
 /// window is already the head). `query` may be empty (pure head-truncation).
 pub fn snippet(body: &str, max: usize, query: &str) -> String {
+    // Window selection and display operate on the CONTENT only: the trailing
+    // [memory/...] / [repo file ...] footer is metadata. A query term matching
+    // inside it (tags, fires-when vocabulary, the literal word 'project', a
+    // heading crumb) used to drag the window to the tail - at narrow caps the
+    // served snippet could be bracket syntax instead of the answer. The footer
+    // stays FTS-findable; it is only excluded from what the agent reads.
+    let body = crate::footer::strip(body);
     let collapsed = body.split_whitespace().collect::<Vec<_>>().join(" ");
     let chars: Vec<char> = collapsed.chars().collect();
     let total = chars.len();
@@ -229,6 +236,13 @@ fn fold_diacritics(s: &str) -> String {
 /// matches only one word of a multi-word question is a coincidence, not an
 /// answer - the courier stays silent instead of injecting it confidently.
 pub fn covers_query(body: &str, query: &str) -> bool {
+    // Gate on CONTENT, not metadata: every memory footer contains the literal
+    // word 'project' (and tags/fires-when vocabulary), so an unstripped body
+    // hands any prompt mentioning 'project' a free coverage term - measured as
+    // real courier noise on the silence set (n02). Author-declared triggers
+    // have their own dedicated path (trigger_rescues); they do not need to
+    // leak through this gate.
+    let body = crate::footer::strip(body);
     // NO stopword fallback here (unlike content_tokens' best-effort search): a
     // stopword-only query has no content terms and never covers - with the
     // fallback, "wat is dat dan" would count its own stopwords as content and
@@ -464,6 +478,23 @@ fn trigger_bonus(body: &str, query: &str, qterms: &[String]) -> f64 {
 fn trigger_rescues(body: &str, query: &str, qterms: &[String]) -> bool {
     let (generic, identifier, _) = trigger_evidence(body, query, qterms);
     identifier >= 1 || generic + identifier >= 2
+}
+
+/// Author-declared firing evidence for the courier's coverage gate: the same
+/// specificity rule as the below-floor rescue, computed from the raw query.
+/// covers_query gates on CONTENT (footer stripped), so declared triggers -
+/// which live in the footer - need this dedicated door instead of leaking
+/// through the coverage count.
+pub fn trigger_authorizes(body: &str, query: &str) -> bool {
+    let qterms: Vec<String> = {
+        let mut seen = HashSet::new();
+        content_tokens(query)
+            .iter()
+            .map(|t| fold_diacritics(&t.to_lowercase()))
+            .filter(|t| seen.insert(t.clone()))
+            .collect()
+    };
+    trigger_rescues(body, query, &qterms)
 }
 
 /// Bounded reward when a candidate body contains an exact identifier/path

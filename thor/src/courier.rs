@@ -844,8 +844,16 @@ fn try_semantic_recall(
     if vecs.model_id().as_deref() != Some(crate::embed::MODEL_ID) {
         return None; // sidecar built by a different model -> stale until rebuilt
     }
+    // The symbol sidecar rides the same deliberate-only gate as path boosting;
+    // absent or unopenable degrades to no bonus, never an error.
+    let symbols = if boost_paths {
+        crate::symbols::SymbolStore::open_default(db).ok()
+    } else {
+        None
+    };
     match crate::recall::recall_fused_scoped(
         store, query, &qvec, &vecs, limit, crate::recall::FUSION_LAMBDA, scope, boost_paths,
+        symbols.as_ref(),
     ) {
         Ok(hits) if !hits.is_empty() => Some(hits),
         _ => None,

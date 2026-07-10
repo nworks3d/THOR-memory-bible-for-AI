@@ -29,6 +29,12 @@ pub fn print_doctor(db: &Path) {
     #[cfg(not(feature = "semantic"))]
     println!("semantic: not built in (bm25-only binary)");
 
+    let sympath = crate::symbols::default_symbols_path(db);
+    println!(
+        "symbols sidecar: {}",
+        if sympath.exists() { "present" } else { "absent (run `thor symbols`; where_used/impact and the symbol recall bonus stay off)" }
+    );
+
     match crate::daemon_client::health(db) {
         Some(h) => println!(
             "injection daemon: WARM (pid {}, bind {}, db {})",

@@ -563,6 +563,50 @@ const PATH_AFFINITY_BONUS: f64 = 0.25;
 #[cfg(feature = "semantic")]
 const PATH_STEM_STOPLIST: [&str; 10] =
     ["main", "mod", "lib", "index", "app", "util", "utils", "test", "tests", "src"];
+/// Symbol-definition bonus (deliberate path, symbol sidecar): the query names
+/// a symbol (`linkJobModal`, `pack_blocks`) and the candidate chunk DEFINES
+/// it. Sharper than path affinity - it selects the right chunk WITHIN the
+/// right file, the measured V6 structure residue that chunk-shape A-Bs could
+/// not fix. camelCase query tokens match directly (one folded token);
+/// snake/kebab names also match by identifier-style containment in the raw
+/// query (their parts get shredded by tokenization). Value swept on the
+/// 93-question code A-B + 52-battery - see the call-site note.
+#[cfg(feature = "semantic")]
+const SYMBOL_DEF_BONUS: f64 = 0.25;
+
+/// A defined name is SPECIFIC evidence only when it looks like an identifier
+/// someone coined: a camelCase transition or a snake/kebab separator. Plain
+/// single words match ordinary prose query terms and boosted the WRONG chunks
+/// in the 93-question A-B - and a bare length floor does not help either
+/// ("production", "environment" are long AND ordinary; that exact false fire
+/// cost a measured config-how battery hit before the length rule was dropped).
+#[cfg(feature = "semantic")]
+fn symbol_name_is_specific(name: &str) -> bool {
+    name.contains(['_', '-'])
+        || name.chars().zip(name.chars().skip(1)).any(|(a, b)| a.is_lowercase() && b.is_uppercase())
+}
+
+#[cfg(feature = "semantic")]
+fn symbol_def_bonus(
+    sym_defs: &std::collections::HashMap<String, Vec<String>>,
+    entity_id: &str,
+    qterms: &[String],
+    folded_query: &str,
+) -> f64 {
+    let Some(names) = sym_defs.get(entity_id) else { return 0.0 };
+    let hit = names.iter().filter(|n| symbol_name_is_specific(n)).any(|n| {
+        let lower = n.to_lowercase();
+        qterms.iter().any(|q| *q == lower)
+            || (n.contains(['_', '-'])
+                && n.chars().count() >= MIN_IDENTIFIER_PHRASE_LEN
+                && folded_query.contains(lower.as_str()))
+    });
+    if hit {
+        SYMBOL_DEF_BONUS
+    } else {
+        0.0
+    }
+}
 
 /// Stem parts of a chunk's file name: snake/kebab splits plus camelCase
 /// boundaries, lowercased ("event_store.rs" -> [event, store];
@@ -1227,6 +1271,7 @@ pub fn recall_fused_scoped(
     lambda: f64,
     scope: &RecallScope,
     boost_paths: bool,
+    symbols: Option<&crate::symbols::SymbolStore>,
 ) -> anyhow::Result<Vec<RecallHit>> {
     if limit == 0 {
         return Ok(vec![]);
@@ -1348,6 +1393,22 @@ pub fn recall_fused_scoped(
             .collect()
     };
     let id_phrases = identifier_phrases(query);
+    // Defined-name lookup for the symbol bonus: one indexed point query per
+    // candidate chunk against the derived sidecar (deliberate path only; the
+    // sidecar may be absent - then the map is empty and the bonus is 0).
+    let sym_defs: std::collections::HashMap<String, Vec<String>> = match symbols {
+        Some(sy) if boost_paths => {
+            let ids: Vec<&str> = cand
+                .iter()
+                .filter_map(|seq| by_seq.get(seq))
+                .map(|ev| ev.entity_id.as_str())
+                .filter(|id| crate::repo::is_chunk_id(id))
+                .collect();
+            sy.defs_for(&ids)
+        }
+        _ => std::collections::HashMap::new(),
+    };
+    let folded_query_sym = fold_diacritics(&query.to_lowercase());
     let mut scored: Vec<(i64, f64, f64)> = cand
         .into_iter()
         .map(|seq| {
@@ -1372,7 +1433,15 @@ pub fn recall_fused_scoped(
                 ),
                 None => (0.0, 0.0, 0.0, 0.0),
             };
-            (seq, rank.unwrap_or(0.0), bm_norm + lambda * cos + delta + coverage + trigger + path_aff)
+            // Symbol-definition bonus (deliberate path, sidecar-backed): the
+            // query names a symbol and THIS chunk defines it - the strongest
+            // "right chunk within the right file" evidence we have. See
+            // SYMBOL_DEF_BONUS for the sweep.
+            let sym = match by_seq.get(&seq) {
+                Some(ev) => symbol_def_bonus(&sym_defs, &ev.entity_id, &qterms, &folded_query_sym),
+                None => 0.0,
+            };
+            (seq, rank.unwrap_or(0.0), bm_norm + lambda * cos + delta + coverage + trigger + path_aff + sym)
         })
         .collect();
     // Same-file sibling vote: the measured code-structure failure mode is
@@ -1442,8 +1511,9 @@ pub fn recall_fused(
     limit: usize,
     lambda: f64,
 ) -> anyhow::Result<Vec<RecallHit>> {
-    // The unscoped wrapper is the deliberate/eval surface: path boosting on.
-    recall_fused_scoped(store, query, qvec, vecs, limit, lambda, &RecallScope::everything(), true)
+    // The unscoped wrapper is the deliberate/eval surface: path boosting on;
+    // no sidecar handle here (internal tests) - examples open it themselves.
+    recall_fused_scoped(store, query, qvec, vecs, limit, lambda, &RecallScope::everything(), true, None)
 }
 
 #[cfg(test)]
@@ -1933,6 +2003,32 @@ mod fused_tests {
         let tagged = "short rule\n\n[memory/note | tags: | fires-when: a.b | project: P]";
         let raw = "config a.b staat in de repo";
         assert_eq!(trigger_bonus(tagged, raw, &tokens(raw)), 0.0);
+    }
+
+    #[cfg(feature = "semantic")]
+    #[test]
+    fn test_symbol_def_bonus_requires_identifier_shaped_names() {
+        use std::collections::HashMap;
+        let mut defs: HashMap<String, Vec<String>> = HashMap::new();
+        defs.insert("P:src/Fleet.jsx#10".into(),
+            vec!["linkJobModal".into(), "production".into()]);
+        defs.insert("P:src/pay.js#14".into(), vec!["production".into()]);
+        let q = |terms: &[&str]| terms.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        // camelCase symbol named in the query (folded to one token) fires
+        let b = symbol_def_bonus(&defs, "P:src/Fleet.jsx#10",
+            &q(&["linkjobmodal", "state"]), "what is the linkjobmodal state");
+        assert!(b > 0.0, "camelCase definition match must fire");
+        // a plain long English word defined as a symbol must NOT fire
+        let b = symbol_def_bonus(&defs, "P:src/pay.js#14",
+            &q(&["production", "isolated"]), "how is dev isolated from production");
+        assert_eq!(b, 0.0, "ordinary-word symbols are not evidence");
+        // snake_case matches by containment in the raw query
+        defs.insert("P:src/lib.rs#0".into(), vec!["pack_blocks".into()]);
+        let b = symbol_def_bonus(&defs, "P:src/lib.rs#0",
+            &q(&["pack", "blocks"]), "where is pack_blocks defined");
+        assert!(b > 0.0, "snake_case containment match must fire");
+        // unknown chunk: nothing
+        assert_eq!(symbol_def_bonus(&defs, "P:none#0", &q(&["linkjobmodal"]), "x"), 0.0);
     }
 
     #[test]

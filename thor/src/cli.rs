@@ -203,6 +203,10 @@ enum Commands {
     /// Read-only health check across THOR's surfaces: store, semantic
     /// model/sidecar, injection daemon warm/cold, and any flags present.
     Doctor,
+    /// (Re)build the derived symbol sidecar (thor-symbols.db): which names
+    /// each code chunk defines and calls. Powers where_used/impact and the
+    /// deliberate-recall symbol bonus. Safe to delete and rebuild any time.
+    Symbols,
     /// Moment-of-action Guard: reads a PreToolUse hook JSON on stdin and, if a
     /// rulebook rule matches the tool call, emits an advisory additionalContext.
     /// Hard fail-open, always exit 0.
@@ -707,6 +711,13 @@ pub fn run() -> Result<()> {
                 spawn_detached_ingest(&db, &paths, override_key.as_deref())?;
             } else {
                 run_ingest(&db, &paths, override_key.as_deref())?;
+                // Derived sidecar refresh, best-effort: a symbols failure must
+                // never fail an ingest (delete + `thor symbols` rebuilds it).
+                if let Ok(store) = EventStore::new(&db) {
+                    if let Ok(mut sy) = crate::symbols::SymbolStore::open_default(&db) {
+                        let _ = sy.rebuild(&store);
+                    }
+                }
             }
         }
         Commands::Init { path, key } => {
@@ -797,6 +808,17 @@ pub fn run() -> Result<()> {
         }
         Commands::Doctor => {
             crate::doctor::print_doctor(&db);
+        }
+        Commands::Symbols => {
+            let store = EventStore::new(&db)?;
+            let mut sy = crate::symbols::SymbolStore::open_default(&db)
+                .map_err(|e| anyhow::anyhow!("symbols sidecar: {e}"))?;
+            let stats = sy.rebuild(&store)?;
+            println!(
+                "symbols rebuilt: {} source chunks -> {} definitions, {} call edges ({})",
+                stats.chunks, stats.symbols, stats.edges,
+                crate::symbols::default_symbols_path(&db).display()
+            );
         }
         Commands::Guard { rulebook } => {
             let path = rulebook.unwrap_or_else(crate::guard::default_rulebook_path);

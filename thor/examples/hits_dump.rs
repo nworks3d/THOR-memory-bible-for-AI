@@ -82,6 +82,8 @@ fn main() -> anyhow::Result<()> {
     };
 
     let store = EventStore::new(&db)?;
+    // Derived symbol sidecar next to the (possibly cloned) store; absent = no bonus.
+    let symbols = thor::symbols::SymbolStore::open(&thor::symbols::default_symbols_path(&db)).ok();
     #[cfg(feature = "semantic")]
     let mut embedder = thor::embed::Embedder::load_default().ok();
     #[cfg_attr(not(feature = "semantic"), allow(unused_variables))]
@@ -152,6 +154,7 @@ fn main() -> anyhow::Result<()> {
                                     thor::recall::FUSION_LAMBDA,
                                     &scope,
                                     true, // deliberate channel: path boosting on
+                                    symbols.as_ref(),
                                 )?
                             }
                             _ => thor::recall::recall_scoped(&store, query, fetch, &scope)?,

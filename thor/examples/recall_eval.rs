@@ -15,7 +15,7 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use thor::embed::{Embedder, DIM};
 use thor::event_store::EventStore;
-use thor::recall::recall_fused;
+use thor::recall::recall_fused_scoped;
 use thor::vectors::{default_vectors_path, VectorStore};
 
 fn local(sub: &[&str]) -> PathBuf {
@@ -69,6 +69,7 @@ fn main() -> anyhow::Result<()> {
     let seq_to_entity: HashMap<i64, String> =
         events.iter().map(|e| (e.seq, e.entity_id.clone())).collect();
     let vecs = VectorStore::open(&default_vectors_path(&db))?;
+    let symbols = thor::symbols::SymbolStore::open(&thor::symbols::default_symbols_path(&db)).ok();
     let mut emb = Embedder::load_default()?;
     let zero = vec![0.0f32; DIM];
 
@@ -119,7 +120,8 @@ fn main() -> anyhow::Result<()> {
         };
 
         // bm25 baseline: a zero query vector -> cosine 0 -> pure bm25 order.
-        let base = recall_fused(&store, query, &zero, &vecs, 5, 1.0)?;
+        let base = recall_fused_scoped(&store, query, &zero, &vecs, 5, 1.0,
+            &thor::recall::RecallScope::everything(), true, symbols.as_ref())?;
         let bc = bm.entry(category.clone()).or_insert([0, 0, 0]);
         bc[2] += 1;
         if count(&base, 3) {
@@ -131,7 +133,8 @@ fn main() -> anyhow::Result<()> {
 
         // fused, one accumulator per lambda.
         for (i, &lam) in lambdas.iter().enumerate() {
-            let hits = recall_fused(&store, query, &qvec, &vecs, 5, lam)?;
+            let hits = recall_fused_scoped(&store, query, &qvec, &vecs, 5, lam,
+                &thor::recall::RecallScope::everything(), true, symbols.as_ref())?;
             let fc = fu[i].entry(category.clone()).or_insert([0, 0, 0]);
             fc[2] += 1;
             if count(&hits, 3) {

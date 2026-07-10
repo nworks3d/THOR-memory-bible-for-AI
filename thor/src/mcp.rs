@@ -88,6 +88,28 @@ pub struct RecallArgs {
 }
 
 #[derive(Deserialize, schemars::JsonSchema)]
+pub struct WhereUsedArgs {
+    /// Symbol name, exact and case-sensitive ("pack_blocks", "linkJobModal").
+    pub symbol: String,
+    /// Project key to search. Omitted = the server's current project;
+    /// explicitly pass "all" to search every project.
+    #[serde(default)]
+    pub project: Option<String>,
+}
+
+#[derive(Deserialize, schemars::JsonSchema)]
+pub struct ImpactArgs {
+    /// Symbol name whose change blast-radius to walk (exact, case-sensitive).
+    pub symbol: String,
+    /// Project key. Omitted = the server's current project; "all" = every project.
+    #[serde(default)]
+    pub project: Option<String>,
+    /// Reverse-walk depth, 1-3 (default 2): callers, then callers-of-callers.
+    #[serde(default)]
+    pub depth: Option<usize>,
+}
+
+#[derive(Deserialize, schemars::JsonSchema)]
 pub struct OutlineArgs {
     /// File path (or unambiguous path suffix) to outline, e.g.
     /// "src/recall.rs" or "web/client/src/pages/Fleet.jsx".
@@ -341,6 +363,92 @@ impl ThorServer {
                 crate::ledger::increment(&db, "access", &args.entity_id);
             }
             Ok(render_get(&args.entity_id, &events))
+        })
+        .await
+    }
+
+    #[tool(description = "Who calls this symbol? Name-based lookup on the derived symbol sidecar: the chunks that DEFINE the symbol and the chunks that CALL it. Follow with `get <chunk id>` for a caller's full body. Run `thor symbols` once if the sidecar is missing.")]
+    async fn where_used(&self, Parameters(args): Parameters<WhereUsedArgs>) -> String {
+        let server_project = self.project.clone();
+        let db = self.db.clone();
+        self.blocking(move |_s| {
+            let sy = crate::symbols::SymbolStore::open_default(&db)
+                .map_err(|e| format!("symbol sidecar unavailable ({e}); run `thor symbols`"))?;
+            let project = resolve_symbol_project(args.project, server_project);
+            let defs = sy.definers_of(&args.symbol, project.as_deref());
+            let callers = sy.callers_of(&args.symbol, project.as_deref());
+            if defs.is_empty() && callers.is_empty() {
+                return Ok(format!(
+                    "No definitions or calls of '{}' in the symbol sidecar{}.",
+                    args.symbol,
+                    project.as_deref().map(|p| format!(" (project {p})")).unwrap_or_default()
+                ));
+            }
+            let mut out = String::new();
+            out.push_str(&format!("defined in ({}):\n", defs.len()));
+            for d in &defs {
+                out.push_str(&format!("  {d}\n"));
+            }
+            out.push_str(&format!("called from ({}):\n", callers.len()));
+            for c in callers.iter().take(40) {
+                out.push_str(&format!("  {c}\n"));
+            }
+            if callers.len() > 40 {
+                out.push_str(&format!("  ... {} more\n", callers.len() - 40));
+            }
+            out.push_str("(full body: get <chunk id>; resolution is name-based, not type-resolved)\n");
+            Ok(out)
+        })
+        .await
+    }
+
+    #[tool(description = "Change blast-radius of a symbol: reverse-walks the call edges (who calls it, who calls THOSE definers) up to depth 3. Name-based and heuristic - a triage map, not a type-checked proof. Needs the symbol sidecar (`thor symbols`).")]
+    async fn impact(&self, Parameters(args): Parameters<ImpactArgs>) -> String {
+        let server_project = self.project.clone();
+        let db = self.db.clone();
+        self.blocking(move |_s| {
+            let sy = crate::symbols::SymbolStore::open_default(&db)
+                .map_err(|e| format!("symbol sidecar unavailable ({e}); run `thor symbols`"))?;
+            let project = resolve_symbol_project(args.project, server_project);
+            let depth = args.depth.unwrap_or(2).clamp(1, 3);
+            let mut out = String::new();
+            let mut frontier: Vec<String> = vec![args.symbol.clone()];
+            let mut seen_chunks: std::collections::HashSet<String> = Default::default();
+            let mut total = 0usize;
+            for level in 1..=depth {
+                let mut next_names: Vec<String> = Vec::new();
+                let mut level_chunks: Vec<String> = Vec::new();
+                for name in &frontier {
+                    for caller in sy.callers_of(name, project.as_deref()) {
+                        if seen_chunks.insert(caller.clone()) {
+                            // the caller's own definitions are the next frontier
+                            next_names.extend(sy.defined_in(&caller));
+                            level_chunks.push(caller);
+                        }
+                    }
+                }
+                if level_chunks.is_empty() {
+                    break;
+                }
+                total += level_chunks.len();
+                out.push_str(&format!("depth {level}: {} caller chunk(s)\n", level_chunks.len()));
+                for c in level_chunks.iter().take(25) {
+                    out.push_str(&format!("  {c}\n"));
+                }
+                if level_chunks.len() > 25 {
+                    out.push_str(&format!("  ... {} more\n", level_chunks.len() - 25));
+                }
+                if total > 150 {
+                    out.push_str("(walk capped at 150 chunks)\n");
+                    break;
+                }
+                frontier = next_names;
+            }
+            if out.is_empty() {
+                return Ok(format!("No callers of '{}' in the symbol sidecar.", args.symbol));
+            }
+            out.push_str("(name-based reverse walk; full body: get <chunk id>)\n");
+            Ok(out)
         })
         .await
     }
@@ -736,6 +844,17 @@ fn render_mutate_err(e: anyhow::Error) -> String {
     }
 }
 
+/// Effective project filter for the symbol tools: an explicit "all" widens to
+/// every project, an explicit key pins one, omitted falls back to the server's
+/// startup project (None = unscoped, matching the HTTP server's behavior).
+fn resolve_symbol_project(arg: Option<String>, server: Option<String>) -> Option<String> {
+    match arg {
+        Some(p) if p.eq_ignore_ascii_case("all") => None,
+        Some(p) => Some(p),
+        None => server,
+    }
+}
+
 /// First non-empty line of a body, whitespace-collapsed and truncated: the
 /// one-line signature used by recall's index mode and the outline tool.
 fn first_line(body: &str, max: usize) -> String {
@@ -1042,6 +1161,35 @@ mod tests {
         assert!(out.contains("e2 |"), "index line per hit: {out}");
         assert!(!out.contains("detail line"), "index mode serves the first line only: {out}");
         assert!(out.len() < 600, "index mode stays compact: {} chars", out.len());
+    }
+
+    #[tokio::test]
+    async fn test_where_used_and_impact_walk_the_sidecar() {
+        // The tools open the sidecar NEXT TO the server's db path, so the
+        // fixture store must be file-backed and the sidecar built beside it.
+        let (server, d) = server_with(EventStore::in_memory().unwrap());
+        let db = d.path().join("thor.db");
+        let mut fstore = EventStore::new(&db).unwrap();
+        for (eid, body) in [
+            ("P:src/core.rs#0", "pub fn pack_blocks() {}\n\n[repo file | P/src/core.rs | chunk 1/1]"),
+            ("P:src/caller.rs#0", "pub fn run_ingest() { pack_blocks(); }\n\n[repo file | P/src/caller.rs | chunk 1/1]"),
+            ("P:src/top.rs#0", "pub fn main_flow() { run_ingest(); }\n\n[repo file | P/src/top.rs | chunk 1/1]"),
+        ] {
+            fstore.append_event("s", "l", "a", EventKind::FactCreated, eid, None, body).unwrap();
+        }
+        let mut sy = crate::symbols::SymbolStore::open_default(&db).unwrap();
+        sy.rebuild(&fstore).unwrap();
+        let out = server
+            .where_used(Parameters(WhereUsedArgs { symbol: "pack_blocks".into(), project: None }))
+            .await;
+        assert!(out.contains("P:src/core.rs#0"), "definer listed: {out}");
+        assert!(out.contains("P:src/caller.rs#0"), "caller listed: {out}");
+        let out = server
+            .impact(Parameters(ImpactArgs { symbol: "pack_blocks".into(), project: None, depth: Some(2) }))
+            .await;
+        assert!(out.contains("depth 1") && out.contains("P:src/caller.rs#0"), "level 1: {out}");
+        assert!(out.contains("depth 2") && out.contains("P:src/top.rs#0"),
+            "level 2 walks callers-of-definers: {out}");
     }
 
     #[tokio::test]

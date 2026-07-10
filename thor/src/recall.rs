@@ -546,6 +546,97 @@ const IDENTIFIER_BONUS: f64 = 0.20;
 /// rise, others must not fall) - see the sweep note at the call site.
 #[cfg(feature = "semantic")]
 const SIBLING_BONUS: f64 = 0.10;
+/// Query-term <-> file-stem affinity for repo chunks: when the query names the
+/// FILE ("the Fleet page", "the event store"), every chunk of that file is a
+/// candidate answer - but the path occurs exactly once per chunk (its footer),
+/// so bm25 barely feels it and code-text matches elsewhere drown it out (the
+/// measured v6 ranking residue: 7/8 hard code losses had the right chunk in
+/// store, outside the top 5). FULL-stem coverage only - a partial multi-part
+/// match earns nothing. Swept (93-question code A-B + 52-battery): 0.25
+/// full-only = +5/-1 on code coverage with battery @5 35->38 and config-how
+/// 5->8/9, nothing down; 0.35 added a second regression; a half-bonus for
+/// partial matches yielded identically to full-only, so the tighter rule stays.
+#[cfg(feature = "semantic")]
+const PATH_AFFINITY_BONUS: f64 = 0.25;
+/// Ubiquitous file stems that name half a codebase rather than one file: a
+/// full-stem match on these is no evidence the user meant THIS file.
+#[cfg(feature = "semantic")]
+const PATH_STEM_STOPLIST: [&str; 10] =
+    ["main", "mod", "lib", "index", "app", "util", "utils", "test", "tests", "src"];
+
+/// Stem parts of a chunk's file name: snake/kebab splits plus camelCase
+/// boundaries, lowercased ("event_store.rs" -> [event, store];
+/// "Fleet.jsx" -> [fleet]; "PrinterDetail.jsx" -> [printer, detail]).
+#[cfg(feature = "semantic")]
+fn path_stem_parts(entity_id: &str) -> Vec<String> {
+    if !crate::repo::is_chunk_id(entity_id) {
+        return Vec::new();
+    }
+    let Some((_, rest)) = entity_id.split_once(':') else { return Vec::new() };
+    let rel = rest.rsplit_once('#').map_or(rest, |(r, _)| r);
+    let file = rel.rsplit(['/', '\\']).next().unwrap_or(rel);
+    let stem = file.split('.').next().unwrap_or(file);
+    let mut parts: Vec<String> = Vec::new();
+    let mut cur = String::new();
+    for c in stem.chars() {
+        if c == '_' || c == '-' {
+            if !cur.is_empty() {
+                parts.push(cur.to_lowercase());
+                cur.clear();
+            }
+        } else {
+            if c.is_uppercase() && cur.chars().last().is_some_and(|p| p.is_lowercase()) {
+                parts.push(cur.to_lowercase());
+                cur.clear();
+            }
+            cur.push(c);
+        }
+    }
+    if !cur.is_empty() {
+        parts.push(cur.to_lowercase());
+    }
+    parts.retain(|p| p.chars().count() >= 3);
+    parts
+}
+
+#[cfg(feature = "semantic")]
+fn path_affinity_bonus(entity_id: &str, qterms: &[String]) -> f64 {
+    let parts = path_stem_parts(entity_id);
+    if parts.is_empty() || (parts.len() == 1 && PATH_STEM_STOPLIST.contains(&parts[0].as_str())) {
+        return 0.0;
+    }
+    let matched = parts.iter().filter(|p| qterms.iter().any(|q| q == *p)).count();
+    if matched == parts.len() {
+        PATH_AFFINITY_BONUS
+    } else {
+        0.0
+    }
+}
+
+#[cfg(all(test, feature = "semantic"))]
+mod path_affinity_tests {
+    use super::*;
+
+    fn q(terms: &[&str]) -> Vec<String> {
+        terms.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn full_stem_match_fires_partial_and_stoplist_do_not() {
+        // single-part stem, named in the query
+        assert!(path_affinity_bonus("P:client/src/pages/Fleet.jsx#10", &q(&["fleet", "page"])) > 0.0);
+        // snake_case stem needs EVERY part ("event store" names the file...)
+        assert!(path_affinity_bonus("P:thor/src/event_store.rs#1", &q(&["event", "store", "types"])) > 0.0);
+        // ...one part alone does not
+        assert_eq!(path_affinity_bonus("P:thor/src/event_store.rs#1", &q(&["store", "fact"])), 0.0);
+        // camelCase splits: both words required, both present
+        assert!(path_affinity_bonus("P:src/PrinterDetail.jsx#0", &q(&["printer", "detail"])) > 0.0);
+        // ubiquitous stems never fire, even on an exact match
+        assert_eq!(path_affinity_bonus("P:server/index.js#2", &q(&["index"])), 0.0);
+        // memories are never path-boosted
+        assert_eq!(path_affinity_bonus("01KMEMORYULID", &q(&["fleet"])), 0.0);
+    }
+}
 /// A file only lends its vote when its best candidate is within this fraction
 /// of the pool's global best - weak files never lift their siblings.
 #[cfg(feature = "semantic")]
@@ -1259,15 +1350,16 @@ pub fn recall_fused_scoped(
                 None => 0.0,
             };
             let cos = cos_by_seq.get(&seq).copied().unwrap_or(0.0).max(0.0);
-            let (delta, coverage, trigger) = match by_seq.get(&seq) {
+            let (delta, coverage, trigger, path_aff) = match by_seq.get(&seq) {
                 Some(ev) => (
                     class_delta(route, source_class(&ev.entity_id)),
                     coverage_bonus(&ev.body, &qterms, &id_phrases),
                     trigger_bonus(&ev.body, query, &qterms),
+                    path_affinity_bonus(&ev.entity_id, &qterms),
                 ),
-                None => (0.0, 0.0, 0.0),
+                None => (0.0, 0.0, 0.0, 0.0),
             };
-            (seq, rank.unwrap_or(0.0), bm_norm + lambda * cos + delta + coverage + trigger)
+            (seq, rank.unwrap_or(0.0), bm_norm + lambda * cos + delta + coverage + trigger + path_aff)
         })
         .collect();
     // Same-file sibling vote: the measured code-structure failure mode is

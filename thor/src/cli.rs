@@ -803,6 +803,7 @@ pub fn run() -> Result<()> {
             println!("{}", crate::backup::backup_to_repo(&store, &repo, force)?);
         }
         Commands::Import { path } => {
+            crate::importer::refuse_when_seeded(&db)?;
             let mut store = EventStore::new(&db)?;
             let stats = crate::importer::import_jsonl(&mut store, &path)?;
             // Report EVERY counter: a status-driven run that only retracts used
@@ -819,6 +820,25 @@ pub fn run() -> Result<()> {
                 stats.skipped_malformed,
                 stats.skipped_diverged
             );
+            // Arm the one-time-seeding guard only when the run actually changed
+            // the store: a no-op run (empty or mistyped file) must not lock out
+            // the real seeding. A failed flag write is a hard error - reporting
+            // success while the store is left unprotected would be exactly the
+            // silent hole the guard exists to close.
+            if stats.imported + stats.revised + stats.retracted > 0 {
+                crate::importer::arm_seeded_flag(&db).map_err(|e| {
+                    anyhow::anyhow!(
+                        "import succeeded but SEEDED.flag could not be written next to {}: {e}\n\
+                         The store is NOT protected against a re-import. Fix the cause and\n\
+                         create the file by hand (any content), or re-run the import.",
+                        db.display()
+                    )
+                })?;
+                println!(
+                    "SEEDED.flag armed next to the store - further imports will be refused \
+                     (delete the flag file to deliberately allow another seeding)."
+                );
+            }
         }
         Commands::Recv { http } => {
             crate::sync::run_recv(&db, &http)?;

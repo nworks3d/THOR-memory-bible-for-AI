@@ -1,6 +1,43 @@
 use crate::event_store::{Event, EventKind, EventStore};
 use std::io::BufRead;
-use std::path::Path;
+use std::path::{Path, PathBuf};
+
+/// Marker next to the store that says the one-time source seeding already
+/// happened. While it exists `thor import` refuses to run: the stores are
+/// isolated by decision (the import was ONE-TIME seeding), and a re-import
+/// would silently overwrite locally revised heads (e.g. retro-added
+/// fires-when/anchors footers) with the source body and resurrect locally
+/// retracted imports. Deleting the file is the deliberate override - a file
+/// op, the same convention as THOR-PRIMARY.flag / THOR-SILENT.flag.
+pub fn seeded_flag_path(db: &Path) -> PathBuf {
+    db.with_file_name("SEEDED.flag")
+}
+
+/// Refuse an import while the SEEDED flag is present.
+pub fn refuse_when_seeded(db: &Path) -> anyhow::Result<()> {
+    let flag = seeded_flag_path(db);
+    if flag.exists() {
+        anyhow::bail!(
+            "thor import: refused - {} exists.\n\
+             This store was already seeded once; the stores are isolated by decision.\n\
+             Re-importing would silently overwrite locally revised heads (retro-tags)\n\
+             and resurrect locally retracted imports.\n\
+             To seed a brand-new store on purpose: delete that flag file first, then\n\
+             run the import again (a successful import re-arms the flag).",
+            flag.display()
+        );
+    }
+    Ok(())
+}
+
+/// Arm (create) the seeding flag after a successful import so the next import
+/// on this store refuses by default.
+pub fn arm_seeded_flag(db: &Path) -> std::io::Result<()> {
+    std::fs::write(
+        seeded_flag_path(db),
+        "one-time seeding done; delete this file to deliberately allow another import\n",
+    )
+}
 
 #[derive(Debug, Default, Clone, Copy)]
 pub struct ImportStats {
@@ -342,5 +379,22 @@ mod tests {
         assert_eq!(stats2.imported, 0);
         assert_eq!(stats2.skipped_existing, 2, "both facts already present");
         assert_eq!(store.get_all_events().unwrap().len(), 2, "no duplicates appended");
+    }
+
+    #[test]
+    fn test_seeded_flag_guards_reimport() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("s.db");
+        // no flag yet -> a fresh store may be seeded
+        assert!(refuse_when_seeded(&db).is_ok(), "a fresh store may be seeded");
+        // arm the flag (what the CLI does after a successful import)
+        arm_seeded_flag(&db).unwrap();
+        assert!(seeded_flag_path(&db).exists(), "arming writes the flag next to the db");
+        let err = refuse_when_seeded(&db).unwrap_err().to_string();
+        assert!(err.contains("SEEDED.flag"), "refusal names the flag file: {err}");
+        assert!(err.contains("retro-tags"), "refusal explains the blast radius: {err}");
+        // deleting the flag file is the deliberate override
+        std::fs::remove_file(seeded_flag_path(&db)).unwrap();
+        assert!(refuse_when_seeded(&db).is_ok(), "removing the flag re-allows a deliberate seed");
     }
 }

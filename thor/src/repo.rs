@@ -27,6 +27,10 @@ pub const SKIP_EXT: &[&str] = &[
     "db", "sqlite", "bin", "exe", "dll", "so", "dylib", "class", "jar", "wasm", "lock",
     // CAD / mesh / EDA / toolpath (asset dumps, not source or docs)
     "step", "stp", "stl", "3mf", "f3d", "iges", "igs", "obj", "dxf", "dwg", "gbr", "gcode",
+    // line-delimited data dumps (eval corpora, exports): rows with no recall
+    // value that compete with the real facts they mention - a chunked eval
+    // scenario looks exactly like the drift prompt it was written to test
+    "jsonl", "ndjson",
 ];
 
 /// Walk up from `start` until a directory containing a `.git` entry is found.

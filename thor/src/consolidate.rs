@@ -106,9 +106,16 @@ struct LiveHead {
     prefix: String,
     first_line: String,
     typed: bool,
-    /// Footer carries a source-store reference: this is the import-synced copy
-    /// of an external source of truth (its lifecycle is decided THERE).
+    /// Footer carries a source-store reference: this head arrived via the
+    /// one-time source seeding. Historical marker only - the stores are
+    /// isolated (imports are guarded by SEEDED.flag), so these heads live and
+    /// die in THOR like any native fact.
     imported: bool,
+    /// Another live head's body cites this entity id (e.g. an "m:01K..." or
+    /// "mimir:01K..." link in prose). Retracting it would break that
+    /// reference for recall, so decay never suggests it - the same rationale
+    /// the dup keep-priority uses to prefer the seeded copy.
+    referenced: bool,
     pinned: bool,
 }
 
@@ -133,6 +140,7 @@ fn live_memory_heads(events: &[Event], pins: &[String]) -> Vec<LiveHead> {
         }
     }
     let mut out = Vec::new();
+    let mut bodies: Vec<String> = Vec::new(); // aligned with `out` until the sort
     for (id, hs) in &heads {
         if crate::repo::is_chunk_id(id) || hs.is_diverged || hs.heads.len() != 1 {
             continue;
@@ -153,8 +161,16 @@ fn live_memory_heads(events: &[Event], pins: &[String]) -> Vec<LiveHead> {
             first_line: first_line(&head.body),
             typed: crate::footer::fact_type(&head.body).is_some(),
             imported: crate::footer::has_source_ref(&head.body),
+            referenced: false, // filled below, once every body is known
             pinned: pins.iter().any(|p| p == id),
         });
+        bodies.push(head.body.clone());
+    }
+    // Mark heads whose id is cited inside ANOTHER live head's body (a fact's
+    // own footer cites its own id - that self-reference does not count).
+    for i in 0..out.len() {
+        let id = out[i].entity_id.clone();
+        out[i].referenced = bodies.iter().enumerate().any(|(j, b)| j != i && b.contains(&id));
     }
     out.sort_by_key(|h| h.create_seq);
     out
@@ -173,12 +189,12 @@ fn dup_groups(heads: &[LiveHead]) -> Vec<DupGroup> {
         if group.len() < 2 {
             continue;
         }
-        // Keep-priority: pinned > import-synced copy (a future source revision
-        // flows in under THAT id, so retracting it would resurrect the twin on
-        // the next import) > typed > proven-useful (positive strength) >
-        // oldest. Typed/strength rank above age for the same reason decay
-        // protects them: those signals say "this copy is the curated one".
-        // A pinned twin is never a retract target.
+        // Keep-priority: pinned > seeded copy (its entity id IS the source id
+        // that fact bodies cross-reference, e.g. "m:01K..." links - keeping it
+        // preserves those references) > typed > proven-useful (positive
+        // strength) > oldest. Typed/strength rank above age for the same
+        // reason decay protects them: those signals say "this copy is the
+        // curated one". A pinned twin is never a retract target.
         let keep = group
             .iter()
             .max_by_key(|h| {
@@ -215,9 +231,14 @@ fn decay_candidates(
     let mut out: Vec<DecayCandidate> = heads
         .iter()
         .filter(|h| {
+            // Seeded (imported) heads are NOT excluded: the stores are isolated
+            // (one-time seeding, SEEDED.flag guards re-imports), so a stale
+            // seeded note decays like any native one - nothing resurrects it.
+            // A head cited by another live fact's body IS excluded: retracting
+            // it would break that reference for recall.
             !h.typed
                 && !h.pinned
-                && !h.imported
+                && !h.referenced
                 // never useful on balance: no (recency-weighted) echo or read
                 // outweighs its noise marks - the ONE strength concept
                 && h.strength <= 0.0
@@ -669,7 +690,7 @@ mod tests {
     }
 
     #[test]
-    fn decay_requires_untyped_unread_unmarked_unimported_and_old() {
+    fn decay_requires_untyped_unread_unmarked_and_old_seeded_included() {
         let dir = tempfile::tempdir().unwrap();
         let (mut store, db) = store_at(dir.path());
         create(&mut store, "mem-stale", "an old scratch note about a temporary path nobody ever used");
@@ -678,6 +699,19 @@ mod tests {
             &mut store,
             "01KMIRROR",
             "a mirrored source fact\n\n[memory/note | tags: | project: global | mimir:01KMIRROR]",
+        );
+        // an equally old seeded note that ANOTHER live fact cites by id: it
+        // must never be suggested for decay (the citer is typed, so the citer
+        // itself is protected too)
+        create(
+            &mut store,
+            "01KCITED",
+            "an old seeded note nobody reads directly\n\n[memory/note | tags: | project: global | mimir:01KCITED]",
+        );
+        create(
+            &mut store,
+            "mem-citer",
+            "see the full trade-off in m:01KCITED before changing this\n\n[memory/gotcha | tags: x | project: P]",
         );
         create(&mut store, "mem-echoed", "a note that was marked useful once by the agent");
         store
@@ -712,8 +746,10 @@ mod tests {
         ids.sort();
         assert_eq!(
             ids,
-            vec!["mem-noised", "mem-stale"],
-            "the untouched old note AND the noise-drowned note decay; everything protected stays"
+            vec!["01KMIRROR", "mem-noised", "mem-stale"],
+            "untouched old notes decay - INCLUDING a stale seeded (imported) one, since the \
+             stores are isolated and no import resurrects it; everything protected stays: \
+             typed, pinned, echoed, read, recent, AND the id-cited note (01KCITED)"
         );
     }
 

@@ -336,6 +336,49 @@ mod tests {
     }
 
     #[test]
+    fn jsonl_eval_corpus_is_skipped_and_stale_chunks_retract() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo_dir = tmp.path().join("MyProj");
+        std::fs::create_dir_all(&repo_dir).unwrap();
+        init_repo(&repo_dir);
+        write(&repo_dir, "a.rs", "fn alpha() {}");
+        write(
+            &repo_dir,
+            "eval/scenarios.jsonl",
+            r#"{"id":"s01","task_prompt":"move the database to the NAS share"}"#,
+        );
+        git(&repo_dir, &["add", "a.rs", "eval/scenarios.jsonl"]); // BOTH tracked
+        let db = tmp.path().join("j.db");
+        let mut store = EventStore::new(&db).unwrap();
+
+        // Simulate the pre-fix live store: the eval corpus was chunked in
+        // before jsonl joined SKIP_EXT.
+        store
+            .append_event(
+                "ingest", "repo-ingest", "test", EventKind::FactCreated,
+                "MyProj:eval/scenarios.jsonl#0",
+                None,
+                "{\"id\":\"s01\",\"task_prompt\":\"move the database to the NAS share\"}\n\n[repo file | MyProj/eval/scenarios.jsonl | chunk 1/1]",
+            )
+            .unwrap();
+
+        let s = ingest_repos(&mut store, &[repo_dir.clone()], "test", None).unwrap();
+        assert_eq!(s.created, 1, "only a.rs is chunked; the tracked jsonl is skip-ext");
+        assert!(s.skipped_binary >= 1, "the jsonl counts as skipped");
+        assert_eq!(s.retracted, 1, "the stale pre-fix jsonl chunk is retracted by reconcile");
+        assert!(
+            recall(&store, "task_prompt database NAS share", 5)
+                .unwrap()
+                .iter()
+                .all(|h| h.entity_id != "MyProj:eval/scenarios.jsonl#0"),
+            "eval scenario text no longer surfaces in recall"
+        );
+        // idempotent: a second run neither re-creates nor re-retracts it
+        let s2 = ingest_repos(&mut store, &[repo_dir.clone()], "test", None).unwrap();
+        assert_eq!(s2.created + s2.revised + s2.retracted, 0, "clean no-op after the cleanup");
+    }
+
+    #[test]
     fn global_ingest_surfaces_in_every_project() {
         use crate::recall::{recall_scoped, RecallScope};
         let tmp = tempfile::tempdir().unwrap();

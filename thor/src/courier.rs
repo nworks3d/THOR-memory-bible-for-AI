@@ -171,7 +171,9 @@ fn injection_with_store(store: &EventStore, db: &Path, pre: &PreCheck) -> Option
     let session_id = pre.session_id.as_str();
     let project = cwd.as_deref().and_then(|c| crate::repo::project_key(Path::new(c)));
     let scope = RecallScope::current(project.clone());
-    let pool = recall_for(db, &store, &query, &scope, POOL_HITS);
+    // No path boosting on the courier pool: drift preventers are memories, and
+    // the file-stem lift measurably displaced them here (live replay A-B).
+    let pool = recall_for(db, &store, &query, &scope, POOL_HITS, false);
 
     // Silence threshold: an OR-fallback pool (only some query words matched) is
     // gated on real term coverage, so "best of an all-weak pool" is silence, not
@@ -795,14 +797,15 @@ pub(crate) fn recall_for(
     query: &str,
     scope: &RecallScope,
     limit: usize,
+    boost_paths: bool,
 ) -> Vec<RecallHit> {
     #[cfg(feature = "semantic")]
     {
-        if let Some(hits) = try_semantic_recall(db, store, query, scope, limit) {
+        if let Some(hits) = try_semantic_recall(db, store, query, scope, limit, boost_paths) {
             return hits;
         }
     }
-    let _ = db; // only the semantic path needs the db path (for the daemon/sidecar)
+    let _ = (db, boost_paths); // only the semantic path needs these
     recall_scoped(store, query, limit, scope).unwrap_or_default()
 }
 
@@ -817,6 +820,7 @@ fn try_semantic_recall(
     query: &str,
     scope: &RecallScope,
     limit: usize,
+    boost_paths: bool,
 ) -> Option<Vec<RecallHit>> {
     use crate::vectors::{default_vectors_path, VectorStore};
 
@@ -840,7 +844,9 @@ fn try_semantic_recall(
     if vecs.model_id().as_deref() != Some(crate::embed::MODEL_ID) {
         return None; // sidecar built by a different model -> stale until rebuilt
     }
-    match crate::recall::recall_fused_scoped(store, query, &qvec, &vecs, limit, crate::recall::FUSION_LAMBDA, scope) {
+    match crate::recall::recall_fused_scoped(
+        store, query, &qvec, &vecs, limit, crate::recall::FUSION_LAMBDA, scope, boost_paths,
+    ) {
         Ok(hits) if !hits.is_empty() => Some(hits),
         _ => None,
     }

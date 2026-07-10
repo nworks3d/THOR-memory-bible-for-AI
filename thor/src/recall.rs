@@ -1218,6 +1218,7 @@ pub fn recall_fused_scoped(
     limit: usize,
     lambda: f64,
     scope: &RecallScope,
+    boost_paths: bool,
 ) -> anyhow::Result<Vec<RecallHit>> {
     if limit == 0 {
         return Ok(vec![]);
@@ -1355,7 +1356,11 @@ pub fn recall_fused_scoped(
                     class_delta(route, source_class(&ev.entity_id)),
                     coverage_bonus(&ev.body, &qterms, &id_phrases),
                     trigger_bonus(&ev.body, query, &qterms),
-                    path_affinity_bonus(&ev.entity_id, &qterms),
+                    // Deliberate path only: on the courier's drift-catching
+                    // pool the same boost let file chunks displace memory
+                    // preventers (live replay 54.1 -> 51.4 either-surfaced),
+                    // so the courier keeps its own balance.
+                    if boost_paths { path_affinity_bonus(&ev.entity_id, &qterms) } else { 0.0 },
                 ),
                 None => (0.0, 0.0, 0.0, 0.0),
             };
@@ -1429,7 +1434,8 @@ pub fn recall_fused(
     limit: usize,
     lambda: f64,
 ) -> anyhow::Result<Vec<RecallHit>> {
-    recall_fused_scoped(store, query, qvec, vecs, limit, lambda, &RecallScope::everything())
+    // The unscoped wrapper is the deliberate/eval surface: path boosting on.
+    recall_fused_scoped(store, query, qvec, vecs, limit, lambda, &RecallScope::everything(), true)
 }
 
 #[cfg(test)]

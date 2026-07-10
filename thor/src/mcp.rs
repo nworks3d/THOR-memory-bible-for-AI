@@ -257,8 +257,9 @@ impl ThorServer {
             } else {
                 // Fused parity with the courier: a deliberate agent query gets
                 // the same semantic score-fusion path (bm25 on non-semantic
-                // builds or any semantic failure - recall_for degrades itself).
-                crate::courier::recall_for(&db, s, &args.query, &scope, fetch)
+                // builds or any semantic failure - recall_for degrades itself),
+                // plus the deliberate-only path-affinity boost.
+                crate::courier::recall_for(&db, s, &args.query, &scope, fetch, true)
             };
             if hits.is_empty() {
                 return Ok(format!("No THOR hits for: {}", args.query));

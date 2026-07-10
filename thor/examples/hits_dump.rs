@@ -145,6 +145,7 @@ fn main() -> anyhow::Result<()> {
                                     fetch,
                                     thor::recall::FUSION_LAMBDA,
                                     &scope,
+                                    true, // deliberate channel: path boosting on
                                 )?
                             }
                             _ => thor::recall::recall_scoped(&store, query, fetch, &scope)?,

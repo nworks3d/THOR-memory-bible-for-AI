@@ -325,6 +325,12 @@ fn file_memory_advisory(db: &Path, hook: &Value) -> Option<String> {
 /// (remember's `anchors` param, footer field) match `pred`. The anchor pass
 /// runs BEFORE the lexical heuristics: an anchor is exact declared intent and
 /// must never depend on bm25 reaching the fact or on the fact being typed.
+///
+/// KNOWN COST: this fold duplicates the one recall_memories_scoped performs
+/// internally right after, so a non-debounced advisory pays the O(n) log fold
+/// twice. Bounded by design (once per file/command-token-set per session,
+/// misses neg-cached) and it collapses to two cheap lookups when the
+/// materialized heads table (M2) lands - measured before optimizing further.
 fn anchored_memories(
     store: &crate::event_store::EventStore,
     scope: &crate::recall::RecallScope,

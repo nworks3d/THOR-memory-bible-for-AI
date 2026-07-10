@@ -211,7 +211,34 @@ pub fn counter(db: &Path, ns: &str, key: &str) -> u64 {
     get(db, ns, key).and_then(|v| v.as_u64()).unwrap_or(0)
 }
 
-/// All counters in a namespace (for consolidate's decay scan). Empty on error.
+/// Counters for the GIVEN keys only (`k IN (...)`): the hot-path read. The
+/// access/noise namespaces grow one row per entity ever read/marked and are
+/// never pruned, so a per-prompt caller must never scan the whole namespace.
+pub fn counters_for(db: &Path, ns: &str, keys: &[String]) -> HashMap<String, u64> {
+    if keys.is_empty() {
+        return HashMap::new();
+    }
+    let Some(c) = conn(db) else { return HashMap::new() };
+    let placeholders = vec!["?"; keys.len()].join(",");
+    let sql = format!("SELECT k, v FROM kv WHERE ns = ? AND k IN ({})", placeholders);
+    let Ok(mut stmt) = c.prepare(&sql) else { return HashMap::new() };
+    let params = std::iter::once(ns.to_string()).chain(keys.iter().cloned());
+    let mut out = HashMap::new();
+    let rows = stmt.query_map(rusqlite::params_from_iter(params), |r| {
+        Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
+    });
+    if let Ok(rows) = rows {
+        for (k, v) in rows.flatten() {
+            if let Ok(n) = v.parse::<u64>() {
+                out.insert(k, n);
+            }
+        }
+    }
+    out
+}
+
+/// All counters in a namespace (for consolidate's decay scan - an OFFLINE
+/// command; per-prompt callers use counters_for). Empty on error.
 pub fn counters(db: &Path, ns: &str) -> HashMap<String, u64> {
     let Some(c) = conn(db) else { return HashMap::new() };
     let mut out = HashMap::new();

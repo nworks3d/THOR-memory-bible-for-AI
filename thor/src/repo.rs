@@ -298,11 +298,22 @@ const MAX_CRUMB_CHARS: usize = 90;
 /// (possibly empty) trail per chunk.
 pub fn heading_trails(chunks: &[String]) -> Vec<String> {
     let mut stack: Vec<(usize, String)> = Vec::new();
+    // Fence state carries ACROSS chunks: a ``` block split over a chunk
+    // boundary must keep masking its `# comment` lines - a shell comment in a
+    // fenced example is not a heading and must never pop the real stack.
+    let mut in_fence = false;
     let mut trails = Vec::with_capacity(chunks.len());
     for chunk in chunks {
         let trail = stack.iter().map(|(_, t)| t.as_str()).collect::<Vec<_>>().join(" > ");
         trails.push(trail.chars().take(MAX_CRUMB_CHARS).collect());
         for line in chunk.lines() {
+            if line.trim_start().starts_with("```") {
+                in_fence = !in_fence;
+                continue;
+            }
+            if in_fence {
+                continue;
+            }
             let hashes = line.chars().take_while(|c| *c == '#').count();
             if (1..=6).contains(&hashes) && line.chars().nth(hashes).is_some_and(|c| c == ' ') {
                 let title: String = crate::footer::field_safe(line[hashes..].trim())
@@ -421,6 +432,18 @@ mod tests {
         // '#' without a space is code/comment, never a heading
         let code: Vec<String> = vec!["#!/bin/sh\n".into(), "#define X 1\n".into(), "echo hi\n".into()];
         assert!(heading_trails(&code).iter().all(|t| t.is_empty()));
+
+        // a '# comment' inside a fenced code block is NOT a heading - even
+        // when the fence spans a chunk boundary
+        let fenced: Vec<String> = vec![
+            "# Guide\n## Setup\n```bash\n".into(),
+            "# a shell comment, not a heading\n```\n".into(),
+            "## Usage\n".into(),
+            "usage text\n".into(),
+        ];
+        let trails = heading_trails(&fenced);
+        assert_eq!(trails[2], "Guide > Setup", "fenced comment never entered the stack");
+        assert_eq!(trails[3], "Guide > Usage", "the real H2 still lands after the fence");
     }
 
     #[test]

@@ -27,22 +27,29 @@ const ACCESS_CAP: f64 = 4.0;
 /// One noise mark cancels one full-strength echo.
 const NOISE_WEIGHT: f64 = 1.0;
 
-/// Usage strength per entity, for the given ids only (served by
-/// idx_event_entity - this runs on the courier's per-prompt hot path).
+/// Usage strength per entity, for the given ids only - EVERY read here is
+/// id-scoped SQL (`entity_id IN`/`k IN`), because this runs on the courier's
+/// per-prompt hot path and the echo/access/noise stores all grow with total
+/// history, never with the candidate pool. Duplicate ids (a diverged fact
+/// surfacing once per contested head) are folded once, not double-counted.
 /// Fail-soft everywhere: a query/ledger error contributes zero, never blocks.
 pub fn strength_for(store: &EventStore, db: &Path, ids: &[String]) -> HashMap<String, f64> {
     if ids.is_empty() {
         return HashMap::new();
     }
+    let unique: Vec<String> = {
+        let mut seen = std::collections::HashSet::new();
+        ids.iter().filter(|id| seen.insert(id.as_str())).cloned().collect()
+    };
     let tip = tip_seq(store);
     let mut out: HashMap<String, f64> = HashMap::new();
-    for (id, seq) in echo_seqs(store, ids) {
+    for (id, seq) in echo_seqs(store, &unique) {
         let behind = (tip - seq).max(0) as f64;
         *out.entry(id).or_insert(0.0) += 0.5f64.powf(behind / ECHO_HALF_LIFE_EVENTS);
     }
-    let access = crate::ledger::counters(db, "access");
-    let noise = crate::ledger::counters(db, "noise");
-    for id in ids {
+    let access = crate::ledger::counters_for(db, "access", &unique);
+    let noise = crate::ledger::counters_for(db, "noise", &unique);
+    for id in &unique {
         let mut s = out.remove(id).unwrap_or(0.0);
         s += ACCESS_WEIGHT * (access.get(id).copied().unwrap_or(0) as f64).min(ACCESS_CAP);
         s -= NOISE_WEIGHT * noise.get(id).copied().unwrap_or(0) as f64;
@@ -129,6 +136,28 @@ mod tests {
             (read_only - ACCESS_WEIGHT * ACCESS_CAP).abs() < 1e-9,
             "50 reads saturate at the cap: {read_only}"
         );
+    }
+
+    #[test]
+    fn reads_are_id_scoped_and_duplicates_fold_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut store, db) = setup(dir.path());
+        store.append_event("s", "l", "a", EventKind::FactEchoed, "e1", None, "echo").unwrap();
+        crate::ledger::increment(&db, "access", "e1");
+        crate::ledger::increment(&db, "access", "e1");
+        // foreign ledger rows OUTSIDE the requested set must not leak in
+        for i in 0..30 {
+            crate::ledger::increment(&db, "access", &format!("other{i}"));
+            crate::ledger::increment(&db, "noise", &format!("other{i}"));
+        }
+        let single = strength_for(&store, &db, &["e1".to_string()]);
+        let doubled =
+            strength_for(&store, &db, &["e1".to_string(), "e1".to_string()]);
+        assert_eq!(
+            single.get("e1"), doubled.get("e1"),
+            "a diverged fact (same id twice in the pool) folds once, never double-counts"
+        );
+        assert_eq!(single.len(), 1, "foreign ids never appear in the result");
     }
 
     #[test]

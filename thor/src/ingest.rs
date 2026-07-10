@@ -129,10 +129,17 @@ pub fn ingest_repos(
             }
             let chunks = repo::chunk_text(&text, repo::MAX_CHUNK_CHARS);
             let total = chunks.len();
+            // Markdown chunks carry their heading trail as a footer crumb, so
+            // a chunk cut below its heading stays findable by section name.
+            let trails = if repo::is_crumb_doc(&rel) {
+                repo::heading_trails(&chunks)
+            } else {
+                vec![String::new(); total]
+            };
             for (i, ch) in chunks.iter().enumerate() {
                 desired.insert(
                     repo::chunk_entity_id(&project, &rel, i),
-                    repo::chunk_body(ch, &project, &rel, i, total),
+                    repo::chunk_body(ch, &project, &rel, i, total, &trails[i]),
                 );
             }
             stats.files += 1;

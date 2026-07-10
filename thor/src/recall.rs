@@ -1109,6 +1109,11 @@ pub fn recall_fused_scoped(
     // scores always resolve the same way across runs.
     scored.sort_by(|a, b| b.2.total_cmp(&a.2).then(a.0.cmp(&b.0)));
 
+    // NOTE: a min-score floor on the fused score was measured here (53-question
+    // set, floors 0.35-1.2) and REJECTED: no floor value improved coverage -
+    // every cut removed gold-carrying tail hits (-0.1pp at 0.8 up to -2.2pp at
+    // 1.2) while the courier's coverage/AND gates already handle noise more
+    // precisely. Same verdict as the removed bm25 floor: do not re-add one.
     Ok(finalize_heads(
         scored.into_iter().map(|(seq, rank, _)| (seq, rank)),
         &by_seq,

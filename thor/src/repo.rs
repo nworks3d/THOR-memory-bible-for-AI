@@ -274,9 +274,67 @@ pub fn chunk_text(text: &str, max: usize) -> Vec<String> {
     chunks.into_iter().filter(|c| !c.trim().is_empty()).collect()
 }
 
+/// Markdown files get a heading-trail crumb in the chunk footer; other doc
+/// formats have no `#` headings and code files must never get one (a `#`
+/// comment is not a heading).
+const CRUMB_EXTS: &[&str] = &["md", "markdown"];
+
+pub fn is_crumb_doc(rel: &str) -> bool {
+    std::path::Path::new(rel)
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(|e| CRUMB_EXTS.contains(&e.to_ascii_lowercase().as_str()))
+        .unwrap_or(false)
+}
+
+/// Rendered length cap for a trail: a crumb is orientation, not content.
+const MAX_CRUMB_CHARS: usize = 90;
+
+/// The markdown heading trail ACTIVE at the START of each chunk ("Setup >
+/// Windows > Paths"): the doc-chunk breadcrumb as a STRUCTURED footer field,
+/// so a chunk cut below its heading still carries where it belongs - findable
+/// by FTS, stripped with the footer by dedup/snippets, and (footer = body
+/// tail) essentially invisible to the embedder's content window. One
+/// (possibly empty) trail per chunk.
+pub fn heading_trails(chunks: &[String]) -> Vec<String> {
+    let mut stack: Vec<(usize, String)> = Vec::new();
+    let mut trails = Vec::with_capacity(chunks.len());
+    for chunk in chunks {
+        let trail = stack.iter().map(|(_, t)| t.as_str()).collect::<Vec<_>>().join(" > ");
+        trails.push(trail.chars().take(MAX_CRUMB_CHARS).collect());
+        for line in chunk.lines() {
+            let hashes = line.chars().take_while(|c| *c == '#').count();
+            if (1..=6).contains(&hashes) && line.chars().nth(hashes).is_some_and(|c| c == ' ') {
+                let title: String = crate::footer::field_safe(line[hashes..].trim())
+                    .chars()
+                    .take(60)
+                    .collect();
+                if !title.is_empty() {
+                    stack.retain(|(lvl, _)| *lvl < hashes);
+                    stack.push((hashes, title));
+                }
+            }
+        }
+    }
+    trails
+}
+
 /// The recall body for chunk `i` (0-based) of `total` from `project/rel`.
-pub fn chunk_body(chunk: &str, project: &str, rel: &str, i: usize, total: usize) -> String {
-    format!("{}\n\n[repo file | {}/{} | chunk {}/{}]", chunk.trim_end(), project, rel, i + 1, total)
+/// `crumb` (empty = no field) is the heading trail from [`heading_trails`].
+pub fn chunk_body(chunk: &str, project: &str, rel: &str, i: usize, total: usize, crumb: &str) -> String {
+    if crumb.is_empty() {
+        format!("{}\n\n[repo file | {}/{} | chunk {}/{}]", chunk.trim_end(), project, rel, i + 1, total)
+    } else {
+        format!(
+            "{}\n\n[repo file | {}/{} | chunk {}/{} | crumb: {}]",
+            chunk.trim_end(),
+            project,
+            rel,
+            i + 1,
+            total,
+            crumb
+        )
+    }
 }
 
 /// The stable entity_id for chunk `i` (0-based) of `project/rel`.
@@ -348,6 +406,32 @@ mod tests {
         assert_eq!(owner_project("@global:dev-loop.md#0"), Some("@global"));
         assert_eq!(owner_project("01ARZ3NDEKTSV4RRFFQ69G5FAV"), None);
         assert_eq!(owner_project("mcp-40480511-8679-4244"), None);
+    }
+
+    #[test]
+    fn heading_trails_track_the_markdown_stack() {
+        let text = "# Guide\nintro line\n## Setup\nsetup text\n### Windows\nwin text\n## Usage\nusage text\n";
+        let chunks: Vec<String> = text.lines().map(|l| format!("{l}\n")).collect();
+        let trails = heading_trails(&chunks);
+        assert_eq!(trails[0], "", "nothing active before the first heading");
+        assert_eq!(trails[1], "Guide", "intro sits under the H1");
+        assert_eq!(trails[3], "Guide > Setup");
+        assert_eq!(trails[5], "Guide > Setup > Windows");
+        assert_eq!(trails[7], "Guide > Usage", "an H2 pops the deeper H3");
+        // '#' without a space is code/comment, never a heading
+        let code: Vec<String> = vec!["#!/bin/sh\n".into(), "#define X 1\n".into(), "echo hi\n".into()];
+        assert!(heading_trails(&code).iter().all(|t| t.is_empty()));
+    }
+
+    #[test]
+    fn chunk_body_renders_crumb_and_strip_removes_it() {
+        let with = chunk_body("content line", "Proj", "docs/guide.md", 1, 3, "Guide > Setup");
+        assert!(with.ends_with("[repo file | Proj/docs/guide.md | chunk 2/3 | crumb: Guide > Setup]"), "{with}");
+        assert_eq!(crate::footer::strip(&with), "content line", "the crumb strips with the footer");
+        let without = chunk_body("content line", "Proj", "src/a.rs", 0, 1, "");
+        assert!(without.ends_with("[repo file | Proj/src/a.rs | chunk 1/1]"), "no empty crumb field: {without}");
+        assert!(is_crumb_doc("docs/guide.md") && is_crumb_doc("README.MD"));
+        assert!(!is_crumb_doc("src/a.rs") && !is_crumb_doc("notes.txt"));
     }
 
     #[test]

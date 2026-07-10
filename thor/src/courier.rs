@@ -558,7 +558,14 @@ pub(crate) fn freshness(entity_id: &str, stored_body: &str, project: Option<&str
     if n >= chunks.len() {
         return Freshness::Stale;
     }
-    let live = crate::repo::chunk_body(&chunks[n], project, rel, n, chunks.len());
+    // Rebuild the body EXACTLY as ingest would - including the heading-trail
+    // crumb - or every markdown chunk would compare as "changed" forever.
+    let crumb = if crate::repo::is_crumb_doc(rel) {
+        crate::repo::heading_trails(&chunks).into_iter().nth(n).unwrap_or_default()
+    } else {
+        String::new()
+    };
+    let live = crate::repo::chunk_body(&chunks[n], project, rel, n, chunks.len(), &crumb);
     if live == stored_body {
         Freshness::Current
     } else {

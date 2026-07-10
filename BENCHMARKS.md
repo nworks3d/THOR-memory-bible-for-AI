@@ -3,22 +3,30 @@
 An honest, measured comparison of THOR against
 [mimir](https://github.com/MakerViking/mimir) on the same machine. Every number
 below is measured; nothing is invented, and the weaknesses are listed in full.
-Every test was re-measured fresh on 2026-07-11, after the v4 serving/matching
-round (identifier-aware trigger matching, footer-stripped serving, full-body
-memories on the deliberate path, neighbor stitching, courier full-body typed
-facts in an 8000-char budget, silence scenarios, a confusion table and a
-one-way noise ratchet; the identifier matching and the confusion-table
-discipline are idea adoptions from mimir's own rounds, credited in the README)
-- against mimir's strongest opponent build to date:
-unreleased upstream main commit `f98c7fd` (post-v0.13.0: an in-place
-MatrixCache cache fix, a warm `/inject` daemon, a fast cold-path mode,
-code-content indexing as `CodeChunk`, an identifier RRF leg, recency/type
-priors), built from source, with code content indexed and docs re-indexed and
-re-embedded over the same two main projects. Every test this round is scored
-by a **3-judge median** (three distinct judge lenses), blind, with a seeded
-relabel - no number below is carried over from an earlier run. No writes were
-made to either store between hit generation and judging (verified with `thor
-fsck` before and after).
+Every test was re-measured fresh on 2026-07-11 - the second full measurement
+round of that day - after two same-day THOR improvement rounds: the v4
+serving/matching round (identifier-aware trigger matching, footer-stripped
+serving, full-body memories on the deliberate path, neighbor stitching,
+courier full-body typed facts in an 8000-char budget, silence scenarios, a
+confusion table and a one-way noise ratchet; the identifier matching and the
+confusion-table discipline are idea adoptions from mimir's own rounds,
+credited in the README) and a second round at commit `b98c75b` (a retro-tag
+sweep over the whole typed population, absolute-evidence trigger scoring, doc
+stitching depth 2, wider courier chunk windows, symbol-boundary source
+chunking, and 7 distilled decision canonicals). The opponent is mimir's
+strongest build to date, unchanged between the two rounds: unreleased upstream
+main commit `f98c7fd` (post-v0.13.0: an in-place MatrixCache cache fix, a warm
+`/inject` daemon, a fast cold-path mode, code-content indexing as `CodeChunk`,
+an identifier RRF leg, recency/type priors), built from source, with code
+content indexed and docs re-indexed and re-embedded over the same two main
+projects. Every test this round is scored by a **3-judge median** (three
+distinct judge lenses), blind, with a fresh salted seeded relabel - no number
+below is carried over from an earlier run. Worth stating plainly: **BOTH
+systems scored lower on Test 1 than the same-day earlier round** (THOR 71.4%
+-> 68.5%, mimir 60.8% -> 59.8%) - jury strictness varies between runs even
+with a 3-judge median, and the relative picture, not the absolute level, is
+what carries. No writes were made to either store between hit generation and
+judging (verified with `thor fsck` before and after).
 
 ![THOR vs mimir - coverage, quality, drift and speed](assets/benchmark.svg)
 
@@ -64,30 +72,36 @@ earlier 504-question set that was dominated by code-only questions.
 
 | category | THOR | mimir |
 |---|---:|---:|
-| code-structure | 53.8% | **57.6%** |
-| code-behavior | **70.8%** | 55.8% |
-| doc-reference | **77.5%** | 60.0% |
-| config how-to | **85.3%** | 70.6% |
-| gotcha | **76.1%** | 71.7% |
-| decision | **72.2%** | 61.1% |
-| **overall (n=200)** | **71.4%** | 60.8% |
+| code-structure | 50.0% | **57.6%** |
+| code-behavior | **67.5%** | 54.2% |
+| doc-reference | **75.0%** | 60.0% |
+| config how-to | **79.4%** | 73.5% |
+| gotcha | **76.1%** | 69.6% |
+| decision | **70.4%** | 57.4% |
+| **overall (n=200)** | **68.5%** | 59.8% |
 
-mimir now wins code-structure (57.6% vs 53.8%) - its new tree-sitter
-code-chunk indexing (`CodeChunk`) folded into ordinary `recall` catches up on
-symbol-shaped questions for the first time. THOR still leads every other
-category and overall, by 10.6 points (71.4% vs 60.8%), a similar margin to the
-prior round, though the category picture has shifted: config how-to is the
-only category to clear an 80% bar this round (THOR 85.3%).
+mimir keeps code-structure (57.6% vs 50.0%) - its tree-sitter code-chunk
+indexing (`CodeChunk`) folded into ordinary `recall` beats THOR on
+symbol-shaped questions for the second run running; THOR's own new
+dependency-free symbol-boundary source chunker landed this round but did not
+measurably lift the judged score. THOR leads the other five categories and
+overall, by 8.7 points (68.5% vs 59.8%). Both systems scored lower than the
+same-day earlier round on this identical corpus (THOR 71.4% -> 68.5%, mimir
+60.8% -> 59.8%): the blind maps were freshly re-salted and jury strictness
+moves absolute numbers between runs even with a 3-judge median. No category
+clears an 80% bar this run (config how-to came closest at 79.4%; it was
+85.3% in the earlier same-day run).
 
 ## Test 2 - Same knowledge (118 facts both systems have)
 
 The fair, apples-to-apples comparison: only questions whose source fact is a
 dual-written memory or a doc chunk **both** stores hold.
 
-**Not re-measured this round.** No fresh Test 2 data was produced in the v4
-round (this round's `final_summary.json` covers Test 1, Test 3 and drift
-only); rather than invent a number or silently carry one forward as if it were
-fresh, this section keeps the last measured result for reference:
+**Still not re-measured this round.** No fresh Test 2 data was produced in
+either 2026-07-11 round: the shared-ids subset that defines this test did not
+map onto this round's item ids, so a fresh cut could not be built without
+guessing. Rather than invent a number or silently carry one forward as if it
+were fresh, this section keeps the last measured result for reference:
 
 **Previous result (v3 round) - overall (n=118): THOR 61.4% vs mimir 53.8%** -
 on the broad shared set THOR led by +8 points, thanks to score-fusion plus the
@@ -115,19 +129,19 @@ the project's working dir); the top-5 retrieved chunks were pulled in full and j
 | project | THOR | mimir |
 |---|---:|---:|
 | Project 1 | 90.0% | **100.0%** |
-| Project 2 | **100.0%** | 96.7% |
-| Project 3 | 93.3% | 93.3% (tie) |
-| **overall (n=45)** | 94.4% | **96.7%** |
+| Project 2 | 100.0% | 100.0% (tie) |
+| Project 3 | 86.7% | **96.7%** |
+| **overall (n=45)** | 92.2% | **98.9%** |
 
-**mimir retakes the overall lead this round, 96.7% vs 94.4%.** The swing is
-almost entirely Project 3, where full source ingest used to be THOR's biggest
-structural edge (a 16.6-point THOR lead last round, 93% vs 77%): mimir's new
-code-content indexing (the same `CodeChunk` upgrade behind its Test 1
-code-structure win) closes it completely - a dead-even 93.3% vs 93.3% this
-round. mimir also widens its lead on Project 1's hand-curated docs (100.0% vs
-90.0%, up from 97% vs 90%): hand-curated architecture/bring-up docs remain a
-strong retrieval substrate on design questions. THOR keeps Project 2 (100.0%
-vs 96.7%), a similar margin to before.
+**mimir leads overall, 98.9% vs 92.2%, and widens the gap from the same-day
+earlier round** (96.7% vs 94.4%). Its code-content indexing (`CodeChunk`, the
+same upgrade behind its Test 1 code-structure win) has fully erased what used
+to be THOR's biggest structural edge: Project 3, a 16.6-point THOR lead two
+runs ago, is now a mimir win (96.7% vs 86.7%). mimir holds its perfect score
+on Project 1's hand-curated docs (100.0% vs 90.0%): hand-curated
+architecture/bring-up docs remain a strong retrieval substrate on design
+questions. Project 2, THOR's win in the earlier round, is now a 100.0% tie.
+THOR no longer wins any project outright on this test.
 
 ## Session drift compensation (73 scenarios, 3-way)
 
@@ -144,70 +158,85 @@ mimir searching **every** project (`--all`, its best case).
 
 | metric | THOR courier (scoped, as-deployed) | THOR recall (deliberate, fused) | mimir (--all) |
 |---|---:|---:|---:|
-| preventer surfaced (>=partial) | **74.0%** | 72.6% | 56.2% |
-| clear catch (fully surfaced) | **47.9%** | **47.9%** | 42.5% |
+| preventer surfaced (>=partial) | 69.9% | **71.2%** | 50.7% |
+| clear catch (fully surfaced) | **50.7%** | **50.7%** | 39.7% |
 
-**Correction, this round.** The courier channel was first generated with a
-single *fixed* working directory (`The-AI-memory-bible`) for all 73 scenarios.
-That is an instrument bug, not a courier limitation: the project-scoped
-courier correctly excludes another project's facts when run from a different
-project's directory, but 37 of the 73 scenarios have a different true home
-project (mostly Project 3) and were measured from the wrong one. Under
-that bug the courier scored only 35.6% surfaced. Regenerating per-scenario
-with each scenario's actual home project fixed it, producing the 74.0% /
-47.9% in the table above. **The same fixed-cwd bug was present, unnoticed, in
-the courier numbers previously published in this document** (65.8% surfaced /
-45.2% clear catch) - those were measured the same wrong way and understate the
-as-deployed courier; read them as historical, not as its real ceiling.
+Both THOR channels clearly beat mimir's best case on both metrics; between
+THOR's own two channels the deliberate recall edges the courier slightly on
+surfaced (71.2% vs 69.9%) and they tie on clear catch (50.7%). The most
+meaningful movement this round is **catch conversion**: of the scenarios where
+the courier surfaces the preventer at all, **72.5% are now full, clear catches
+(50.7 of 69.9), up from 64.7% in the same-day earlier round (47.9 of 74.0)** -
+the wider courier chunk windows serve enough of the fact to count as a clear
+catch instead of a partial glimpse. Absolute surfaced percentages moved down a
+few points for every channel against the earlier round (the same
+jury-strictness variance as Test 1); the relative picture held.
 
-On the corrected numbers, the as-deployed courier leads or ties its own
-deliberate recall (74.0% vs 72.6% surfaced; 47.9% vs 47.9% clear catch, a tie)
-and leads mimir's best case on both metrics (74.0% vs 56.2% surfaced; 47.9%
-vs 42.5% clear catch). None of the three channels clears an 80% bar on either
-metric this round. The channels built for the post-compaction window on top
-of this - **pinned rules** (re-injected in full by construction) and the
-**file-touch + command guards** (fired at the moment of action, with exact
-author-declared `anchors`; 16/16 surfaced on the committed corpus) - are
-reported via the in-repo reproducible measurement:
-`cargo run --example drift_eval`. Those in-repo numbers are a separate,
-committed synthetic corpus, were not part of this round's re-measurement, and
-are unchanged.
+**Correction note (earlier same-day round; still applies to older published
+numbers).** In the first 2026-07-11 round the courier channel was initially
+generated with a single *fixed* working directory (`The-AI-memory-bible`) for
+all 73 scenarios. That was an instrument bug, not a courier limitation: 37 of
+the 73 scenarios have a different true home project (mostly Project 3), and
+the project-scoped courier - correctly - excluded their preventer facts when
+run from the wrong directory. Under that bug the courier scored only 35.6%
+surfaced. **The same fixed-cwd bug was present, unnoticed, in the courier
+numbers this document published before 2026-07-11** (65.8% surfaced / 45.2%
+clear catch) - those understate the as-deployed courier; read them as
+historical. This round's measurement used the corrected per-scenario home
+scoping from the start (home mapping taken from the corpus metadata, two
+per-home harness invocations, 0/73 courier-silent).
+
+None of the three channels clears an 80% bar on either metric this round. The
+channels built for the post-compaction window on top of this - **pinned
+rules** (re-injected in full by construction) and the **file-touch + command
+guards** (fired at the moment of action, with exact author-declared `anchors`;
+16/16 surfaced on the committed corpus) - are reported via the in-repo
+reproducible measurement: `cargo run --example drift_eval`. Those in-repo
+numbers are a separate, committed synthetic corpus, were not part of this
+round's re-measurement, and are unchanged.
 
 ## Speed and cost
 
-Full per-prompt cost (process start + recall), median of 20 runs, same 20
-(long, realistic task-prompt) prompts fed to every channel, same machine:
+Full per-prompt cost (process start + recall), median of 20 runs, same machine.
+The prompt set is now a **canonical fixed set of 20 prompts** (the first 20
+unique drift scenarios by sequence order), documented and reused verbatim
+between rounds so speed numbers are cross-run comparable from here on:
 
 | | THOR courier | mimir cold (as-deployed default) | mimir warm (opt-in daemon) |
 |---|---:|---:|---:|
-| latency (median) | 234 ms | 564 ms | **66 ms** |
-| tokens injected / prompt | 579 | **236** | not measured here |
+| latency (median) | 253 ms | 589.5 ms | **62 ms** |
+| tokens injected / prompt (avg) | 679 | 236 | **48** |
 
-THOR is **~2.4x faster** than mimir's as-deployed default path (the
+THOR is **~2.3x faster** than mimir's as-deployed default path (the
 `hook_recall.ps1` PowerShell hook - PowerShell's own process-start cost is
 included, since it is a genuine part of that as-deployed latency) - but
 mimir's **opt-in warm daemon** (a background process serving `/inject`, single
 best-effort memory only, floor-gated, **not** the same `recall -n 8` + dedup
-algorithm as the cold path) is itself **~3.5x faster than THOR**. On tokens,
-THOR injects **~2.5x more** tokens than mimir's cold path on this sample - the
-reverse of the headline this document used to carry.
+algorithm as the cold path) is itself **~4x faster than THOR** and injects the
+fewest tokens by far - with the plain caveat that it is faster and quieter
+because it serves less: **5 of the 20 prompts got an empty injection** (below
+its single-memory relevance floor; the same five prompt positions as the
+earlier round, i.e. deterministic floor behavior, counted as 0 in the
+average). Faster and cheaper, but lower coverage on the same prompts. On
+tokens, THOR injects **~2.9x more** than mimir's cold path on this set - the
+reverse of the headline this document once carried, and slightly worse than
+the earlier same-day round (579 -> 679 avg; the plausible causes are THOR's
+own round-2 changes - symbol-boundary chunking moved chunk boundaries and the
+courier's chunk windows were deliberately widened for drift catches within
+the same budget ceiling - reported as measured).
 
-Investigated, not papered over: this round's smaller 20-prompt sample leans
-heavily on Project 3 scenarios, and several of those prompts surface
-long `[global]`-tier THOR facts (in scope regardless of cwd) rather than short
-project-local snippets, which pulls THOR's average up. The old "~1.5x faster /
-~2.1x fewer tokens" headline does not hold on this sample and is retired.
-Absolute numbers move with prompt set and machine load between runs (this
-document has now measured THOR between 83 and 268 ms depending on the set) -
-treat ratios, not any single absolute number, as the takeaway, and treat this
-round's ratios as a fresh, honestly sample-dependent measurement rather than a
-refutation of the old figures.
+The old "~1.5x faster / ~2.1x fewer tokens" headline does not hold on this
+prompt set and stays retired. THOR's 253 ms median is also **marginally over
+its own 250 ms latency guardrail** (see Honest weaknesses). Absolute numbers
+move with machine load between runs (mimir's cold path re-measured 563.5 ->
+589.5 ms on an unchanged store and identical injected chars) - treat ratios,
+not any single absolute number, as the takeaway.
 
 Resident RAM was not re-measured this round; the last measured figures were
 ~570 MB (THOR, semantic daemon) / 0 (THOR, bm25 default) and ~700 MB observed
 for mimir. mimir's warm daemon here is opt-in (off by default); its cold path
-runs a fast mode that skips the embedder, though on this sample the
-PowerShell hook's own process-start cost dominates its latency regardless.
+runs a fast mode that skips the embedder, though on this set the PowerShell
+hook's own process-start cost dominates its latency regardless.
 
 ## What each is built for (structural)
 
@@ -225,8 +254,9 @@ PowerShell hook's own process-start cost dominates its latency regardless.
 
 - **It has the answer at all (coverage).** THOR chunks your repositories into the
   same index auto-recall searches, so a code question is answered automatically at
-  the prompt. mimir keeps code in a separate graph you must call by hand - great
-  for "which functions call X", but it never fires at a session boundary.
+  the prompt. mimir's new code-content indexing narrows this gap (it now wins the
+  code-structure category and the multi-project test), but THOR still leads
+  overall coverage as deployed (68.5% vs 59.8%).
 - **It ranks better on equal footing (score-fusion + class prior + density
   snippets).** THOR fuses lexical bm25 with a dense multilingual embedding,
   routes knowledge-phrased questions toward hand-written facts, and cuts its
@@ -234,17 +264,18 @@ PowerShell hook's own process-start cost dominates its latency regardless.
   round; previous round: +8 points on the broad shared set, though on the
   strictest dual-written cut mimir stayed ahead by ~3 points - see Test 2
   above.)*
-- **It compensates for session drift on every channel.** The as-deployed
-  auto-injection, correctly per-scenario project-scoped this round, surfaces
-  the drift-preventing fact more often than mimir at its best (74.0% vs 56.2%)
-  and fully catches it more often (47.9% vs 42.5%) - and the pins +
-  file-touch/command guards (with exact author-declared anchors) cover the
-  windows prompt-association cannot reach, by construction.
-- **It is faster than mimir's default path.** ~2.4x lower latency than mimir's
-  as-deployed cold hook (234 ms vs 564 ms) on this round's sample - though
-  mimir's opt-in warm daemon is faster still (66 ms), and on this sample THOR
-  injects more tokens than mimir's cold path, not fewer; see Speed and cost
-  above for the honest full picture.
+- **It compensates for session drift on every channel.** Both THOR channels
+  surface the drift-preventing fact more often than mimir at its best (courier
+  69.9% / deliberate 71.2% vs 50.7%) and fully catch it more often (50.7% vs
+  39.7%), and 72.5% of courier surfacings are now full catches (up from 64.7%,
+  the wider chunk windows) - and the pins + file-touch/command guards (with
+  exact author-declared anchors) cover the windows prompt-association cannot
+  reach, by construction.
+- **It is faster than mimir's default path.** ~2.3x lower latency than mimir's
+  as-deployed cold hook (253 ms vs 589.5 ms) on the canonical prompt set -
+  though mimir's opt-in warm daemon is faster still (62 ms, at lower coverage:
+  5 of 20 prompts get nothing), and THOR injects more tokens than mimir's cold
+  path, not fewer; see Speed and cost above for the honest full picture.
 - **It never loses a write.** Every fact is an event in a hash-chained append-only
   log; a conflicting edit branches (both heads kept and surfaced) instead of
   overwriting, and `fsck` recomputes the chain so tampering is detectable.
@@ -253,23 +284,30 @@ PowerShell hook's own process-start cost dominates its latency regardless.
 
 ## Honest weaknesses
 
-- **mimir retakes the overall multi-project lead (96.7% vs 94.4%).** Its new
-  code-content indexing closed what used to be THOR's biggest structural edge
-  (Project 3 went from a 16.6-point THOR lead to a dead-even tie) and widened
-  mimir's lead on the curated-docs project (100.0% vs 90.0%).
-- **mimir now wins code-structure on Test 1 (57.6% vs 53.8%).** Its own
-  tree-sitter code-chunk indexing (`CodeChunk`), folded into ordinary
-  `recall`, catches up on symbol-shaped questions - the one Test 1 category
-  THOR does not lead this round.
-- **Only one v4 target was reached.** Of this round's categories, only
-  config-how-to cleared an 80% bar on Test 1 (THOR 85.3%); every other Test 1
-  category, and every drift metric on all three channels (courier / deliberate
-  / mimir, both surfaced and clear-catch), stayed below 80%.
-- **On this round's speed sample, mimir's opt-in warm daemon beats THOR's
-  latency (66 ms vs 234 ms), and THOR injects more tokens than mimir's cold
-  path (579 vs 236)** - the reverse of the headline this document used to
-  carry. See Speed and cost above for the honest full picture and why (a
-  smaller, differently-composed 20-prompt sample this round).
+- **mimir leads the multi-project test outright (98.9% vs 92.2%).** Its
+  code-content indexing erased what used to be THOR's biggest structural edge
+  (Project 3 went from a 16.6-point THOR lead two runs ago to a mimir win,
+  96.7% vs 86.7%), it keeps a perfect score on the curated-docs project
+  (100.0% vs 90.0%), and THOR's only prior project win is now a tie. THOR
+  wins no project outright this round.
+- **mimir keeps code-structure on Test 1 (57.6% vs 50.0%).** Its tree-sitter
+  code-chunk indexing (`CodeChunk`), folded into ordinary `recall`, beats THOR
+  on symbol-shaped questions for the second run running - and THOR's own new
+  dependency-free symbol-boundary source chunker, which landed this round,
+  did not measurably lift the judged score.
+- **The v4 "80% goal" round closed at 0 of 8 gates on this stricter run.**
+  In the same-day earlier run one gate held (config how-to, 85.3%); on this
+  re-run it slipped to 79.4%, and every other Test 1 category and every drift
+  metric on all three channels stayed below 80% as well. Zero of the eight
+  targets stand on the latest measurement.
+- **On the canonical speed set, mimir's opt-in warm daemon beats THOR's
+  latency (62 ms vs 253 ms), and THOR injects more tokens than mimir's cold
+  path (679 vs 236, worse than the earlier round's 579)** - the reverse of
+  the headline this document once carried. The warm daemon's caveat (5 of 20
+  prompts served nothing) is real but does not erase the latency gap.
+- **THOR's courier median (253 ms) is marginally over its own 250 ms
+  guardrail** - the symbol-boundary chunking sits on the freshness path and
+  the budget needs to be won back.
 - **On the strictest dual-written cut mimir won (94.3% vs 91.5%), as of the
   last time Test 2 was measured (v3 round; not re-measured this round - see
   Test 2 above).** Pure memory recall over a small, clean set of hand-written
@@ -286,12 +324,14 @@ PowerShell hook's own process-start cost dominates its latency regardless.
   drift mechanism IS reproducible in-repo via `examples/drift_eval.rs` and its
   committed synthetic corpus, unaffected by this round's numbers above). This
   round every re-measured test (Test 1, Test 3, drift) is scored by a 3-judge
-  median across three distinct judge lenses, blind with a seeded relabel; Test
-  2 was not re-measured this round. Jury strictness and prompt-set composition
-  move absolute numbers between runs - the drift correction and the speed
-  reversal above are two concrete examples this round. THOR pinned at commit
-  `80d001c`, mimir at unreleased main commit `f98c7fd` built from source, no
-  store writes between hit generation and judging.
+  median across three distinct judge lenses, blind with a fresh salted seeded
+  relabel; Test 2 was not re-measured. Jury strictness moves absolute numbers
+  between runs even with a 3-judge median - both systems scored lower on Test
+  1 than the same-day earlier round on an identical corpus, and the earlier
+  round's drift correction and speed reversal are further concrete examples.
+  THOR pinned at commit `b98c75b`, mimir unchanged at unreleased main commit
+  `f98c7fd` built from source, no store writes between hit generation and
+  judging.
 
 ## Method
 
@@ -301,8 +341,9 @@ PowerShell hook's own process-start cost dominates its latency regardless.
   `--cwd` for the drift courier's corrected project scoping) - for THOR;
   `mimir recall --json` for mimir.
 - Judging: every item blind - systems relabelled A/B(/C) with a seeded
-  deterministic mapping per question id (`sha256(id) % 2` for the 2-way
-  tests, `% 6` for the 3-way drift permutation) - scored 0-2 for
+  deterministic mapping per question id (`sha256(salt + id) % 2` for the
+  2-way tests, `% 6` for the 3-way drift permutation; the salt is fresh per
+  round, so each round's blind maps genuinely reshuffle) - scored 0-2 for
   answer-presence by a **3-judge median** (three distinct judge lenses) for
   every test this round. Hit text is **not** id-stripped: system-revealing
   markers (`m:`/`d:`/`c:` prefixes, bare THOR ULIDs, chunk ids, and THOR's
@@ -310,8 +351,11 @@ PowerShell hook's own process-start cost dominates its latency regardless.
   by relabeling, not by redaction.
 - Latency: `thor courier` (production hook) vs mimir's production
   `hook_recall.ps1` (cold, as-deployed default) and mimir's opt-in warm
-  `/inject` daemon, wall-clock, median of 20, same 20 prompts for every
-  channel.
+  `/inject` daemon, wall-clock, median of 20, the canonical fixed 20-prompt
+  set for every channel; each channel's timed loop runs alone, with a
+  discarded warm-up call and fresh per-run session ids (a first attempt that
+  reused a session id was suppressed by the courier's own session ledger and
+  was discarded and fully re-run).
 - Test 1 = 200 questions (118 shared-knowledge + 82 category-stratified) over
   THOR's store. Test 2 = the 118 whose source fact both stores hold, with the
   53-question strict dual-written cut (not re-measured this round). Test 3 =
@@ -320,9 +364,10 @@ PowerShell hook's own process-start cost dominates its latency regardless.
   chunks. Drift = 73 fresh-session task prompts (74 raw scenarios, one
   duplicate seq deduped) built from the store's gotchas and decisions, three
   channels measured per scenario, courier scoped per-scenario to its actual
-  home project this round (see the correction note above); scenarios without a
-  home project run PROJECTLESS on both systems (a neutral working directory).
+  home project (see the correction note above); scenarios without a home
+  project run PROJECTLESS on both systems (a neutral working directory).
   No writes were made to either store between hit generation and judging
-  (verified with `thor fsck`). THOR pinned at commit `80d001c`; mimir at
-  unreleased upstream main commit `f98c7fd`, built from source. Numbers are
-  the measured aggregates.
+  (verified with `thor fsck`). THOR pinned at commit `b98c75b` (store
+  re-ingested under the new symbol-boundary chunking, semantic sidecar fully
+  synced before measuring); mimir unchanged at unreleased upstream main
+  commit `f98c7fd`, built from source. Numbers are the measured aggregates.

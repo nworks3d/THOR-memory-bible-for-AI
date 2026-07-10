@@ -72,7 +72,12 @@ for "which functions call X". THOR chunks source into recall instead. See
   code chunks, hits matching the WHOLE question tightly outrank one-word tf
   spam, and slot 3 is reserved for a close-ranked typed constraint
   (gotcha/decision/preference) when none made the top - while code-phrased
-  queries get none of this, so code ranking stays untouched. Hook/debounce
+  queries get none of this, so code ranking stays untouched. A fact stored
+  with `triggers` ("when should this fire?" - commands, file names, error
+  strings) carries a `fires-when` footer field: a prompt hitting those words
+  gives the fact a bounded boost, and it may compete from below the relevance
+  floor - the author declared exactly this moment. Facts without the field
+  rank exactly as before, by construction. Hook/debounce
   state lives in one SQLite sidecar (`thor-ledger.db`), so parallel hooks and
   sessions never lose each other's entries.
 - **Drift hooks.** Pin standing rules (`thor pin`) and SessionStart re-injects

@@ -106,6 +106,13 @@ pub struct RememberArgs {
     /// Free-form tags, stored in the footer for later search.
     #[serde(default)]
     pub tags: Option<Vec<String>>,
+    /// WHEN should this fact fire? The exact task words a future prompt would
+    /// contain when this fact matters: commands ("docker compose"), file names
+    /// ("deploy-watcher.sh"), error strings ("subsystem request failed").
+    /// Stored as a fires-when footer field; a query hitting these words gets a
+    /// deliberate ranking boost toward this fact.
+    #[serde(default)]
+    pub triggers: Option<Vec<String>>,
 }
 
 #[derive(Deserialize, schemars::JsonSchema)]
@@ -295,7 +302,7 @@ impl ThorServer {
         .await
     }
 
-    #[tool(description = "Store a NEW fact (fact_created). Recall first; a near-duplicate of a live fact is refused with a pointer to it. Accepts fact_type (gotcha|decision|preference) and tags.")]
+    #[tool(description = "Store a NEW fact (fact_created). Recall first; a near-duplicate of a live fact is refused with a pointer to it. Accepts fact_type (gotcha|decision|preference), tags, and triggers - ask yourself WHEN this fact should fire and pass those exact task words (commands, file names, error strings) so future recall boosts it at the right moment.")]
     async fn remember(&self, Parameters(args): Parameters<RememberArgs>) -> String {
         let server_project = self.project.clone();
         self.blocking(move |s| {
@@ -337,7 +344,11 @@ impl ThorServer {
             // Only when the caller passed a type or tags.
             let clean_body = body.to_string();
             let mut body = body.to_string();
-            if args.fact_type.is_some() || args.tags.as_deref().is_some_and(|t| !t.is_empty()) {
+            let triggers = args.triggers.unwrap_or_default();
+            if args.fact_type.is_some()
+                || args.tags.as_deref().is_some_and(|t| !t.is_empty())
+                || !triggers.is_empty()
+            {
                 let scope_label = crate::repo::owner_project(&entity_id)
                     .map(str::to_string)
                     .unwrap_or_else(|| "global".into());
@@ -345,6 +356,7 @@ impl ThorServer {
                     args.fact_type.as_deref().unwrap_or("note"),
                     &args.tags.unwrap_or_default(),
                     &scope_label,
+                    &triggers,
                 );
                 body.push_str("\n\n");
                 body.push_str(&footer);
@@ -774,7 +786,14 @@ mod tests {
     }
 
     fn remember_args(body: &str) -> RememberArgs {
-        RememberArgs { body: body.into(), entity_id: None, project: None, fact_type: None, tags: None }
+        RememberArgs {
+            body: body.into(),
+            entity_id: None,
+            project: None,
+            fact_type: None,
+            tags: None,
+            triggers: None,
+        }
     }
 
     #[tokio::test]
@@ -827,6 +846,7 @@ mod tests {
                 project: None,
                 fact_type: Some("decision".into()),
                 tags: Some(vec!["zephyr".into(), "test".into()]),
+                triggers: None,
             }))
             .await;
         assert!(stored.starts_with("stored entity mcp-"), "got: {stored}");
@@ -860,6 +880,7 @@ mod tests {
                 project: None,
                 fact_type: Some("gotcha".into()),
                 tags: Some(vec!["db".into()]),
+                triggers: None,
             }))
             .await;
         assert!(first.starts_with("stored entity"), "{first}");
@@ -871,6 +892,7 @@ mod tests {
                 project: None,
                 fact_type: Some("gotcha".into()),
                 tags: None,
+                triggers: None,
             }))
             .await;
         assert!(dup.contains("NOT stored"), "typed footer must not defeat dup detection: {dup}");
@@ -884,6 +906,7 @@ mod tests {
                 project: Some("ProjA".into()),
                 fact_type: None,
                 tags: None,
+                triggers: None,
             }))
             .await;
         assert!(a.starts_with("stored entity"), "{a}");
@@ -894,6 +917,7 @@ mod tests {
                 project: Some("ProjB".into()),
                 fact_type: None,
                 tags: None,
+                triggers: None,
             }))
             .await;
         assert!(
@@ -912,6 +936,7 @@ mod tests {
                 project: Some("acme:widgets".into()),
                 fact_type: None,
                 tags: None,
+                triggers: None,
             }))
             .await;
         assert!(
@@ -932,6 +957,7 @@ mod tests {
                 project: None,
                 fact_type: None,
                 tags: None,
+                triggers: None,
             }))
             .await;
         assert!(out.contains("NOT stored"), "{out}");
@@ -946,6 +972,7 @@ mod tests {
                 project: None,
                 fact_type: None,
                 tags: None,
+                triggers: None,
             }))
             .await;
         assert!(chunk.contains("chunk"), "{chunk}");

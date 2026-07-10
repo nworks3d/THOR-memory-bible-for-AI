@@ -627,8 +627,10 @@ fn capture_nudge(db: &Path, hook: &Value, haystack_lower: &str) -> Option<String
     Some(
         "[THOR capture] This reply looks like it contains a durable decision, gotcha, or \
          milestone (project start, code/data move, direction change). If it is durable and \
-         not yet stored: store it in THOR now (remember - concise and self-contained). If it \
-         is already stored or not durable, just finish. This nudge fires at most once per session."
+         not yet stored: store it in THOR now (remember - concise and self-contained), and ask \
+         yourself WHEN it should fire: pass those task words (commands, file names, error \
+         strings) as triggers. If it is already stored or not durable, just finish. This nudge \
+         fires at most once per session."
             .to_string(),
     )
 }

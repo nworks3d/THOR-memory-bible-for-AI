@@ -375,6 +375,38 @@ const TIGHT_BONUS: f64 = 0.15;
 #[cfg(feature = "semantic")]
 const TIGHT_WINDOW_CHARS: usize = 240;
 
+/// Author-declared firing vocabulary: a fact stored with `triggers` carries a
+/// `fires-when:` footer field naming the task words that should surface it.
+/// A query hitting those words is a DELIBERATE match the author asked for -
+/// scored over the TRIGGER terms (matched/declared), not the query terms, so
+/// a long task prompt touching two of three declared triggers still fires
+/// strongly. Bounded like every other delta: it breaks near-ties, it never
+/// lifts an unrelated fact over a strong lexical/semantic match. Facts
+/// without the field always score 0 - pre-existing ranking is untouched by
+/// construction. NOT semantic-gated: the boost is pure lexical work and must
+/// fire identically on the bm25-only path (non-semantic builds, the courier's
+/// no-sidecar fallback).
+const TRIGGER_WEIGHT: f64 = 0.35;
+
+fn trigger_bonus(body: &str, qterms: &[String]) -> f64 {
+    if qterms.is_empty() {
+        return 0.0;
+    }
+    let Some(fires) = crate::footer::fires_when(body) else {
+        return 0.0;
+    };
+    let tterms: Vec<String> = fires
+        .split_whitespace()
+        .map(|t| fold_diacritics(&t.to_lowercase()))
+        .filter(|t| t.chars().count() >= 3)
+        .collect();
+    if tterms.is_empty() {
+        return 0.0;
+    }
+    let matched = tterms.iter().filter(|t| qterms.iter().any(|q| q == *t)).count();
+    TRIGGER_WEIGHT * (matched as f64 / tterms.len() as f64)
+}
+
 #[cfg(feature = "semantic")]
 fn coverage_bonus(body: &str, qterms: &[String]) -> f64 {
     if qterms.is_empty() {
@@ -456,12 +488,18 @@ fn fts_query_and(text: &str) -> Option<String> {
 /// relevance floor and near-duplicate collapse, until `limit` heads are kept.
 /// There is NO fixed candidate window: iterating lazily can never let the many
 /// superseded revs of one frequently-revised entity starve its current head.
+/// How many rank-ordered rows past the relevance floor are still scanned for
+/// author-declared trigger carriers before giving up (bounds the extra cost on
+/// a huge OR cursor).
+const FLOOR_TRIGGER_SCAN_CAP: usize = 200;
+
 fn collect_heads(
     store: &EventStore,
     fts: &str,
     by_seq: &HashMap<i64, &Event>,
     heads: &HashMap<String, crate::cas::HeadSet>,
     filter: &ScopeFilter,
+    qterms: &[String],
     limit: usize,
 ) -> Vec<RecallHit> {
     let conn = store.conn();
@@ -478,6 +516,7 @@ fn collect_heads(
     let mut seen: HashSet<String> = HashSet::new();
     let mut seen_prefixes: Vec<String> = Vec::new();
     let mut best_rank: Option<f64> = None;
+    let mut below_floor = 0usize;
     for row in rows {
         let (seq, rank) = match row {
             Ok(pair) => pair,
@@ -500,11 +539,21 @@ fn collect_heads(
         if !seen.insert(ev.this_hash.clone()) {
             continue;
         }
-        // Relevance floor: once we have the strongest head, stop at the first hit
-        // far weaker than it (rows are rank-sorted, so all remaining are weaker too).
+        // Relevance floor: once we have the strongest head, hits far weaker
+        // than it are junk (rows are rank-sorted, so everything after is
+        // weaker too) - EXCEPT an author-declared trigger match: a fires-when
+        // fact competes from below the floor, because being findable on weak
+        // lexical evidence is exactly what declaring triggers is for. The
+        // continued scan is bounded (FLOOR_TRIGGER_SCAN_CAP rows).
         if let Some(best) = best_rank {
             if rank > best * RELEVANCE_FLOOR_FRAC {
-                break;
+                below_floor += 1;
+                if below_floor > FLOOR_TRIGGER_SCAN_CAP {
+                    break;
+                }
+                if trigger_bonus(&ev.body, qterms) == 0.0 {
+                    continue;
+                }
             }
         }
         // Near-duplicate collapse: skip a body whose normalized prefix duplicates
@@ -653,16 +702,66 @@ fn recall_scoped_inner(
     // AND-first: prefer memories that match the WHOLE question over a single-word
     // coincidence; fall back to the OR query only when the strict pass finds no
     // head. collect_heads applies the relevance floor + near-duplicate collapse.
+    // The pool is a little wider than `limit` so an author-declared trigger hit
+    // sitting just below the cut can be boosted into it (see trigger_boost).
+    let qterms: Vec<String> = {
+        let mut seen = HashSet::new();
+        content_tokens(query)
+            .iter()
+            .map(|t| fold_diacritics(&t.to_lowercase()))
+            .filter(|t| seen.insert(t.clone()))
+            .collect()
+    };
+    let fetch = limit.saturating_add(TRIGGER_POOL_EXTRA);
     if let Some(aq) = and_query {
-        let mut strict = collect_heads(store, &aq, &by_seq, &heads, &filter, limit);
+        let mut strict = collect_heads(store, &aq, &by_seq, &heads, &filter, &qterms, fetch);
         if !strict.is_empty() {
             for h in &mut strict {
                 h.matched_and = true; // every content term matched: strong evidence
             }
-            return Ok(strict);
+            return Ok(trigger_boost(strict, &qterms, limit));
         }
     }
-    Ok(collect_heads(store, &or_query, &by_seq, &heads, &filter, limit))
+    let pool = collect_heads(store, &or_query, &by_seq, &heads, &filter, &qterms, fetch);
+    Ok(trigger_boost(pool, &qterms, limit))
+}
+
+/// Extra heads collected past `limit` purely as trigger-boost headroom.
+const TRIGGER_POOL_EXTRA: usize = 8;
+
+/// The lexical-path trigger boost: rescore the collected pool as (min-max
+/// normalized bm25) + trigger_bonus and cut to `limit`. When NO collected hit
+/// carries a fires-when field, the pool is returned in plain bm25 order
+/// truncated to `limit` - byte-identical to the pre-trigger behavior by
+/// construction (the wider fetch walks the same rank-ordered cursor).
+fn trigger_boost(mut hits: Vec<RecallHit>, qterms: &[String], limit: usize) -> Vec<RecallHit> {
+    let bonuses: Vec<f64> = hits.iter().map(|h| trigger_bonus(&h.body, qterms)).collect();
+    if bonuses.iter().all(|b| *b == 0.0) {
+        hits.truncate(limit);
+        return hits;
+    }
+    // FTS5 bm25 rank: more negative = stronger. Normalize the pool to [0,1]
+    // (strongest = 1.0) so the bounded bonus trades against lexical strength
+    // exactly like on the fused path.
+    let (rmin, rmax) = hits
+        .iter()
+        .fold((f64::MAX, f64::MIN), |(lo, hi), h| (lo.min(h.rank), hi.max(h.rank)));
+    let span = rmax - rmin;
+    let mut order: Vec<usize> = (0..hits.len()).collect();
+    let score = |i: usize| {
+        let norm = if span > 0.0 { (rmax - hits[i].rank) / span } else { 1.0 };
+        norm + bonuses[i]
+    };
+    // stable + deterministic: equal scores keep bm25 order
+    order.sort_by(|&a, &b| score(b).partial_cmp(&score(a)).unwrap_or(std::cmp::Ordering::Equal).then(a.cmp(&b)));
+    let mut out: Vec<RecallHit> = Vec::with_capacity(limit.min(hits.len()));
+    let mut slots: Vec<Option<RecallHit>> = hits.drain(..).map(Some).collect();
+    for i in order.into_iter().take(limit) {
+        if let Some(h) = slots[i].take() {
+            out.push(h);
+        }
+    }
+    out
 }
 
 /// Unscoped bm25 recall (every project + global). Thin wrapper over `recall_scoped`.
@@ -995,14 +1094,15 @@ pub fn recall_fused_scoped(
                 None => 0.0,
             };
             let cos = cos_by_seq.get(&seq).copied().unwrap_or(0.0).max(0.0);
-            let (delta, coverage) = match by_seq.get(&seq) {
+            let (delta, coverage, trigger) = match by_seq.get(&seq) {
                 Some(ev) => (
                     class_delta(route, source_class(&ev.entity_id)),
                     coverage_bonus(&ev.body, &qterms),
+                    trigger_bonus(&ev.body, &qterms),
                 ),
-                None => (0.0, 0.0),
+                None => (0.0, 0.0, 0.0),
             };
-            (seq, rank.unwrap_or(0.0), bm_norm + lambda * cos + delta + coverage)
+            (seq, rank.unwrap_or(0.0), bm_norm + lambda * cos + delta + coverage + trigger)
         })
         .collect();
     // Total order (NaN-safe) with a deterministic seq tie-break, so equal fused
@@ -1049,6 +1149,54 @@ mod tests {
         let none = RecallScope::current(None);
         assert!(none.allows(None) && none.allows(Some("@global")), "projectless -> global tier only");
         assert!(!none.allows(Some("ProjA")), "projectless hides all projects");
+    }
+
+    #[test]
+    fn test_lexical_trigger_boost_rescues_declared_fact_from_below_the_floor() {
+        // One distractor matches three query words tightly - so strong that
+        // the relevance floor cuts everything else out of the pool. The
+        // preventer's own prose shares NO query word; only its footer carries
+        // them. Control store: the exact same words as plain tags (identical
+        // FTS strength) - only the fires-when FIELD may make the difference,
+        // not the words' presence.
+        let seed = |field: &str| {
+            let mut store = EventStore::in_memory().unwrap();
+            store
+                .append_event("s", "l", "a", EventKind::FactCreated, "d-strong", None,
+                    "DECISION: bladeren door een reeks preloadt de volgende twee previews, niet meer.")
+                .unwrap();
+            store
+                .append_event("s", "l", "a", EventKind::FactCreated, "d-weak1", None,
+                    "NOTE: de cache-map is veilig te legen; hij wordt lazy heropgebouwd.")
+                .unwrap();
+            store
+                .append_event("s", "l", "a", EventKind::FactCreated, "d-weak2", None,
+                    "NOTE: previews gebruiken de embedded JPEG uit het RAW-bestand.")
+                .unwrap();
+            store
+                .append_event("s", "l", "a", EventKind::FactCreated, "prev", None,
+                    &format!("de verkleiner houdt een strak geheugenbudget aan; grote sets gaan in delen\n\n[memory/decision | {field} | project: global]"))
+                .unwrap();
+            store
+        };
+        let query =
+            "de previews openen traag; versnel de thumbnails met een cache zodat bladeren door een reeks vlot gaat";
+
+        let tagged = seed("tags: x | fires-when: thumbnails cache previews versnellen");
+        let hits = recall(&tagged, query, 3).unwrap();
+        assert!(
+            hits.iter().any(|h| h.entity_id == "prev"),
+            "declared triggers rescue the fact past the relevance floor: {:?}",
+            hits.iter().map(|h| &h.entity_id).collect::<Vec<_>>()
+        );
+
+        let control = seed("tags: thumbnails cache previews versnellen");
+        let hits = recall(&control, query, 3).unwrap();
+        assert!(
+            hits.iter().all(|h| h.entity_id != "prev"),
+            "same words as plain tags get no boost - the FIELD is the signal: {:?}",
+            hits.iter().map(|h| &h.entity_id).collect::<Vec<_>>()
+        );
     }
 
     #[test]
@@ -1394,6 +1542,26 @@ mod fused_tests {
         // code-routed queries never get a delta, for any class
         assert_eq!(class_delta(QueryRoute::Code, SourceClass::Memory), 0.0);
         assert_eq!(class_delta(QueryRoute::Code, SourceClass::Doc), 0.0);
+    }
+
+    #[test]
+    fn test_trigger_bonus_fires_only_on_declared_vocabulary() {
+        let q: Vec<String> =
+            ["export", "resume", "progressbar"].iter().map(|s| s.to_string()).collect();
+        let tagged = "the export rule\n\n[memory/gotcha | tags: x | fires-when: export progressbar | project: P]";
+        let untagged = "the export rule about export and progressbar, mentioned inline";
+        let full = trigger_bonus(tagged, &q);
+        assert!((full - TRIGGER_WEIGHT).abs() < 1e-9, "both declared triggers matched: {full}");
+        assert_eq!(trigger_bonus(untagged, &q), 0.0, "no fires-when field = no bonus, ever");
+        // partial: one of two declared triggers matched = half the weight
+        let half = trigger_bonus(
+            "r\n\n[memory/note | tags: | fires-when: export tarball | project: P]",
+            &q,
+        );
+        assert!((half - TRIGGER_WEIGHT / 2.0).abs() < 1e-9, "matched/declared scoring: {half}");
+        // an unrelated query never fires
+        let other: Vec<String> = ["courier", "snippet"].iter().map(|s| s.to_string()).collect();
+        assert_eq!(trigger_bonus(tagged, &other), 0.0);
     }
 
     #[test]

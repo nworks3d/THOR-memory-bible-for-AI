@@ -39,6 +39,7 @@ fn main() -> anyhow::Result<()> {
     let mut scope_arg = "all".to_string();
     let mut full = false;
     let mut channel = "fused".to_string();
+    let mut db_override: Option<PathBuf> = None;
     let mut cwd: Option<String> = None;
     let mut rerank = false;
 
@@ -52,6 +53,7 @@ fn main() -> anyhow::Result<()> {
             "--scope" => scope_arg = args.next().unwrap_or_else(|| "all".into()),
             "--full" => full = true,
             "--channel" => channel = args.next().unwrap_or_else(|| "fused".into()),
+            "--db" => db_override = args.next().map(PathBuf::from),
             "--cwd" => cwd = args.next(),
             "--rerank" => rerank = true,
             other => anyhow::bail!("unknown argument '{}'", other),
@@ -60,9 +62,13 @@ fn main() -> anyhow::Result<()> {
     let queries_path = queries_path.ok_or_else(|| anyhow::anyhow!("--queries is required"))?;
     let out_path = out_path.ok_or_else(|| anyhow::anyhow!("--out is required"))?;
 
-    let db = thor::ledger::data_dir()
-        .ok_or_else(|| anyhow::anyhow!("no data dir (LOCALAPPDATA/XDG_DATA_HOME/HOME unset)"))?
-        .join("thor.db");
+    // --db <path> targets a store clone (A-B experiments); default = the live store.
+    let db = match db_override {
+        Some(p) => p,
+        None => thor::ledger::data_dir()
+            .ok_or_else(|| anyhow::anyhow!("no data dir (LOCALAPPDATA/XDG_DATA_HOME/HOME unset)"))?
+            .join("thor.db"),
+    };
 
     let items: Vec<serde_json::Value> =
         serde_json::from_reader(std::fs::File::open(&queries_path)?)?;

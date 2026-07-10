@@ -605,6 +605,12 @@ fn path_affinity_bonus(entity_id: &str, qterms: &[String]) -> f64 {
     if parts.is_empty() || (parts.len() == 1 && PATH_STEM_STOPLIST.contains(&parts[0].as_str())) {
         return 0.0;
     }
+    // A camelCase/snake_case query token names the file as ONE token
+    // ("useConfirm" -> useconfirm == join(use, confirm)): full-stem evidence.
+    let joined: String = parts.concat();
+    if qterms.iter().any(|q| *q == joined) {
+        return PATH_AFFINITY_BONUS;
+    }
     let matched = parts.iter().filter(|p| qterms.iter().any(|q| q == *p)).count();
     if matched == parts.len() {
         PATH_AFFINITY_BONUS
@@ -631,6 +637,8 @@ mod path_affinity_tests {
         assert_eq!(path_affinity_bonus("P:thor/src/event_store.rs#1", &q(&["store", "fact"])), 0.0);
         // camelCase splits: both words required, both present
         assert!(path_affinity_bonus("P:src/PrinterDetail.jsx#0", &q(&["printer", "detail"])) > 0.0);
+        // a camelCase QUERY token names the file as one token
+        assert!(path_affinity_bonus("P:src/hooks/useConfirm.jsx#0", &q(&["useconfirm", "return"])) > 0.0);
         // ubiquitous stems never fire, even on an exact match
         assert_eq!(path_affinity_bonus("P:server/index.js#2", &q(&["index"])), 0.0);
         // memories are never path-boosted

@@ -215,6 +215,9 @@ impl ThorServer {
             let fresh_project = cwd.as_deref().and_then(|c| crate::repo::project_key(Path::new(c)));
             let mut out = String::new();
             for hit in hits {
+                // A served hit is an access: counted in the LOCAL ledger (decay
+                // signal for consolidate), never in the synced hash-chained log.
+                crate::ledger::increment(&db, "access", &hit.entity_id);
                 let short = &hit.rev[..hit.rev.len().min(8)];
                 let (fresh_tag, snip) = crate::courier::fresh_snippet(
                     &hit.entity_id, &hit.body, &args.query, 220, fresh_project.as_deref(), cwd.as_deref(),
@@ -239,8 +242,14 @@ impl ThorServer {
 
     #[tool(description = "Show the current head(s) of one THOR entity by id (DIVERGED shows every contested head).")]
     async fn get(&self, Parameters(args): Parameters<GetArgs>) -> String {
+        let db = self.db.clone();
         self.blocking(move |s| {
             let events = s.get_all_events().map_err(|e| format!("error: {e}"))?;
+            // Only an EXISTING entity counts as an access - a typo'd id must not
+            // seed a phantom counter in the ledger.
+            if events.iter().any(|e| e.entity_id == args.entity_id) {
+                crate::ledger::increment(&db, "access", &args.entity_id);
+            }
             Ok(render_get(&args.entity_id, &events))
         })
         .await
@@ -722,6 +731,20 @@ mod tests {
         let (server, _d) = server_with(seed());
         let out = server.recall(Parameters(recall_args("deploy watcher"))).await;
         assert!(out.contains("e1"), "recall must surface the seeded fact: {out}");
+    }
+
+    #[tokio::test]
+    async fn test_get_and_recall_serves_count_access_in_ledger() {
+        let (server, d) = server_with(seed());
+        let db = d.path().join("thor.db");
+        // a miss must not seed a phantom counter
+        let _ = server.get(Parameters(GetArgs { entity_id: "nope".into() })).await;
+        assert_eq!(crate::ledger::counter(&db, "access", "nope"), 0);
+        // one get + one recall serve = two accesses
+        let _ = server.get(Parameters(GetArgs { entity_id: "e1".into() })).await;
+        let out = server.recall(Parameters(recall_args("deploy watcher"))).await;
+        assert!(out.contains("e1"), "precondition: recall must serve e1: {out}");
+        assert_eq!(crate::ledger::counter(&db, "access", "e1"), 2);
     }
 
     #[tokio::test]

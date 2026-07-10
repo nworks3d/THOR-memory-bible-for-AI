@@ -127,7 +127,7 @@ pub fn ingest_repos(
             if repo::truncate_to_max_file_chars(&mut text) {
                 stats.skipped_big += 1;
             }
-            let chunks = repo::chunk_text(&text, repo::MAX_CHUNK_CHARS);
+            let chunks = repo::chunk_file(&rel, &text, repo::MAX_CHUNK_CHARS);
             let total = chunks.len();
             // Markdown chunks carry their heading trail as a footer crumb, so
             // a chunk cut below its heading stays findable by section name.

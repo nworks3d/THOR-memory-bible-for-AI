@@ -702,7 +702,10 @@ pub(crate) fn freshness(entity_id: &str, stored_body: &str, project: Option<&str
         Err(_) => return Freshness::Stale, // tracked at ingest, unreadable now
     };
     crate::repo::truncate_to_max_file_chars(&mut text);
-    let chunks = crate::repo::chunk_text(&text, crate::repo::MAX_CHUNK_CHARS);
+    // MUST match ingest's chunking byte-for-byte (repo::chunk_file dispatches
+    // source files to the symbol-boundary chunker) or every chunk of a source
+    // file reads as changed forever.
+    let chunks = crate::repo::chunk_file(rel, &text, crate::repo::MAX_CHUNK_CHARS);
     if n >= chunks.len() {
         return Freshness::Stale;
     }

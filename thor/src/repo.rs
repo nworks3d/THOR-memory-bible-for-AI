@@ -278,6 +278,110 @@ pub fn chunk_text(text: &str, max: usize) -> Vec<String> {
     chunks.into_iter().filter(|c| !c.trim().is_empty()).collect()
 }
 
+/// Source extensions that get symbol-boundary chunking. Everything else
+/// (markdown, config, prose) keeps the plain line-packing chunker.
+const SOURCE_EXTS: &[&str] = &[
+    "rs", "js", "jsx", "ts", "tsx", "py", "sh", "bash", "ps1", "psm1", "go", "c", "h", "hpp",
+    "cpp", "cc", "java", "rb", "php", "cs", "swift", "kt",
+];
+
+pub fn is_source_file(rel: &str) -> bool {
+    match rel.rsplit_once('.') {
+        Some((_, ext)) => SOURCE_EXTS.contains(&ext.to_ascii_lowercase().as_str()),
+        None => false,
+    }
+}
+
+/// True when `line` opens a TOP-LEVEL symbol (function/type/class/section of
+/// code): non-indented and led by a definition keyword, after any number of
+/// common visibility/async prefixes. Deliberately a cheap surface check - this
+/// runs on the courier's hot freshness path, so it must stay a linear scan
+/// (no parser, no regex engine).
+fn is_symbol_start(line: &str) -> bool {
+    if line.is_empty() || line.starts_with(char::is_whitespace) {
+        return false;
+    }
+    let mut l = line;
+    loop {
+        let before = l;
+        for p in ["pub(crate) ", "pub(super) ", "pub ", "export ", "default ", "async ",
+                  "unsafe ", "extern \"C\" ", "static ", "final ", "abstract "] {
+            l = l.strip_prefix(p).unwrap_or(l);
+        }
+        if l == before {
+            break;
+        }
+    }
+    const KW: &[&str] = &[
+        "fn ", "impl ", "impl<", "struct ", "enum ", "trait ", "mod ", "macro_rules!",
+        "class ", "def ", "function ", "interface ", "const fn ",
+    ];
+    KW.iter().any(|k| l.starts_with(k))
+}
+
+/// Symbol-boundary chunking for source files: the text is split into blocks at
+/// top-level symbol starts (the preamble - imports, consts - is the first
+/// block), whole blocks are then greedily packed into <= `max`-char chunks so
+/// small symbols share a chunk instead of each minting a near-dup-prone sliver,
+/// and a single block larger than `max` falls back to the plain line packer
+/// INSIDE the block - its parts stay adjacent ordinals, which is exactly what
+/// neighbor stitching re-joins at serving time. Concatenating the returned
+/// chunks reproduces the input byte-for-byte (same invariant as chunk_text -
+/// the freshness comparison depends on it). Idea credit: symbol-boundary code
+/// chunks come from mimir's CodeChunk round (MakerViking/mimir); this is a
+/// dependency-free reimplementation, not tree-sitter.
+pub fn chunk_source(text: &str, max: usize) -> Vec<String> {
+    // 1. blocks at top-level symbol boundaries
+    let mut blocks: Vec<String> = Vec::new();
+    let mut buf = String::new();
+    for line in text.split_inclusive('\n') {
+        if is_symbol_start(line) && !buf.is_empty() {
+            blocks.push(std::mem::take(&mut buf));
+        }
+        buf.push_str(line);
+    }
+    if !buf.is_empty() {
+        blocks.push(buf);
+    }
+    // 2. pack whole blocks up to max; oversized blocks split internally
+    let mut chunks: Vec<String> = Vec::new();
+    let mut packed = String::new();
+    let mut size = 0usize;
+    for block in blocks {
+        let bl = block.chars().count();
+        if bl > max {
+            if !packed.is_empty() {
+                chunks.push(std::mem::take(&mut packed));
+                size = 0;
+            }
+            chunks.extend(chunk_text(&block, max));
+            continue;
+        }
+        if size + bl > max && !packed.is_empty() {
+            chunks.push(std::mem::take(&mut packed));
+            size = 0;
+        }
+        packed.push_str(&block);
+        size += bl;
+    }
+    if !packed.is_empty() {
+        chunks.push(packed);
+    }
+    chunks.into_iter().filter(|c| !c.trim().is_empty()).collect()
+}
+
+/// THE chunker dispatch, used by ingest AND the courier's freshness re-read:
+/// both sides must chunk byte-for-byte identically or freshness misreports
+/// every chunk of a file as changed. Never call chunk_text/chunk_source
+/// directly for file content - route through here.
+pub fn chunk_file(rel: &str, text: &str, max: usize) -> Vec<String> {
+    if is_source_file(rel) {
+        chunk_source(text, max)
+    } else {
+        chunk_text(text, max)
+    }
+}
+
 /// Markdown files get a heading-trail crumb in the chunk footer; other doc
 /// formats have no `#` headings and code files must never get one (a `#`
 /// comment is not a heading).
@@ -459,6 +563,43 @@ mod tests {
         assert!(without.ends_with("[repo file | Proj/src/a.rs | chunk 1/1]"), "no empty crumb field: {without}");
         assert!(is_crumb_doc("docs/guide.md") && is_crumb_doc("README.MD"));
         assert!(!is_crumb_doc("src/a.rs") && !is_crumb_doc("notes.txt"));
+    }
+
+    #[test]
+    fn symbol_chunker_packs_small_symbols_and_splits_oversized_ones() {
+        for (line, want) in [
+            ("pub fn alpha() {", true),
+            ("fn beta() {", true),
+            ("    fn indented_method() {", false),
+            ("class Foo:", true),
+            ("def foo():", true),
+            ("async def bar():", true),
+            ("export default async function go() {", true),
+            ("let x = 1;", false),
+            ("use std::fs;", false),
+            ("impl Widget {", true),
+        ] {
+            assert_eq!(is_symbol_start(line), want, "{line}");
+        }
+        let big_body = format!("fn big() {{\n{}}}\n", "    line();\n".repeat(20));
+        let text = format!(
+            "use std::fs;\n\nfn a() {{ one(); }}\n\nfn b() {{ two(); }}\n\n{}fn c() {{ three(); }}\n",
+            big_body
+        );
+        let chunks = chunk_source(&text, 80);
+        // concatenation reproduces the input byte-for-byte (freshness invariant)
+        assert_eq!(chunks.concat(), text, "chunk concat must equal input");
+        // small fns pack together instead of minting sliver chunks
+        let a_chunk = chunks.iter().find(|c| c.contains("fn a()")).unwrap();
+        assert!(a_chunk.contains("fn b()"), "small siblings share a chunk: {a_chunk}");
+        // the oversized fn is split internally across ADJACENT chunks
+        let big_parts = chunks.iter().filter(|c| c.contains("line();")).count();
+        assert!(big_parts >= 2, "oversized symbol splits into multiple parts");
+        // a small symbol after the big one starts fresh, never glued mid-symbol
+        assert!(chunks.iter().any(|c| c.contains("fn c()")));
+        // dispatcher: markdown keeps the plain packer, source routes to symbols
+        assert_eq!(chunk_file("docs/x.md", &text, 80), chunk_text(&text, 80));
+        assert_eq!(chunk_file("src/x.rs", &text, 80), chunks);
     }
 
     #[test]

@@ -460,12 +460,21 @@ fn trigger_evidence(body: &str, query: &str, qterms: &[String]) -> (usize, usize
     (generic, identifier, tterms.len())
 }
 
+/// Absolute-evidence scoring, NOT matched/declared ratio. Under sparse tagging
+/// the ratio worked; once the whole typed population carries triggers (the v4
+/// sweep), ratio rewards SHORT lists - a bystander matching 1 of its 2 terms
+/// (0.5) outscored the actual preventer matching 2 of its 5 (0.4), measured as
+/// 3 lost scenarios on the live replay. Matched COUNT is what discriminates
+/// the on-topic fact from its topical siblings; identifier/path matches count
+/// double (a declared file or scoped name appearing verbatim in the prompt is
+/// the strongest firing evidence there is). Bounded at 3 points = full weight.
 fn trigger_bonus(body: &str, query: &str, qterms: &[String]) -> f64 {
     let (generic, identifier, declared) = trigger_evidence(body, query, qterms);
     if declared == 0 {
         return 0.0;
     }
-    TRIGGER_WEIGHT * ((generic + identifier) as f64 / declared as f64)
+    let points = (generic + 2 * identifier).min(3);
+    TRIGGER_WEIGHT * (points as f64 / 3.0)
 }
 
 /// Below-floor rescue takes SPECIFIC evidence, not any partial ratio: at least
@@ -1679,15 +1688,19 @@ mod fused_tests {
         let tagged = "the export rule\n\n[memory/gotcha | tags: x | fires-when: export progressbar | project: P]";
         let untagged = "the export rule about export and progressbar, mentioned inline";
         let full = trigger_bonus(tagged, raw, &q);
-        assert!((full - TRIGGER_WEIGHT).abs() < 1e-9, "both declared triggers matched: {full}");
+        assert!(
+            (full - TRIGGER_WEIGHT * 2.0 / 3.0).abs() < 1e-9,
+            "two matched generic terms = 2 evidence points: {full}"
+        );
         assert_eq!(trigger_bonus(untagged, raw, &q), 0.0, "no fires-when field = no bonus, ever");
-        // partial: one of two declared triggers matched = half the weight
-        let half = trigger_bonus(
+        // absolute evidence: one matched term scores the same regardless of
+        // how long the declared list is (ratio no longer rewards short lists)
+        let one = trigger_bonus(
             "r\n\n[memory/note | tags: | fires-when: export tarball | project: P]",
             raw,
             &q,
         );
-        assert!((half - TRIGGER_WEIGHT / 2.0).abs() < 1e-9, "matched/declared scoring: {half}");
+        assert!((one - TRIGGER_WEIGHT / 3.0).abs() < 1e-9, "one evidence point: {one}");
         // an unrelated query never fires
         let other: Vec<String> = ["courier", "snippet"].iter().map(|s| s.to_string()).collect();
         assert_eq!(trigger_bonus(tagged, "courier snippet", &other), 0.0);
@@ -1713,7 +1726,10 @@ mod fused_tests {
         let raw = "werk server/lib/be-postal.json bij met de nieuwe fusiegemeenten";
         let q: Vec<String> = tokens(raw);
         let bonus = trigger_bonus(tagged, raw, &q);
-        assert!((bonus - TRIGGER_WEIGHT).abs() < 1e-9, "path trigger fires via containment: {bonus}");
+        assert!(
+            (bonus - TRIGGER_WEIGHT * 2.0 / 3.0).abs() < 1e-9,
+            "one identifier match = 2 evidence points: {bonus}"
+        );
         // and not on an unrelated prompt that merely shares fragments
         let other = "de server leest json config bij het opstarten";
         assert_eq!(trigger_bonus(tagged, other, &tokens(other)), 0.0);

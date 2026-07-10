@@ -515,6 +515,9 @@ pub(crate) const DELIBERATE_CHUNK_CAP: usize = 500;
 /// failure mode is an answer SPLIT across a chunk boundary, so the joined text
 /// gets room for a window that spans the seam.
 pub(crate) const DELIBERATE_STITCHED_CAP: usize = 900;
+/// Wider window for depth-2 stitched MARKDOWN chunks: doc answers spread over
+/// several short sections, and the joined text is up to five chunks long.
+pub(crate) const DELIBERATE_STITCHED_DOC_CAP: usize = 1200;
 
 /// The current live single-head body of an entity: None when absent, diverged
 /// (a contested neighbor is not safe stitching material) or retracted.
@@ -536,12 +539,24 @@ fn live_head_body(store: &EventStore, entity_id: &str) -> Option<String> {
     Some(ev.body.clone())
 }
 
-/// The `<prefix>#<n-1>` / `<prefix>#<n+1>` sibling ids of a chunk id.
-fn neighbor_ids(entity_id: &str) -> Option<(Option<String>, String)> {
+/// Sibling chunk ids of `entity_id` up to `depth` on each side, nearest first:
+/// ([n-1, n-2, ...], [n+1, n+2, ...]).
+fn neighbor_ids(entity_id: &str, depth: usize) -> Option<(Vec<String>, Vec<String>)> {
     let (prefix, n) = entity_id.rsplit_once('#')?;
     let n: usize = n.parse().ok()?;
-    let prev = n.checked_sub(1).map(|p| format!("{prefix}#{p}"));
-    Some((prev, format!("{prefix}#{}", n + 1)))
+    let before = (1..=depth).filter_map(|d| n.checked_sub(d).map(|p| format!("{prefix}#{p}"))).collect();
+    let after = (1..=depth).map(|d| format!("{prefix}#{}", n + d)).collect();
+    Some((before, after))
+}
+
+/// Stitching depth per chunk kind: markdown sections fragment answers across
+/// MORE boundaries than code (a doc answer often spans several short
+/// sections), so doc chunks pull two neighbors each side where code pulls one.
+fn stitch_depth(entity_id: &str) -> usize {
+    entity_id
+        .split_once(':')
+        .map(|(_, rest)| rest.rsplit_once('#').map_or(rest, |(rel, _)| rel))
+        .map_or(1, |rel| if crate::repo::is_crumb_doc(rel) { 2 } else { 1 })
 }
 
 /// Deliberate-path serving (MCP recall, CLI recall, benchmark harness): a
@@ -574,20 +589,38 @@ pub fn serve_deliberate(
     // Stitch stored neighbors (live heads only; fail-open to the bare chunk).
     // Neighbors come from the store, not the live file, so the benchmark and
     // the MCP surface serve identically; a refreshed center with stored
-    // neighbors is the accepted, documented asymmetry.
+    // neighbors is the accepted, documented asymmetry. Depth is per kind:
+    // markdown pulls two neighbors each side, code one.
     let mut joined = crate::footer::strip(&center).trim().to_string();
     let mut stitched = false;
-    if let Some((prev, next)) = neighbor_ids(entity_id) {
-        if let Some(p) = prev.and_then(|id| live_head_body(store, &id)) {
-            joined = format!("{} {}", crate::footer::strip(&p).trim(), joined);
-            stitched = true;
+    let depth = stitch_depth(entity_id);
+    if let Some((before, after)) = neighbor_ids(entity_id, depth) {
+        // nearest-first order: prepend walks outward, append walks outward
+        for id in before {
+            match live_head_body(store, &id) {
+                Some(p) => {
+                    joined = format!("{} {}", crate::footer::strip(&p).trim(), joined);
+                    stitched = true;
+                }
+                None => break, // a gap ends the contiguous run
+            }
         }
-        if let Some(n) = live_head_body(store, &next) {
-            joined = format!("{} {}", joined, crate::footer::strip(&n).trim());
-            stitched = true;
+        for id in after {
+            match live_head_body(store, &id) {
+                Some(n) => {
+                    joined = format!("{} {}", joined, crate::footer::strip(&n).trim());
+                    stitched = true;
+                }
+                None => break,
+            }
         }
     }
-    let cap = if stitched { DELIBERATE_STITCHED_CAP } else { DELIBERATE_CHUNK_CAP };
+    let cap = match (stitched, depth) {
+        (false, _) => DELIBERATE_CHUNK_CAP,
+        (true, 1) => DELIBERATE_STITCHED_CAP,
+        // Doc chunks: more joined text deserves a wider window, still bounded.
+        (true, _) => DELIBERATE_STITCHED_DOC_CAP,
+    };
     (tag, crate::recall::snippet(&joined, cap, query))
 }
 
@@ -799,6 +832,31 @@ mod tests {
         assert!(tag.is_empty());
         assert!(full.len() > 700, "memory body not truncated: {}", full.len());
         assert!(!full.contains("[memory/"), "footer stripped from the served body");
+    }
+
+    #[test]
+    fn test_doc_chunks_stitch_two_neighbors_each_side() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("md.db");
+        let mut store = EventStore::new(&db).unwrap();
+        for i in 0..5 {
+            let body = format!(
+                "section {} text over topic-{}\n\n[repo file | P/docs/guide.md | chunk {}/5 | crumb: Guide]",
+                i, i, i + 1
+            );
+            store
+                .append_event("s", "l", "a", EventKind::FactCreated, &format!("P:docs/guide.md#{i}"), None, &body)
+                .unwrap();
+        }
+        assert_eq!(stitch_depth("P:docs/guide.md#2"), 2, "markdown stitches depth 2");
+        assert_eq!(stitch_depth("P:src/a.rs#2"), 1, "code stitches depth 1");
+        let (_, snip) = serve_deliberate(
+            &store, "P:docs/guide.md#2",
+            "section 2 text over topic-2\n\n[repo file | P/docs/guide.md | chunk 3/5 | crumb: Guide]",
+            "topic-0 topic-4", None, None,
+        );
+        assert!(snip.contains("topic-0"), "outermost previous section reachable: {snip}");
+        assert!(snip.contains("topic-4"), "outermost next section reachable: {snip}");
     }
 
     #[test]

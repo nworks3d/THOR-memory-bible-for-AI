@@ -69,11 +69,22 @@ pub struct Cluster {
     pub members: Vec<String>,
 }
 
+/// A typed constraint (gotcha/decision/preference) with no author-declared
+/// fires-when vocabulary: it can only surface on lexical/semantic luck, never
+/// on its intended firing moment. Candidate for a retro-tag revise.
+pub struct RetroTagCandidate {
+    pub entity_id: String,
+    pub first_line: String,
+    /// Usage strength at report time - the sweep tags proven-useful facts first.
+    pub strength: f64,
+}
+
 #[derive(Default)]
 pub struct Report {
     pub dups: Vec<DupGroup>,
     pub decay: Vec<DecayCandidate>,
     pub clusters: Vec<Cluster>,
+    pub needs_retro_tag: Vec<RetroTagCandidate>,
     /// Clusters dropped for being over MAX_CLUSTER_MEMBERS (batch families,
     /// union-find chains) - counted so the cap is never silent.
     pub broad_clusters_skipped: usize,
@@ -83,6 +94,9 @@ pub struct Report {
 }
 
 impl Report {
+    /// needs_retro_tag deliberately does NOT count as dirt: it is a work list
+    /// for the tagging sweep, not a hygiene failure - a store with untagged
+    /// legacy facts must not fail the CI gate forever.
     pub fn is_clean(&self) -> bool {
         self.dups.is_empty() && self.decay.is_empty() && self.clusters.is_empty()
     }
@@ -111,6 +125,8 @@ struct LiveHead {
     /// isolated (imports are guarded by SEEDED.flag), so these heads live and
     /// die in THOR like any native fact.
     imported: bool,
+    /// Footer carries a fires-when field (author-declared trigger vocabulary).
+    has_triggers: bool,
     /// Another live head's body cites this entity id (e.g. an "m:01K..." or
     /// "mimir:01K..." link in prose). Retracting it would break that
     /// reference for recall, so decay never suggests it - the same rationale
@@ -161,6 +177,7 @@ fn live_memory_heads(events: &[Event], pins: &[String]) -> Vec<LiveHead> {
             first_line: first_line(&head.body),
             typed: crate::footer::fact_type(&head.body).is_some(),
             imported: crate::footer::has_source_ref(&head.body),
+            has_triggers: crate::footer::fires_when(&head.body).is_some(),
             referenced: false, // filled below, once every body is known
             pinned: pins.iter().any(|p| p == id),
         });
@@ -403,6 +420,7 @@ pub fn build_report(store: &EventStore, db: &Path, events: &[Event], opts: &Opti
 
     let dups = dup_groups(&heads);
     let decay = decay_candidates(&heads, tip_seq, opts.min_age_events);
+    let needs_retro_tag = retro_tag_candidates(&heads);
     #[allow(unused_mut)]
     let (mut clusters, mut broad_clusters_skipped) = prefix_band_clusters(&heads);
     #[allow(unused_mut)]
@@ -413,7 +431,25 @@ pub fn build_report(store: &EventStore, db: &Path, events: &[Event], opts: &Opti
         broad_clusters_skipped += skipped;
         cosine_ran = true;
     }
-    Report { dups, decay, clusters, broad_clusters_skipped, cosine_ran }
+    Report { dups, decay, clusters, needs_retro_tag, broad_clusters_skipped, cosine_ran }
+}
+
+/// Typed constraints without author-declared trigger vocabulary, proven-useful
+/// first (highest strength), then oldest: the retro-tag sweep works this list
+/// top-down. Report-only - the tagging itself is an agent revise, never
+/// mechanical.
+fn retro_tag_candidates(heads: &[LiveHead]) -> Vec<RetroTagCandidate> {
+    let mut out: Vec<RetroTagCandidate> = heads
+        .iter()
+        .filter(|h| h.typed && !h.has_triggers)
+        .map(|h| RetroTagCandidate {
+            entity_id: h.entity_id.clone(),
+            first_line: h.first_line.clone(),
+            strength: h.strength,
+        })
+        .collect();
+    out.sort_by(|a, b| b.strength.total_cmp(&a.strength).then_with(|| a.entity_id.cmp(&b.entity_id)));
+    out
 }
 
 #[derive(Default)]
@@ -481,9 +517,14 @@ pub fn apply_dedup(db: &Path, store: &mut EventStore, report: &Report) -> anyhow
 
 pub fn print_report(report: &Report) {
     println!("THOR consolidate - metabolism report");
-    if report.is_clean() {
+    if report.is_clean() && report.needs_retro_tag.is_empty() {
         println!("clean: nothing to digest");
         return;
+    }
+    if report.is_clean() {
+        // Hygiene is clean (exit 0); the retro-tag WORK LIST below is
+        // informational and never fails the gate.
+        println!("hygiene clean; retro-tag work list below");
     }
     if !report.dups.is_empty() {
         println!(
@@ -502,6 +543,15 @@ pub fn print_report(report: &Report) {
         );
         for d in &report.decay {
             println!("  {} ({} events behind tip) | {}", d.entity_id, d.events_behind_tip, d.first_line);
+        }
+    }
+    if !report.needs_retro_tag.is_empty() {
+        println!(
+            "\n{} typed fact(s) without fires-when triggers (proven-useful first) - retro-tag via revise:",
+            report.needs_retro_tag.len()
+        );
+        for c in &report.needs_retro_tag {
+            println!("  {} (strength {:.2}) | {}", c.entity_id, c.strength, c.first_line);
         }
     }
     if !report.clusters.is_empty() {
@@ -750,6 +800,26 @@ mod tests {
             "untouched old notes decay - INCLUDING a stale seeded (imported) one, since the \
              stores are isolated and no import resurrects it; everything protected stays: \
              typed, pinned, echoed, read, recent, AND the id-cited note (01KCITED)"
+        );
+    }
+
+    #[test]
+    fn retro_tag_candidates_lists_untagged_typed_facts_strength_first() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut store, db) = store_at(dir.path());
+        create(&mut store, "mem-tagged", "a tagged rule\n\n[memory/gotcha | tags: x | fires-when: deploy tarball | project: P]");
+        create(&mut store, "mem-untagged-a", "an untagged rule about exports\n\n[memory/decision | tags: x | project: P]");
+        create(&mut store, "mem-untagged-b", "an untagged rule about backups\n\n[memory/gotcha | tags: y | project: P]");
+        create(&mut store, "mem-plain", "a plain note without any footer at all");
+        // proven-useful: b gets an echo so it must sort FIRST in the work list
+        store.append_event("s", "l", "a", EventKind::FactEchoed, "mem-untagged-b", None, "echo").unwrap();
+        let events = store.get_all_events().unwrap();
+        let report = build_report(&store, &db, &events, &opts(5));
+        let ids: Vec<&str> = report.needs_retro_tag.iter().map(|c| c.entity_id.as_str()).collect();
+        assert_eq!(
+            ids,
+            vec!["mem-untagged-b", "mem-untagged-a"],
+            "typed-without-triggers only, proven-useful first; tagged and untyped never listed"
         );
     }
 

@@ -328,10 +328,18 @@ thor/
 - **MakerViking** - for the inspiration and the great fight. This project would
   not exist without the spark, and it would not be half as good without a worthy
   rival to measure against. Skål!
-- **mimir** - the wise opponent in every benchmark in this repo. In the sagas,
-  Mimir guards the well of knowledge; here it set the bar THOR had to clear. The
-  scoreboard shows real wins and real losses on purpose: a rival this good
-  deserves honest numbers.
+- **mimir** ([MakerViking/mimir](https://github.com/MakerViking/mimir)) - the
+  wise opponent in every benchmark in this repo. In the sagas, Mimir guards the
+  well of knowledge; here it set the bar THOR had to clear. The scoreboard
+  shows real wins and real losses on purpose: a rival this good deserves honest
+  numbers.
+- **Idea credit, both directions.** Two THOR mechanisms are idea adoptions from
+  mimir's own improvement rounds, reimplemented here in THOR's idiom: the
+  identifier/path-aware matching in recall (mimir's identifier RRF leg) and the
+  eval discipline that scores the injection DECISION as a confusion table with
+  a one-way "injected-wrong must never rise" ratchet. Mimir in turn credits
+  THOR for code-content indexing and per-prompt auto-recall - exactly the kind
+  of exchange open source is for. Thanks, MakerViking.
 
 ## License
 

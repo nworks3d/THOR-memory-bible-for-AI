@@ -7,7 +7,9 @@ Every test was re-measured fresh on 2026-07-11, after the v4 serving/matching
 round (identifier-aware trigger matching, footer-stripped serving, full-body
 memories on the deliberate path, neighbor stitching, courier full-body typed
 facts in an 8000-char budget, silence scenarios, a confusion table and a
-one-way noise ratchet) - against mimir's strongest opponent build to date:
+one-way noise ratchet; the identifier matching and the confusion-table
+discipline are idea adoptions from mimir's own rounds, credited in the README)
+- against mimir's strongest opponent build to date:
 unreleased upstream main commit `f98c7fd` (post-v0.13.0: an in-place
 MatrixCache cache fix, a warm `/inject` daemon, a fast cold-path mode,
 code-content indexing as `CodeChunk`, an identifier RRF leg, recency/type

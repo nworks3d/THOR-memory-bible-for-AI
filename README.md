@@ -280,7 +280,7 @@ overwrites your live compose file and never touches the data volume.
 | `thor review-scope [--mark]` | list no-signal global memories to review (SessionStart nudges once/day) |
 | `thor courier` / `thor session-start` | per-prompt recall hook (session-dedup, noise gate, live-file freshness) / SessionStart refresh + pinned `<thor-brief>` + setup cue |
 | `thor pin <id> \| --list` / `thor unpin <id>` | pin standing rules: their full body re-injects at every session start and right after a compaction |
-| `thor mark <id>` | record that a fact actually helped (feeds the courier's ranking prior) |
+| `thor mark <id> [--noise]` | record that a fact actually helped - or was noise here (local; one unified usage strength feeds the courier's promotion and consolidate's decay) |
 | `thor warm` | pre-warm the semantic embedder (idempotent; for SessionStart) |
 | `thor guard` / `thor stop-guard` | moment-of-action advisories (risk rulebook + first-touch file memories) / response advisories + a once-per-session capture nudge for unstored decisions/gotchas |
 | `thor install` | write the hooks into settings.json |

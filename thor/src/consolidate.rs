@@ -7,10 +7,11 @@
 //!      (`recall::dedup_prefix`, the SAME key the remember/import gates refuse
 //!      on) collides: the legacy twins that predate those gates. The only
 //!      mechanically-applied pass (`--apply-dedup`).
-//!   2. decay candidates - untyped notes never marked useful (no fact_echoed),
-//!      never read (ledger "access" counter 0) and long inactive. The log has
-//!      no wall clock (timestamps are not canonical content), so age = events
-//!      behind the tip. Candidates ONLY - an agent confirms each via retract.
+//!   2. decay candidates - untyped notes with non-positive usage strength
+//!      (crate::strength: recency-weighted echoes + capped reads - noise
+//!      marks) and long inactive. The log has no wall clock (timestamps are
+//!      not canonical content), so age = events behind the tip. Candidates
+//!      ONLY - an agent confirms each via retract.
 //!   3. same-topic clusters - groups likely about one subject (shared prefix
 //!      band, plus cosine neighbors when the vectors sidecar is readable), as
 //!      input for agent judgement: contradiction or distillation via
@@ -99,7 +100,9 @@ struct LiveHead {
     head_seq: i64,
     create_seq: i64,
     last_seq: i64,
-    echoes: u64,
+    /// Unified usage strength (crate::strength: recency-weighted echoes +
+    /// capped reads - noise marks). <= 0 = never useful on balance.
+    strength: f64,
     prefix: String,
     first_line: String,
     typed: bool,
@@ -117,7 +120,6 @@ fn live_memory_heads(events: &[Event], pins: &[String]) -> Vec<LiveHead> {
     let heads = crate::cas::compute_head_sets(events);
     let by_hash: HashMap<&str, &Event> =
         events.iter().map(|e| (e.this_hash.as_str(), e)).collect();
-    let mut echoes: HashMap<&str, u64> = HashMap::new();
     let mut create_seq: HashMap<&str, i64> = HashMap::new();
     let mut last_seq: HashMap<&str, i64> = HashMap::new();
     for e in events {
@@ -128,9 +130,6 @@ fn live_memory_heads(events: &[Event], pins: &[String]) -> Vec<LiveHead> {
         if !matches!(e.kind, EventKind::FactReprojected) {
             let l = last_seq.entry(&e.entity_id).or_insert(e.seq);
             *l = (*l).max(e.seq);
-        }
-        if matches!(e.kind, EventKind::FactEchoed) {
-            *echoes.entry(&e.entity_id).or_insert(0) += 1;
         }
     }
     let mut out = Vec::new();
@@ -149,7 +148,7 @@ fn live_memory_heads(events: &[Event], pins: &[String]) -> Vec<LiveHead> {
             head_seq: head.seq,
             create_seq: *create_seq.get(id.as_str()).unwrap_or(&head.seq),
             last_seq: *last_seq.get(id.as_str()).unwrap_or(&head.seq),
-            echoes: *echoes.get(id.as_str()).unwrap_or(&0),
+            strength: 0.0, // filled by build_report via crate::strength
             prefix: crate::recall::dedup_prefix(&head.body),
             first_line: first_line(&head.body),
             typed: crate::footer::fact_type(&head.body).is_some(),
@@ -176,14 +175,14 @@ fn dup_groups(heads: &[LiveHead]) -> Vec<DupGroup> {
         }
         // Keep-priority: pinned > import-synced copy (a future source revision
         // flows in under THAT id, so retracting it would resurrect the twin on
-        // the next import) > typed > marked-useful > oldest. Typed/echoed rank
-        // above age for the same reason decay protects them: those signals say
-        // "this copy is the curated one". A pinned twin is never a retract
-        // target.
+        // the next import) > typed > proven-useful (positive strength) >
+        // oldest. Typed/strength rank above age for the same reason decay
+        // protects them: those signals say "this copy is the curated one".
+        // A pinned twin is never a retract target.
         let keep = group
             .iter()
             .max_by_key(|h| {
-                (h.pinned, h.imported, h.typed, h.echoes > 0, std::cmp::Reverse(h.create_seq))
+                (h.pinned, h.imported, h.typed, h.strength > 0.0, std::cmp::Reverse(h.create_seq))
             })
             .expect("group.len() >= 2");
         let mut retract: Vec<RetractTarget> = group
@@ -210,7 +209,6 @@ fn dup_groups(heads: &[LiveHead]) -> Vec<DupGroup> {
 
 fn decay_candidates(
     heads: &[LiveHead],
-    access: &HashMap<String, u64>,
     tip_seq: i64,
     min_age_events: i64,
 ) -> Vec<DecayCandidate> {
@@ -220,8 +218,9 @@ fn decay_candidates(
             !h.typed
                 && !h.pinned
                 && !h.imported
-                && h.echoes == 0
-                && access.get(&h.entity_id).copied().unwrap_or(0) == 0
+                // never useful on balance: no (recency-weighted) echo or read
+                // outweighs its noise marks - the ONE strength concept
+                && h.strength <= 0.0
                 && tip_seq - h.last_seq >= min_age_events
         })
         .map(|h| DecayCandidate {
@@ -368,14 +367,21 @@ fn cosine_clusters(
     Some((out, skipped))
 }
 
-pub fn build_report(db: &Path, events: &[Event], opts: &Options) -> Report {
+pub fn build_report(store: &EventStore, db: &Path, events: &[Event], opts: &Options) -> Report {
     let pins = crate::ledger::read_pins(db);
-    let heads = live_memory_heads(events, &pins);
-    let access = crate::ledger::counters(db, "access");
+    let mut heads = live_memory_heads(events, &pins);
+    // The unified usage strength (crate::strength), computed once for every
+    // live head: decay eligibility and dup keep-priority read the same number
+    // the courier's promotion does.
+    let ids: Vec<String> = heads.iter().map(|h| h.entity_id.clone()).collect();
+    let strengths = crate::strength::strength_for(store, db, &ids);
+    for h in &mut heads {
+        h.strength = strengths.get(&h.entity_id).copied().unwrap_or(0.0);
+    }
     let tip_seq = events.iter().map(|e| e.seq).max().unwrap_or(0);
 
     let dups = dup_groups(&heads);
-    let decay = decay_candidates(&heads, &access, tip_seq, opts.min_age_events);
+    let decay = decay_candidates(&heads, tip_seq, opts.min_age_events);
     #[allow(unused_mut)]
     let (mut clusters, mut broad_clusters_skipped) = prefix_band_clusters(&heads);
     #[allow(unused_mut)]
@@ -533,7 +539,7 @@ mod tests {
         create(&mut store, "mem-other", "a completely unrelated fact about the courier snippet cap");
 
         let events = store.get_all_events().unwrap();
-        let report = build_report(&db, &events, &opts(i64::MAX));
+        let report = build_report(&store, &db, &events, &opts(i64::MAX));
         assert_eq!(report.dups.len(), 1, "one duplicate group");
         let g = &report.dups[0];
         assert_eq!(g.keep, "01KIMPORT", "the import-synced copy wins over the older native twin");
@@ -543,7 +549,7 @@ mod tests {
         let stats = apply_dedup(&db, &mut store, &report).unwrap();
         assert_eq!((stats.retracted, stats.skipped), (2, 0));
         let events = store.get_all_events().unwrap();
-        let report2 = build_report(&db, &events, &opts(i64::MAX));
+        let report2 = build_report(&store, &db, &events, &opts(i64::MAX));
         assert!(report2.dups.is_empty(), "apply is idempotent: a re-run reports no twins");
     }
 
@@ -557,7 +563,7 @@ mod tests {
         create(&mut store, "mem-new-typed", &format!("{LONG_A}\n\n[memory/gotcha | tags: x | project: P]"));
 
         let events = store.get_all_events().unwrap();
-        let report = build_report(&db, &events, &opts(i64::MAX));
+        let report = build_report(&store, &db, &events, &opts(i64::MAX));
         assert_eq!(report.dups.len(), 1);
         assert_eq!(report.dups[0].keep, "mem-new-typed", "typed beats older raw");
         assert_eq!(report.dups[0].retract[0].entity_id, "mem-old-raw");
@@ -582,7 +588,7 @@ mod tests {
         create(&mut store, "mem-c-twin", LONG_C);
 
         let events = store.get_all_events().unwrap();
-        let report = build_report(&db, &events, &opts(i64::MAX));
+        let report = build_report(&store, &db, &events, &opts(i64::MAX));
         assert_eq!(report.dups.len(), 3, "three duplicate groups in the report");
 
         // the world changes between report and apply
@@ -633,7 +639,7 @@ mod tests {
         .unwrap();
 
         let events = store.get_all_events().unwrap();
-        let report = build_report(&db, &events, &opts(i64::MAX));
+        let report = build_report(&store, &db, &events, &opts(i64::MAX));
         assert_eq!(report.dups.len(), 1);
         assert_eq!(report.dups[0].keep, "mem-pinned", "pinned beats the imported copy");
         assert_eq!(report.dups[0].retract[0].entity_id, "01KIMPORT");
@@ -654,7 +660,7 @@ mod tests {
             .unwrap();
 
         let events = store.get_all_events().unwrap();
-        let report = build_report(&db, &events, &opts(5));
+        let report = build_report(&store, &db, &events, &opts(5));
         assert!(
             report.decay.iter().any(|d| d.entity_id == "mem-old"),
             "a reproject must not reset staleness: {:?}",
@@ -679,6 +685,14 @@ mod tests {
             .unwrap();
         create(&mut store, "mem-read", "a note that was read through mcp get at least once");
         crate::ledger::increment(&db, "access", "mem-read");
+        // an echoed note DROWNED by noise marks: unified strength goes
+        // negative, so it decays despite the echo
+        create(&mut store, "mem-noised", "a note once echoed but repeatedly marked as noise since");
+        store
+            .append_event("s", "l", "a", EventKind::FactEchoed, "mem-noised", None, "echo")
+            .unwrap();
+        crate::ledger::increment(&db, "noise", "mem-noised");
+        crate::ledger::increment(&db, "noise", "mem-noised");
         create(&mut store, "mem-pinned", "a pinned standing rule that never needs marking");
         crate::ledger::mutate_pins(&db, |mut pins| {
             pins.push("mem-pinned".to_string());
@@ -693,9 +707,14 @@ mod tests {
         create(&mut store, "mem-recent", "a brand new note right at the tip of the log");
 
         let events = store.get_all_events().unwrap();
-        let report = build_report(&db, &events, &opts(5));
-        let ids: Vec<&str> = report.decay.iter().map(|d| d.entity_id.as_str()).collect();
-        assert_eq!(ids, vec!["mem-stale"], "only the untyped, unread, unmarked, old native note decays");
+        let report = build_report(&store, &db, &events, &opts(5));
+        let mut ids: Vec<&str> = report.decay.iter().map(|d| d.entity_id.as_str()).collect();
+        ids.sort();
+        assert_eq!(
+            ids,
+            vec!["mem-noised", "mem-stale"],
+            "the untouched old note AND the noise-drowned note decay; everything protected stays"
+        );
     }
 
     #[test]
@@ -710,7 +729,7 @@ mod tests {
         create(&mut store, "mem-d", LONG_A);
 
         let events = store.get_all_events().unwrap();
-        let report = build_report(&db, &events, &opts(i64::MAX));
+        let report = build_report(&store, &db, &events, &opts(i64::MAX));
         assert_eq!(report.clusters.len(), 1, "one topic cluster");
         assert_eq!(report.clusters[0].members, vec!["mem-a".to_string(), "mem-b".to_string()]);
         assert_eq!(report.dups.len(), 1, "the byte-twins land in the duplicates pass");
@@ -734,7 +753,7 @@ mod tests {
             .unwrap();
 
         let events = store.get_all_events().unwrap();
-        let report = build_report(&db, &events, &opts(0));
+        let report = build_report(&store, &db, &events, &opts(0));
         assert!(report.dups.is_empty(), "chunk twins are ingest's business, diverged needs resolve first");
         assert!(report.decay.iter().all(|d| d.entity_id == "mem-div" || !d.entity_id.contains('#')),
             "chunks never decay");
@@ -772,7 +791,7 @@ mod tests {
         vs.upsert_batch(&[(e1.seq, near_a), (e2.seq, near_b), (e3.seq, far)]).unwrap();
 
         let events = store.get_all_events().unwrap();
-        let report = build_report(&db, &events, &opts(i64::MAX));
+        let report = build_report(&store, &db, &events, &opts(i64::MAX));
         assert!(report.cosine_ran, "sidecar present: the cosine pass must run");
         let cosine: Vec<&Cluster> =
             report.clusters.iter().filter(|c| c.reason.starts_with("cosine")).collect();
@@ -791,7 +810,7 @@ mod tests {
         let vpath = crate::vectors::default_vectors_path(&db);
         assert!(!vpath.exists(), "precondition: no sidecar");
         let events = store.get_all_events().unwrap();
-        let report = build_report(&db, &events, &opts(i64::MAX));
+        let report = build_report(&store, &db, &events, &opts(i64::MAX));
         assert!(!report.cosine_ran, "no sidecar = the cosine pass did NOT run");
         assert!(!vpath.exists(), "a report-only command must not materialize the sidecar");
     }
@@ -809,7 +828,7 @@ mod tests {
         drop(vs);
 
         let events = store.get_all_events().unwrap();
-        let report = build_report(&db, &events, &opts(i64::MAX));
+        let report = build_report(&store, &db, &events, &opts(i64::MAX));
         assert!(!report.cosine_ran, "a sidecar from another model is stale, never trusted");
     }
 }

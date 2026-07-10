@@ -150,14 +150,15 @@ pub fn injection_for_hook_json(db: &Path, raw: &str) -> Option<String> {
     let survivors: Vec<RecallHit> =
         pool.into_iter().filter(|h| !ledger.suppressed(h)).collect();
 
-    // Echo prior: if none of the top picks was ever marked useful but a
-    // below-the-fold fact was (and it ranks close enough), give it slot 3. The
-    // echo query only runs when a promotion is even possible (survivors deeper
-    // than the slots), and only over the survivors' own entity ids.
+    // Usage prior: if none of the top picks carries positive usage strength
+    // (recency-weighted echoes + reads - noise marks; see crate::strength) but
+    // a below-the-fold fact does (and it ranks close enough), give it slot 3.
+    // The strength query only runs when a promotion is even possible
+    // (survivors deeper than the slots), and only over the survivors' own ids.
     let selected = if survivors.len() > MAX_HITS {
         let ids: Vec<String> = survivors.iter().map(|h| h.entity_id.clone()).collect();
-        let echo = echo_counts_for(&store, &ids);
-        select_hits(survivors, &echo)
+        let strength = crate::strength::strength_for(&store, db, &ids);
+        select_hits(survivors, &strength)
     } else {
         select_hits(survivors, &HashMap::new())
     };
@@ -288,35 +289,6 @@ pub fn injection_for_hook_json(db: &Path, raw: &str) -> Option<String> {
     Some(out)
 }
 
-/// FactEchoed count per entity, restricted to the given entity ids (served by
-/// idx_event_entity instead of a full-table scan - this runs on the per-prompt
-/// hot path). The "this actually helped me" signal written by the mark tool.
-/// Fail-soft: any query error means an empty map (no prior).
-fn echo_counts_for(store: &EventStore, ids: &[String]) -> HashMap<String, i64> {
-    if ids.is_empty() {
-        return HashMap::new();
-    }
-    let conn = store.conn();
-    let placeholders = vec!["?"; ids.len()].join(",");
-    let sql = format!(
-        "SELECT entity_id, COUNT(*) FROM event WHERE kind = ? AND entity_id IN ({}) GROUP BY entity_id",
-        placeholders
-    );
-    let mut stmt = match conn.prepare(&sql) {
-        Ok(s) => s,
-        Err(_) => return HashMap::new(),
-    };
-    let params = std::iter::once(crate::event_store::EventKind::FactEchoed.as_str().to_string())
-        .chain(ids.iter().cloned());
-    let rows = match stmt.query_map(rusqlite::params_from_iter(params), |r| {
-        Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?))
-    }) {
-        Ok(r) => r,
-        Err(_) => return HashMap::new(),
-    };
-    rows.flatten().collect()
-}
-
 /// Rank slack for the typed-constraint slot: a deeper gotcha/decision/preference
 /// may take slot 3 only when its bm25 strength is within this factor of slot 3's.
 /// Same conservatism as the echo prior: a typed fact never displaces a clearly
@@ -334,8 +306,10 @@ const TYPED_RANK_SLACK: f64 = 1.5;
 ///    same-topic chunks.
 /// Conservative by construction; a promotion never fires against a dense-only
 /// slot 3 (rank 0.0 = no lexical evidence to compare against).
-fn select_hits(pool: Vec<RecallHit>, echo: &HashMap<String, i64>) -> Vec<RecallHit> {
-    let echoed = |h: &RecallHit| echo.get(&h.entity_id).copied().unwrap_or(0) > 0;
+fn select_hits(pool: Vec<RecallHit>, strength: &HashMap<String, f64>) -> Vec<RecallHit> {
+    // Positive usage strength = proven useful on balance; a noise-marked fact
+    // (strength <= 0) never earns the promotion, however often it was echoed.
+    let echoed = |h: &RecallHit| strength.get(&h.entity_id).copied().unwrap_or(0.0) > 0.0;
     let typed = |h: &RecallHit| h.fact_type.is_some();
     let mut selected: Vec<RecallHit> = Vec::with_capacity(MAX_HITS);
     let mut rest: Vec<RecallHit> = Vec::new();
@@ -869,7 +843,7 @@ mod tests {
             matched_and: true,
         };
         let mut echo = std::collections::HashMap::new();
-        echo.insert("e4".to_string(), 2i64);
+        echo.insert("e4".to_string(), 2.0f64);
 
         // e4 (echoed) is within 1.5x of slot 3 -> promoted into slot 3
         let pool = vec![mk("e1", -9.0), mk("e2", -8.0), mk("e3", -6.0), mk("e4", -5.0)];
@@ -885,10 +859,18 @@ mod tests {
 
         // an echoed fact already in the top 3 -> no swap needed
         let mut echo2 = std::collections::HashMap::new();
-        echo2.insert("e2".to_string(), 1i64);
+        echo2.insert("e2".to_string(), 1.0f64);
         let pool = vec![mk("e1", -9.0), mk("e2", -8.0), mk("e3", -6.0), mk("e4", -5.9)];
         let sel = select_hits(pool, &echo2);
         assert_eq!(sel[2].entity_id, "e3", "top already carries an echoed fact");
+
+        // noise-drowned strength (<= 0) never earns the promotion, however
+        // close it ranks - the mark --noise demotion in action
+        let mut noisy = std::collections::HashMap::new();
+        noisy.insert("e4".to_string(), -1.0f64);
+        let pool = vec![mk("e1", -9.0), mk("e2", -8.0), mk("e3", -6.0), mk("e4", -5.9)];
+        let sel = select_hits(pool, &noisy);
+        assert_eq!(sel[2].entity_id, "e3", "negative strength = no promotion");
     }
 
     #[test]
@@ -929,7 +911,7 @@ mod tests {
 
         // echo promotion outranks typed promotion (one swap max)
         let mut echo = std::collections::HashMap::new();
-        echo.insert("e".to_string(), 1i64);
+        echo.insert("e".to_string(), 1.0f64);
         let pool = vec![
             mk("c1", -9.0, None),
             mk("c2", -8.0, None),

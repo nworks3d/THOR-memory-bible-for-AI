@@ -155,6 +155,17 @@ pub struct EntityArgs {
 }
 
 #[derive(Deserialize, schemars::JsonSchema)]
+pub struct MarkArgs {
+    /// The entity id.
+    pub entity_id: String,
+    /// true = this fact was NOISE here (injected/recalled but only
+    /// distracting): demotes its promotion and feeds decay, locally.
+    /// Default false = useful.
+    #[serde(default)]
+    pub noise: bool,
+}
+
+#[derive(Deserialize, schemars::JsonSchema)]
 pub struct ReprojectArgs {
     /// The entity id to move (memories only, never repo chunks).
     pub entity_id: String,
@@ -476,11 +487,19 @@ impl ThorServer {
         .await
     }
 
-    #[tool(description = "Mark a fact as USEFUL (it actually answered your question / prevented a mistake). Head-neutral, sync-safe; feeds the ranking prior, so marking honestly improves your own future recall.")]
-    async fn mark(&self, Parameters(args): Parameters<EntityArgs>) -> String {
+    #[tool(description = "Mark a fact as USEFUL (it actually answered your question / prevented a mistake), or with noise:true as NOISE (it was injected/recalled but only distracted here). Marking honestly improves your own future recall: useful feeds the promotion prior, noise demotes and feeds decay. Useful is a synced head-neutral event; noise stays in the local ledger.")]
+    async fn mark(&self, Parameters(args): Parameters<MarkArgs>) -> String {
+        let db = self.db.clone();
         self.blocking(move |s| {
             if s.get_events_by_entity(&args.entity_id).map_err(|e| format!("error: {e}"))?.is_empty() {
                 return Err(format!("unknown entity: {}", args.entity_id));
+            }
+            if args.noise {
+                // "Noise for me during this task" is a LOCAL judgement, not an
+                // institutional fact: it lives in the ledger, never the synced
+                // log (see crate::strength for how it counts against echoes).
+                crate::ledger::increment(&db, "noise", &args.entity_id);
+                return Ok(format!("marked {} as noise (local)", args.entity_id));
             }
             s.append_event("mcp", "mcp-session", "mcp", EventKind::FactEchoed, &args.entity_id, None, "")
                 .map_err(|e| format!("error: {e}"))?;
@@ -1059,13 +1078,23 @@ mod tests {
 
     #[tokio::test]
     async fn test_mark_appends_echo_and_validates_entity() {
-        let (server, _d) = server_with(seed());
-        let out = server.mark(Parameters(EntityArgs { entity_id: "e1".into() })).await;
+        let (server, d) = server_with(seed());
+        let out = server.mark(Parameters(MarkArgs { entity_id: "e1".into(), noise: false })).await;
         assert!(out.contains("marked e1"), "{out}");
         let hist = server.history(Parameters(EntityArgs { entity_id: "e1".into() })).await;
         assert!(hist.contains("fact_echoed"), "the echo lands in the log: {hist}");
-        let bad = server.mark(Parameters(EntityArgs { entity_id: "nope".into() })).await;
+        let bad = server.mark(Parameters(MarkArgs { entity_id: "nope".into(), noise: false })).await;
         assert!(bad.contains("unknown entity"), "{bad}");
+
+        // noise: LOCAL ledger counter, never a log event
+        let db = d.path().join("thor.db");
+        let out = server.mark(Parameters(MarkArgs { entity_id: "e1".into(), noise: true })).await;
+        assert!(out.contains("noise"), "{out}");
+        assert_eq!(crate::ledger::counter(&db, "noise", "e1"), 1);
+        let hist = server.history(Parameters(EntityArgs { entity_id: "e1".into() })).await;
+        assert_eq!(hist.matches("fact_echoed").count(), 1, "noise never lands in the synced log");
+        let bad = server.mark(Parameters(MarkArgs { entity_id: "nope".into(), noise: true })).await;
+        assert!(bad.contains("unknown entity"), "noise mark validates existence too: {bad}");
     }
 
     #[tokio::test]

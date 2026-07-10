@@ -320,8 +320,15 @@ enum Commands {
         mark: bool,
     },
     /// Mark a fact as USEFUL (appends a head-neutral fact_echoed event). Feeds the
-    /// courier's echo prior, so a fact that actually helped wins close ranking calls.
-    Mark { entity_id: String },
+    /// courier's promotion prior, so a fact that actually helped wins close ranking
+    /// calls. With --noise: the fact was injected but only distracted - a LOCAL
+    /// counter (never synced) that demotes its promotion and feeds decay.
+    Mark {
+        entity_id: String,
+        /// Mark as noise instead of useful (local ledger, not the synced log).
+        #[arg(long)]
+        noise: bool,
+    },
     /// Pin a fact: `thor session-start` then re-injects its full body at every
     /// session start (and right after a compaction) via a <thor-brief> block - the
     /// memory version of CLAUDE.md, per project, without editing any file. Pins are
@@ -964,13 +971,18 @@ pub fn run() -> Result<()> {
                 }
             }
         }
-        Commands::Mark { entity_id } => {
+        Commands::Mark { entity_id, noise } => {
             let mut store = EventStore::new(&db)?;
             if store.get_events_by_entity(&entity_id)?.is_empty() {
                 anyhow::bail!("unknown entity: {}", entity_id);
             }
-            let ev = store.append_event("cli", "cli", "cli", EventKind::FactEchoed, &entity_id, None, "")?;
-            println!("marked {} as useful (fact_echoed, seq {})", entity_id, ev.seq);
+            if noise {
+                crate::ledger::increment(&db, "noise", &entity_id);
+                println!("marked {} as noise (local ledger, not synced)", entity_id);
+            } else {
+                let ev = store.append_event("cli", "cli", "cli", EventKind::FactEchoed, &entity_id, None, "")?;
+                println!("marked {} as useful (fact_echoed, seq {})", entity_id, ev.seq);
+            }
         }
         Commands::Pin { entity_id, list } => {
             let pins = crate::ledger::read_pins(&db);
@@ -1041,6 +1053,7 @@ pub fn run() -> Result<()> {
             let mut store = EventStore::new(&db)?;
             let events = store.get_all_events()?;
             let report = crate::consolidate::build_report(
+                &store,
                 &db,
                 &events,
                 &crate::consolidate::Options { min_age_events },

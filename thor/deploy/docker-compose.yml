@@ -12,18 +12,27 @@ services:
     container_name: thor-mcp
     restart: always
     environment:
-      # Live replication to a PC replica (see deploy/SYNC-DEPLOY.md). Set BOTH to
-      # turn it on: the container then also runs `thor ship --watch` to the replica.
-      # Leave THOR_REPLICA_URL empty for MCP-only (the ship loop does not start).
-      # Put the REAL token on the NAS only - NEVER commit it (this repo file keeps
-      # placeholders).
+      # Optional live replication (see deploy/SYNC-DEPLOY.md). Put the REAL token
+      # on the NAS only - NEVER commit it (this repo file keeps placeholders).
+      # Pick ONE role (or neither, for MCP-only):
+      #  - AUTHORITY (this container is the source): set THOR_REPLICA_URL to the
+      #    replica's recv endpoint; it runs `thor ship --watch`.
+      #  - REPLICA (a remote authority, e.g. a PC, pushes into this store): set
+      #    THOR_RECV_BIND and publish that port below; it runs `thor recv`. Leave
+      #    THOR_REPLICA_URL empty.
       THOR_TOKEN: "<shared-token>"
-      THOR_REPLICA_URL: ""   # e.g. http://<pc-lan-ip>:5555
+      THOR_REPLICA_URL: ""   # AUTHORITY role, e.g. http://<pc-lan-ip>:5555
+      THOR_RECV_BIND: ""     # REPLICA role, e.g. 0.0.0.0:5555 (also publish it below)
     volumes:
       # holds thor.db; drop the backup export here (events.jsonl) for first-run restore
       - ./data:/data
     expose:
       - "8078"
+    # REPLICA role only: publish the recv port so the shipping authority can reach
+    # it. This port IS bearer-token gated, so LAN/tailnet exposure is fine - unlike
+    # 8078 (MCP, no auth) which stays internal. Uncomment and match THOR_RECV_BIND.
+    # ports:
+    #   - "5555:5555"
     networks:
       - cloudflared_net
 

@@ -1,7 +1,7 @@
 # Generates assets/benchmark.svg from the measured aggregates (BENCHMARKS.md).
 # The chart is data: regenerate it here after every fresh benchmark run instead
-# of hand-editing bar widths. Values below are the V5 round (run_v6, THOR
-# b03c920): every test re-measured fresh, including the rebuilt Test 2 cuts.
+# of hand-editing bar widths. Values below are the 2026-07-14 round: production
+# THOR vs mimir v0.14.0, every test re-measured fresh, 3-judge median, blind.
 import os
 
 CYAN = "#22d3ee"
@@ -64,89 +64,75 @@ def bullet(text):
 y = 32
 out.append(f'<text x="20" y="{y}" fill="{FG}" font-size="22" font-weight="800">THOR vs mimir - the honest picture</text>')
 y += 22
-out.append(f'<text x="20" y="{y}" fill="{MUT}" font-size="12">Same machine, blind-judged, re-measured fresh in the V5 round + V6/V7 code re-judges (3-judge median, blind maps).</text>')
+out.append(f'<text x="20" y="{y}" fill="{MUT}" font-size="12">Same machine, blind-judged, re-measured fresh 2026-07-14 vs mimir v0.14.0 (3-judge median, fresh blind maps).</text>')
 y += 30
 
 # ---- test 1 ----
-header("TEST 1 - COVERAGE  (200 questions: 118 shared-knowledge + 82 stratified)", "deliberate recall over the live store . higher is better")
+header("TEST 1 - COVERAGE  (200 questions: shared-knowledge + category-stratified)", "deliberate recall over the live store . higher is better")
 for label, t, m in [
-    ("Code structure (re-judged)", 54.5, 56.1),
-    ("Code behavior (re-judged)", 72.5, 59.2),
-    ("Doc reference", 70.0, 66.2),
-    ("Config how-to", 79.4, 76.5),
-    ("Gotcha", 71.7, 65.2),
-    ("Decision", 72.2, 55.6),
+    ("Code structure", 63.6, 74.2),
+    ("Code behavior", 78.3, 70.0),
+    ("Doc reference", 81.2, 70.0),
+    ("Config how-to", 88.2, 79.4),
+    ("Gotcha", 73.9, 73.9),
+    ("Decision", 79.6, 59.3),
 ]:
     d = round(t - m)
     delta = f"+{d}%" if d > 0 else (f"{d}%" if d < 0 else "tie")
     pair(label, t, m, delta, delta_color=SOFT if d == 0 else None)
 rule()
-note(f'Test 1 overall  <tspan fill="{CYAN}">THOR 63.8%</tspan> vs <tspan fill="{MUT}">mimir 64.0%</tspan>  (n=200, full V5 run) - a statistical tie', color=FG, size=13, bold=True)
-note("The CODE rows show the current state: re-judged after the V6/V7 fixes (fresh dumps, fresh blind juries, same 93")
-note("items). In the original full run they read 42.4 vs 63.6 and 60.0 vs 62.5 - the overall above still uses those, so")
-note("it UNDERSTATES THOR's current position. Knowledge rows and the overall are the full V5 run, unchanged.")
-y += 14
-
-# ---- test 1 addendum: the V6/V7 code re-judges ----
-header("HOW THE CODE CATEGORIES GOT THERE (V6 + V7 rounds)", "serving parity + path affinity, then the derived symbol sidecar . re-judged per round")
-note("Behavior flipped and held above 70 twice (60.0 -> 71.7 -> 72.5 vs mimir 62.5 -> 57.5 -> 59.2). Structure went", color=SOFT)
-note("42.4 -> 50.0 -> 54.5 while mimir fell 63.6 -> 57.6 -> 56.1: a 21-point gap closed to 1.6 - and excluding four", color=SOFT)
-note("dead-source items (files deliberately removed; both systems score zero) both judge at exactly 60.3% vs 60.3%.", color=SOFT)
-note("New agent tools from the same round: where_used / impact / outline on a derived, rebuildable symbol sidecar.", color=SOFT)
+note(f'Test 1 overall  <tspan fill="{CYAN}">THOR 77.0%</tspan> vs <tspan fill="{MUT}">mimir 70.5%</tspan>  (n=200) - THOR leads by 6.5 points', color=FG, size=13, bold=True)
+note("THOR wins four of six categories (decision +20, doc-reference +11, config +9, behavior +8), ties gotcha, and loses")
+note("only code-structure (63.6 vs 74.2) - mimir's first-class tree-sitter symbol graph, THOR's one honest open gap.")
 y += 14
 
 # ---- test 2 ----
-header("TEST 2 - SAME KNOWLEDGE  (facts both systems verifiably hold)", "RE-MEASURED on a rebuilt shared subset . cuts over the judged Test 1 medians")
-pair("Strict dual-written (n=53)", 96.2, 93.4, "+3%")
-pair("Broad shared (n=152)", 77.0, 81.2, "-4%")
-note("THOR takes the strict dual-written cut FOR THE FIRST TIME (96.2% vs 93.4%) - pure memory recall was mimir's home", color=SOFT)
-note("turf across four earlier juries. mimir takes the broad cut, which is two-thirds code/doc-chunk questions.", color=SOFT)
+header("TEST 2 - SAME KNOWLEDGE  (facts both systems verifiably hold)", "cuts over the judged Test 1 medians . the equal-corpus comparison")
+pair("Strict dual-written (n=53)", 97.2, 94.3, "+3%")
+pair("Broad shared (n=152)", 88.8, 86.2, "+3%")
+note("THOR wins BOTH same-knowledge cuts, including the strict dual-written cut (97.2 vs 94.3) - the cleanest equal-corpus", color=SOFT)
+note("test there is, and pure memory recall was mimir's home turf across several earlier juries. THOR now leads it.", color=SOFT)
 y += 14
 
 # ---- test 3 ----
-header("TEST 3 - MULTI-PROJECT  (three private project repos seeded)", "45 real questions from each repo, scoped per project, blind-judged by 3-judge median . top-5 full chunks")
-pair("Project 1", 90.0, 93.3, "-3%")
-pair("Project 2", 100.0, 86.7, "+13%")
-pair("Project 3", 86.7, 96.7, "-10%")
+header("TEST 3 - MULTI-PROJECT  (three private project repos seeded)", "45 real questions from each repo, scoped per project, blind-judged 3-judge median . top-5 full chunks")
+pair("Project 1", 93.3, 93.3, "tie", delta_color=SOFT)
+pair("Project 2", 96.7, 100.0, "-3%")
+pair("Project 3", 100.0, 93.3, "+7%")
 rule()
-note(f'Test 3 overall  <tspan fill="{CYAN}">THOR 92.2%</tspan> vs <tspan fill="{MUT}">mimir 92.2%</tspan>  (n=45) - a dead tie', color=FG, size=13, bold=True)
-note("mimir's previous outright lead (98.9% vs 92.2%) is gone. Per-project numbers on n=15 move with a single question")
-note("(6.7 points each): treat the project split as noisy and the overall tie as the takeaway.")
+note(f'Test 3 overall  <tspan fill="{CYAN}">THOR 96.7%</tspan> vs <tspan fill="{MUT}">mimir 95.6%</tspan>  (n=45) - THOR edges it', color=FG, size=13, bold=True)
+note("Per-project numbers on n=15 move with a single question (6.7 points each): treat the split as noisy and the near-tie")
+note("overall as the takeaway - both systems answer scoped project questions very well.")
 y += 14
 
 # ---- drift ----
 header("SESSION DRIFT COMPENSATION  (73 fresh-session scenarios)", "post-compaction, empty context: does the AS-DEPLOYED auto-injection surface the fact that stops the drift?")
-pair("Preventer surfaced", 72.1, 58.9, "+13%")
-pair("Clear catch (full)", 55.9, 47.9, "+8%")
-note("THOR's best drift numbers to date, judged THREE-WAY BLIND for the first time (courier / deliberate / mimir shuffled", color=SOFT)
-note("onto anonymous sides in one jury pass). The as-deployed courier now also beats THOR's own deliberate recall", color=SOFT)
-note("(62.5 / 48.6) - author-declared bilingual fires-when triggers fire on task prompts score-only ranking misses.", color=SOFT)
-note("Pins + file/command guards cover the rest by construction: cargo run --example drift_eval, reproducible in-repo.", color=SOFT)
+pair("Preventer surfaced", 86.3, 74.0, "+12%")
+pair("Clear catch (full)", 58.9, 50.7, "+8%")
+note("THOR leads BOTH drift metrics decisively - the as-deployed courier surfaces the preventing fact 86.3% (vs mimir's", color=SOFT)
+note("best case 74.0%) and fully catches it 58.9% (vs 50.7%). This is the product's core purpose, and the channel built", color=SOFT)
+note("for it wins. Separately reproducible in-repo, no judge: cargo run --example drift_eval (catches + false fires).", color=SOFT)
 y += 14
 
 # ---- speed ----
-header("SPEED AND TOKENS  (per-prompt cost, lower is better)", "THOR cold vs mimir's as-deployed cold path, median of 20, canonical fixed 20-prompt set")
-pair("Latency (as-deployed)", 206.8, 580.7, "2.8x faster", delta_color=CYAN, unit=" ms", scale=330 / 580.7)
-pair("Tokens injected", 784, 237, "3.3x MORE (not fewer)", delta_color=AMBER, unit="", scale=330 / 784)
-note("NEW: THOR's own opt-in warm inject daemon (idea credit mimir) serves the provably IDENTICAL decision at 192.7 ms.", color=SOFT)
-note("mimir's opt-in warm daemon stays the fastest channel outright - 38.9 ms, ~32 tokens - but served NOTHING on 10 of", color=SOFT)
-note("the 20 prompts (single floor-gated memory): faster and cheaper because it serves less. THOR's cold median is back", color=SOFT)
-note("under its own 250 ms guardrail (253 -> 206.8 ms). Old '1.5x faster / 2.1x fewer tokens' headline stays retired.", color=SOFT)
+header("SPEED  (per-prompt cost, lower is better)", "as-deployed, correct invocation each side (THOR stdin hook, mimir prompt arg) . median of 20")
+pair("Full recall (like-for-like)", 230.2, 298.7, "1.3x faster", delta_color=CYAN, unit=" ms", scale=330 / 298.7)
+note("On a like-for-like FULL recall THOR is faster (230 vs 299 ms) and injects a full block. mimir's as-deployed hook is", color=SOFT)
+note("much faster (~31 ms) but serves at most ONE floor-gated memory and is empty on half the prompts (10/20): fast because", color=SOFT)
+note("it serves less. THOR is compute-bound; a sandbox resident-cache prototype cut recall 213 -> 75 ms (65%), NOT shipped", color=SOFT)
+note("by the quality-over-speed rule. THOR's warm daemon saves only ~15 ms (the cost is per-query work, not startup).", color=SOFT)
 y += 14
 
 # ---- downsides ----
 header("HONEST DOWNSIDES", "where THOR does not win, and the caveats")
 y += 12
 for b in [
-    "Test 1 overall is a tie now, not a THOR lead - and the movement was asymmetric (THOR down, mimir up, same corpus)",
-    "Code-structure: level but not won (54.5 vs 56.1 re-judged; 60.3-60.3 excl. dead sources) - 70% target unmet",
-    "mimir wins the broad shared cut (81.2% vs 77.0%) - two-thirds code questions, same weakness on an equal corpus",
-    "The 80%-everywhere goal still does not stand: 0 of 8 v4 gates (config how-to closest at 79.4%, drift surfaced 72.1%)",
-    "mimir's warm daemon stays fastest outright (38.9 vs 192.7 ms warm); THOR injects ~3.3x more tokens than mimir cold",
-    "Three drift golds stay honest misses (deep drift, zero shared vocabulary) - left as gaps, not trigger-stuffed",
-    "mimir has a code-symbol graph (graph/outline/peek) that THOR deliberately does NOT - for 'which functions call X'",
+    "Code-structure is THOR's one category loss (63.6 vs 74.2) - mimir's first-class tree-sitter symbol graph wins it",
+    "On raw hook latency mimir is much faster (~31 vs ~230 ms) - but serves a single floor-gated memory, empty on 10/20",
+    "THOR is compute-bound; latency grows with store size. A resident cache would fix it (proven 65%) but is not shipped",
+    "mimir has a first-class code-symbol graph (graph/outline/peek); THOR's is a derived sidecar (where_used/impact)",
+    "Newer and far less battle-tested than mimir's daily use; mimir ships at a high cadence (v0.14: sync, GPU, fast cold)",
     "Semantic mode needs a ~235 MB model + a warm embed-daemon resident (off by default; degrades cleanly to bm25)",
-    "Newer and far less battle-tested than mimir's daily use",
     "One machine, private corpus, LLM-judged - only drift is repo-reproducible (examples/drift_eval.rs)",
 ]:
     bullet(b)
@@ -154,12 +140,12 @@ y += 8
 rule()
 y += 2
 note(
-    f'Bottom line <tspan fill="{SOFT}">coverage tie (63.8 vs 64.0)</tspan> . <tspan fill="{CYAN}">strict dual-written 96.2 vs 93.4, 1st win</tspan> . <tspan fill="{SOFT}">multi-project tie</tspan>',
+    f'Bottom line <tspan fill="{CYAN}">coverage 77 vs 70.5</tspan> . <tspan fill="{CYAN}">both same-knowledge cuts</tspan> . <tspan fill="{CYAN}">drift 86 vs 74</tspan> . <tspan fill="{CYAN}">multi-project edge</tspan>',
     color=FG, size=13.5, bold=True,
 )
 y += 4
 note(
-    f'<tspan fill="{CYAN}">drift 72 vs 59</tspan> . <tspan fill="{CYAN}">code re-judge: behavior 72.5 vs 59.2, structure level</tspan> . <tspan fill="{CYAN}">2.8x faster than mimir cold</tspan>',
+    f'<tspan fill="{CYAN}">faster on like-for-like full recall (230 vs 299 ms)</tspan> . <tspan fill="{AMBER}">loses code-structure (63.6 vs 74.2)</tspan>',
     color=FG, size=13.5, bold=True,
 )
 

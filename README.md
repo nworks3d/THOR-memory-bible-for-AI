@@ -17,38 +17,33 @@ one thing the agent can search automatically. Measured against
 [mimir](https://github.com/MakerViking/mimir) on the same machine
 ([full method + weaknesses](BENCHMARKS.md)):
 
-- **It wins where knowledge lives - and, since the V6/V7 code rounds, on code
-  behavior too.** On the 200-question as-deployed set the overall was a
-  statistical tie (**63.8% vs 64.0%**) with THOR leading every knowledge
-  category (decisions +17, gotchas +7, docs +4, config +3). The two code
-  categories were then fixed and re-judged on the same items: **code behavior
-  flipped to a clear THOR win (72.5% vs 59.2%)** and code structure closed a
-  21-point deficit to parity (54.5% vs 56.1%; exactly level excluding
-  dead-source questions).
-- **It wins the cleanest equal-corpus test - for the first time.** On the
-  strict dual-written cut (facts both stores verifiably hold, n=53) THOR now
-  leads **96.2% vs 93.4%** - pure memory recall was mimir's home turf across
-  four earlier juries. mimir takes the broad shared cut (81.2% vs 77.0%),
-  which is two-thirds code questions.
+- **It wins where knowledge lives.** On the 200-question as-deployed set THOR
+  leads overall **77.0% vs 70.5%** (mimir v0.14), winning four of six
+  categories - decision +20, doc-reference +11, config +9, code-behavior +8 -
+  and tying gotcha. Its one category loss is code-structure (63.6% vs 74.2%),
+  mimir's tree-sitter symbol graph.
+- **It wins the cleanest equal-corpus tests.** On the strict dual-written cut
+  (facts both stores verifiably hold, n=53) THOR leads **97.2% vs 94.3%**, and
+  the broad shared cut too (88.8% vs 86.2%) - pure memory recall was mimir's
+  home turf across earlier juries.
 - **It compensates for session drift.** After a compaction the agent starts blank;
-  THOR puts the governing gotcha/decision back in front of it more often than mimir
-  at its best (surfaced **72% vs 59%**, full catch **56% vs 48%** - THOR's best
-  drift numbers to date, judged three-way blind). This is what the tool is *for*.
-- **It is faster than mimir's default path.** ~**2.8x** lower latency than mimir's
-  as-deployed cold hook (206.8 ms vs 580.7 ms), and it now has its own opt-in
-  **warm inject daemon** (192.7 ms, provably the identical decision; idea
-  credit mimir). mimir's warm daemon stays the fastest channel outright
-  (38.9 ms) by serving a single floor-gated memory - 10 of 20 prompts got an
-  empty injection - and THOR injects more tokens than mimir's cold path, not
-  fewer. Full honest picture in BENCHMARKS.md.
+  THOR's as-deployed courier surfaces the governing gotcha/decision **86.3% vs
+  74.0%** (mimir's best case) and fully catches it **58.9% vs 50.7%**, judged
+  three-way blind. This is what the tool is *for*.
+- **On a like-for-like full recall it is faster than mimir** (230 ms vs mimir's
+  299 ms), injecting a full block. mimir's as-deployed hook is much faster
+  (~31 ms) but serves a single floor-gated memory and nothing on half the
+  prompts (10/20 empty) - fast because it serves less. Full honest picture in
+  BENCHMARKS.md.
 - **It never loses a write.** Every fact is an event in a hash-chained append-only
   log; a conflicting edit *branches* (both heads kept) instead of overwriting, and
   `fsck` recomputes the chain so tampering is detectable.
 - **It degrades cleanly.** Semantic off, model missing, sidecar deleted, daemon
   down - each path falls back to bm25 and can never make recall worse.
 
-The one thing mimir does that THOR deliberately does not: a **code-symbol graph**
-for "which functions call X". THOR chunks source into recall instead. See
+Where mimir stays ahead: a **first-class code-symbol graph** for "which
+functions call X" - THOR has a derived `where_used`/`impact` sidecar, but
+mimir's graph is why it wins the code-structure category. See
 [BENCHMARKS.md](BENCHMARKS.md) for the honest trade-offs.
 
 ## What it does
@@ -120,28 +115,18 @@ for "which functions call X". THOR chunks source into recall instead. See
 ## Benchmarks
 
 A blind, judged head-to-head against [mimir](https://github.com/MakerViking/mimir),
-re-measured fresh in the V5 round (third full round) with a 3-judge median on
-every test, fresh random blind maps and one-run-no-re-rolls, against mimir's
-strongest opponent build to date (unreleased main, code-content indexing,
-index refreshed before the run) - wins and losses on a level playing field:
-**coverage** a statistical tie, 63.8% vs 64.0% on the 200-question balanced
-set (THOR leads all four knowledge categories; the code categories were
-subsequently fixed and re-judged in the V6/V7 rounds: behavior 72.5% vs
-59.2% THOR, structure 54.5% vs 56.1% - parity excluding dead sources),
-**same-knowledge quality** re-measured on a rebuilt subset: THOR takes the
-strict dual-written cut for the first time (96.2% vs 93.4%), mimir the broad
-shared cut (81.2% vs 77.0%), **multi-project** a dead tie, 92.2% vs 92.2%
-(mimir's previous outright lead is gone), **session drift** THOR-led on both
-metrics at its best numbers to date, judged three-way blind (surfaces the
-preventing fact 72.1% vs 58.9% as deployed, full catch 55.9% vs 47.9%), and
-on speed THOR is ~2.8x faster than mimir's as-deployed cold path (206.8 ms
-vs 580.7 ms, back under its own 250 ms guardrail) with a new opt-in warm
-inject daemon of its own (192.7 ms, provably identical decisions; idea credit
-mimir) - mimir's warm daemon stays the fastest channel outright (38.9 ms)
-while serving a single floor-gated memory (10 of 20 canonical prompts got
-nothing), and THOR still injects more tokens than mimir's cold path (784 vs
-237) - the old "1.5x faster / 2.1x fewer tokens" headline stays retired.
-Full method, per-category tables and honest weaknesses in
+re-measured fresh 2026-07-14 against **mimir v0.14.0** with a 3-judge median on
+every test, fresh random blind maps and one-run-no-re-rolls, both stores
+hygiene-passed before the run: **coverage** THOR 77.0% vs 70.5% on the
+200-question balanced set (THOR wins four of six categories and loses only
+code-structure, 63.6% vs 74.2%), **same-knowledge quality** THOR wins both
+cuts (strict dual-written 97.2% vs 94.3%, broad shared 88.8% vs 86.2%),
+**multi-project** THOR edges it 96.7% vs 95.6%, **session drift** THOR-led on
+both metrics judged three-way blind (surfaces the preventing fact 86.3% vs
+74.0%, full catch 58.9% vs 50.7%), and on **speed** a like-for-like full recall
+favours THOR (230 ms vs mimir's 299 ms), while mimir's as-deployed hook is much
+faster (~31 ms) by serving a single floor-gated memory and nothing on half the
+prompts (10/20 empty). Full method, per-category tables and honest weaknesses in
 [BENCHMARKS.md](BENCHMARKS.md).
 
 Drift compensation is also measurable IN-REPO, no judge needed: `cargo run
@@ -358,6 +343,19 @@ thor/
   a one-way "injected-wrong must never rise" ratchet. Mimir in turn credits
   THOR for code-content indexing and per-prompt auto-recall - exactly the kind
   of exchange open source is for. Thanks, MakerViking.
+
+## Support this project
+
+THOR is free and GPLv3, built by [N-Works 3D](https://www.youtube.com/@NoizieWorks).
+If it has earned its keep - saved you a re-explanation, caught a drift before it
+cost you, or just kept a session from starting cold - and you'd like to help keep
+it moving, there are two easy ways:
+
+- **PayPal**: https://www.paypal.com/paypalme/ognoizieworks
+- **YouTube members**: https://www.youtube.com/@NoizieWorks/join
+
+No pressure and no paywall - the whole thing stays open either way. Skål, and
+thanks for reading this far.
 
 ## License
 

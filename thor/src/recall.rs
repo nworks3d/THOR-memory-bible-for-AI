@@ -1418,6 +1418,16 @@ pub fn recall_fused_scoped(
         _ => std::collections::HashMap::new(),
     };
     let folded_query_sym = fold_diacritics(&query.to_lowercase());
+    // Recency prior (deliberate path only). THOR has no wall-clock timestamp, so
+    // recency = events-behind-tip (seq position), the same signal strength.rs
+    // decays on. A newer fact gets a small bounded lift. Measured +4pp recall@5
+    // (the win is in code-behavior) on the 52-query battery with NO drift-catching
+    // regression, precisely because it is gated to the deliberate path: the
+    // courier runs with boost_paths=false, so its drift-preventer ranking is
+    // byte-identical to before. See BENCHMARKS.md.
+    const RECENCY_WEIGHT: f64 = 0.3;
+    const RECENCY_HALFLIFE_EVENTS: f64 = 2000.0;
+    let tip_seq = events.iter().map(|e| e.seq).max().unwrap_or(0) as f64;
     let mut scored: Vec<(i64, f64, f64)> = cand
         .into_iter()
         .map(|seq| {
@@ -1450,7 +1460,13 @@ pub fn recall_fused_scoped(
                 Some(ev) => symbol_def_bonus(&sym_defs, &ev.entity_id, &qterms, &folded_query_sym),
                 None => 0.0,
             };
-            (seq, rank.unwrap_or(0.0), bm_norm + lambda * cos + delta + coverage + trigger + path_aff + sym)
+            let recency = if boost_paths {
+                let age = (tip_seq - seq as f64).max(0.0);
+                RECENCY_WEIGHT * 2f64.powf(-age / RECENCY_HALFLIFE_EVENTS)
+            } else {
+                0.0
+            };
+            (seq, rank.unwrap_or(0.0), bm_norm + lambda * cos + delta + coverage + trigger + path_aff + sym + recency)
         })
         .collect();
     // Same-file sibling vote: the measured code-structure failure mode is
@@ -2163,13 +2179,18 @@ mod fused_tests {
             hits.iter().map(|h| h.entity_id.as_str()).collect::<Vec<_>>()
         );
 
-        // Code-routed: NO delta for any class - equal scores fall back to the
-        // deterministic seq tie-break, i.e. the chunk appended first. This is
-        // the code-categories-unchanged gate in miniature.
+        // Code-routed: NO class delta, so equal bm25 scores are broken by the
+        // recency prior (deliberate path), which lifts the NEWER event - the
+        // later-appended "P:mem-dec" (seq 2) over the first-appended chunk
+        // (seq 1). This IS the recency win in miniature (measured +4pp on
+        // code-behavior): on the deliberate path recency replaces the arbitrary
+        // first-appended seq tie-break with "newer wins". The courier path
+        // (boost_paths=false) is unaffected and keeps the old seq tie-break.
+        let _ = chunk;
         let code_hits = recall_fused(&store, "sync_batches() alpha replication", &axis(1.0), &vecs, 3, 1.5).unwrap();
         assert_eq!(
-            code_hits[0].rev, chunk.this_hash,
-            "a code-routed query applies no prior (pure bm25 + tie-break); got: {:?}",
+            code_hits[0].entity_id, "P:mem-dec",
+            "recency breaks the equal-score tie toward the newer event on the deliberate path; got: {:?}",
             code_hits.iter().map(|h| h.entity_id.as_str()).collect::<Vec<_>>()
         );
     }

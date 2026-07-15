@@ -74,6 +74,19 @@ pub enum DaemonReply {
     Inject(String),
 }
 
+/// What an attempt against the daemon actually told us. "Nobody is listening"
+/// and "listening but not answering yet" look the same to a caller that only
+/// sees None, yet they are the difference between a dead daemon and a warming
+/// one - which decides whether the discovery flag may be deleted.
+enum Attempt {
+    /// The daemon answered: HTTP status + body.
+    Answered(u16, String),
+    /// Connect was refused/unreachable: nothing holds that bind.
+    NotListening,
+    /// Connected, but no usable answer inside the budget.
+    NoAnswer,
+}
+
 /// Ask the warm daemon to inject for this raw hook JSON. `None` on ANY failure
 /// (no flag file, connect refused/timeout, malformed or non-2xx response) -
 /// the caller MUST fall back to the cold path. A failure heals the flag only if
@@ -89,10 +102,10 @@ pub fn try_inject(db: &Path, raw_hook_json: &str) -> Option<DaemonReply> {
         return None;
     };
     match request_at(&bind, "POST", "/inject", Some(raw_hook_json), CLIENT_TIMEOUT) {
-        Some((status, body)) if status == 200 => Some(DaemonReply::Inject(body)),
-        Some((status, _)) if status == 204 => Some(DaemonReply::Silent),
-        _ => {
-            heal_stale_flag(db, &bind);
+        Attempt::Answered(200, body) => Some(DaemonReply::Inject(body)),
+        Attempt::Answered(204, _) => Some(DaemonReply::Silent),
+        outcome => {
+            heal_stale_flag(db, &bind, matches!(outcome, Attempt::NotListening));
             None
         }
     }
@@ -115,11 +128,17 @@ pub fn try_inject(db: &Path, raw_hook_json: &str) -> Option<DaemonReply> {
 ///     file - but a fresh daemon may have written its own flag in between. The
 ///     delete then wipes a flag we never read. Comparing the bind we actually
 ///     tried against what the file says now closes that window.
-fn heal_stale_flag(db: &Path, tried_bind: &str) {
+///
+/// `not_listening` short-circuits the probe: a refused connect already proves
+/// nobody holds the bind, so asking /health would only pay a SECOND refused
+/// connect on the hot path. That is not free - it blew the 300ms
+/// connect-refused budget on a loaded CI runner (windows/semantic, run
+/// 29444998320), which is exactly the regression the bound exists to catch.
+fn heal_stale_flag(db: &Path, tried_bind: &str, not_listening: bool) {
     if published_bind(db).as_deref() != Some(tried_bind) {
         return; // the flag changed under us - it is not the one we failed against
     }
-    if health_at_within(tried_bind, HEAL_PROBE_TIMEOUT).is_some() {
+    if !not_listening && health_at_within(tried_bind, HEAL_PROBE_TIMEOUT).is_some() {
         return; // alive, just not answering /inject inside the budget
     }
     let _ = std::fs::remove_file(flagfile(db));
@@ -140,36 +159,44 @@ pub fn health_at(bind: &str) -> Option<serde_json::Value> {
 /// Health probe with an explicit budget: the per-prompt failure path wants a
 /// tighter one than doctor/adoption, which are deliberate and off the hot path.
 fn health_at_within(bind: &str, budget: Duration) -> Option<serde_json::Value> {
-    let (status, body) = request_at(bind, "GET", "/health", None, budget)?;
-    (status == 200).then(|| serde_json::from_str(&body).ok())?
+    match request_at(bind, "GET", "/health", None, budget) {
+        Attempt::Answered(200, body) => serde_json::from_str(&body).ok(),
+        _ => None,
+    }
 }
 
-fn request_at(
-    bind: &str,
-    method: &str,
-    path: &str,
-    body: Option<&str>,
-    budget: Duration,
-) -> Option<(u16, String)> {
-    let addr: std::net::SocketAddr = bind.parse().ok()?;
+fn request_at(bind: &str, method: &str, path: &str, body: Option<&str>, budget: Duration) -> Attempt {
+    // An unparseable bind names no daemon at all: same class as nobody home.
+    let Ok(addr) = bind.parse::<std::net::SocketAddr>() else { return Attempt::NotListening };
     let deadline = Instant::now() + budget;
-    let mut stream = TcpStream::connect_timeout(&addr, CONNECT_TIMEOUT).ok()?;
+    // On loopback a connect is refused when nothing listens, and succeeds via
+    // the accept backlog even when the daemon is busy - so a connect failure
+    // here means gone, not slow.
+    let Ok(mut stream) = TcpStream::connect_timeout(&addr, CONNECT_TIMEOUT) else {
+        return Attempt::NotListening;
+    };
     let remaining = deadline.saturating_duration_since(Instant::now());
     if remaining.is_zero() {
-        return None;
+        return Attempt::NoAnswer;
     }
-    stream.set_read_timeout(Some(remaining)).ok()?;
-    stream.set_write_timeout(Some(remaining)).ok()?;
-    let payload = body.unwrap_or("");
-    let req = format!(
-        "{method} {path} HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Type: application/json\r\n\
-         Content-Length: {}\r\nConnection: close\r\n\r\n{payload}",
-        payload.len(),
-    );
-    stream.write_all(req.as_bytes()).ok()?;
-    let mut buf = Vec::new();
-    stream.read_to_end(&mut buf).ok()?; // Connection: close -> EOF ends the response
-    parse_response(&buf)
+    let mut exchange = || -> Option<Vec<u8>> {
+        stream.set_read_timeout(Some(remaining)).ok()?;
+        stream.set_write_timeout(Some(remaining)).ok()?;
+        let payload = body.unwrap_or("");
+        let req = format!(
+            "{method} {path} HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Type: application/json\r\n\
+             Content-Length: {}\r\nConnection: close\r\n\r\n{payload}",
+            payload.len(),
+        );
+        stream.write_all(req.as_bytes()).ok()?;
+        let mut buf = Vec::new();
+        stream.read_to_end(&mut buf).ok()?; // Connection: close -> EOF ends the response
+        Some(buf)
+    };
+    match exchange().as_deref().and_then(parse_response) {
+        Some((code, text)) => Attempt::Answered(code, text),
+        None => Attempt::NoAnswer,
+    }
 }
 
 /// Minimal HTTP/1.1 response parse: status code + body after the blank line.
@@ -357,7 +384,9 @@ mod tests {
         // The file now names a DIFFERENT (fresh) daemon than the one we tried.
         publish_daemon_flag_as(&db, "127.0.0.1:65000", 999).unwrap();
 
-        heal_stale_flag(&db, &dead_bind);
+        // not_listening = true: the old bind refused us, which is exactly when
+        // the old code would have deleted the fresh daemon's flag.
+        heal_stale_flag(&db, &dead_bind, true);
 
         assert!(flagfile(&db).exists(), "the republished flag must survive");
         assert_eq!(

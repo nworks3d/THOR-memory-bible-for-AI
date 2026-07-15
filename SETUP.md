@@ -59,8 +59,14 @@ the MCP server that means restarting your agent.
 ## 2. Install the hooks (one command)
 
 ```sh
-thor install --with-courier --with-guard
+thor install --with-courier --with-guard --with-daemon
 ```
+
+That is the full setup, and it is the one to run on the machine your agent works
+on. `--with-daemon` keeps a warm process holding the folded log and vector matrix
+resident: measured, that is ~60% of per-prompt latency (349 -> 120 ms) for about
+650 MB of RAM. Drop it if the RAM matters more than the wait; the courier then
+falls back to the cold path and still answers.
 
 This edits your agent's `settings.json` **idempotently** (it backs up first and only
 adds THOR entries, never touching existing hooks), wiring:
@@ -76,9 +82,16 @@ adds THOR entries, never touching existing hooks), wiring:
 
 Optional daily GitHub backup: add `--backup-repo <path-to-a-git-clone>`.
 
-## 3. Semantic recall (optional, off by default)
+## 3. Semantic recall (do this on a client machine)
 
-Lexical bm25 is the always-on default. The dense score-fusion layer needs a model:
+Lexical bm25 is always on; the dense score-fusion layer goes on top and is what
+you want on the machine your agent runs on. Skip it only for a server/NAS (the
+bm25 build carries no ONNX), or if you cannot spare ~650 MB of RAM for the warm
+model daemon. It degrades to bm25 whenever anything is missing, so turning it on
+cannot make recall worse.
+
+The release binaries for Windows and Linux already have the feature compiled in.
+What it needs from you is a model:
 
 ```sh
 thor vectors build      # embed every stored fact once (needs the model under %LOCALAPPDATA%\thor\model\)
@@ -132,7 +145,7 @@ Ordering note: an old binary cannot read a store containing the `fact_reprojecte
 event, so upgrade every machine that shares a store (PC, sync replica, restore host)
 to this build **before** the first `reproject`/`backfill`/`init`.
 
-## 5. Deploy as a remote MCP server (optional)
+## 5. Deploy as a remote MCP server (only for web/mobile access)
 
 `thor/deploy/` has a `Dockerfile` + `docker-compose.yml` template. Run `thor mcp
 --http 0.0.0.0:<port>` in the container, bind it to localhost/an internal network, and

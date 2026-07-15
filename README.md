@@ -69,8 +69,9 @@ mimir's graph is why it wins the code-structure category. See
   built-in `fsck` recomputes the chain, so tampering is detectable.
 - **Automatic recall.** A per-prompt hook (the *courier*) searches memory for the
   current prompt and injects the top hits, so the agent starts each turn with the
-  relevant context. Lexical bm25 (FTS5) by default; an optional semantic
-  score-fusion layer improves recall on paraphrased questions (see below).
+  relevant context. Lexical bm25 (FTS5) is always on; a semantic score-fusion
+  layer on top improves recall on paraphrased questions and is what you want on
+  a client machine (see below).
   The courier never repeats itself (a per-session ledger suppresses recently-shown
   hits and rotates deeper ones in), stays silent instead of injecting weak
   one-word coincidences, and re-reads a chunk's file live so changed code is
@@ -150,7 +151,7 @@ server/NAS (no ONNX). Each has a `.sha256`. On Windows the semantic build needs
 the Microsoft Visual C++ Redistributable installed.
 
 No embedding model ships with it: without one THOR runs pure bm25 and degrades
-cleanly (see [Semantic recall](#semantic-recall-optional-off-by-default)).
+cleanly (see [Semantic recall](#semantic-recall-recommended-on-a-client)).
 
 Or build it yourself:
 
@@ -212,16 +213,30 @@ thor backfill-projects          # attribute legacy memories from their import fo
   indexing silently. Mis-scoped a fact? `thor reproject` moves it (it travels as an event,
   so a replica agrees after sync).
 
-## Semantic recall (optional, off by default)
+## Semantic recall (recommended on a client)
 
-Lexical bm25 is the always-on default. A dense **score-fusion** layer adds
-meaning-based retrieval so a paraphrased question still finds the right memory. It
-is a compile-time feature, OFF by default, and degrades to bm25 whenever anything
-is missing - it can never make recall worse.
+Lexical bm25 is always on. A dense **score-fusion** layer adds meaning-based
+retrieval on top, so a paraphrased question still finds the right memory. Turn it
+on unless you have one of the reasons below: it degrades to bm25 whenever
+anything is missing, so it can never make recall worse.
+
+The **release binaries for Windows and Linux are already built with it** - you
+only need to supply a model (below). If you build from source, add the feature:
 
 ```sh
 cargo build --release --features semantic
 ```
+
+**When to leave it off**, and these are the only reasons:
+
+- **Servers, containers, the NAS.** The default build is bm25-only and pulls no
+  ONNX at all; that is what `thor-linux-x86_64-bm25.tar.gz` is for. A remote
+  store does not run the courier anyway.
+- **Not enough RAM.** Fast semantic recall wants a warm `thor embed-daemon`
+  holding the model resident (~650 MB). Without the daemon the courier still
+  works - it just falls back to bm25 rather than pay a cold model load on your
+  prompt.
+- **You have no model and do not want to fetch one** (~235 MB, see below).
 
 - Put the embedding model files under `%LOCALAPPDATA%\thor\model\` (or point
   `thor vectors build --model-dir <dir>` at them). Any local ONNX sentence-
@@ -242,14 +257,18 @@ cargo build --release --features semantic
 The dense sidecar (`thor-vectors.db`) is derived and deletable: remove it and
 recall silently returns to bm25.
 
-### Cross-encoder rerank (optional, opt-in per call)
+### Cross-encoder rerank (deliberately per-call, NOT a default)
+
+Unlike the semantic layer, this one is opt-in for a real reason: **it is not
+strictly better.** Measured, it wins on paraphrase-heavy questions and *loses*
+on exact lookups (numbers below). So it is a second try when the normal order
+looks wrong, not something to switch on and forget.
 
 A cross-encoder scores each (query, hit) pair through a full transformer pass -
 much better paraphrase ordering than vector cosines, but one forward pass per
-document (~1s median for a 12-hit pool on CPU), so it NEVER runs by default and
-never touches the per-prompt courier. Use it as a deliberate second try when
-the normal order looks wrong: MCP recall takes `rerank: true`, the CLI takes
-`thor recall --rerank`.
+document (~1s median for a 12-hit pool on CPU), so it never runs by default and
+never touches the per-prompt courier. MCP recall takes `rerank: true`, the CLI
+takes `thor recall --rerank`.
 
 - Put a reranker model (ONNX + tokenizer, five files, onnx named `model.onnx`)
   under `%LOCALAPPDATA%\thor\reranker\`; a multilingual base reranker is a good
@@ -261,9 +280,11 @@ the normal order looks wrong: MCP recall takes `rerank: true`, the CLI takes
   exact-lookup questions (doc references) can get WORSE while paraphrase-heavy
   ones improve. That trade-off is WHY it is opt-in rather than default.
 
-## Sync (optional)
+## Sync (only if you have a second machine)
 
-Replicate the log to another machine over the LAN/tailnet, bearer-token gated:
+Replicate the log to another machine over the LAN/tailnet, bearer-token gated.
+Nothing to turn on if you work on one machine; this exists for a laptop plus a
+desktop, or a NAS holding a replica:
 
 ```sh
 # on the replica:
@@ -315,7 +336,7 @@ overwrites your live compose file and never touches the data volume.
 | `thor consolidate [--apply-dedup]` | metabolism report: duplicate twins, decay candidates, same-topic clusters (exit 1 when anything needs digesting; only the dedup pass is ever applied mechanically) |
 | `thor steward` | prepare a stewardship review: the consolidate report + the proven conservative rubric written to a file an agent session works through with the MCP tools (no writes itself) |
 | `thor symbols` | (re)build the derived symbol sidecar (`thor-symbols.db`): which names every code chunk defines and calls - powers `where_used`/`impact` and a deliberate-recall ranking bonus; refreshed automatically after `thor ingest`, safe to delete and rebuild |
-| `thor daemon` / `thor ensure-daemon` | warm injection daemon: `/inject` + `/health` on the HTTP server, discovered via a flag file; the courier answers warm and falls back cold on any failure (`ensure-daemon` is the SessionStart form, opt-in via `thor install --with-daemon`) |
+| `thor daemon` / `thor ensure-daemon` | warm injection daemon: `/inject` + `/health` on the HTTP server, discovered via a flag file; the courier answers warm and falls back cold on any failure. **Recommended** - it holds the folded log + vector matrix resident, which is ~60% of per-prompt latency (349 -> 120 ms measured), for ~650 MB of RAM. Wire it in with `thor install --with-daemon` (`ensure-daemon` is the SessionStart form) |
 | `thor doctor` | one-line health per surface: store, semantic model + sidecars, injection daemon warm/cold, flags |
 | `thor pre-compact` | PreCompact hook: one advisory per session, right before a compaction, to persist durable decisions via remember (installed by `--with-courier`) |
 | `thor recall --rerank` | rescore the top hits with the local cross-encoder (feature `semantic` + downloaded reranker model; MCP recall takes `rerank: true`) |

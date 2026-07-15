@@ -1,5 +1,5 @@
-<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 860 1525" font-family="Segoe UI, Helvetica Neue, Arial, sans-serif">
-<rect x="0" y="0" width="860" height="1525" rx="10" fill="#0d1117"/>
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 860 1620" font-family="Segoe UI, Helvetica Neue, Arial, sans-serif">
+<rect x="0" y="0" width="860" height="1620" rx="10" fill="#0d1117"/>
 <text x="20" y="32" fill="#e6edf3" font-size="22" font-weight="800">THOR vs mimir - the honest picture</text>
 <text x="20" y="54" fill="#8b949e" font-size="12">Same machine, blind-judged, re-measured fresh 2026-07-14 vs mimir v0.14.0 (3-judge median, fresh blind maps).</text>
 <text x="20" y="84" fill="#c9d1d9" font-size="12.5" font-weight="700" letter-spacing="0.4">TEST 1 - COVERAGE  (200 questions: shared-knowledge + category-stratified)</text>
@@ -55,109 +55,117 @@
 <line x1="20" y1="410" x2="840" y2="410" stroke="#21262d" stroke-width="1"/>
 <text x="20" y="428" fill="#e6edf3" font-size="13" font-weight="700">Test 1 overall  <tspan fill="#22d3ee">THOR 77.0%</tspan> vs <tspan fill="#8b949e">mimir 70.5%</tspan>  (n=200) - THOR leads by 6.5 points</text>
 <text x="20" y="444" fill="#8b949e" font-size="11">THOR wins four of six categories (decision +20, doc-reference +11, config +9, behavior +8), ties gotcha, and loses</text>
-<text x="20" y="460" fill="#8b949e" font-size="11">only code-structure (63.6 vs 74.2) - mimir's first-class tree-sitter symbol graph, THOR's one honest open gap.</text>
-<text x="20" y="490" fill="#c9d1d9" font-size="12.5" font-weight="700" letter-spacing="0.4">TEST 2 - SAME KNOWLEDGE  (facts both systems verifiably hold)</text>
-<text x="20" y="506" fill="#8b949e" font-size="11">cuts over the judged Test 1 medians . the equal-corpus comparison</text>
-<rect x="196" y="516" width="320.8" height="14" rx="7" fill="#22d3ee"/>
-<text x="523.76" y="527.5" fill="#e6edf3" font-size="11.5" font-weight="700">97%</text>
-<text x="184" y="527.5" fill="#22d3ee" font-size="10.5" font-weight="700" text-anchor="end">THOR</text>
-<text x="20" y="538" fill="#e6edf3" font-size="13" font-weight="700">Strict dual-written (n=53)</text>
-<text x="838" y="539" fill="#22d3ee" font-size="15" font-weight="800" text-anchor="end">+3%</text>
-<rect x="196" y="536" width="311.2" height="14" rx="7" fill="#484f58"/>
-<text x="514.19" y="547.5" fill="#8b949e" font-size="11.5">94%</text>
-<text x="184" y="547.5" fill="#8b949e" font-size="10.5" text-anchor="end">mimir</text>
-<rect x="196" y="566" width="293.0" height="14" rx="7" fill="#22d3ee"/>
-<text x="496.04" y="577.5" fill="#e6edf3" font-size="11.5" font-weight="700">89%</text>
-<text x="184" y="577.5" fill="#22d3ee" font-size="10.5" font-weight="700" text-anchor="end">THOR</text>
-<text x="20" y="588" fill="#e6edf3" font-size="13" font-weight="700">Broad shared (n=152)</text>
-<text x="838" y="589" fill="#22d3ee" font-size="15" font-weight="800" text-anchor="end">+3%</text>
-<rect x="196" y="586" width="284.5" height="14" rx="7" fill="#484f58"/>
-<text x="487.46" y="597.5" fill="#8b949e" font-size="11.5">86%</text>
-<text x="184" y="597.5" fill="#8b949e" font-size="10.5" text-anchor="end">mimir</text>
-<text x="20" y="616" fill="#c9d1d9" font-size="11">THOR wins BOTH same-knowledge cuts, including the strict dual-written cut (97.2 vs 94.3) - the cleanest equal-corpus</text>
-<text x="20" y="632" fill="#c9d1d9" font-size="11">test there is, and pure memory recall was mimir's home turf across several earlier juries. THOR now leads it.</text>
-<text x="20" y="662" fill="#c9d1d9" font-size="12.5" font-weight="700" letter-spacing="0.4">TEST 3 - MULTI-PROJECT  (three private project repos seeded)</text>
-<text x="20" y="678" fill="#8b949e" font-size="11">45 real questions from each repo, scoped per project, blind-judged 3-judge median . top-5 full chunks</text>
-<rect x="196" y="688" width="307.9" height="14" rx="7" fill="#22d3ee"/>
-<text x="510.89" y="699.5" fill="#e6edf3" font-size="11.5" font-weight="700">93%</text>
-<text x="184" y="699.5" fill="#22d3ee" font-size="10.5" font-weight="700" text-anchor="end">THOR</text>
-<text x="20" y="710" fill="#e6edf3" font-size="13" font-weight="700">Project 1</text>
-<text x="838" y="711" fill="#c9d1d9" font-size="15" font-weight="800" text-anchor="end">tie</text>
-<rect x="196" y="708" width="307.9" height="14" rx="7" fill="#484f58"/>
-<text x="510.89" y="719.5" fill="#8b949e" font-size="11.5">93%</text>
-<text x="184" y="719.5" fill="#8b949e" font-size="10.5" text-anchor="end">mimir</text>
-<rect x="196" y="738" width="319.1" height="14" rx="7" fill="#22d3ee"/>
-<text x="522.11" y="749.5" fill="#e6edf3" font-size="11.5" font-weight="700">97%</text>
-<text x="184" y="749.5" fill="#22d3ee" font-size="10.5" font-weight="700" text-anchor="end">THOR</text>
-<text x="20" y="760" fill="#e6edf3" font-size="13" font-weight="700">Project 2</text>
-<text x="838" y="761" fill="#e3b341" font-size="15" font-weight="800" text-anchor="end">-3%</text>
-<rect x="196" y="758" width="330.0" height="14" rx="7" fill="#484f58"/>
-<text x="533.00" y="769.5" fill="#8b949e" font-size="11.5">100%</text>
-<text x="184" y="769.5" fill="#8b949e" font-size="10.5" text-anchor="end">mimir</text>
-<rect x="196" y="788" width="330.0" height="14" rx="7" fill="#22d3ee"/>
-<text x="533.00" y="799.5" fill="#e6edf3" font-size="11.5" font-weight="700">100%</text>
-<text x="184" y="799.5" fill="#22d3ee" font-size="10.5" font-weight="700" text-anchor="end">THOR</text>
-<text x="20" y="810" fill="#e6edf3" font-size="13" font-weight="700">Project 3</text>
-<text x="838" y="811" fill="#22d3ee" font-size="15" font-weight="800" text-anchor="end">+7%</text>
-<rect x="196" y="808" width="307.9" height="14" rx="7" fill="#484f58"/>
-<text x="510.89" y="819.5" fill="#8b949e" font-size="11.5">93%</text>
-<text x="184" y="819.5" fill="#8b949e" font-size="10.5" text-anchor="end">mimir</text>
-<line x1="20" y1="838" x2="840" y2="838" stroke="#21262d" stroke-width="1"/>
-<text x="20" y="856" fill="#e6edf3" font-size="13" font-weight="700">Test 3 overall  <tspan fill="#22d3ee">THOR 96.7%</tspan> vs <tspan fill="#8b949e">mimir 95.6%</tspan>  (n=45) - THOR edges it</text>
-<text x="20" y="872" fill="#8b949e" font-size="11">Per-project numbers on n=15 move with a single question (6.7 points each): treat the split as noisy and the near-tie</text>
-<text x="20" y="888" fill="#8b949e" font-size="11">overall as the takeaway - both systems answer scoped project questions very well.</text>
-<text x="20" y="918" fill="#c9d1d9" font-size="12.5" font-weight="700" letter-spacing="0.4">SESSION DRIFT COMPENSATION  (73 fresh-session scenarios)</text>
-<text x="20" y="934" fill="#8b949e" font-size="11">post-compaction, empty context: does the AS-DEPLOYED auto-injection surface the fact that stops the drift?</text>
-<rect x="196" y="944" width="284.8" height="14" rx="7" fill="#22d3ee"/>
-<text x="487.79" y="955.5" fill="#e6edf3" font-size="11.5" font-weight="700">86%</text>
-<text x="184" y="955.5" fill="#22d3ee" font-size="10.5" font-weight="700" text-anchor="end">THOR</text>
-<text x="20" y="966" fill="#e6edf3" font-size="13" font-weight="700">Preventer surfaced</text>
-<text x="838" y="967" fill="#22d3ee" font-size="15" font-weight="800" text-anchor="end">+12%</text>
-<rect x="196" y="964" width="244.2" height="14" rx="7" fill="#484f58"/>
-<text x="447.20" y="975.5" fill="#8b949e" font-size="11.5">74%</text>
-<text x="184" y="975.5" fill="#8b949e" font-size="10.5" text-anchor="end">mimir</text>
-<rect x="196" y="994" width="194.4" height="14" rx="7" fill="#22d3ee"/>
-<text x="397.37" y="1005.5" fill="#e6edf3" font-size="11.5" font-weight="700">59%</text>
-<text x="184" y="1005.5" fill="#22d3ee" font-size="10.5" font-weight="700" text-anchor="end">THOR</text>
-<text x="20" y="1016" fill="#e6edf3" font-size="13" font-weight="700">Clear catch (full)</text>
-<text x="838" y="1017" fill="#22d3ee" font-size="15" font-weight="800" text-anchor="end">+8%</text>
-<rect x="196" y="1014" width="167.3" height="14" rx="7" fill="#484f58"/>
-<text x="370.31" y="1025.5" fill="#8b949e" font-size="11.5">51%</text>
-<text x="184" y="1025.5" fill="#8b949e" font-size="10.5" text-anchor="end">mimir</text>
-<text x="20" y="1044" fill="#c9d1d9" font-size="11">THOR leads BOTH drift metrics decisively - the as-deployed courier surfaces the preventing fact 86.3% (vs mimir's</text>
-<text x="20" y="1060" fill="#c9d1d9" font-size="11">best case 74.0%) and fully catches it 58.9% (vs 50.7%). This is the product's core purpose, and the channel built</text>
-<text x="20" y="1076" fill="#c9d1d9" font-size="11">for it wins. Separately reproducible in-repo, no judge: cargo run --example drift_eval (catches + false fires).</text>
-<text x="20" y="1106" fill="#c9d1d9" font-size="12.5" font-weight="700" letter-spacing="0.4">SPEED  (per-prompt cost, lower is better)</text>
-<text x="20" y="1122" fill="#8b949e" font-size="11">as-deployed, correct invocation each side (THOR stdin hook, mimir prompt arg) . median of 20</text>
-<rect x="196" y="1132" width="254.3" height="14" rx="7" fill="#22d3ee"/>
-<text x="457.32" y="1143.5" fill="#e6edf3" font-size="11.5" font-weight="700">230 ms</text>
-<text x="184" y="1143.5" fill="#22d3ee" font-size="10.5" font-weight="700" text-anchor="end">THOR</text>
-<text x="20" y="1154" fill="#e6edf3" font-size="13" font-weight="700">Full recall (like-for-like)</text>
-<text x="838" y="1155" fill="#22d3ee" font-size="15" font-weight="800" text-anchor="end">1.3x faster</text>
-<rect x="196" y="1152" width="330.0" height="14" rx="7" fill="#484f58"/>
-<text x="533.00" y="1163.5" fill="#8b949e" font-size="11.5">299 ms</text>
-<text x="184" y="1163.5" fill="#8b949e" font-size="10.5" text-anchor="end">mimir</text>
-<text x="20" y="1182" fill="#c9d1d9" font-size="11">On a like-for-like FULL recall THOR is faster (230 vs 299 ms) and injects a full block. mimir's as-deployed hook is</text>
-<text x="20" y="1198" fill="#c9d1d9" font-size="11">much faster (~31 ms) but serves at most ONE floor-gated memory and is empty on half the prompts (10/20): fast because</text>
-<text x="20" y="1214" fill="#c9d1d9" font-size="11">it serves less. THOR is compute-bound; a sandbox resident-cache prototype cut recall 213 -> 75 ms (65%), NOT shipped</text>
-<text x="20" y="1230" fill="#c9d1d9" font-size="11">by the quality-over-speed rule. THOR's warm daemon saves only ~15 ms (the cost is per-query work, not startup).</text>
-<text x="20" y="1260" fill="#c9d1d9" font-size="12.5" font-weight="700" letter-spacing="0.4">HONEST DOWNSIDES</text>
-<text x="20" y="1276" fill="#8b949e" font-size="11">where THOR does not win, and the caveats</text>
-<circle cx="26" cy="1294" r="3" fill="#e3b341"/>
-<text x="38" y="1298" fill="#e6edf3" font-size="11.5">Code-structure is THOR's one category loss (63.6 vs 74.2) - mimir's first-class tree-sitter symbol graph wins it</text>
-<circle cx="26" cy="1315" r="3" fill="#e3b341"/>
-<text x="38" y="1319" fill="#e6edf3" font-size="11.5">On raw hook latency mimir is much faster (~31 vs ~230 ms) - but serves a single floor-gated memory, empty on 10/20</text>
-<circle cx="26" cy="1336" r="3" fill="#e3b341"/>
-<text x="38" y="1340" fill="#e6edf3" font-size="11.5">THOR is compute-bound; latency grows with store size. A resident cache would fix it (proven 65%) but is not shipped</text>
-<circle cx="26" cy="1357" r="3" fill="#e3b341"/>
-<text x="38" y="1361" fill="#e6edf3" font-size="11.5">mimir has a first-class code-symbol graph (graph/outline/peek); THOR's is a derived sidecar (where_used/impact)</text>
-<circle cx="26" cy="1378" r="3" fill="#e3b341"/>
-<text x="38" y="1382" fill="#e6edf3" font-size="11.5">Newer and far less battle-tested than mimir's daily use; mimir ships at a high cadence (v0.14: sync, GPU, fast cold)</text>
-<circle cx="26" cy="1399" r="3" fill="#e3b341"/>
-<text x="38" y="1403" fill="#e6edf3" font-size="11.5">Semantic mode needs a ~235 MB model + a warm embed-daemon resident (off by default; degrades cleanly to bm25)</text>
-<circle cx="26" cy="1420" r="3" fill="#e3b341"/>
-<text x="38" y="1424" fill="#e6edf3" font-size="11.5">One machine, private corpus, LLM-judged - only drift is repo-reproducible (examples/drift_eval.rs)</text>
-<line x1="20" y1="1453" x2="840" y2="1453" stroke="#21262d" stroke-width="1"/>
-<text x="20" y="1473" fill="#e6edf3" font-size="13.5" font-weight="700">Bottom line <tspan fill="#22d3ee">coverage 77 vs 70.5</tspan> . <tspan fill="#22d3ee">both same-knowledge cuts</tspan> . <tspan fill="#22d3ee">drift 86 vs 74</tspan> . <tspan fill="#22d3ee">multi-project edge</tspan></text>
-<text x="20" y="1493" fill="#e6edf3" font-size="13.5" font-weight="700"><tspan fill="#22d3ee">faster on like-for-like full recall (230 vs 299 ms)</tspan> . <tspan fill="#e3b341">loses code-structure (63.6 vs 74.2)</tspan></text>
+<text x="20" y="460" fill="#8b949e" font-size="11">only code-structure (63.6 vs 74.2) - a real, open gap, but see the downside below: the symbol-graph explanation</text>
+<text x="20" y="476" fill="#8b949e" font-size="11">we first published for it did not survive scrutiny.</text>
+<text x="20" y="506" fill="#c9d1d9" font-size="12.5" font-weight="700" letter-spacing="0.4">TEST 2 - SAME KNOWLEDGE  (facts both systems verifiably hold)</text>
+<text x="20" y="522" fill="#8b949e" font-size="11">cuts over the judged Test 1 medians . the equal-corpus comparison</text>
+<rect x="196" y="532" width="320.8" height="14" rx="7" fill="#22d3ee"/>
+<text x="523.76" y="543.5" fill="#e6edf3" font-size="11.5" font-weight="700">97%</text>
+<text x="184" y="543.5" fill="#22d3ee" font-size="10.5" font-weight="700" text-anchor="end">THOR</text>
+<text x="20" y="554" fill="#e6edf3" font-size="13" font-weight="700">Strict dual-written (n=53)</text>
+<text x="838" y="555" fill="#22d3ee" font-size="15" font-weight="800" text-anchor="end">+3%</text>
+<rect x="196" y="552" width="311.2" height="14" rx="7" fill="#484f58"/>
+<text x="514.19" y="563.5" fill="#8b949e" font-size="11.5">94%</text>
+<text x="184" y="563.5" fill="#8b949e" font-size="10.5" text-anchor="end">mimir</text>
+<rect x="196" y="582" width="293.0" height="14" rx="7" fill="#22d3ee"/>
+<text x="496.04" y="593.5" fill="#e6edf3" font-size="11.5" font-weight="700">89%</text>
+<text x="184" y="593.5" fill="#22d3ee" font-size="10.5" font-weight="700" text-anchor="end">THOR</text>
+<text x="20" y="604" fill="#e6edf3" font-size="13" font-weight="700">Broad shared (n=152)</text>
+<text x="838" y="605" fill="#22d3ee" font-size="15" font-weight="800" text-anchor="end">+3%</text>
+<rect x="196" y="602" width="284.5" height="14" rx="7" fill="#484f58"/>
+<text x="487.46" y="613.5" fill="#8b949e" font-size="11.5">86%</text>
+<text x="184" y="613.5" fill="#8b949e" font-size="10.5" text-anchor="end">mimir</text>
+<text x="20" y="632" fill="#c9d1d9" font-size="11">THOR wins BOTH same-knowledge cuts, including the strict dual-written cut (97.2 vs 94.3) - the cleanest equal-corpus</text>
+<text x="20" y="648" fill="#c9d1d9" font-size="11">test there is, and pure memory recall was mimir's home turf across several earlier juries. THOR now leads it.</text>
+<text x="20" y="678" fill="#c9d1d9" font-size="12.5" font-weight="700" letter-spacing="0.4">TEST 3 - MULTI-PROJECT  (three private project repos seeded)</text>
+<text x="20" y="694" fill="#8b949e" font-size="11">45 real questions from each repo, scoped per project, blind-judged 3-judge median . top-5 full chunks</text>
+<rect x="196" y="704" width="307.9" height="14" rx="7" fill="#22d3ee"/>
+<text x="510.89" y="715.5" fill="#e6edf3" font-size="11.5" font-weight="700">93%</text>
+<text x="184" y="715.5" fill="#22d3ee" font-size="10.5" font-weight="700" text-anchor="end">THOR</text>
+<text x="20" y="726" fill="#e6edf3" font-size="13" font-weight="700">Project 1</text>
+<text x="838" y="727" fill="#c9d1d9" font-size="15" font-weight="800" text-anchor="end">tie</text>
+<rect x="196" y="724" width="307.9" height="14" rx="7" fill="#484f58"/>
+<text x="510.89" y="735.5" fill="#8b949e" font-size="11.5">93%</text>
+<text x="184" y="735.5" fill="#8b949e" font-size="10.5" text-anchor="end">mimir</text>
+<rect x="196" y="754" width="319.1" height="14" rx="7" fill="#22d3ee"/>
+<text x="522.11" y="765.5" fill="#e6edf3" font-size="11.5" font-weight="700">97%</text>
+<text x="184" y="765.5" fill="#22d3ee" font-size="10.5" font-weight="700" text-anchor="end">THOR</text>
+<text x="20" y="776" fill="#e6edf3" font-size="13" font-weight="700">Project 2</text>
+<text x="838" y="777" fill="#e3b341" font-size="15" font-weight="800" text-anchor="end">-3%</text>
+<rect x="196" y="774" width="330.0" height="14" rx="7" fill="#484f58"/>
+<text x="533.00" y="785.5" fill="#8b949e" font-size="11.5">100%</text>
+<text x="184" y="785.5" fill="#8b949e" font-size="10.5" text-anchor="end">mimir</text>
+<rect x="196" y="804" width="330.0" height="14" rx="7" fill="#22d3ee"/>
+<text x="533.00" y="815.5" fill="#e6edf3" font-size="11.5" font-weight="700">100%</text>
+<text x="184" y="815.5" fill="#22d3ee" font-size="10.5" font-weight="700" text-anchor="end">THOR</text>
+<text x="20" y="826" fill="#e6edf3" font-size="13" font-weight="700">Project 3</text>
+<text x="838" y="827" fill="#22d3ee" font-size="15" font-weight="800" text-anchor="end">+7%</text>
+<rect x="196" y="824" width="307.9" height="14" rx="7" fill="#484f58"/>
+<text x="510.89" y="835.5" fill="#8b949e" font-size="11.5">93%</text>
+<text x="184" y="835.5" fill="#8b949e" font-size="10.5" text-anchor="end">mimir</text>
+<line x1="20" y1="854" x2="840" y2="854" stroke="#21262d" stroke-width="1"/>
+<text x="20" y="872" fill="#e6edf3" font-size="13" font-weight="700">Test 3 overall  <tspan fill="#22d3ee">THOR 96.7%</tspan> vs <tspan fill="#8b949e">mimir 95.6%</tspan>  (n=45) - THOR edges it</text>
+<text x="20" y="888" fill="#8b949e" font-size="11">Per-project numbers on n=15 move with a single question (6.7 points each): treat the split as noisy and the near-tie</text>
+<text x="20" y="904" fill="#8b949e" font-size="11">overall as the takeaway - both systems answer scoped project questions very well.</text>
+<text x="20" y="934" fill="#c9d1d9" font-size="12.5" font-weight="700" letter-spacing="0.4">SESSION DRIFT COMPENSATION  (73 fresh-session scenarios)</text>
+<text x="20" y="950" fill="#8b949e" font-size="11">post-compaction, empty context: does the AS-DEPLOYED auto-injection surface the fact that stops the drift?</text>
+<rect x="196" y="960" width="284.8" height="14" rx="7" fill="#22d3ee"/>
+<text x="487.79" y="971.5" fill="#e6edf3" font-size="11.5" font-weight="700">86%</text>
+<text x="184" y="971.5" fill="#22d3ee" font-size="10.5" font-weight="700" text-anchor="end">THOR</text>
+<text x="20" y="982" fill="#e6edf3" font-size="13" font-weight="700">Preventer surfaced</text>
+<text x="838" y="983" fill="#22d3ee" font-size="15" font-weight="800" text-anchor="end">+12%</text>
+<rect x="196" y="980" width="244.2" height="14" rx="7" fill="#484f58"/>
+<text x="447.20" y="991.5" fill="#8b949e" font-size="11.5">74%</text>
+<text x="184" y="991.5" fill="#8b949e" font-size="10.5" text-anchor="end">mimir</text>
+<rect x="196" y="1010" width="194.4" height="14" rx="7" fill="#22d3ee"/>
+<text x="397.37" y="1021.5" fill="#e6edf3" font-size="11.5" font-weight="700">59%</text>
+<text x="184" y="1021.5" fill="#22d3ee" font-size="10.5" font-weight="700" text-anchor="end">THOR</text>
+<text x="20" y="1032" fill="#e6edf3" font-size="13" font-weight="700">Clear catch (full)</text>
+<text x="838" y="1033" fill="#22d3ee" font-size="15" font-weight="800" text-anchor="end">+8%</text>
+<rect x="196" y="1030" width="167.3" height="14" rx="7" fill="#484f58"/>
+<text x="370.31" y="1041.5" fill="#8b949e" font-size="11.5">51%</text>
+<text x="184" y="1041.5" fill="#8b949e" font-size="10.5" text-anchor="end">mimir</text>
+<text x="20" y="1060" fill="#c9d1d9" font-size="11">THOR leads BOTH drift metrics decisively - the as-deployed courier surfaces the preventing fact 86.3% (vs mimir's</text>
+<text x="20" y="1076" fill="#c9d1d9" font-size="11">best case 74.0%) and fully catches it 58.9% (vs 50.7%). This is the product's core purpose, and the channel built</text>
+<text x="20" y="1092" fill="#c9d1d9" font-size="11">for it wins. Separately reproducible in-repo, no judge: cargo run --example drift_eval (catches + false fires).</text>
+<text x="20" y="1122" fill="#c9d1d9" font-size="12.5" font-weight="700" letter-spacing="0.4">SPEED  (per-prompt cost, lower is better)</text>
+<text x="20" y="1138" fill="#8b949e" font-size="11">as-deployed, correct invocation each side (THOR stdin hook, mimir prompt arg) . median of 20 . 2026-07-15 vs mimir 0.14</text>
+<rect x="196" y="1148" width="122.9" height="14" rx="7" fill="#22d3ee"/>
+<text x="325.89" y="1159.5" fill="#e6edf3" font-size="11.5" font-weight="700">120 ms</text>
+<text x="184" y="1159.5" fill="#22d3ee" font-size="10.5" font-weight="700" text-anchor="end">THOR</text>
+<text x="20" y="1170" fill="#e6edf3" font-size="13" font-weight="700">Full recall (like-for-like)</text>
+<text x="838" y="1171" fill="#22d3ee" font-size="15" font-weight="800" text-anchor="end">2.7x faster</text>
+<rect x="196" y="1168" width="330.0" height="14" rx="7" fill="#484f58"/>
+<text x="533.00" y="1179.5" fill="#8b949e" font-size="11.5">322 ms</text>
+<text x="184" y="1179.5" fill="#8b949e" font-size="10.5" text-anchor="end">mimir</text>
+<text x="20" y="1198" fill="#c9d1d9" font-size="11">THOR's inject daemon now holds the folded log + vector matrix resident: 349 -> 120 ms (-66%), byte-identical output.</text>
+<text x="20" y="1214" fill="#c9d1d9" font-size="11">On a like-for-like FULL recall THOR is 2.7x faster (120 vs 322 ms) and injects a full block on every prompt. With the</text>
+<text x="20" y="1230" fill="#c9d1d9" font-size="11">daemon STOPPED it is 349 ms - slightly slower than mimir there, and it grows with store size (230 ms at 12.7k events,</text>
+<text x="20" y="1246" fill="#c9d1d9" font-size="11">349 at 16.1k). mimir's as-deployed hook is much faster (~34 ms) but serves ONE floor-gated memory (175 chars) and is</text>
+<text x="20" y="1262" fill="#c9d1d9" font-size="11">empty on 6/20 prompts: fast because it serves less.</text>
+<text x="20" y="1292" fill="#c9d1d9" font-size="12.5" font-weight="700" letter-spacing="0.4">HONEST DOWNSIDES</text>
+<text x="20" y="1308" fill="#8b949e" font-size="11">where THOR does not win, and the caveats</text>
+<circle cx="26" cy="1326" r="3" fill="#e3b341"/>
+<text x="38" y="1330" fill="#e6edf3" font-size="11.5">Code-structure is THOR's one category loss (63.6 vs 74.2). But mimir answers it mostly from PROSE, not code: its top</text>
+<circle cx="26" cy="1347" r="3" fill="#e3b341"/>
+<text x="38" y="1351" fill="#e6edf3" font-size="11.5">hit is a doc 70% of the time (THOR 48%) and code only 21% (THOR 42%), and where the gold names a file THOR serves it</text>
+<circle cx="26" cy="1368" r="3" fill="#e3b341"/>
+<text x="38" y="1372" fill="#e6edf3" font-size="11.5">more often (81% vs 69%). The golds are prose, which favours a doc that states the answer over source to interpret.</text>
+<circle cx="26" cy="1389" r="3" fill="#e3b341"/>
+<text x="38" y="1393" fill="#e6edf3" font-size="11.5">On raw hook latency mimir is much faster (~34 vs ~120 ms) - but serves a single floor-gated memory, empty on 6/20</text>
+<circle cx="26" cy="1410" r="3" fill="#e3b341"/>
+<text x="38" y="1414" fill="#e6edf3" font-size="11.5">THOR is compute-bound; latency grows with store size (230 ms at 12.7k events, 349 at 16.1k). The resident cache</text>
+<circle cx="26" cy="1431" r="3" fill="#e3b341"/>
+<text x="38" y="1435" fill="#e6edf3" font-size="11.5">removes that growth only WHILE A DAEMON IS UP (120 ms); a bare per-prompt hook has nothing to keep resident.</text>
+<circle cx="26" cy="1452" r="3" fill="#e3b341"/>
+<text x="38" y="1456" fill="#e6edf3" font-size="11.5">mimir has a first-class code-symbol graph (graph/outline/peek); THOR's is a derived sidecar (where_used/impact)</text>
+<circle cx="26" cy="1473" r="3" fill="#e3b341"/>
+<text x="38" y="1477" fill="#e6edf3" font-size="11.5">Newer and far less battle-tested than mimir's daily use; mimir ships at a high cadence (v0.14: sync, GPU, fast cold)</text>
+<circle cx="26" cy="1494" r="3" fill="#e3b341"/>
+<text x="38" y="1498" fill="#e6edf3" font-size="11.5">Semantic mode needs a ~235 MB model + a warm embed-daemon resident (off by default; degrades cleanly to bm25)</text>
+<circle cx="26" cy="1515" r="3" fill="#e3b341"/>
+<text x="38" y="1519" fill="#e6edf3" font-size="11.5">One machine, private corpus, LLM-judged - only drift is repo-reproducible (examples/drift_eval.rs)</text>
+<line x1="20" y1="1548" x2="840" y2="1548" stroke="#21262d" stroke-width="1"/>
+<text x="20" y="1568" fill="#e6edf3" font-size="13.5" font-weight="700">Bottom line <tspan fill="#22d3ee">coverage 77 vs 70.5</tspan> . <tspan fill="#22d3ee">both same-knowledge cuts</tspan> . <tspan fill="#22d3ee">drift 86 vs 74</tspan> . <tspan fill="#22d3ee">multi-project edge</tspan></text>
+<text x="20" y="1588" fill="#e6edf3" font-size="13.5" font-weight="700"><tspan fill="#22d3ee">2.7x faster on like-for-like full recall (120 vs 322 ms, daemon up)</tspan> . <tspan fill="#e3b341">loses code-structure (63.6 vs 74.2)</tspan></text>
 </svg>

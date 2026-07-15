@@ -83,7 +83,8 @@ for label, t, m in [
 rule()
 note(f'Test 1 overall  <tspan fill="{CYAN}">THOR 77.0%</tspan> vs <tspan fill="{MUT}">mimir 70.5%</tspan>  (n=200) - THOR leads by 6.5 points', color=FG, size=13, bold=True)
 note("THOR wins four of six categories (decision +20, doc-reference +11, config +9, behavior +8), ties gotcha, and loses")
-note("only code-structure (63.6 vs 74.2) - mimir's first-class tree-sitter symbol graph, THOR's one honest open gap.")
+note("only code-structure (63.6 vs 74.2) - a real, open gap, but see the downside below: the symbol-graph explanation")
+note("we first published for it did not survive scrutiny.")
 y += 14
 
 # ---- test 2 ----
@@ -115,21 +116,25 @@ note("for it wins. Separately reproducible in-repo, no judge: cargo run --exampl
 y += 14
 
 # ---- speed ----
-header("SPEED  (per-prompt cost, lower is better)", "as-deployed, correct invocation each side (THOR stdin hook, mimir prompt arg) . median of 20")
-pair("Full recall (like-for-like)", 230.2, 298.7, "1.3x faster", delta_color=CYAN, unit=" ms", scale=330 / 298.7)
-note("On a like-for-like FULL recall THOR is faster (230 vs 299 ms) and injects a full block. mimir's as-deployed hook is", color=SOFT)
-note("much faster (~31 ms) but serves at most ONE floor-gated memory and is empty on half the prompts (10/20): fast because", color=SOFT)
-note("it serves less. THOR is compute-bound; a sandbox resident-cache prototype cut recall 213 -> 75 ms (65%), NOT shipped", color=SOFT)
-note("by the quality-over-speed rule. THOR's warm daemon saves only ~15 ms (the cost is per-query work, not startup).", color=SOFT)
+header("SPEED  (per-prompt cost, lower is better)", "as-deployed, correct invocation each side (THOR stdin hook, mimir prompt arg) . median of 20 . 2026-07-15 vs mimir 0.14")
+pair("Full recall (like-for-like)", 119.8, 321.7, "2.7x faster", delta_color=CYAN, unit=" ms", scale=330 / 321.7)
+note("THOR's inject daemon now holds the folded log + vector matrix resident: 349 -> 120 ms (-66%), byte-identical output.", color=SOFT)
+note("On a like-for-like FULL recall THOR is 2.7x faster (120 vs 322 ms) and injects a full block on every prompt. With the", color=SOFT)
+note("daemon STOPPED it is 349 ms - slightly slower than mimir there, and it grows with store size (230 ms at 12.7k events,", color=SOFT)
+note("349 at 16.1k). mimir's as-deployed hook is much faster (~34 ms) but serves ONE floor-gated memory (175 chars) and is", color=SOFT)
+note("empty on 6/20 prompts: fast because it serves less.", color=SOFT)
 y += 14
 
 # ---- downsides ----
 header("HONEST DOWNSIDES", "where THOR does not win, and the caveats")
 y += 12
 for b in [
-    "Code-structure is THOR's one category loss (63.6 vs 74.2) - mimir's first-class tree-sitter symbol graph wins it",
-    "On raw hook latency mimir is much faster (~31 vs ~230 ms) - but serves a single floor-gated memory, empty on 10/20",
-    "THOR is compute-bound; latency grows with store size. A resident cache would fix it (proven 65%) but is not shipped",
+    "Code-structure is THOR's one category loss (63.6 vs 74.2). But mimir answers it mostly from PROSE, not code: its top",
+    "hit is a doc 70% of the time (THOR 48%) and code only 21% (THOR 42%), and where the gold names a file THOR serves it",
+    "more often (81% vs 69%). The golds are prose, which favours a doc that states the answer over source to interpret.",
+    "On raw hook latency mimir is much faster (~34 vs ~120 ms) - but serves a single floor-gated memory, empty on 6/20",
+    "THOR is compute-bound; latency grows with store size (230 ms at 12.7k events, 349 at 16.1k). The resident cache",
+    "removes that growth only WHILE A DAEMON IS UP (120 ms); a bare per-prompt hook has nothing to keep resident.",
     "mimir has a first-class code-symbol graph (graph/outline/peek); THOR's is a derived sidecar (where_used/impact)",
     "Newer and far less battle-tested than mimir's daily use; mimir ships at a high cadence (v0.14: sync, GPU, fast cold)",
     "Semantic mode needs a ~235 MB model + a warm embed-daemon resident (off by default; degrades cleanly to bm25)",
@@ -145,7 +150,7 @@ note(
 )
 y += 4
 note(
-    f'<tspan fill="{CYAN}">faster on like-for-like full recall (230 vs 299 ms)</tspan> . <tspan fill="{AMBER}">loses code-structure (63.6 vs 74.2)</tspan>',
+    f'<tspan fill="{CYAN}">2.7x faster on like-for-like full recall (120 vs 322 ms, daemon up)</tspan> . <tspan fill="{AMBER}">loses code-structure (63.6 vs 74.2)</tspan>',
     color=FG, size=13.5, bold=True,
 )
 

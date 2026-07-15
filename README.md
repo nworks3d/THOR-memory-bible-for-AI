@@ -30,10 +30,12 @@ one thing the agent can search automatically. Measured against
   THOR's as-deployed courier surfaces the governing gotcha/decision **86.3% vs
   74.0%** (mimir's best case) and fully catches it **58.9% vs 50.7%**, judged
   three-way blind. This is what the tool is *for*.
-- **On a like-for-like full recall it is faster than mimir** (230 ms vs mimir's
-  299 ms), injecting a full block. mimir's as-deployed hook is much faster
-  (~31 ms) but serves a single floor-gated memory and nothing on half the
-  prompts (10/20 empty) - fast because it serves less. Full honest picture in
+- **On a like-for-like full recall it is 2.7x faster than mimir** with the
+  inject daemon up (120 ms vs mimir 0.14's 322 ms), injecting a full block on
+  every prompt. With the daemon stopped it is 349 ms - slightly slower than
+  mimir there, and it grows with store size. mimir's as-deployed hook is much
+  faster (~34 ms) but serves a single floor-gated memory (175 chars) and nothing
+  on 6 of 20 prompts - fast because it serves less. Full honest picture in
   BENCHMARKS.md.
 - **It never loses a write.** Every fact is an event in a hash-chained append-only
   log; a conflicting edit *branches* (both heads kept) instead of overwriting, and
@@ -123,11 +125,13 @@ code-structure, 63.6% vs 74.2%), **same-knowledge quality** THOR wins both
 cuts (strict dual-written 97.2% vs 94.3%, broad shared 88.8% vs 86.2%),
 **multi-project** THOR edges it 96.7% vs 95.6%, **session drift** THOR-led on
 both metrics judged three-way blind (surfaces the preventing fact 86.3% vs
-74.0%, full catch 58.9% vs 50.7%), and on **speed** a like-for-like full recall
-favours THOR (230 ms vs mimir's 299 ms), while mimir's as-deployed hook is much
-faster (~31 ms) by serving a single floor-gated memory and nothing on half the
-prompts (10/20 empty). Full method, per-category tables and honest weaknesses in
-[BENCHMARKS.md](BENCHMARKS.md).
+74.0%, full catch 58.9% vs 50.7%), and on **speed** (re-measured 2026-07-15 vs
+mimir 0.14) a like-for-like full recall favours THOR with the daemon up (120 ms
+vs 322 ms) but not without it (349 ms), while mimir's as-deployed hook is much
+faster (~34 ms) by serving a single floor-gated memory and nothing on 6 of 20
+prompts. Full method, per-category tables and honest weaknesses - including why
+the code-structure loss is probably not the symbol-graph gap we first called it
+- in [BENCHMARKS.md](BENCHMARKS.md).
 
 Drift compensation is also measurable IN-REPO, no judge needed: `cargo run
 --example drift_eval` replays a committed synthetic corpus

@@ -142,31 +142,44 @@ Per-prompt cost, median of 20 over a fixed real-knowledge prompt set, same
 machine, each side invoked as it is actually deployed (THOR reads the hook JSON
 on stdin; mimir takes the prompt as an argument):
 
-| channel | median | empty |
-|---|---:|---:|
-| THOR courier (recall + inject) | 230 ms | 3/20 |
-| mimir `recall-inject` (as-deployed hook) | 31 ms | 10/20 |
-| mimir `recall` (full recall) | 299 ms | 0/20 |
+| channel | median | served | empty |
+|---|---:|---:|---:|
+| THOR courier, inject daemon running | **120 ms** | 3188 chars | 0/20 |
+| THOR courier, daemon stopped | 349 ms | 3188 chars | 0/20 |
+| mimir `recall-inject` (as-deployed hook) | 34 ms | 175 chars | 6/20 |
+| mimir `recall --full` (like-for-like) | 322 ms | 9389 chars | 0/20 |
+
+Measured 2026-07-15 against mimir 0.14.0, both stores at their live size (THOR
+16.1k events). Numbers moved since the earlier round and not only in our favour,
+so read them with the two caveats below.
 
 Two things are true at once, and both matter:
 
-- **mimir's as-deployed hook is much faster (~31 ms vs ~230 ms)** - but it
-  serves at most a *single* floor-gated memory and returns nothing on half the
-  prompts (10/20 empty here). It is fast because it serves less.
-- **On a like-for-like full recall, THOR is faster** (`mimir recall` 299 ms vs
-  THOR's 230 ms). THOR's courier injects a full real-recall block on every
-  prompt it has a hit for; its 3/20 empty is the noise gate staying silent on a
-  weak match, by design.
+- **mimir's as-deployed hook is much faster (~34 ms vs ~120 ms)** - but it
+  serves at most a *single* floor-gated memory, 175 chars on average, and
+  returns nothing on 6 of 20 prompts. It is fast because it serves less. (It
+  serves less *often* than before: 0.13 was empty 10/20, 0.14 is 6/20.)
+- **On a like-for-like full recall, THOR is 2.7x faster with the daemon up**
+  (120 ms vs mimir's 322 ms) while serving a complete recall block on every
+  prompt.
 
-So the honest trade is real: mimir wins raw hook latency by injecting one
-floor-gated memory (or nothing half the time); THOR spends more time to inject
-a full recall, and doing the same full recall THOR is faster. THOR's warm
-inject daemon saves only ~15 ms because the cost is the per-query work - folding
-the whole event log and scanning the vector matrix - not process start. A
-sandbox prototype that holds those resident (materialized heads + resident
-vector matrix) cut recall latency **213 -> 75 ms (65%, byte-identical hits)**;
-it is **deliberately not shipped** - a resident cache adds a stale-cache
-correctness surface, and THOR's rule is **quality over speed**.
+The warm daemon is what changed. It used to save only ~15 ms, because the cost
+is the per-query work - folding the whole event log, scanning the vector matrix -
+not process start. It now holds that state resident and revalidates it per query
+against a cheap store fingerprint, rebuilding whole on any write: **349 -> 120 ms
+(-66%), byte-identical injection** (74/74 drift scenarios and 120/120 recall
+prompts identical to the cold path). Correctness gated the change, not speed:
+843 recall comparisons, 0 mismatches, including writes landing mid-session.
+
+Two honest caveats on this table:
+
+- **With the daemon stopped THOR is now slightly slower than mimir's full
+  recall** (349 vs 322 ms). THOR is compute-bound and its latency grows with
+  store size: the same cold channel measured 230 ms at 12.7k events and is
+  349 ms at 16.1k. The resident cache removes that growth only while a daemon
+  is up; a bare per-prompt hook has nothing to keep.
+- **mimir serves ~3x more text on full recall** (9389 vs 3188 chars), so the
+  like-for-like comparison is not identical work either way.
 
 ## What each is built for (structural)
 
@@ -182,17 +195,27 @@ correctness surface, and THOR's rule is **quality over speed**.
 
 ## Honest weaknesses
 
-- **Code-structure is THOR's one category loss (63.6% vs 74.2%).** mimir's
-  first-class tree-sitter symbol graph retrieves structure ("which function is
-  where / calls what") better than THOR's chunked source. This is the honest
-  open gap and the clearest next quality target.
-- **On raw hook latency mimir's as-deployed hook is much faster (~31 ms vs
-  ~230 ms)** - but by serving a single floor-gated memory and nothing on half
-  the prompts (10/20 empty). On a like-for-like full recall THOR is faster
-  (230 vs 299 ms); the trade is real either way.
-- **THOR is compute-bound and its latency grows with store size** (the whole
-  log is folded per query). A resident cache would fix it (proven 65% in a
-  sandbox prototype) but is not shipped, by the quality-over-speed rule above.
+- **Code-structure is THOR's one category loss (63.6% vs 74.2%).** The number
+  stands. The *explanation* we published for it did not survive scrutiny: we
+  attributed it to mimir's first-class tree-sitter symbol graph, but on this
+  battery mimir answers code-structure questions mostly from prose, not code -
+  its top hit is a doc 70% of the time against THOR's 48%, and it is *code* only
+  21% of the time against THOR's 42%. Where the gold answer names a file
+  (n=26), THOR serves that file in its top-5 more often than mimir (81% vs
+  69%). The likeliest driver is the gold format: these answers are prose, and a
+  doc that states the answer in words scores easily where source code has to be
+  interpreted. So the gap is real and still open, but it is not evidence of a
+  retrieval capability THOR lacks, and closing it by copying a symbol graph is
+  not supported by this data. Measured 2026-07-15, single run, n=33 - treat as
+  a strong hint, not a settled result.
+- **On raw hook latency mimir's as-deployed hook is much faster (~34 ms vs
+  ~120 ms)** - but by serving a single floor-gated memory (175 chars) and
+  nothing on 6 of 20 prompts. The trade is real either way.
+- **THOR is compute-bound and its latency grows with store size** (the whole log
+  is folded per query): 230 ms at 12.7k events, 349 ms at 16.1k on the cold
+  channel. The resident cache removes that growth *while a daemon is up*
+  (120 ms), but a bare per-prompt hook has nothing to keep, so the growth is
+  only deferred, not solved.
 - **Maturity.** THOR is new; mimir is battle-tested in daily use and shipping
   at a high cadence (v0.14 added a fast cold-mode, centralized sync, and an
   opt-in GPU build).

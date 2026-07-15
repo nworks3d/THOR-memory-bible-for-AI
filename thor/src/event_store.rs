@@ -739,6 +739,30 @@ impl EventStore {
         contiguous_tip_conn(&self.conn)
     }
 
+    /// A cheap key that changes whenever the log changes: (row count, max seq).
+    ///
+    /// EXACT for this table by construction: every statement that touches
+    /// `event` is a plain `INSERT` (`append_event`, `ingest_batch`, restore) -
+    /// there is no UPDATE, no DELETE and no INSERT OR REPLACE anywhere, so a row
+    /// can never change under a fixed count. Any append moves the count; `max
+    /// seq` rides along as a second witness and costs nothing.
+    ///
+    /// Deliberately NOT `contiguous_tip()`: that one is hole-proof (it scans for
+    /// the first gap) and measures ~30ms on a 16k-event log - a third of the
+    /// 81ms fold it is supposed to guard, which would eat the entire point of a
+    /// resident cache. It is not needed here anyway: `ingest_batch` only accepts
+    /// tip+1, so a replica cannot punch a hole below `MAX(seq)`. This pair costs
+    /// ~0.02ms (both index-only), i.e. ~4000x cheaper than the fold - and that
+    /// asymmetry is exactly what makes a resident cache worth holding.
+    /// Used by `recall::ResidentCache` to decide reuse-or-rebuild.
+    pub fn cache_fingerprint(&self) -> SqlResult<(i64, i64)> {
+        self.conn.query_row(
+            "SELECT COUNT(*), COALESCE(MAX(seq), 0) FROM event",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+    }
+
     /// The shipper's read side: every event with seq > `after_seq`, in chain
     /// order. Map with `Event::to_shipped` to ship the backlog to a replica.
     pub fn events_since(&self, after_seq: i64) -> SqlResult<Vec<Event>> {

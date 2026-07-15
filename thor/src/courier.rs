@@ -183,7 +183,7 @@ pub fn injection_for_hook_json(db: &Path, raw: &str) -> Option<String> {
     // Store unreachable -> silent (the "hub-down -> exit 0" contract). Opening
     // creates an empty store if none exists, which simply yields no hits.
     let store = EventStore::new(db).ok()?;
-    injection_with_store(&store, db, &pre)
+    injection_with_store(&store, db, &pre, None)
 }
 
 /// Warm entry point for the daemon's /inject handler: the caller supplies an
@@ -192,10 +192,30 @@ pub fn injection_for_hook_json(db: &Path, raw: &str) -> Option<String> {
 /// fresh on every call, never cached in the daemon).
 pub fn injection_for_hook_json_warm(store: &EventStore, db: &Path, raw: &str) -> Option<String> {
     let pre = precheck(db, raw)?;
-    injection_with_store(store, db, &pre)
+    injection_with_store(store, db, &pre, None)
 }
 
-fn injection_with_store(store: &EventStore, db: &Path, pre: &PreCheck) -> Option<String> {
+/// As [`injection_for_hook_json_warm`], but the daemon passes its resident
+/// `WarmRecall` so the per-prompt fold is skipped. `warm = None` is identical to
+/// the cold hook path.
+#[cfg(feature = "semantic")]
+pub fn injection_for_hook_json_resident(
+    store: &EventStore,
+    db: &Path,
+    raw: &str,
+    warm: &mut crate::recall::WarmRecall,
+) -> Option<String> {
+    let pre = precheck(db, raw)?;
+    injection_with_store(store, db, &pre, Some(warm))
+}
+
+fn injection_with_store(
+    store: &EventStore,
+    db: &Path,
+    pre: &PreCheck,
+    #[cfg(feature = "semantic")] warm: Option<&mut crate::recall::WarmRecall>,
+    #[cfg(not(feature = "semantic"))] warm: Option<&mut ()>,
+) -> Option<String> {
     let query = pre.query.clone();
     // Project isolation: recall inside project A must not surface project B's code
     // OR its memories. Derive the project from the hook cwd (a `.thor` marker or git
@@ -208,7 +228,7 @@ fn injection_with_store(store: &EventStore, db: &Path, pre: &PreCheck) -> Option
     let scope = RecallScope::current(project.clone());
     // No path boosting on the courier pool: drift preventers are memories, and
     // the file-stem lift measurably displaced them here (live replay A-B).
-    let pool = recall_for(db, &store, &query, &scope, POOL_HITS, false);
+    let pool = recall_for_warm(db, &store, &query, &scope, POOL_HITS, false, warm);
 
     // Silence threshold: an OR-fallback pool (only some query words matched) is
     // gated on real term coverage, so "best of an all-weak pool" is silence, not
@@ -834,13 +854,33 @@ pub(crate) fn recall_for(
     limit: usize,
     boost_paths: bool,
 ) -> Vec<RecallHit> {
+    recall_for_warm(db, store, query, scope, limit, boost_paths, None)
+}
+
+/// As [`recall_for`], but a long-lived caller (the daemon) may pass its resident
+/// `WarmRecall` to skip re-opening the sidecar and re-folding the log. `warm =
+/// None` is the cold path, byte-for-byte unchanged. The warm state refreshes
+/// itself against `store` before use, so this can only be faster, never staler.
+pub(crate) fn recall_for_warm(
+    db: &Path,
+    store: &EventStore,
+    query: &str,
+    scope: &RecallScope,
+    limit: usize,
+    boost_paths: bool,
+    #[cfg(feature = "semantic")] warm: Option<&mut crate::recall::WarmRecall>,
+    #[cfg(not(feature = "semantic"))] warm: Option<&mut ()>,
+) -> Vec<RecallHit> {
     #[cfg(feature = "semantic")]
     {
-        if let Some(hits) = try_semantic_recall(db, store, query, scope, limit, boost_paths) {
+        if let Some(hits) = try_semantic_recall(db, store, query, scope, limit, boost_paths, warm) {
             return hits;
         }
+        // Semantic path declined (no model/sidecar, cold embed daemon, empty
+        // result): fall through to bm25, exactly as before.
     }
-    let _ = (db, boost_paths); // only the semantic path needs these
+    #[cfg(not(feature = "semantic"))]
+    let _ = (db, boost_paths, warm); // only the semantic path needs these
     recall_scoped(store, query, limit, scope).unwrap_or_default()
 }
 
@@ -856,6 +896,7 @@ fn try_semantic_recall(
     scope: &RecallScope,
     limit: usize,
     boost_paths: bool,
+    warm: Option<&mut crate::recall::WarmRecall>,
 ) -> Option<Vec<RecallHit>> {
     use crate::vectors::{default_vectors_path, VectorStore};
 
@@ -875,10 +916,6 @@ fn try_semantic_recall(
             return None;
         }
     };
-    let vecs = VectorStore::open(&vpath).ok()?;
-    if vecs.model_id().as_deref() != Some(crate::embed::MODEL_ID) {
-        return None; // sidecar built by a different model -> stale until rebuilt
-    }
     // The symbol sidecar rides the same deliberate-only gate as path boosting;
     // absent or unopenable degrades to no bonus, never an error.
     let symbols = if boost_paths {
@@ -886,10 +923,32 @@ fn try_semantic_recall(
     } else {
         None
     };
-    match crate::recall::recall_fused_scoped(
-        store, query, &qvec, &vecs, limit, crate::recall::FUSION_LAMBDA, scope, boost_paths,
-        symbols.as_ref(),
-    ) {
+    // WARM: reuse the resident sidecar + fold (refreshed against the store
+    // first). COLD: open the sidecar and fold, exactly as before. Both run the
+    // SAME model-id gate - a sidecar from another model is stale either way.
+    let hits = match warm {
+        Some(w) => {
+            if w.model_id().as_deref() != Some(crate::embed::MODEL_ID) {
+                return None;
+            }
+            let (vecs, cache) = w.for_query(store);
+            crate::recall::recall_fused_scoped_cached(
+                store, query, &qvec, vecs, limit, crate::recall::FUSION_LAMBDA, scope, boost_paths,
+                symbols.as_ref(), Some(cache),
+            )
+        }
+        None => {
+            let vecs = VectorStore::open(&vpath).ok()?;
+            if vecs.model_id().as_deref() != Some(crate::embed::MODEL_ID) {
+                return None; // sidecar built by a different model -> stale until rebuilt
+            }
+            crate::recall::recall_fused_scoped(
+                store, query, &qvec, &vecs, limit, crate::recall::FUSION_LAMBDA, scope,
+                boost_paths, symbols.as_ref(),
+            )
+        }
+    };
+    match hits {
         Ok(hits) if !hits.is_empty() => Some(hits),
         _ => None,
     }

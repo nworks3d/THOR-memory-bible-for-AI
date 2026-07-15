@@ -1021,6 +1021,13 @@ struct InjectState {
     store: Arc<Mutex<EventStore>>,
     db: PathBuf,
     bind: String,
+    /// Recall state held across prompts (the daemon is the only THOR process
+    /// that lives long enough to reuse anything). `None` = never built or the
+    /// sidecar is absent, and every prompt then runs the cold path exactly as
+    /// the per-prompt hook does. Behind the same mutex discipline as the store:
+    /// one prompt at a time, and the fold is re-validated per query.
+    #[cfg(feature = "semantic")]
+    warm: Arc<Mutex<Option<crate::recall::WarmRecall>>>,
 }
 
 /// Warm per-prompt injection: same gates, ledger and freshness as the cold
@@ -1037,8 +1044,29 @@ async fn inject_handler(
     };
     let store = state.store.clone();
     let db = state.db.clone();
+    #[cfg(feature = "semantic")]
+    let warm = state.warm.clone();
     let result = tokio::task::spawn_blocking(move || {
         let s = store.lock().unwrap_or_else(|p| p.into_inner());
+        #[cfg(feature = "semantic")]
+        {
+            // Build the resident state on first use (not at startup: a daemon
+            // that never serves a prompt should not pay the fold, and the
+            // sidecar may not exist yet). Any failure just leaves it None and
+            // this prompt takes the cold path - never an error to the hook.
+            let mut w = warm.lock().unwrap_or_else(|p| p.into_inner());
+            if w.is_none() {
+                let vpath = crate::vectors::default_vectors_path(&db);
+                if vpath.exists() {
+                    if let Ok(v) = crate::vectors::VectorStore::open(&vpath) {
+                        *w = crate::recall::WarmRecall::build(&s, v).ok();
+                    }
+                }
+            }
+            if let Some(w) = w.as_mut() {
+                return crate::courier::injection_for_hook_json_resident(&s, &db, &raw, w);
+            }
+        }
         crate::courier::injection_for_hook_json_warm(&s, &db, &raw)
     })
     .await;
@@ -1099,7 +1127,13 @@ async fn serve_http(store: Arc<Mutex<EventStore>>, db: PathBuf, bind: &str) -> a
              prompt text with no auth. Front it with an auth gate or bind 127.0.0.1."
         );
     }
-    let inject_state = InjectState { store, db: db.clone(), bind: actual.clone() };
+    let inject_state = InjectState {
+        store,
+        db: db.clone(),
+        bind: actual.clone(),
+        #[cfg(feature = "semantic")]
+        warm: Arc::new(Mutex::new(None)),
+    };
     let inject_router = axum::Router::new()
         .route("/inject", axum::routing::post(inject_handler))
         .route("/health", axum::routing::get(health_handler))

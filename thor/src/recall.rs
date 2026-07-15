@@ -1270,6 +1270,136 @@ fn finalize_heads(
 /// an empty query or no candidates yields an empty result; a vector-load error
 /// degrades to bm25. The bm25 relevance floor is deliberately NOT applied here -
 /// under fusion a low-bm25 but high-cosine hit is precisely what we want to surface.
+/// Resident recall state for a LONG-LIVED process (the MCP server, the inject
+/// daemon): the per-query O(n) rebuild of data that did not change. Each query
+/// re-reads the whole event log, re-folds the head sets, re-derives the project
+/// map and re-parses the vector matrix; a process that stays up can hold all
+/// four and skip straight to scoring.
+///
+/// STALENESS IS THE WHOLE RISK, so validity is not tracked incrementally - the
+/// cache records the store's `cache_fingerprint` (row count + contiguous tip)
+/// and the vector count it was built from, and `is_valid_for` re-checks both on
+/// every use. Any change (a remember, revise, retract, a replica ingest, or a
+/// vectors sync) moves one of them and the cache is REBUILT WHOLE, never
+/// patched. Incremental head-patching is exactly where a stale head after a
+/// revise/retract could survive, and no amount of speed is worth that - THOR's
+/// rule is quality over speed. The append-only log makes the fingerprint a
+/// sound key: nothing is mutated in place, so an unchanged fingerprint means
+/// the folded state is unchanged too.
+#[cfg(feature = "semantic")]
+pub struct ResidentCache {
+    events: Vec<Event>,
+    heads: HashMap<String, crate::cas::HeadSet>,
+    projects: HashMap<String, Option<String>>,
+    vectors: Vec<(i64, Vec<f32>)>,
+    fingerprint: (i64, i64),
+    vec_key: (i64, i64),
+}
+
+#[cfg(feature = "semantic")]
+impl ResidentCache {
+    /// Fold the store once. Cheap enough to redo whenever `is_valid_for` fails.
+    ///
+    /// The fingerprint is taken BEFORE the reads: if a write lands during the
+    /// fold, the post-read fingerprint would match data we only partly saw,
+    /// which is the one way this cache could silently keep stale state. Reading
+    /// it first means such a race can only make the cache look stale (a wasted
+    /// rebuild), never look fresh.
+    pub fn build(
+        store: &EventStore,
+        vecs: &crate::vectors::VectorStore,
+    ) -> anyhow::Result<Self> {
+        let fingerprint = store.cache_fingerprint()?;
+        let vec_key = vecs.change_key().unwrap_or((0, 0));
+        let events = store.get_all_events()?;
+        let heads = compute_head_sets(&events);
+        let projects = crate::cas::compute_projects(&events);
+        let vectors = vecs.all_vectors().unwrap_or_default();
+        Ok(ResidentCache { events, heads, projects, vectors, fingerprint, vec_key })
+    }
+
+    /// Does this cache still describe the store EXACTLY? Both keys must hold:
+    /// the log fingerprint and the vector sidecar's change key (a sync leaves
+    /// the log untouched, so the log key alone would miss it). Any error reading
+    /// either counts as INVALID - an unreadable store falls back to the cold
+    /// path, it never serves cached state.
+    pub fn is_valid_for(
+        &self,
+        store: &EventStore,
+        vecs: &crate::vectors::VectorStore,
+    ) -> bool {
+        matches!(store.cache_fingerprint(), Ok(f) if f == self.fingerprint)
+            && matches!(vecs.change_key(), Ok(k) if k == self.vec_key)
+    }
+
+    /// The cache to use for this query: the resident one when still exact, else
+    /// a fresh fold. Callers hold the returned value for the query's duration.
+    pub fn refreshed(
+        self,
+        store: &EventStore,
+        vecs: &crate::vectors::VectorStore,
+    ) -> anyhow::Result<Self> {
+        if self.is_valid_for(store, vecs) {
+            return Ok(self);
+        }
+        Self::build(store, vecs)
+    }
+}
+
+/// Everything a LONG-LIVED process can hold open across prompts: the vector
+/// sidecar connection and the folded event state. A per-prompt hook is a cold
+/// process with nothing to reuse, so it passes `None` and pays what it always
+/// paid; the daemon holds one of these and skips both re-reads.
+///
+/// `for_query` is the only way to read it - it refreshes against the store
+/// first, so a caller cannot accidentally serve a stale fold.
+#[cfg(feature = "semantic")]
+pub struct WarmRecall {
+    vecs: crate::vectors::VectorStore,
+    cache: ResidentCache,
+    reuses: u64,
+    rebuilds: u64,
+}
+
+#[cfg(feature = "semantic")]
+impl WarmRecall {
+    pub fn build(store: &EventStore, vecs: crate::vectors::VectorStore) -> anyhow::Result<Self> {
+        let cache = ResidentCache::build(store, &vecs)?;
+        Ok(WarmRecall { vecs, cache, reuses: 0, rebuilds: 0 })
+    }
+
+    /// The sidecar + a cache guaranteed current for `store`. Rebuilds the fold
+    /// when the store moved (a write since the last prompt); cheap check
+    /// otherwise. Returns the pair so the caller cannot mix a fresh cache with
+    /// a different sidecar.
+    pub fn for_query(
+        &mut self,
+        store: &EventStore,
+    ) -> (&crate::vectors::VectorStore, &ResidentCache) {
+        if !self.cache.is_valid_for(store, &self.vecs) {
+            if let Ok(fresh) = ResidentCache::build(store, &self.vecs) {
+                self.cache = fresh;
+                self.rebuilds += 1;
+            }
+        } else {
+            self.reuses += 1;
+        }
+        (&self.vecs, &self.cache)
+    }
+
+    /// (reuses, rebuilds) so far. A benchmark MUST check this: if every query
+    /// rebuilds, the "warm" arm is the cold arm plus overhead, and any timing
+    /// drawn from it is a lie.
+    pub fn stats(&self) -> (u64, u64) {
+        (self.reuses, self.rebuilds)
+    }
+
+    /// The sidecar's model id, for the same staleness gate the cold path uses.
+    pub fn model_id(&self) -> Option<String> {
+        self.vecs.model_id()
+    }
+}
+
 #[cfg(feature = "semantic")]
 pub fn recall_fused_scoped(
     store: &EventStore,
@@ -1282,21 +1412,64 @@ pub fn recall_fused_scoped(
     boost_paths: bool,
     symbols: Option<&crate::symbols::SymbolStore>,
 ) -> anyhow::Result<Vec<RecallHit>> {
+    recall_fused_scoped_cached(
+        store, query, qvec, vecs, limit, lambda, scope, boost_paths, symbols, None,
+    )
+}
+
+/// Like [`recall_fused_scoped`], but reuses `cache` when it is still exact for
+/// this store. `cache = None` (and a stale cache) behave identically to the
+/// uncached path - the cache is a memoization of unchanged data, never a
+/// different answer.
+#[cfg(feature = "semantic")]
+#[allow(clippy::too_many_arguments)]
+pub fn recall_fused_scoped_cached(
+    store: &EventStore,
+    query: &str,
+    qvec: &[f32],
+    vecs: &crate::vectors::VectorStore,
+    limit: usize,
+    lambda: f64,
+    scope: &RecallScope,
+    boost_paths: bool,
+    symbols: Option<&crate::symbols::SymbolStore>,
+    cache: Option<&ResidentCache>,
+) -> anyhow::Result<Vec<RecallHit>> {
     if limit == 0 {
         return Ok(vec![]);
     }
 
-    let events = store.get_all_events()?;
+    // A cache is used ONLY while it still matches the store exactly; a stale one
+    // is ignored and the data re-read, so a caller that forgets to refresh gets
+    // a slow answer, never a wrong one.
+    let fresh = cache.filter(|c| c.is_valid_for(store, vecs));
+    let owned_events;
+    let owned_heads;
+    let owned_projects;
+    let owned_vecs;
+    let (events, heads, projects, all): (
+        &[Event],
+        &HashMap<String, crate::cas::HeadSet>,
+        &HashMap<String, Option<String>>,
+        &[(i64, Vec<f32>)],
+    ) = match fresh {
+        Some(c) => (&c.events, &c.heads, &c.projects, &c.vectors),
+        None => {
+            owned_events = store.get_all_events()?;
+            owned_heads = compute_head_sets(&owned_events);
+            owned_projects = crate::cas::compute_projects(&owned_events);
+            owned_vecs = vecs.all_vectors().unwrap_or_default();
+            (&owned_events, &owned_heads, &owned_projects, &owned_vecs)
+        }
+    };
     let by_seq: HashMap<i64, &Event> = events.iter().map(|e| (e.seq, e)).collect();
-    let heads = compute_head_sets(&events);
-    let projects = crate::cas::compute_projects(&events);
-    let filter = ScopeFilter { projects: &projects, scope, memories_only: false };
+    let filter = ScopeFilter { projects, scope, memories_only: false };
 
     // Lexical leg: current-head candidates in bm25 rank order (streaming head-walk,
     // NO fixed raw-row window - see lexical_head_pool). Empty if the query has no
     // content tokens.
     let lexical: Vec<(i64, f64)> = match fts_query(query) {
-        Some(or_query) => lexical_head_pool(store, &or_query, &by_seq, &heads, &filter, FUSION_POOL),
+        Some(or_query) => lexical_head_pool(store, &or_query, &by_seq, heads, &filter, FUSION_POOL),
         None => vec![],
     };
 
@@ -1308,7 +1481,7 @@ pub fn recall_fused_scoped(
     // not be a candidate at all - dropped exactly where pure bm25 (AND-first)
     // would have returned it first.
     let and_pool: Vec<(i64, f64)> = match fts_query_and(query) {
-        Some(aq) => lexical_head_pool(store, &aq, &by_seq, &heads, &filter, FUSION_POOL),
+        Some(aq) => lexical_head_pool(store, &aq, &by_seq, heads, &filter, FUSION_POOL),
         None => vec![],
     };
     let mut strong: HashSet<i64> = and_pool.iter().map(|(s, _)| *s).collect();
@@ -1320,10 +1493,10 @@ pub fn recall_fused_scoped(
         bm_rank.entry(*seq).or_insert(*rank);
     }
 
-    // Dense leg: brute-force the query cosine over EVERY stored vector, keep the
-    // top-M. Real dense retrieval (not a pool rerank), so a paraphrase gold with
-    // no lexical overlap is reachable. An empty/absent sidecar leaves this empty.
-    let all = vecs.all_vectors().unwrap_or_default();
+    // Dense leg: brute-force the query cosine over EVERY stored vector (the
+    // resident matrix when one is live), keep the top-M. Real dense retrieval
+    // (not a pool rerank), so a paraphrase gold with no lexical overlap is
+    // reachable. An empty/absent sidecar leaves this empty.
     let cos_by_seq: HashMap<i64, f64> = all.iter().map(|(s, v)| (*s, dot(qvec, v))).collect();
     // Keep only in-scope CURRENT-HEAD dense candidates. The head check mirrors
     // lexical_head_pool's guard: without it, the near-identical vectors of a
@@ -1887,6 +2060,132 @@ mod fused_tests {
             fused[0].entity_id, "e2",
             "fusion promotes the semantically-aligned doc above the stronger bm25 one"
         );
+    }
+
+    /// The resident cache's whole safety argument is: any write moves the
+    /// fingerprint, so `is_valid_for` goes false and the query re-reads. If a
+    /// future change ever mutates `event` in place (an UPDATE, a DELETE, an
+    /// INSERT OR REPLACE), the count+max key stops being exact and this test is
+    /// the tripwire.
+    #[cfg(feature = "semantic")]
+    #[test]
+    fn resident_cache_invalidates_on_every_write_kind() {
+        let mut store = EventStore::in_memory().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let vecs = VectorStore::open(&dir.path().join("v.db")).unwrap();
+        let e1 = store
+            .append_event("s", "l", "a", EventKind::FactCreated, "e1", None, "alpha token")
+            .unwrap();
+
+        let cache = ResidentCache::build(&store, &vecs).unwrap();
+        assert!(cache.is_valid_for(&store, &vecs), "fresh cache must be valid");
+
+        // CREATE
+        store.append_event("s", "l", "a", EventKind::FactCreated, "e2", None, "beta token").unwrap();
+        assert!(!cache.is_valid_for(&store, &vecs), "a create must invalidate");
+
+        // REVISE - the stale-head case
+        let cache = ResidentCache::build(&store, &vecs).unwrap();
+        let e1b = store
+            .append_event(
+                "s", "l", "a", EventKind::FactRevised, "e1", Some(&e1.this_hash), "alpha token v2",
+            )
+            .unwrap();
+        assert!(!cache.is_valid_for(&store, &vecs), "a revise must invalidate");
+
+        // RETRACT
+        let cache = ResidentCache::build(&store, &vecs).unwrap();
+        store
+            .append_event(
+                "s", "l", "a", EventKind::FactRetracted, "e1", Some(&e1b.this_hash), "[retracted]",
+            )
+            .unwrap();
+        assert!(!cache.is_valid_for(&store, &vecs), "a retract must invalidate");
+    }
+
+    /// A stale cache must never change the ANSWER - the cached path is required
+    /// to notice and re-read, so a caller that forgets to refresh gets a slow
+    /// answer, never a wrong one. This is the property the feature was parked
+    /// over.
+    #[cfg(feature = "semantic")]
+    #[test]
+    fn stale_cache_never_serves_a_superseded_head() {
+        let mut store = EventStore::in_memory().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let vecs = VectorStore::open(&dir.path().join("v.db")).unwrap();
+        let e1 = store
+            .append_event("s", "l", "a", EventKind::FactCreated, "e1", None, "alpha token original")
+            .unwrap();
+
+        // Build a cache, THEN move the head underneath it.
+        let stale = ResidentCache::build(&store, &vecs).unwrap();
+        store
+            .append_event(
+                "s", "l", "a", EventKind::FactRevised, "e1", Some(&e1.this_hash),
+                "alpha token revised",
+            )
+            .unwrap();
+
+        let qvec = vec![0.0f32; DIM];
+        let with_stale = recall_fused_scoped_cached(
+            &store, "alpha token", &qvec, &vecs, 5, 1.0, &RecallScope::everything(), true, None,
+            Some(&stale),
+        )
+        .unwrap();
+        let cold = recall_fused_scoped(
+            &store, "alpha token", &qvec, &vecs, 5, 1.0, &RecallScope::everything(), true, None,
+        )
+        .unwrap();
+
+        assert_eq!(
+            with_stale.len(),
+            cold.len(),
+            "a stale cache must fall back, not serve its snapshot"
+        );
+        assert!(
+            with_stale.iter().all(|h| h.body.contains("revised")),
+            "stale cache served the SUPERSEDED body - the exact regression this guards"
+        );
+        assert_eq!(
+            with_stale.first().map(|h| &h.rev),
+            cold.first().map(|h| &h.rev),
+            "stale-cache path must equal the cold path exactly"
+        );
+    }
+
+    /// A fresh cache must return byte-identical hits to the cold path - if it
+    /// did not, the speed win would be bought with wrong answers.
+    #[cfg(feature = "semantic")]
+    #[test]
+    fn fresh_cache_matches_cold_path_exactly() {
+        let mut store = EventStore::in_memory().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let mut vecs = VectorStore::open(&dir.path().join("v.db")).unwrap();
+        let a = store
+            .append_event("s", "l", "a", EventKind::FactCreated, "e1", None, "shared token one one")
+            .unwrap();
+        let b = store
+            .append_event("s", "l", "a", EventKind::FactCreated, "e2", None, "shared token two")
+            .unwrap();
+        vecs.upsert_batch(&[(a.seq, axis(-1.0)), (b.seq, axis(1.0))]).unwrap();
+
+        let cache = ResidentCache::build(&store, &vecs).unwrap();
+        for lambda in [0.5, 1.0, 2.0] {
+            let cold = recall_fused_scoped(
+                &store, "shared token", &axis(1.0), &vecs, 5, lambda,
+                &RecallScope::everything(), true, None,
+            )
+            .unwrap();
+            let warm = recall_fused_scoped_cached(
+                &store, "shared token", &axis(1.0), &vecs, 5, lambda,
+                &RecallScope::everything(), true, None, Some(&cache),
+            )
+            .unwrap();
+            let ids = |v: &[RecallHit]| {
+                v.iter().map(|h| format!("{}|{}|{}", h.entity_id, h.rev, h.body)).collect::<Vec<_>>()
+            };
+            assert_eq!(ids(&cold), ids(&warm), "cached path differs at lambda {lambda}");
+        }
     }
 
     #[test]

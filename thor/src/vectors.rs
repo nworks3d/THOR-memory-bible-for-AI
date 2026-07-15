@@ -67,6 +67,32 @@ impl VectorStore {
         Ok(self.conn.query_row("SELECT COUNT(*) FROM vec", [], |r| r.get(0))?)
     }
 
+    /// A cheap key that changes whenever this sidecar changes: (data_version,
+    /// max seq). For `recall::ResidentCache`, which holds the parsed matrix
+    /// resident and must notice a rebuild or a re-embed.
+    ///
+    /// Why not `count()`: unlike the event log, this table is rewritable
+    /// (`INSERT OR REPLACE INTO vec`, `DELETE FROM vec`), so a re-embed of an
+    /// existing seq changes a row's CONTENT while the count and max stay put -
+    /// count is not even exact here. And it is expensive: `vec(seq INTEGER
+    /// PRIMARY KEY, v BLOB)` is a rowid table with no secondary index, so
+    /// COUNT(*) walks every BLOB overflow page (~20ms measured) - a quarter of
+    /// the fold it guards.
+    ///
+    /// `PRAGMA data_version` ticks whenever ANOTHER connection commits to this
+    /// database, which covers every real writer: `thor vectors build/sync` runs
+    /// in its own process on its own connection, and even in-process it would
+    /// open its own `VectorStore`. The one thing it cannot see is a write made
+    /// through the very same connection the cache reads from - and that
+    /// connection is read-only by construction (the cache is handed a `&VectorStore`
+    /// it only queries). `max seq` is a free second witness for plain appends.
+    pub fn change_key(&self) -> Result<(i64, i64)> {
+        let data_version: i64 = self.conn.query_row("PRAGMA data_version", [], |r| r.get(0))?;
+        let max_seq: i64 =
+            self.conn.query_row("SELECT COALESCE(MAX(seq), 0) FROM vec", [], |r| r.get(0))?;
+        Ok((data_version, max_seq))
+    }
+
     /// Drop all vectors (used before a full rebuild). The `model_id` is reset by
     /// the caller via `set_model_id`.
     pub fn clear(&self) -> Result<()> {

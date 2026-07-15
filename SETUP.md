@@ -3,7 +3,31 @@
 THOR is a local, lossless memory plus auto-recall for AI coding agents. This walks
 through the full setup. Every command is idempotent and safe to re-run.
 
-## 1. Build
+## 1. Get the binary
+
+### Option A: download a release (no toolchain needed)
+
+Grab the asset for your platform from [Releases](../../releases), verify it
+against the `.sha256` next to it, unpack, and put `thor` (or `thor.exe`) on your
+PATH - or straight where the hooks expect it (on Windows the per-user home is
+`%LOCALAPPDATA%\thor\thor.exe`).
+
+| asset | recall | for |
+|---|---|---|
+| `thor-windows-x86_64.zip` | semantic + bm25 | Windows client (the agent machine) |
+| `thor-linux-x86_64.tar.gz` | semantic + bm25 | Linux client |
+| `thor-linux-x86_64-bm25.tar.gz` | bm25 only | servers / NAS / containers - no ONNX |
+
+Two things the binary does NOT include:
+
+- **No embedding model.** Semantic recall needs a local ONNX model you supply
+  (step 3). Without one THOR runs pure bm25 and degrades cleanly - it does not
+  break.
+- **Windows: the Microsoft Visual C++ Redistributable** must be installed
+  (`MSVCP140.dll`, `VCRUNTIME140.dll`). If the binary refuses to start, that is
+  why.
+
+### Option B: build from source
 
 ```sh
 cd thor
@@ -11,8 +35,26 @@ cargo test                                   # run the suite (should be all gree
 cargo build --release --features semantic    # semantic recall; omit the feature for bm25-only
 ```
 
-The binary is `thor/target/release/thor`. Put it on PATH, or install it where your
-hooks expect it (on Windows the per-user home is `%LOCALAPPDATA%\thor\thor.exe`).
+The binary is `thor/target/release/thor`. Same placement as above.
+
+Note the feature flag: a plain `cargo build --release` produces a **bm25-only**
+binary (~10 MB vs ~35 MB). That is the right build for a server or NAS, but
+deploy it on your client machine and you silently lose dense recall. Check the
+size if you are unsure.
+
+### Replacing a binary that is already running
+
+The MCP server and any daemon hold the file open, so overwriting fails. Rename
+the old one out of the way first, then copy the new one in:
+
+```sh
+mv "$LOCALAPPDATA/thor/thor.exe" "$LOCALAPPDATA/thor/thor.exe.old"   # Windows
+cp <new-binary> "$LOCALAPPDATA/thor/thor.exe"
+```
+
+The courier spawns fresh per prompt, so it picks up the new binary immediately.
+A long-lived MCP server or daemon keeps the old one **until it restarts** - for
+the MCP server that means restarting your agent.
 
 ## 2. Install the hooks (one command)
 
@@ -99,10 +141,17 @@ front it with an authenticating reverse proxy (the transport has no auth of its 
 ## 6. Verify
 
 ```sh
+thor doctor                        # store, model, sidecars, daemon, flags - start here
 thor fsck                          # chain integrity + FTS/heads projection
 thor recall "how does X work"      # scoped to the current project + global
 thor recall --all-projects "X"     # search everything
 ```
+
+`thor doctor` is the first thing to run after installing a binary and the first
+thing to paste into a bug report: recall behaviour depends almost entirely on
+whether the model, the vectors sidecar and the daemon are actually present, and
+it reports all three. If semantic recall "does nothing", doctor tells you which
+of them is missing.
 
 Full command reference is in [README.md](README.md); measured comparison + honest
 weaknesses in [BENCHMARKS.md](BENCHMARKS.md).

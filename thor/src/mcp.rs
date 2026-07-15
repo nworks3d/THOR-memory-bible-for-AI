@@ -514,7 +514,9 @@ impl ThorServer {
             rows.sort();
             let mut out = String::new();
             let mut current_file = String::new();
-            for (file, ord, id, first, chars) in &rows {
+            // The chunk id is not printed per line (it would dominate a compact
+            // outline); one example id goes in the peek hint below instead.
+            for (file, ord, _id, first, chars) in &rows {
                 if *file != current_file {
                     let n = rows.iter().filter(|r| &r.0 == file).count();
                     let total: usize = rows.iter().filter(|r| &r.0 == file).map(|r| r.4).sum();

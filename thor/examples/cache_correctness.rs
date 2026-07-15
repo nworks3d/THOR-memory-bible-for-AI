@@ -143,7 +143,7 @@ fn main() -> anyhow::Result<()> {
     let mut checked = 0usize;
     let mut mismatches: Vec<String> = Vec::new();
 
-    let mut run = |cache: &ResidentCache,
+    let run = |cache: &ResidentCache,
                    c: &Case,
                    qvec: &[f32],
                    checked: &mut usize,

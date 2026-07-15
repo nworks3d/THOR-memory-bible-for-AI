@@ -83,6 +83,9 @@ fn main() -> anyhow::Result<()> {
 
     let store = EventStore::new(&db)?;
     // Derived symbol sidecar next to the (possibly cloned) store; absent = no bonus.
+    // Only the fused path reads it, so a bm25-only build never touches it (same
+    // shape as `vecs` below).
+    #[cfg_attr(not(feature = "semantic"), allow(unused_variables))]
     let symbols = thor::symbols::SymbolStore::open(&thor::symbols::default_symbols_path(&db)).ok();
     #[cfg(feature = "semantic")]
     let mut embedder = thor::embed::Embedder::load_default().ok();

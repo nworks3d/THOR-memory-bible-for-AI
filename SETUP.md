@@ -155,7 +155,7 @@ front it with an authenticating reverse proxy (the transport has no auth of its 
 
 ```sh
 thor doctor                        # store, model, sidecars, daemon, flags - start here
-thor fsck                          # chain integrity + FTS/heads projection
+thor fsck                          # chain integrity + FTS/heads projection + footer health
 thor recall "how does X work"      # scoped to the current project + global
 thor recall --all-projects "X"     # search everything
 ```

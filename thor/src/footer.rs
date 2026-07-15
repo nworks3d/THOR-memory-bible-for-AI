@@ -8,7 +8,9 @@
 //! (facts written by one side, unreadable by another), so BOTH sides live here
 //! and the old call sites keep thin shims.
 
+use crate::event_store::{Event, EventKind};
 use crate::repo::FactType;
+use std::collections::HashMap;
 
 /// Compose the footer for a fact written at type-aware write time (MCP
 /// remember). Fields are sanitized here so a caller can never corrupt the
@@ -259,6 +261,96 @@ pub fn write_defect(body: &str) -> Option<String> {
     None
 }
 
+/// A live fact whose footer is damaged. The event log itself is always intact
+/// here - this is CONTENT health, which is why `thor fsck` reports it without
+/// failing: nothing is corrupt, a fact has just stopped carrying its metadata.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Defect {
+    /// The head carries no footer while an ancestor still did: the fingerprint
+    /// of a revise written by a pre-carry_over binary (see carry_over). `footer`
+    /// is the nearest ancestor's, ready to re-attach to the CURRENT body.
+    Wiped { entity_id: String, rev: String, from_rev: String, footer: String },
+    /// The head's footer is structurally broken (see write_defect).
+    Malformed { entity_id: String, rev: String, reason: String },
+}
+
+impl Defect {
+    pub fn entity_id(&self) -> &str {
+        match self {
+            Defect::Wiped { entity_id, .. } | Defect::Malformed { entity_id, .. } => entity_id,
+        }
+    }
+
+    pub fn rev(&self) -> &str {
+        match self {
+            Defect::Wiped { rev, .. } | Defect::Malformed { rev, .. } => rev,
+        }
+    }
+}
+
+/// Every live fact whose footer is damaged, folded from the log (events in seq
+/// order). The counterpart of carry_over on the READ side: carry_over stops the
+/// damage at the write, this surfaces what an older binary already did - a
+/// fact that silently stopped firing at the moment of action can otherwise only
+/// be noticed by missing it.
+///
+/// Only CONTENT-bearing heads count (created/revised): a retract body is a
+/// tombstone and a supersede points elsewhere, so neither is expected to carry
+/// a footer - the same rule carry_over applies. Chunk ids are skipped: their
+/// trailing `[repo file | ...]` line is the ingest's, not a memory's.
+///
+/// Why the ancestor comparison and not "no footer = defect": the footer is not
+/// a separate field, it is the body's tail, and a fact that never had one is
+/// legitimate (untyped facts exist by design). Only "an ancestor had one and
+/// the head does not" is evidence of a LOSS.
+pub fn defects(events: &[Event]) -> Vec<Defect> {
+    let heads = crate::cas::compute_head_sets(events);
+    let by_hash: HashMap<&str, &Event> = events.iter().map(|e| (e.this_hash.as_str(), e)).collect();
+
+    let mut out = Vec::new();
+    for (entity_id, head_set) in &heads {
+        if crate::repo::is_chunk_id(entity_id) {
+            continue;
+        }
+        for rev in &head_set.heads {
+            let Some(head) = by_hash.get(rev.as_str()) else { continue };
+            if !matches!(head.kind, EventKind::FactCreated | EventKind::FactRevised) {
+                continue;
+            }
+            if let Some(reason) = write_defect(&head.body) {
+                out.push(Defect::Malformed {
+                    entity_id: entity_id.clone(),
+                    rev: rev.clone(),
+                    reason,
+                });
+                continue;
+            }
+            if extract(&head.body).is_some() {
+                continue;
+            }
+            // Walk back to the nearest ancestor that still carried one. A
+            // tombstone in between simply has no footer, so the walk passes it.
+            let mut parent = head.parent_rev.as_deref();
+            while let Some(p) = parent {
+                let Some(ancestor) = by_hash.get(p) else { break };
+                if let Some(footer) = extract(&ancestor.body) {
+                    out.push(Defect::Wiped {
+                        entity_id: entity_id.clone(),
+                        rev: rev.clone(),
+                        from_rev: ancestor.this_hash.clone(),
+                        footer: footer.to_string(),
+                    });
+                    break;
+                }
+                parent = ancestor.parent_rev.as_deref();
+            }
+        }
+    }
+    // Head-sets fold into a HashMap, so sort for a stable, diffable report.
+    out.sort_by(|a, b| (a.entity_id(), a.rev()).cmp(&(b.entity_id(), b.rev())));
+    out
+}
+
 /// Parse the footer's `| project: <name> |` field, if present.
 pub fn project(body: &str) -> Option<String> {
     let idx = body.find("| project: ")?;
@@ -336,6 +428,117 @@ pub fn has_source_ref(body: &str) -> bool {
     match trimmed.rfind("\n\n[") {
         Some(i) if !trimmed[i + 2..].contains('\n') => trimmed[i + 2..].contains("| mimir:"),
         _ => false,
+    }
+}
+
+#[cfg(test)]
+mod defect_tests {
+    use super::*;
+
+    fn mk(seq: i64, entity: &str, kind: EventKind, parent: Option<&str>, this: &str, body: &str) -> Event {
+        Event {
+            seq,
+            event_uuid: format!("uuid-{seq}"),
+            session_id: "s".to_string(),
+            lineage_id: "l".to_string(),
+            actor: "a".to_string(),
+            kind,
+            entity_id: entity.to_string(),
+            parent_rev: parent.map(|s| s.to_string()),
+            body: body.to_string(),
+            body_ch: body.to_string(),
+            prev_hash: String::new(),
+            this_hash: this.to_string(),
+        }
+    }
+
+    fn footer_of(ty: &str) -> String {
+        compose(ty, &["x".into()], "global", &[], &["anchor.rs".into()], None)
+    }
+
+    fn typed(ty: &str, text: &str) -> String {
+        format!("{}\n\n{}", text, footer_of(ty))
+    }
+
+    /// The whole point: a fact damaged by a pre-carry_over binary is invisible
+    /// (it stays findable, it just never fires again), so the ONLY way to see
+    /// it is the log itself - an ancestor had a footer, the head does not.
+    #[test]
+    fn defects_reports_a_wiped_footer_with_the_footer_to_re_attach() {
+        let events = vec![
+            mk(1, "mem-1", EventKind::FactCreated, None, "A", &typed("gotcha", "old")),
+            mk(2, "mem-1", EventKind::FactRevised, Some("A"), "B", "rewritten body, footer dropped"),
+        ];
+        let got = defects(&events);
+        assert_eq!(
+            got,
+            vec![Defect::Wiped {
+                entity_id: "mem-1".to_string(),
+                rev: "B".to_string(),
+                from_rev: "A".to_string(),
+                footer: footer_of("gotcha"),
+            }],
+            "the report must carry the footer itself, or the repair needs a history dig"
+        );
+    }
+
+    #[test]
+    fn defects_walks_back_past_intermediate_footerless_revisions() {
+        // Damage found two revisions later must still cite the ORIGINAL footer.
+        let events = vec![
+            mk(1, "mem-1", EventKind::FactCreated, None, "A", &typed("decision", "v1")),
+            mk(2, "mem-1", EventKind::FactRevised, Some("A"), "B", "v2 without footer"),
+            mk(3, "mem-1", EventKind::FactRevised, Some("B"), "C", "v3 still without footer"),
+        ];
+        let got = defects(&events);
+        assert_eq!(got.len(), 1, "one live head, one defect: {got:?}");
+        assert!(matches!(&got[0], Defect::Wiped { rev, from_rev, footer, .. }
+            if rev == "C" && from_rev == "A" && *footer == footer_of("decision")));
+    }
+
+    #[test]
+    fn defects_stays_silent_on_every_legitimate_shape() {
+        let events = vec![
+            // footer carried across a revise: the fixed path
+            mk(1, "mem-ok", EventKind::FactCreated, None, "A", &typed("gotcha", "old")),
+            mk(2, "mem-ok", EventKind::FactRevised, Some("A"), "B", &typed("gotcha", "new")),
+            // never had a footer: untyped facts are legitimate, not damage
+            mk(3, "mem-untyped", EventKind::FactCreated, None, "C", "a plain note"),
+            mk(4, "mem-untyped", EventKind::FactRevised, Some("C"), "D", "a plain note, edited"),
+            // retracted: the tombstone body is not expected to carry a footer
+            mk(5, "mem-gone", EventKind::FactCreated, None, "E", &typed("decision", "obsolete")),
+            mk(6, "mem-gone", EventKind::FactRetracted, Some("E"), "F", "[retracted: superseded]"),
+            // a chunk's trailing line is the ingest's, not a memory footer
+            mk(7, "P:src/a.rs#0", EventKind::FactCreated, None, "G", "fn a() {}\n\n[repo file | P/src/a.rs | chunk 1/1]"),
+            mk(8, "P:src/a.rs#0", EventKind::FactRevised, Some("G"), "H", "fn a() { b(); }"),
+        ];
+        assert_eq!(defects(&events), vec![], "no defect may be invented");
+    }
+
+    #[test]
+    fn defects_reports_a_structurally_broken_footer() {
+        let broken = format!("{}\nKind: fact_created", typed("gotcha", "a rule"));
+        let events = vec![mk(1, "mem-1", EventKind::FactCreated, None, "A", &broken)];
+        let got = defects(&events);
+        assert!(matches!(&got[0], Defect::Malformed { rev, reason, .. }
+            if rev == "A" && reason.contains("trailing text")), "{got:?}");
+    }
+
+    #[test]
+    fn defects_reports_both_heads_of_a_diverged_fact() {
+        // A diverged fact needs `resolve` before a repair can land, but the
+        // damage must still be visible - silence would read as "clean".
+        // Both writers revised from A: the second no longer cites a head, so it
+        // branches instead of fast-forwarding (see cas::compute_head_sets).
+        let events = vec![
+            mk(1, "mem-1", EventKind::FactCreated, None, "A", &typed("gotcha", "v1")),
+            mk(2, "mem-1", EventKind::FactRevised, Some("A"), "B", "branch one, no footer"),
+            mk(3, "mem-1", EventKind::FactRevised, Some("A"), "C", "branch two, no footer"),
+        ];
+        let got = defects(&events);
+        assert_eq!(got.len(), 2, "both live heads are damaged: {got:?}");
+        assert_eq!(got[0].rev(), "B", "output is sorted, so the report is diffable");
+        assert_eq!(got[1].rev(), "C");
     }
 }
 

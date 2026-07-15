@@ -582,6 +582,59 @@ fn read_hook_stdin() -> Option<serde_json::Value> {
     serde_json::from_str(raw).ok()
 }
 
+/// The fsck report for damaged footers. Written for someone who has never met
+/// the footer before: what broke, why it matters, and the exact way out - a
+/// bare "2 defects" would leave the reader with a store they cannot repair.
+fn print_footer_defects(defects: &[crate::footer::Defect]) {
+    use crate::footer::Defect;
+
+    let wiped = defects.iter().filter(|d| matches!(d, Defect::Wiped { .. })).count();
+    let malformed = defects.len() - wiped;
+    println!(
+        "Footer integrity: {} DEGRADED fact(s) - {} wiped, {} malformed (the log is intact: \
+         this is content, not corruption)",
+        defects.len(),
+        wiped,
+        malformed
+    );
+    println!(
+        "  A fact's footer is the last line of its body ([memory/<type> | tags: ... | \
+         fires-when: ... | anchors: ... | project: ...]). It carries the type, the tags, the \
+         fires-when boost and the Guard's anchors. Without it a fact stays findable through \
+         recall, but it never fires at the moment of action again - which is usually why it was \
+         written."
+    );
+    for d in defects {
+        match d {
+            Defect::Wiped { entity_id, rev, from_rev, footer } => {
+                println!("\n  WIPED     {} (head {})", entity_id, &rev[..12.min(rev.len())]);
+                println!("    its footer, last seen at rev {}:", &from_rev[..12.min(from_rev.len())]);
+                println!("    {}", footer);
+                println!("    Repair - re-attach that footer to the CURRENT body:");
+                println!("      1. thor get {}", entity_id);
+                println!("      2. copy the body EXACTLY as it stands (do not rewrite it)");
+                println!("      3. thor revise {} {} \"<body>", entity_id, rev);
+                println!("         <blank line>");
+                println!("         {}\"", footer);
+                println!(
+                    "    (Only facts damaged by a pre-0.9.2 binary land here: a revise now \
+                     carries the footer across by itself.)"
+                );
+            }
+            Defect::Malformed { entity_id, rev, reason } => {
+                println!("\n  MALFORMED {} (head {})", entity_id, &rev[..12.min(rev.len())]);
+                println!("    {}", reason);
+                println!("    Repair: thor get {} , fix the footer line, then thor revise {} {} \"<body>\"",
+                    entity_id, entity_id, rev);
+            }
+        }
+    }
+    println!(
+        "\n  A DIVERGED fact (two heads) must be resolved first - `thor resolve` - before a \
+         repair can land on it."
+    );
+}
+
 pub fn run() -> Result<()> {
     let cli = Cli::parse();
     let db = match cli.db.clone().or_else(default_db_path) {
@@ -801,7 +854,22 @@ pub fn run() -> Result<()> {
             }
             println!("FTS projection: OK");
 
-            println!("fsck: all checks passed");
+            // Footer integrity is CONTENT health, not log integrity: the checks
+            // above assert the store is internally consistent, this one asserts
+            // that live facts still carry the metadata they were written with.
+            // A wiped footer can therefore never fail fsck - nothing is corrupt,
+            // and an old binary elsewhere writing one must not block a release.
+            let defects = crate::footer::defects(&events);
+            if defects.is_empty() {
+                println!("Footer integrity: OK");
+                println!("fsck: all checks passed");
+                return Ok(());
+            }
+            print_footer_defects(&defects);
+            println!(
+                "fsck: integrity checks passed; {} fact(s) need a footer repair (see above)",
+                defects.len()
+            );
         }
         Commands::Courier => {
             // Never propagate: the courier must always let the prompt through.

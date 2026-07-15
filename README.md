@@ -176,7 +176,7 @@ thor remember "<a durable fact>"     # (via the MCP tool in an agent session)
 thor ingest <repo-path>              # index a repo's tracked files (incremental)
 thor recall "how does X work"        # search memory (scoped to the current project)
 thor get <entity_id>                 # the authoritative head(s) for one fact
-thor fsck                            # verify chain integrity
+thor fsck                            # verify chain integrity + footer health
 ```
 
 The courier runs automatically per prompt and injects a `<thor-recall>` block.
@@ -332,7 +332,7 @@ overwrites your live compose file and never touches the data volume.
 | `thor embed-daemon` | warm embedder for the courier (feature `semantic`) |
 | `thor export` / `restore` / `backup` | JSONL backup + verified restore |
 | `thor ship` / `recv` / `status` | cross-machine log-shipping sync |
-| `thor fsck` | verify chain integrity + FTS projection |
+| `thor fsck` | verify chain integrity + FTS projection, and report facts whose footer got lost (content health: it names them and never fails the run) |
 | `thor consolidate [--apply-dedup]` | metabolism report: duplicate twins, decay candidates, same-topic clusters (exit 1 when anything needs digesting; only the dedup pass is ever applied mechanically) |
 | `thor steward` | prepare a stewardship review: the consolidate report + the proven conservative rubric written to a file an agent session works through with the MCP tools (no writes itself) |
 | `thor symbols` | (re)build the derived symbol sidecar (`thor-symbols.db`): which names every code chunk defines and calls - powers `where_used`/`impact` and a deliberate-recall ranking bonus; refreshed automatically after `thor ingest`, safe to delete and rebuild |

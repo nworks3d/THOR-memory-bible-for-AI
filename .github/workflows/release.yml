@@ -81,19 +81,25 @@ jobs:
         working-directory: thor
         run: cargo build --release ${{ matrix.features }}
 
+      # Stage into dist/ rather than the repo root: the crate lives in a
+      # directory called `thor` and the linux binary is also called `thor`, so
+      # copying it to `.` collides with that directory and the package step dies.
       - name: Package (windows)
         if: runner.os == 'Windows'
         shell: pwsh
         run: |
-          Copy-Item thor/target/release/${{ matrix.bin }} .
-          Copy-Item LICENSE .
-          Compress-Archive -Path ${{ matrix.bin }}, LICENSE -DestinationPath ${{ matrix.asset }}
+          New-Item -ItemType Directory -Force -Path dist | Out-Null
+          Copy-Item thor/target/release/${{ matrix.bin }} dist/
+          Copy-Item LICENSE dist/
+          Compress-Archive -Path dist/* -DestinationPath ${{ matrix.asset }}
 
       - name: Package (linux)
         if: runner.os == 'Linux'
         run: |
-          cp thor/target/release/${{ matrix.bin }} .
-          tar czf ${{ matrix.asset }} ${{ matrix.bin }} LICENSE
+          mkdir -p dist
+          cp thor/target/release/${{ matrix.bin }} dist/
+          cp LICENSE dist/
+          tar czf ${{ matrix.asset }} -C dist ${{ matrix.bin }} LICENSE
 
       # Anyone should be able to verify the download matches what CI produced.
       - name: Checksum

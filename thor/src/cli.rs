@@ -624,7 +624,11 @@ pub fn run() -> Result<()> {
             actor,
         } => {
             let mut store = EventStore::new(&db)?;
-            let event = store.append_event(
+            // Same path as the MCP tool: CAS-checked (a stale parent is refused
+            // instead of silently branching) and it carries the fact's footer
+            // across a content-only edit, so a body written without one does not
+            // strip the type, tags, fires-when and the guard's anchors.
+            let event = store.append_mutate_checked(
                 &session_id,
                 &lineage_id,
                 &actor,

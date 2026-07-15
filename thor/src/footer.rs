@@ -182,6 +182,41 @@ pub fn strip(body: &str) -> &str {
     }
 }
 
+/// The trailing footer LINE itself (`[memory/... | project: X]`), or None when
+/// the body has none. The inverse of [`strip`], which returns the content.
+pub fn extract(body: &str) -> Option<&str> {
+    let trimmed = body.trim_end();
+    if !trimmed.ends_with(']') {
+        return None;
+    }
+    match trimmed.rfind("\n\n[") {
+        Some(i) if !trimmed[i + 2..].contains('\n') => Some(trimmed[i + 2..].trim()),
+        _ => None,
+    }
+}
+
+/// A revised body with the PREVIOUS head's footer re-attached, when the caller
+/// dropped it. Returns None when nothing needs doing (the new body already
+/// carries a footer, or the old head had none).
+///
+/// Why this exists: the footer is not a separate field, it is the body's tail -
+/// so `revise` with a rewritten body silently drops the fact's type, tags,
+/// fires-when vocabulary and the guard's anchors. The fact stays findable
+/// (recall reads the content), so the loss is invisible: it just never fires at
+/// the moment of action again, which was the whole point of writing it. That is
+/// a correctness bug in the tool, not a caller mistake to be scolded for -
+/// carrying the metadata across a CONTENT edit is what the caller meant.
+///
+/// Deliberately not "always overwrite": a new body that brings its own footer
+/// wins, so retyping / re-anchoring a fact stays possible in one call.
+pub fn carry_over(new_body: &str, prev_body: &str) -> Option<String> {
+    if extract(new_body).is_some() {
+        return None; // the caller supplied a footer - theirs wins
+    }
+    let prev_footer = extract(prev_body)?;
+    Some(format!("{}\n\n{}", new_body.trim_end(), prev_footer))
+}
+
 /// Write-time footer integrity check for agent-supplied bodies (MCP
 /// revise/remember). Catches the two defect classes measured live in the v5
 /// diagnosis: (1) trailing garbage after the footer's closing `]` - typically
@@ -307,6 +342,53 @@ pub fn has_source_ref(body: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The bug this guards: a revise that rewrites the body drops the footer,
+    /// which silently strips the guard's anchors and the fires-when boost. The
+    /// fact stays findable, so nobody notices it stopped firing.
+    #[test]
+    fn carry_over_reattaches_a_dropped_footer() {
+        let footer = compose(
+            "decision",
+            &["nas".into()],
+            "global",
+            &["ssh".into()],
+            &["ssh admin@host".into(), "/usr/local/bin/docker".into()],
+            None,
+        );
+        let prev = format!("old content\n\n{}", footer);
+
+        let carried = carry_over("new content", &prev).expect("footer must be carried");
+        assert_eq!(strip(&carried), "new content", "content is the caller's");
+        assert_eq!(fact_type(&carried), Some(FactType::Decision), "type survives");
+        assert_eq!(fires_when(&carried).as_deref(), Some("ssh"), "boost survives");
+        assert_eq!(
+            anchors(&carried),
+            vec!["ssh admin@host", "/usr/local/bin/docker"],
+            "the guard's anchors survive - the whole point"
+        );
+        assert!(write_defect(&carried).is_none(), "result must be a valid body");
+    }
+
+    #[test]
+    fn carry_over_never_overrides_a_supplied_footer() {
+        // Retyping/re-anchoring in one call must stay possible: a new body that
+        // brings its own footer wins.
+        let prev = format!(
+            "old\n\n{}",
+            compose("note", &["a".into()], "global", &[], &["old-anchor".into()], None)
+        );
+        let new = format!(
+            "new\n\n{}",
+            compose("gotcha", &["b".into()], "global", &[], &["new-anchor".into()], None)
+        );
+        assert_eq!(carry_over(&new, &prev), None, "caller's footer is left alone");
+    }
+
+    #[test]
+    fn carry_over_is_a_noop_without_a_previous_footer() {
+        assert_eq!(carry_over("new", "plain old body"), None);
+    }
 
     #[test]
     fn compose_parse_roundtrip() {

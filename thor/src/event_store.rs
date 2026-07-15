@@ -634,6 +634,31 @@ impl EventStore {
             }
         };
 
+        // Carry the fact's footer across a content-only REVISE. The footer is
+        // the body's tail, not a field, so a caller who rewrites the body
+        // without re-typing it silently drops the fact's type, tags, fires-when
+        // vocabulary and the guard's anchors. Nothing errors and recall still
+        // finds the fact, so the loss is invisible - it just stops firing at the
+        // moment of action, which was the reason it was written. A new body that
+        // brings its OWN footer wins (retyping stays a one-call operation).
+        //
+        // Revise only: a retract's body is the tombstone and a supersede points
+        // elsewhere - neither should inherit the old metadata.
+        let carried;
+        let body = match kind {
+            EventKind::FactRevised => {
+                let prev = events.iter().find(|e| e.this_hash == parent);
+                match prev.and_then(|p| crate::footer::carry_over(body, &p.body)) {
+                    Some(b) => {
+                        carried = b;
+                        carried.as_str()
+                    }
+                    None => body,
+                }
+            }
+            _ => body,
+        };
+
         let event = insert_event(&tx, session_id, lineage_id, actor, kind, entity_id, Some(&parent), body)?;
         tx.commit()?;
         Ok(event)
@@ -1179,6 +1204,52 @@ mod tests {
         let retrieved = store.get_event_by_uuid(&event.event_uuid).unwrap();
         assert!(retrieved.is_some());
         assert_eq!(retrieved.unwrap().seq, 1);
+    }
+
+    #[test]
+    /// A revise that rewrites the body must keep the fact's footer: it holds
+    /// the type, tags, fires-when vocabulary and the guard's ANCHORS, and losing
+    /// them is invisible (recall still finds the fact - it just never fires at
+    /// the moment of action again). Hit live: a revise meant to widen a memory's
+    /// anchors wiped them instead.
+    #[test]
+    fn revise_keeps_the_facts_footer_but_retract_does_not_inherit_it() {
+        let mut store = EventStore::in_memory().unwrap();
+        let footer = crate::footer::compose(
+            "gotcha",
+            &["nas".into()],
+            "global",
+            &["ssh".into()],
+            &["ssh admin@host".into()],
+            None,
+        );
+        let v1 = store
+            .append_event("s", "l", "a", EventKind::FactCreated, "e1", None, &format!("old\n\n{footer}"))
+            .unwrap();
+
+        // content-only revise: caller sends no footer, the fact keeps its own
+        let v2 = store
+            .append_mutate_checked("s", "l", "a", EventKind::FactRevised, "e1", Some(&v1.this_hash), "new content")
+            .unwrap();
+        assert_eq!(crate::footer::strip(&v2.body), "new content");
+        assert_eq!(crate::footer::anchors(&v2.body), vec!["ssh admin@host"], "anchors survive");
+        assert_eq!(crate::footer::fact_type(&v2.body), Some(crate::repo::FactType::Gotcha));
+
+        // a caller's own footer still wins (retyping in one call)
+        let retyped = format!(
+            "newer\n\n{}",
+            crate::footer::compose("decision", &["x".into()], "global", &[], &["other".into()], None)
+        );
+        let v3 = store
+            .append_mutate_checked("s", "l", "a", EventKind::FactRevised, "e1", Some(&v2.this_hash), &retyped)
+            .unwrap();
+        assert_eq!(crate::footer::anchors(&v3.body), vec!["other"], "caller's footer is respected");
+
+        // a RETRACT must not inherit the metadata: its body is the tombstone
+        let dead = store
+            .append_mutate_checked("s", "l", "a", EventKind::FactRetracted, "e1", Some(&v3.this_hash), "[retracted: gone]")
+            .unwrap();
+        assert_eq!(dead.body, "[retracted: gone]", "tombstone stays verbatim");
     }
 
     #[test]

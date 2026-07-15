@@ -163,4 +163,14 @@ jobs:
 
             Unpack, put the binary on your PATH, then `thor install --with-courier` to wire
             the hooks into your agent (it backs up settings.json first and only adds THOR's
-            own entries).
+            own entries). Run `thor doctor` first if anything looks off - it reports the
+            store, model, sidecars and daemon, which is what recall behaviour depends on.
+            Full walkthrough: SETUP.md.
+
+            **What has actually been run**
+
+            Every asset is built and tested by CI on a clean runner (build + library suite,
+            both feature sets, plus the drift corpus). Beyond that, only the platform the
+            maintainer uses gets smoke-tested by hand before publishing - the others are
+            CI-built but nobody has started them. Reports welcome; that is exactly the gap
+            between this and a 1.0 (see RELEASING.md).

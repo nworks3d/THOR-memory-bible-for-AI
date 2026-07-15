@@ -658,14 +658,18 @@ fn neighbor_ids(entity_id: &str, depth: usize) -> Option<(Vec<String>, Vec<Strin
     Some((before, after))
 }
 
+/// The repo-relative path inside a chunk id (`<project>:<rel>#<n>` -> `rel`).
+/// None for a non-chunk id. What the file IS decides how it is served, so both
+/// the stitch depth and the seam glue read it from here.
+fn chunk_rel(entity_id: &str) -> Option<&str> {
+    entity_id.split_once(':').map(|(_, rest)| rest.rsplit_once('#').map_or(rest, |(rel, _)| rel))
+}
+
 /// Stitching depth per chunk kind: markdown sections fragment answers across
 /// MORE boundaries than code (a doc answer often spans several short
 /// sections), so doc chunks pull two neighbors each side where code pulls one.
 fn stitch_depth(entity_id: &str) -> usize {
-    entity_id
-        .split_once(':')
-        .map(|(_, rest)| rest.rsplit_once('#').map_or(rest, |(rel, _)| rel))
-        .map_or(1, |rel| if crate::repo::is_crumb_doc(rel) { 2 } else { 1 })
+    chunk_rel(entity_id).map_or(1, |rel| if crate::repo::is_crumb_doc(rel) { 2 } else { 1 })
 }
 
 /// Deliberate-path serving (MCP recall, CLI recall, benchmark harness): a
@@ -703,12 +707,22 @@ pub fn serve_deliberate(
     let mut joined = crate::footer::strip(&center).trim().to_string();
     let mut stitched = false;
     let depth = stitch_depth(entity_id);
+    // Seam glue. Chunks are cut on LINE boundaries, so joining code with a space
+    // welds the previous chunk's last line onto the next chunk's first line and
+    // the seam lands mid-statement (`}` `export function foo() {` on one line) -
+    // unreadable for the agent, and invisible as a boundary to any line-based
+    // reader. Prose is unharmed by a space (markdown reflows), so only source
+    // files get the newline back.
+    let glue = match chunk_rel(entity_id).is_some_and(crate::repo::is_source_file) {
+        true => "\n",
+        false => " ",
+    };
     if let Some((before, after)) = neighbor_ids(entity_id, depth) {
         // nearest-first order: prepend walks outward, append walks outward
         for id in before {
             match live_head_body(store, &id) {
                 Some(p) => {
-                    joined = format!("{} {}", crate::footer::strip(&p).trim(), joined);
+                    joined = format!("{}{}{}", crate::footer::strip(&p).trim(), glue, joined);
                     stitched = true;
                 }
                 None => break, // a gap ends the contiguous run
@@ -717,7 +731,7 @@ pub fn serve_deliberate(
         for id in after {
             match live_head_body(store, &id) {
                 Some(n) => {
-                    joined = format!("{} {}", joined, crate::footer::strip(&n).trim());
+                    joined = format!("{}{}{}", joined, glue, crate::footer::strip(&n).trim());
                     stitched = true;
                 }
                 None => break,
@@ -1027,6 +1041,21 @@ mod tests {
         assert!(snip.contains("matrix_cache"), "center content served: {snip}");
         assert!(snip.contains("matrix_ensure_rebuild"), "next-chunk content stitched in: {snip}");
         assert!(!snip.contains("[repo file"), "footers never reach the served window: {snip}");
+        // The seam must be a LINE break, not a space: chunks are cut on line
+        // boundaries, so a space welds `}` onto the next chunk's `fn ...` and
+        // the served code is broken mid-statement.
+        for line in snip.lines() {
+            assert!(
+                !(line.contains('}') && line.contains("fn ") && line.matches("fn ").count() > 0
+                    && line.trim_start().starts_with('}')),
+                "chunk seam welded two lines together: {line:?}"
+            );
+        }
+        assert!(
+            snip.contains("build(); }\nfn gamma"),
+            "code chunks must be stitched with a newline at the seam: {snip:?}"
+        );
+
         // A memory fact is served full-body, footer stripped, uncapped.
         let long = format!("GOTCHA: {}\n\n[memory/gotcha | tags: x | project: P]", "detail ".repeat(120));
         let (tag, full) = serve_deliberate(&store, "P:mem-x", &long, "detail", None, None);

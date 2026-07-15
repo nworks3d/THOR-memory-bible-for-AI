@@ -151,19 +151,45 @@ fn try_client_embed(db: &Path, text: &str) -> Option<Vec<f32>> {
     (vec.len() == DIM).then_some(vec)
 }
 
+/// Claim the right to spawn the daemon. Exactly ONE caller in a burst wins.
+///
+/// The claim is the ATOMIC creation of the marker file, not a check followed by
+/// a write: a burst of couriers all miss the marker within the same millisecond
+/// and a plain `write` succeeds for every one of them, so each spawns its own
+/// daemon (measured live: three, all started in the same second, each holding
+/// the ~650 MB model). `create_new` fails with `AlreadyExists` for every loser,
+/// which is the whole point.
+///
+/// A marker older than the debounce is stale (a previous start died before the
+/// daemon published its port) and must not block starts forever, so it is
+/// cleared first. Any error claiming the marker fails OPEN: a spare daemon is a
+/// wart, no daemon at all is a silent drop to bm25 on every prompt.
+fn claim_spawn(sf: &Path) -> bool {
+    if let Ok(meta) = std::fs::metadata(sf) {
+        let fresh = meta
+            .modified()
+            .ok()
+            .and_then(|m| m.elapsed().ok())
+            .is_some_and(|e| e < SPAWN_DEBOUNCE);
+        if fresh {
+            return false; // a start is already in flight
+        }
+        let _ = std::fs::remove_file(sf); // stale marker: let the claim below decide
+    }
+    match std::fs::OpenOptions::new().write(true).create_new(true).open(sf) {
+        Ok(_) => true,
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => false, // lost the race
+        Err(_) => true, // cannot claim at all - fail open rather than never start
+    }
+}
+
 /// Ensure a daemon is (being) started, detached so it outlives this courier
 /// process. Debounced via a start-marker file so a burst of prompts during the
 /// ~1.25s warm-up does not spawn a swarm of daemons.
 pub fn ensure_daemon(db: &Path) {
-    let sf = startfile(db);
-    if let Ok(meta) = std::fs::metadata(&sf) {
-        if let Ok(modified) = meta.modified() {
-            if modified.elapsed().map(|e| e < SPAWN_DEBOUNCE).unwrap_or(false) {
-                return; // a start is already in flight
-            }
-        }
+    if !claim_spawn(&startfile(db)) {
+        return;
     }
-    let _ = std::fs::write(&sf, "");
     if let Ok(exe) = std::env::current_exe() {
         let _ = spawn_detached(&exe, db);
     }
@@ -205,6 +231,54 @@ fn spawn_detached(exe: &Path, db: &Path) -> std::io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The bug this guards: a burst of couriers hitting a cold daemon all miss
+    /// the marker in the same millisecond. Check-then-write let every one of
+    /// them through (measured live: three daemons, same second, ~650 MB each).
+    /// Exactly one claim may win.
+    #[test]
+    fn only_one_of_a_burst_may_claim_the_spawn() {
+        let dir = tempfile::tempdir().unwrap();
+        let sf = dir.path().join("thor-embedd.starting");
+        let winners = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(8));
+
+        let handles: Vec<_> = (0..8)
+            .map(|_| {
+                let (sf, winners, barrier) = (sf.clone(), winners.clone(), barrier.clone());
+                std::thread::spawn(move || {
+                    barrier.wait(); // release them all at once - this is the race
+                    if claim_spawn(&sf) {
+                        winners.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    }
+                })
+            })
+            .collect();
+        for h in handles {
+            h.join().unwrap();
+        }
+        assert_eq!(
+            winners.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "a burst must spawn exactly one daemon, not a swarm"
+        );
+    }
+
+    #[test]
+    fn a_fresh_marker_blocks_and_a_stale_one_does_not() {
+        let dir = tempfile::tempdir().unwrap();
+        let sf = dir.path().join("thor-embedd.starting");
+
+        assert!(claim_spawn(&sf), "no marker: the first caller starts the daemon");
+        assert!(!claim_spawn(&sf), "marker is fresh: a start is already in flight");
+
+        // A start that died leaves the marker behind; it must not block forever.
+        let stale = std::time::SystemTime::now() - SPAWN_DEBOUNCE - Duration::from_secs(5);
+        let f = std::fs::File::options().write(true).open(&sf).unwrap();
+        f.set_modified(stale).unwrap();
+        drop(f);
+        assert!(claim_spawn(&sf), "a stale marker must not block a restart forever");
+    }
 
     #[test]
     fn test_portfile_and_startfile_next_to_db() {

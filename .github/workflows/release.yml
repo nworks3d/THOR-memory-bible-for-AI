@@ -1,0 +1,160 @@
+# Release: tag -> build on clean runners -> attach binaries.
+#
+# Triggered ONLY by a version tag, so a release always corresponds to an exact
+# commit, and the binary is built by CI on a clean machine - never uploaded from
+# a maintainer's laptop, where "works here" proves nothing.
+#
+# Two assets, because THOR ships in two shapes and they are not interchangeable:
+#   thor-<ver>-windows-x86_64.zip  - semantic (dense recall). The client build.
+#   thor-<ver>-linux-x86_64.tar.gz - semantic (dense recall). The client build.
+#   thor-<ver>-linux-x86_64-bm25.tar.gz - default. No ONNX: the server/NAS build.
+#
+# See RELEASING.md for the human procedure around this file.
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Tag to build (must already exist)"
+        required: true
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  # A tag that does not build or does not pass its tests must never become a
+  # release. This repeats CI on purpose: tags can be pushed without a green run.
+  gate:
+    name: gate (build + tests must pass first)
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: true
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: thor
+      - name: Test (semantic)
+        working-directory: thor
+        run: cargo test --release --features semantic --lib
+      - name: Build (default / bm25 - the server shape must keep compiling)
+        working-directory: thor
+        run: cargo build --release
+
+  build:
+    name: ${{ matrix.asset }}
+    needs: gate
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            features: "--features semantic"
+            bin: thor.exe
+            asset: thor-windows-x86_64.zip
+          - os: ubuntu-latest
+            features: "--features semantic"
+            bin: thor
+            asset: thor-linux-x86_64.tar.gz
+          - os: ubuntu-latest
+            features: ""
+            bin: thor
+            asset: thor-linux-x86_64-bm25.tar.gz
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: thor
+
+      - name: Build
+        working-directory: thor
+        run: cargo build --release ${{ matrix.features }}
+
+      - name: Package (windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          Copy-Item thor/target/release/${{ matrix.bin }} .
+          Copy-Item LICENSE .
+          Compress-Archive -Path ${{ matrix.bin }}, LICENSE -DestinationPath ${{ matrix.asset }}
+
+      - name: Package (linux)
+        if: runner.os == 'Linux'
+        run: |
+          cp thor/target/release/${{ matrix.bin }} .
+          tar czf ${{ matrix.asset }} ${{ matrix.bin }} LICENSE
+
+      # Anyone should be able to verify the download matches what CI produced.
+      - name: Checksum
+        shell: bash
+        run: |
+          sha256sum ${{ matrix.asset }} > ${{ matrix.asset }}.sha256 2>/dev/null \
+            || shasum -a 256 ${{ matrix.asset }} > ${{ matrix.asset }}.sha256
+          cat ${{ matrix.asset }}.sha256
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.asset }}
+          path: |
+            ${{ matrix.asset }}
+            ${{ matrix.asset }}.sha256
+
+  publish:
+    name: publish release
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: List what will be published
+        run: ls -la dist
+
+      # The notes state what the binary does NOT include, because that is what
+      # generates issues otherwise: no embedding model ships with it, and the
+      # semantic build needs the MSVC runtime on Windows.
+      - name: Publish
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*
+          draft: true
+          generate_release_notes: true
+          body: |
+            Built by CI from this tag on clean runners. Verify with the `.sha256` next to each asset.
+
+            **Which asset**
+
+            | asset | recall | for |
+            |---|---|---|
+            | `thor-windows-x86_64.zip` | semantic + bm25 | Windows client (the agent machine) |
+            | `thor-linux-x86_64.tar.gz` | semantic + bm25 | Linux client |
+            | `thor-linux-x86_64-bm25.tar.gz` | bm25 only | servers / NAS / containers - no ONNX |
+
+            **What is NOT in the box**
+
+            - **No embedding model.** Semantic recall needs a local ONNX sentence-embedding
+              model (~235 MB) that you supply; nothing auto-downloads. Without it THOR runs
+              pure bm25 and degrades cleanly - it does not break. See README ("Semantic mode").
+            - **Windows: needs the Microsoft Visual C++ Redistributable** (`MSVCP140.dll`,
+              `VCRUNTIME140.dll`) and `DirectML.dll` (present on Windows 10 1903+). If the
+              binary refuses to start, install the VC++ redistributable first.
+
+            **Install**
+
+            Unpack, put the binary on your PATH, then `thor install --with-courier` to wire
+            the hooks into your agent (it backs up settings.json first and only adds THOR's
+            own entries).

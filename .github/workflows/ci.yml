@@ -1,0 +1,89 @@
+# CI: prove THOR builds and passes its tests on a CLEAN machine - not just on
+# the maintainer's. That is the whole point; everything else is style.
+#
+# Both feature sets are built because both are shipped:
+#   default             = pure bm25, no ONNX. What the NAS/server build runs.
+#   --features semantic = the dense score-fusion client path.
+# A change that only compiles under one of them is broken, so both gate.
+#
+# NOT gated here (deliberately, so this stays honest rather than decorative):
+# rustfmt and clippy. The tree is not currently clean under either, and running
+# `cargo fmt` across it would churn every file for no behaviour change. See
+# CONTRIBUTING.md - match the local style in your diff instead.
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build-and-test:
+    name: ${{ matrix.name }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # The server/NAS shape: no ONNX, pure bm25.
+          - name: linux / default (bm25)
+            os: ubuntu-latest
+            features: ""
+          # The client shape: the semantic recall path.
+          - name: windows / semantic
+            os: windows-latest
+            features: "--features semantic"
+          # Keeps the semantic path honest on Linux too (the courier is not
+          # Windows-only); this is what the linux release asset is built from.
+          - name: linux / semantic
+            os: ubuntu-latest
+            features: "--features semantic"
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      # Compiling fastembed/ort/tokenizers/rusqlite from scratch is the slow
+      # part; cache keyed on the lockfile so a docs-only PR is fast.
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: thor
+
+      - name: Build
+        working-directory: thor
+        run: cargo build --release ${{ matrix.features }}
+
+      # The library suite runs WITHOUT a local embedding model or a daemon (the
+      # semantic path degrades to bm25 when they are absent), so a clean runner
+      # is a valid place to run it. Verified: 243/243 pass with no model present.
+      - name: Test
+        working-directory: thor
+        run: cargo test --release ${{ matrix.features }} --lib
+
+      # The eval harnesses are part of the argument this repo makes, so they must
+      # at least compile. They are not RUN here: they need a real store, a model
+      # and a warm daemon.
+      - name: Build examples
+        working-directory: thor
+        run: cargo build --release ${{ matrix.features }} --examples
+
+  # The one claim in this repo a stranger can reproduce without our private
+  # corpus: drift compensation over the committed synthetic scenarios. If this
+  # breaks, the README is lying, so it gates.
+  drift-eval:
+    name: drift eval (repo-reproducible claim)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: thor
+      - name: Run the committed drift corpus
+        working-directory: thor
+        run: cargo run --release --example drift_eval

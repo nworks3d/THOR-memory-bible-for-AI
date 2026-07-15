@@ -144,6 +144,16 @@ live store read-only, scoring both entity-id and content presence.
 
 ## Quick start
 
+Grab a prebuilt binary from [Releases](../../releases) - `windows-x86_64` or
+`linux-x86_64` for the semantic client build, `linux-x86_64-bm25` for a
+server/NAS (no ONNX). Each has a `.sha256`. On Windows the semantic build needs
+the Microsoft Visual C++ Redistributable installed.
+
+No embedding model ships with it: without one THOR runs pure bm25 and degrades
+cleanly (see [Semantic recall](#semantic-recall-optional-off-by-default)).
+
+Or build it yourself:
+
 ```sh
 cd thor
 cargo test            # run the test suite
@@ -360,6 +370,14 @@ it moving, there are two easy ways:
 
 No pressure and no paywall - the whole thing stays open either way. Skål, and
 thanks for reading this far.
+
+## Contributing
+
+Bug reports and PRs welcome. THOR is a memory an agent is supposed to trust, so
+the bar is correctness and honest measurement rather than volume of features -
+the checklist before you commit, and the ways measuring THOR goes wrong, are in
+**[CONTRIBUTING.md](CONTRIBUTING.md)**. Maintainer release procedure:
+[RELEASING.md](RELEASING.md).
 
 ## License
 

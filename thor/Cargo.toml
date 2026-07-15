@@ -60,3 +60,19 @@ name = "drift_eval"
 # but cfg-degrades to bm25, so it compiles on both feature sets too.
 [[example]]
 name = "hits_dump"
+
+# The resident-cache harnesses (the gate, the A/B on what counts, and the raw
+# timing) all drive semantic-only API - ResidentCache / WarmRecall / vectors -
+# so they cannot compile against a bm25-only library. Same reason as
+# recall_eval above.
+[[example]]
+name = "cache_correctness"
+required-features = ["semantic"]
+
+[[example]]
+name = "warm_ab"
+required-features = ["semantic"]
+
+[[example]]
+name = "cache_speed"
+required-features = ["semantic"]

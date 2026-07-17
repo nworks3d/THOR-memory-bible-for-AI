@@ -30,6 +30,98 @@ fn default_db_path() -> Option<PathBuf> {
     Some(dir.join("thor.db"))
 }
 
+/// Summary of a `thor drain-inbox` run, returned so the caller (and tests) can
+/// assert what happened without parsing stdout.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct DrainSummary {
+    pub total: usize,
+    pub applied: usize,
+    pub skipped: usize,
+    pub errors: usize,
+}
+
+/// Drain a replica's capture inbox into the authority store at `db`: replay each
+/// captured remember/revise/retract as a real event. The footer is already baked
+/// into each op's body (`remember` composed it before the divert), so this never
+/// re-derives footer state - it re-runs the same dedup + append the live
+/// `remember` would have, preserving the mobile-assigned entity id so revisions
+/// chain correctly. Idempotent on create: a create whose entity/dup already exists
+/// is skipped, so re-draining the same file is safe.
+pub fn run_drain_inbox(db: &Path, inbox: &Path) -> anyhow::Result<DrainSummary> {
+    let ops = crate::inbox::read_all(inbox)?;
+    let mut store = EventStore::new(db)?;
+    let mut s = DrainSummary { total: ops.len(), ..Default::default() };
+    for op in &ops {
+        match op.op.as_str() {
+            "create" => {
+                // Reconstruct the exact dedup the live remember used: the footer is
+                // already in op.body, so dedup_prefix strips it the same way, scoped
+                // to where the fact lives.
+                let scope = crate::recall::RecallScope::current(
+                    crate::repo::owner_project(&op.entity_id).map(str::to_string),
+                );
+                let prefix = crate::recall::dedup_prefix(&op.body);
+                match store.append_created_unique(
+                    "drain-inbox",
+                    "drain-inbox",
+                    "mcp",
+                    &op.entity_id,
+                    &op.body,
+                    |_, project, head_body| {
+                        scope.allows(project) && crate::recall::dedup_prefix(head_body) == prefix
+                    },
+                ) {
+                    Ok(ev) => {
+                        s.applied += 1;
+                        println!("created {} rev {}", op.entity_id, &ev.this_hash[..8.min(ev.this_hash.len())]);
+                    }
+                    Err(e) => {
+                        // A create conflict = the fact is already on the authority
+                        // (dup or same id): idempotent skip so a re-drain is safe.
+                        if e.downcast_ref::<crate::event_store::MutateConflict>().is_some() {
+                            s.skipped += 1;
+                            println!("skip (already present): {}", op.entity_id);
+                        } else {
+                            s.errors += 1;
+                            eprintln!("ERROR create {}: {e}", op.entity_id);
+                        }
+                    }
+                }
+            }
+            "revise" | "retract" => {
+                let kind = if op.op == "revise" {
+                    EventKind::FactRevised
+                } else {
+                    EventKind::FactRetracted
+                };
+                match store.append_mutate_checked(
+                    "drain-inbox",
+                    "drain-inbox",
+                    "mcp",
+                    kind,
+                    &op.entity_id,
+                    op.parent_rev.as_deref(),
+                    &op.body,
+                ) {
+                    Ok(ev) => {
+                        s.applied += 1;
+                        println!("{} {} rev {}", op.op, op.entity_id, &ev.this_hash[..8.min(ev.this_hash.len())]);
+                    }
+                    Err(e) => {
+                        s.errors += 1;
+                        eprintln!("ERROR {} {}: {e}", op.op, op.entity_id);
+                    }
+                }
+            }
+            other => {
+                s.errors += 1;
+                eprintln!("ERROR unknown inbox op '{other}' for {}", op.entity_id);
+            }
+        }
+    }
+    Ok(s)
+}
+
 /// True iff `db` is a Windows UNC / network path (\\server\share or the verbatim
 /// \\?\UNC\ form). Local disks (C:\, \\?\C:\) and relative paths are NOT network.
 /// On non-Windows an NFS mount is indistinguishable from a local path by name, so
@@ -307,6 +399,14 @@ enum Commands {
         /// Reconcile interval in seconds (used with --watch).
         #[arg(long, default_value_t = 60)]
         interval: u64,
+    },
+    /// Drain a replica's capture inbox into THIS (authority) store: replay each
+    /// captured remember/revise/retract as a real event in this log. Run from the
+    /// PC's ship job after fetching the replica's rotated inbox file. See inbox.rs.
+    DrainInbox {
+        /// Path to the inbox jsonl file (a rotated copy fetched from the replica).
+        #[arg(long)]
+        inbox: PathBuf,
     },
     /// Show the sync status: this store's contiguous tip, and (with --to) the
     /// replica's tip + current lag, or that it is unreachable (honest degraded RPO).
@@ -1053,6 +1153,16 @@ steward review prepared: {}", path.display());
                 .filter(|t| !t.trim().is_empty());
             crate::sync::print_status(&db, to.as_deref(), token.as_deref())?;
         }
+        Commands::DrainInbox { inbox } => {
+            let s = run_drain_inbox(&db, &inbox)?;
+            println!(
+                "drain done: {} applied, {} skipped, {} error(s) of {} op(s)",
+                s.applied, s.skipped, s.errors, s.total
+            );
+            if s.errors > 0 {
+                anyhow::bail!("{} inbox op(s) failed to apply (file kept for inspection)", s.errors);
+            }
+        }
         Commands::Vectors { action, model_dir, force } => {
             #[cfg(feature = "semantic")]
             {
@@ -1785,5 +1895,63 @@ mod tests {
         assert!(!is_network_path(Path::new("thor.db")), "a relative local path is fine");
         assert!(refuse_network_db(Path::new(r"\\server\share\thor.db")).is_err(), "the guard must reject a UNC db");
         assert!(refuse_network_db(Path::new(r"C:\local\thor.db")).is_ok(), "the guard must allow a local db");
+    }
+
+    #[test]
+    fn drain_applies_create_then_revise_preserving_id_and_footer() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("thor.db");
+        let inbox = dir.path().join("inbox.jsonl");
+        crate::inbox::append(&inbox, &crate::inbox::InboxOp {
+            op: "create".into(),
+            entity_id: "acme:mem-metrics".into(),
+            body: "the metrics port is 9464\n\n[memory/gotcha | tags:  | project: acme]".into(),
+            parent_rev: None,
+            ts: "1".into(),
+            capture_id: "c1".into(),
+        }).unwrap();
+        crate::inbox::append(&inbox, &crate::inbox::InboxOp {
+            op: "revise".into(),
+            entity_id: "acme:mem-metrics".into(),
+            body: "the metrics port is 9464 (confirmed)\n\n[memory/gotcha | tags:  | project: acme]".into(),
+            parent_rev: None,
+            ts: "2".into(),
+            capture_id: "c2".into(),
+        }).unwrap();
+
+        let summary = run_drain_inbox(&db, &inbox).unwrap();
+        assert_eq!(summary, DrainSummary { total: 2, applied: 2, skipped: 0, errors: 0 });
+
+        let store = EventStore::new(&db).unwrap();
+        let events = store.get_all_events().unwrap();
+        let heads = crate::cas::compute_head_sets(&events);
+        let hs = heads.get("acme:mem-metrics").expect("entity landed on the authority");
+        assert!(!hs.is_diverged && hs.heads.len() == 1, "one clean head, no fork");
+        let head_hash = hs.heads.iter().next().unwrap();
+        let head = events.iter().find(|e| &e.this_hash == head_hash).unwrap();
+        assert!(head.body.contains("confirmed"), "revise applied onto the same id");
+        assert!(head.body.contains("[memory/gotcha"), "footer preserved through the drain");
+    }
+
+    #[test]
+    fn drain_is_idempotent_on_create() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("thor.db");
+        let inbox = dir.path().join("inbox.jsonl");
+        crate::inbox::append(&inbox, &crate::inbox::InboxOp {
+            op: "create".into(),
+            entity_id: "acme:mem-x".into(),
+            body: "a fact\n\n[memory/note | project: acme]".into(),
+            parent_rev: None,
+            ts: "1".into(),
+            capture_id: "c1".into(),
+        }).unwrap();
+        assert_eq!(run_drain_inbox(&db, &inbox).unwrap().applied, 1);
+        // Re-draining the same file must not double-create: the create is skipped.
+        let second = run_drain_inbox(&db, &inbox).unwrap();
+        assert_eq!((second.applied, second.skipped, second.errors), (0, 1, 0));
+        let store = EventStore::new(&db).unwrap();
+        let heads = crate::cas::compute_head_sets(&store.get_all_events().unwrap());
+        assert_eq!(heads.get("acme:mem-x").unwrap().heads.len(), 1, "still exactly one head");
     }
 }

@@ -100,14 +100,48 @@ Mirror image: set `THOR_REPLICA_URL` on the container (not `THOR_RECV_BIND`), ru
 `thor recv` on the replica machine, and re-seed the replica from the container's
 export. Same token, same verification.
 
+## Capture inbox: writing from a replica without forking
+
+The replica's log must stay a strict prefix of the authority's - that is what makes
+`recv` a verbatim, hash-verified copy. So a `remember` / `revise` / `retract` sent
+to the replica's MCP (e.g. from a phone whose only always-on endpoint is the
+container) would fork the chain and block the next ship. The capture inbox lets
+those writes happen anyway without ever touching the log:
+
+- Set `THOR_CAPTURE_INBOX=/data/inbox.jsonl` on the **replica** container. Its MCP
+  server then *diverts* every write to that append-only file instead of appending
+  to `thor.db`, and answers the client `queued to capture inbox (pending sync)`.
+  Reads (recall / get) are unchanged. The stdio (local authority) server never
+  diverts - only the HTTP server reads this env.
+- On the **authority**, drain the inbox back into the real log with
+  `thor drain-inbox --inbox <file>`: it replays each captured op as a proper event,
+  preserving the entity id so revisions chain correctly, and re-running the same
+  duplicate check `remember` does (so a re-drain is idempotent).
+
+Wire it into the authority's ship job so captures round-trip automatically. Because
+the drain mints the facts on the authority, the next ship replicates them straight
+back to the container the normal, non-forking way:
+
+1. rotate the inbox on the replica so new captures land in a fresh file:
+   `mv /data/inbox.jsonl /data/inbox.draining.jsonl` (skip if absent/empty)
+2. fetch `inbox.draining.jsonl` to the authority
+3. `thor drain-inbox --inbox inbox.draining.jsonl`
+4. on success, delete `inbox.draining.jsonl` on the replica
+5. ship as usual
+
+**Trade-off:** a capture is not visible in the replica's own recall until the next
+drain+ship (bounded by the ship interval). It is a capture channel, not a live
+write - the price of keeping one lossless, hash-verified chain.
+
 ## Caveats
 
-- **The replica is effectively read-oriented.** If clients write to the replica's
-  MCP (e.g. a `remember` from the mobile/web connector) while the authority also
-  ships, the two hash chains diverge and the next reconcile is rejected until the
-  replica is re-seeded. In an authority+replica setup, route durable writes to the
-  authority. A future bidirectional mode would need both ends to ship+recv with
-  conflict handling; that is out of scope here.
+- **The replica is effectively read-oriented.** A write sent straight to the
+  replica's MCP (e.g. a `remember` from the mobile/web connector) while the
+  authority also ships would diverge the two hash chains and block the next
+  reconcile until the replica is re-seeded. Either route durable writes to the
+  authority, or use the capture inbox above so replica-side writes are queued and
+  replayed on the authority instead of forking the log. A fully bidirectional mode
+  (both ends ship+recv with conflict handling) is out of scope here.
 - **Token hygiene.** The token is the only auth on the transport. Keep it out of
   git (this repo carries placeholders), rotate it by setting the new value on both
   ends, and keep the recv port off the public internet.

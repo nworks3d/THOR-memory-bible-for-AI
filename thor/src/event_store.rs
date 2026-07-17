@@ -1206,7 +1206,6 @@ mod tests {
         assert_eq!(retrieved.unwrap().seq, 1);
     }
 
-    #[test]
     /// A revise that rewrites the body must keep the fact's footer: it holds
     /// the type, tags, fires-when vocabulary and the guard's ANCHORS, and losing
     /// them is invisible (recall still finds the fact - it just never fires at

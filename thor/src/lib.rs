@@ -24,6 +24,7 @@ pub mod symbols;
 pub mod importer;
 pub mod mcp;
 pub mod sync;
+pub mod inbox;
 pub mod guard;
 pub mod install;
 pub mod backup;

@@ -53,6 +53,10 @@ pub struct ThorServer {
     db: PathBuf,
     #[allow(dead_code)] // read only inside the #[tool_handler] macro expansion
     tool_router: ToolRouter<Self>,
+    /// When set (env THOR_CAPTURE_INBOX, on a replica), remember/revise/retract
+    /// are diverted to this append-only inbox file instead of appending to the
+    /// local log - so the replica's chain never forks the authority. See inbox.rs.
+    inbox: Option<PathBuf>,
 }
 
 #[derive(Deserialize, schemars::JsonSchema)]
@@ -232,11 +236,20 @@ pub struct BriefArgs {
 #[tool_router]
 impl ThorServer {
     pub fn new(store: EventStore, db: PathBuf) -> Self {
-        Self::from_shared(Arc::new(Mutex::new(store)), None, db)
+        Self::from_shared(Arc::new(Mutex::new(store)), None, db, None)
     }
 
-    pub fn from_shared(store: Arc<Mutex<EventStore>>, project: Option<String>, db: PathBuf) -> Self {
-        ThorServer { store, project, db, tool_router: Self::tool_router() }
+    /// `inbox`: when `Some`, this server is in replica divert mode - remember /
+    /// revise / retract queue to that inbox file instead of appending to the local
+    /// log (see inbox.rs). Only the HTTP server (the remote/NAS connector) ever
+    /// sets it; the stdio server (the local authority) always passes `None`.
+    pub fn from_shared(
+        store: Arc<Mutex<EventStore>>,
+        project: Option<String>,
+        db: PathBuf,
+        inbox: Option<PathBuf>,
+    ) -> Self {
+        ThorServer { store, project, db, tool_router: Self::tool_router(), inbox }
     }
 
     /// Run a sync store closure off the async runtime; its Ok/Err String is the
@@ -543,6 +556,7 @@ impl ThorServer {
     #[tool(description = "Store a NEW fact (fact_created). Recall first; a near-duplicate of a live fact is refused with a pointer to it. Accepts fact_type (gotcha|decision|preference), tags, and triggers - ask yourself WHEN this fact should fire and pass those exact task words (commands, file names, error strings) so future recall boosts it at the right moment.")]
     async fn remember(&self, Parameters(args): Parameters<RememberArgs>) -> String {
         let server_project = self.project.clone();
+        let inbox = self.inbox.clone();
         self.blocking(move |s| {
             let body = args.body.trim();
             if body.is_empty() {
@@ -626,6 +640,26 @@ impl ThorServer {
             // so a typed fact's footer cannot defeat it), scoped to where the NEW
             // fact will live - the same body deliberately stored for a different
             // project is a legitimate write, not a duplicate.
+            // Replica divert: queue the fully-prepared create (footer already in
+            // `body`, id already minted) to the capture inbox instead of forking
+            // the local log; the authority's drain-inbox re-runs the same dedup.
+            if let Some(path) = &inbox {
+                let op = crate::inbox::InboxOp {
+                    op: "create".into(),
+                    entity_id: entity_id.clone(),
+                    body: body.clone(),
+                    parent_rev: None,
+                    ts: crate::inbox::now_ts(),
+                    capture_id: Uuid::new_v4().to_string(),
+                };
+                return match crate::inbox::append(path, &op) {
+                    Ok(()) => Ok(format!(
+                        "queued to capture inbox: entity {} (pending sync to the authority)",
+                        entity_id
+                    )),
+                    Err(e) => Err(format!("capture inbox write failed: {e}")),
+                };
+            }
             let scope = RecallScope::current(crate::repo::owner_project(&entity_id).map(str::to_string));
             let prefix = crate::recall::dedup_prefix(&clean_body);
             match s.append_created_unique("mcp", "mcp-session", "mcp", &entity_id, &body, |_, project, head_body| {
@@ -655,6 +689,7 @@ impl ThorServer {
 
     #[tool(description = "Update an existing fact with a corrected body (fact_revised). Single-headed facts auto-fill parent_rev; a stale parent_rev is rejected with the fresh head-set (no silent branch). Prefer this over remember for a fact that CHANGED.")]
     async fn revise(&self, Parameters(args): Parameters<ReviseArgs>) -> String {
+        let inbox = self.inbox.clone();
         self.blocking(move |s| {
             let body = args.body.trim();
             if body.is_empty() {
@@ -667,6 +702,24 @@ impl ThorServer {
             // the body instead of storing a degraded head.
             if let Some(defect) = crate::footer::write_defect(body) {
                 return Err(format!("body refused: {defect}"));
+            }
+            // Replica divert: queue the revise for the authority to replay.
+            if let Some(path) = &inbox {
+                let op = crate::inbox::InboxOp {
+                    op: "revise".into(),
+                    entity_id: args.entity_id.clone(),
+                    body: body.to_string(),
+                    parent_rev: args.parent_rev.clone(),
+                    ts: crate::inbox::now_ts(),
+                    capture_id: Uuid::new_v4().to_string(),
+                };
+                return match crate::inbox::append(path, &op) {
+                    Ok(()) => Ok(format!(
+                        "queued to capture inbox: revise {} (pending sync to the authority)",
+                        args.entity_id
+                    )),
+                    Err(e) => Err(format!("capture inbox write failed: {e}")),
+                };
             }
             match s.append_mutate_checked(
                 "mcp",
@@ -686,6 +739,7 @@ impl ThorServer {
 
     #[tool(description = "Retract a wrong or obsolete fact (fact_retracted): recall stops surfacing it, the log keeps its history. Same CAS rules as revise.")]
     async fn retract(&self, Parameters(args): Parameters<RetractArgs>) -> String {
+        let inbox = self.inbox.clone();
         self.blocking(move |s| {
             // Never store an empty retraction body: a retracted rev STAYS a head,
             // and when it is one side of a DIVERGED entity the courier renders its
@@ -695,6 +749,24 @@ impl ThorServer {
                 .reason
                 .filter(|r| !r.trim().is_empty())
                 .unwrap_or_else(|| "[retracted via mcp]".to_string());
+            // Replica divert: queue the retract for the authority to replay.
+            if let Some(path) = &inbox {
+                let op = crate::inbox::InboxOp {
+                    op: "retract".into(),
+                    entity_id: args.entity_id.clone(),
+                    body: body.clone(),
+                    parent_rev: args.parent_rev.clone(),
+                    ts: crate::inbox::now_ts(),
+                    capture_id: Uuid::new_v4().to_string(),
+                };
+                return match crate::inbox::append(path, &op) {
+                    Ok(()) => Ok(format!(
+                        "queued to capture inbox: retract {} (pending sync to the authority)",
+                        args.entity_id
+                    )),
+                    Err(e) => Err(format!("capture inbox write failed: {e}")),
+                };
+            }
             match s.append_mutate_checked(
                 "mcp",
                 "mcp-session",
@@ -1002,7 +1074,7 @@ fn run(db: &Path, http: Option<String>) -> anyhow::Result<()> {
         match http {
             Some(bind) => serve_http(shared, db, &bind).await,
             None => {
-                let service = ThorServer::from_shared(shared, startup_project(), db)
+                let service = ThorServer::from_shared(shared, startup_project(), db, None)
                     .serve(rmcp::transport::stdio())
                     .await?;
                 service.waiting().await?;
@@ -1097,10 +1169,19 @@ async fn health_handler(
 async fn serve_http(store: Arc<Mutex<EventStore>>, db: PathBuf, bind: &str) -> anyhow::Result<()> {
     // HTTP/remote has no cwd: unscoped by default (a cwd-less remote consumer is
     // cross-project by nature), honoring an explicit `project` arg per call.
+    // Replica divert: on the NAS the container sets THOR_CAPTURE_INBOX so mobile
+    // writes queue to an inbox instead of forking the log (inbox.rs). Only the
+    // HTTP server reads it - the local stdio authority never diverts.
+    let inbox = std::env::var("THOR_CAPTURE_INBOX")
+        .ok()
+        .filter(|s| !s.is_empty())
+        .map(PathBuf::from);
     let mcp_router = {
         let store = store.clone();
         let db = db.clone();
-        mcp_http_router(move || Ok(ThorServer::from_shared(store.clone(), None, db.clone())))
+        mcp_http_router(move || {
+            Ok(ThorServer::from_shared(store.clone(), None, db.clone(), inbox.clone()))
+        })
     };
     let listener = match tokio::net::TcpListener::bind(bind).await {
         Ok(l) => l,
@@ -1184,6 +1265,46 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let db = dir.path().join("thor.db");
         (ThorServer::new(store, db), dir)
+    }
+
+    /// A server in replica DIVERT mode: writes queue to `inbox`, never the log.
+    fn server_with_inbox(store: EventStore, inbox: PathBuf) -> (ThorServer, tempfile::TempDir) {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("thor.db");
+        let s = ThorServer::from_shared(Arc::new(Mutex::new(store)), None, db, Some(inbox));
+        (s, dir)
+    }
+
+    #[tokio::test]
+    async fn remember_diverts_to_inbox_and_never_touches_the_replica_log() {
+        let dir = tempfile::tempdir().unwrap();
+        let inbox = dir.path().join("inbox.jsonl");
+        let (server, _d) = server_with_inbox(EventStore::in_memory().unwrap(), inbox.clone());
+
+        let reply = server
+            .remember(Parameters(RememberArgs {
+                body: "the metrics port is 9464".into(),
+                entity_id: None,
+                project: Some("acme".into()),
+                fact_type: Some("gotcha".into()),
+                tags: None,
+                triggers: None,
+                anchors: None,
+                expires: None,
+            }))
+            .await;
+        assert!(reply.contains("queued to capture inbox"), "reply: {reply}");
+
+        // The capture is in the inbox, with its footer already composed...
+        let ops = crate::inbox::read_all(&inbox).unwrap();
+        assert_eq!(ops.len(), 1);
+        assert_eq!(ops[0].op, "create");
+        assert!(ops[0].body.contains("the metrics port is 9464"));
+        assert!(ops[0].body.contains("[memory/gotcha"), "footer composed before the divert");
+
+        // ...and the replica log is untouched (this is what stops the fork).
+        let events = server.store.lock().unwrap().get_all_events().unwrap();
+        assert!(events.is_empty(), "a diverted write must NOT append to the log");
     }
 
     fn recall_args(query: &str) -> RecallArgs {

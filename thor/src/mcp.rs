@@ -23,6 +23,70 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use uuid::Uuid;
 
+/// Deserialize helpers for the optional list-of-strings tool arguments (`tags`,
+/// `triggers`, `anchors`). serde's stock error for a caller who passes a bare
+/// string is "invalid type: string, expected a sequence" - correct, but it names
+/// neither the field nor "JSON array", so the agent has to guess the fix. These
+/// keep the type exactly as strict (still a JSON array of strings) and only make
+/// the failure self-explanatory: the message names the field and says "JSON array
+/// of strings", so a wrong-shaped call retries right the first time.
+mod string_list {
+    use serde::de::{self, Deserializer, SeqAccess, Visitor};
+    use std::fmt;
+
+    struct SeqV(&'static str);
+    impl<'de> Visitor<'de> for SeqV {
+        type Value = Vec<String>;
+        fn expecting(&self, f: &mut fmt::Formatter) -> fmt::Result {
+            write!(f, "{} to be a JSON array of strings like [\"a\", \"b\"]", self.0)
+        }
+        fn visit_seq<A: SeqAccess<'de>>(self, mut seq: A) -> Result<Self::Value, A::Error> {
+            let mut out = Vec::new();
+            while let Some(s) = seq.next_element::<String>()? {
+                out.push(s);
+            }
+            Ok(out)
+        }
+    }
+
+    struct OptV(&'static str);
+    impl<'de> Visitor<'de> for OptV {
+        type Value = Option<Vec<String>>;
+        fn expecting(&self, f: &mut fmt::Formatter) -> fmt::Result {
+            write!(f, "{} to be a JSON array of strings like [\"a\", \"b\"], or omitted", self.0)
+        }
+        // An explicit JSON null (or an absent field routed here) is "no list".
+        fn visit_none<E: de::Error>(self) -> Result<Self::Value, E> {
+            Ok(None)
+        }
+        fn visit_unit<E: de::Error>(self) -> Result<Self::Value, E> {
+            Ok(None)
+        }
+        // A present value must be a sequence; a bare string lands in serde_json's
+        // deserialize_seq, which reports invalid_type against SeqV's `expecting`.
+        fn visit_some<D: Deserializer<'de>>(self, d: D) -> Result<Self::Value, D::Error> {
+            d.deserialize_seq(SeqV(self.0)).map(Some)
+        }
+    }
+
+    fn de<'de, D: Deserializer<'de>>(
+        d: D,
+        field: &'static str,
+    ) -> Result<Option<Vec<String>>, D::Error> {
+        d.deserialize_option(OptV(field))
+    }
+
+    pub fn tags<'de, D: Deserializer<'de>>(d: D) -> Result<Option<Vec<String>>, D::Error> {
+        de(d, "tags")
+    }
+    pub fn triggers<'de, D: Deserializer<'de>>(d: D) -> Result<Option<Vec<String>>, D::Error> {
+        de(d, "triggers")
+    }
+    pub fn anchors<'de, D: Deserializer<'de>>(d: D) -> Result<Option<Vec<String>>, D::Error> {
+        de(d, "anchors")
+    }
+}
+
 const INSTRUCTIONS: &str = "THOR is the user's lossless memory - and YOURS to maintain, not just \
 to fill. recall searches the current-head facts (scoped to the current project + the global tier; \
 all_projects:true for everything, project:\"<key>\" for one, kind:\"memory\" to exclude code \
@@ -145,21 +209,21 @@ pub struct RememberArgs {
     #[serde(default)]
     pub fact_type: Option<String>,
     /// Free-form tags, stored in the footer for later search.
-    #[serde(default)]
+    #[serde(default, deserialize_with = "string_list::tags")]
     pub tags: Option<Vec<String>>,
     /// WHEN should this fact fire? The exact task words a future prompt would
     /// contain when this fact matters: commands ("docker compose"), file names
     /// ("deploy-watcher.sh"), error strings ("subsystem request failed").
     /// Stored as a fires-when footer field; a query hitting these words gets a
     /// deliberate ranking boost toward this fact.
-    #[serde(default)]
+    #[serde(default, deserialize_with = "string_list::triggers")]
     pub triggers: Option<Vec<String>>,
     /// Exact file paths or command strings this fact GOVERNS (e.g.
     /// "deploy/watcher.sh", "docker compose up"). The moment-of-action guard
     /// surfaces the fact verbatim when a tool call touches one - exact match,
     /// no ranking involved. Use for hard constraints tied to a specific file
     /// or command.
-    #[serde(default)]
+    #[serde(default, deserialize_with = "string_list::anchors")]
     pub anchors: Option<Vec<String>>,
     /// Known-temporary fact? YYYY-MM-DD after which it stops surfacing in
     /// recall ("pin to v1.9 until the upstream fix lands"). History keeps it;
@@ -731,7 +795,7 @@ impl ThorServer {
                 body,
             ) {
                 Ok(ev) => Ok(format!("revised {} -> rev {}", args.entity_id, ev.this_hash)),
-                Err(e) => Err(render_mutate_err(e)),
+                Err(e) => Err(render_mutate_err(s, &args.entity_id, e)),
             }
         })
         .await
@@ -777,7 +841,7 @@ impl ThorServer {
                 &body,
             ) {
                 Ok(ev) => Ok(format!("retracted {} (rev {})", args.entity_id, ev.this_hash)),
-                Err(e) => Err(render_mutate_err(e)),
+                Err(e) => Err(render_mutate_err(s, &args.entity_id, e)),
             }
         })
         .await
@@ -796,7 +860,7 @@ impl ThorServer {
                 .map(|h| h.heads.clone())
                 .unwrap_or_default();
             if current.is_empty() {
-                return Err(format!("unknown entity: {}", args.entity_id));
+                return Err(unknown_entity_msg(s, &args.entity_id));
             }
             let discarded: Vec<String> =
                 current.iter().filter(|r| **r != args.keep_rev).cloned().collect();
@@ -819,7 +883,7 @@ impl ThorServer {
         let db = self.db.clone();
         self.blocking(move |s| {
             if s.get_events_by_entity(&args.entity_id).map_err(|e| format!("error: {e}"))?.is_empty() {
-                return Err(format!("unknown entity: {}", args.entity_id));
+                return Err(unknown_entity_msg(s, &args.entity_id));
             }
             if args.noise {
                 // "Noise for me during this task" is a LOCAL judgement, not an
@@ -840,7 +904,7 @@ impl ThorServer {
         let db = self.db.clone();
         self.blocking(move |s| {
             if s.get_events_by_entity(&args.entity_id).map_err(|e| format!("error: {e}"))?.is_empty() {
-                return Err(format!("unknown entity: {}", args.entity_id));
+                return Err(unknown_entity_msg(s, &args.entity_id));
             }
             // One write transaction: a concurrent pin (CLI, another session)
             // can no longer be dropped by a last-write-wins overwrite.
@@ -892,7 +956,7 @@ impl ThorServer {
                 ));
             }
             if s.get_events_by_entity(&args.entity_id).map_err(|e| format!("error: {e}"))?.is_empty() {
-                return Err(format!("unknown entity: {}", args.entity_id));
+                return Err(unknown_entity_msg(s, &args.entity_id));
             }
             let (body, target) = if args.project.eq_ignore_ascii_case("global") {
                 (r#"{"project":null}"#.to_string(), "global".to_string())
@@ -920,10 +984,53 @@ impl ThorServer {
     }
 }
 
+/// When a mutate/curate targets an id that has no live head, look for the one
+/// live entity whose id differs only by its `<project>:` prefix - the caller
+/// pasted the bare local part (`mem-…`) instead of the full id remember/recall
+/// hands back. Return that full id so the retry is copy-paste, not a guess.
+/// `None` when the id is already prefixed, matches nothing, or is ambiguous (we
+/// never guess between two candidates).
+fn suggest_full_id(s: &EventStore, given: &str) -> Option<String> {
+    // Already carries a project prefix: nothing to disambiguate.
+    if given.contains(':') {
+        return None;
+    }
+    let events = s.get_all_events().ok()?;
+    let heads = crate::cas::compute_head_sets(&events);
+    let mut matches: Vec<&String> = heads
+        .keys()
+        .filter(|id| id.split_once(':').is_some_and(|(_, local)| local == given))
+        .collect();
+    matches.sort();
+    matches.dedup();
+    match matches.as_slice() {
+        [only] => Some((*only).clone()),
+        _ => None,
+    }
+}
+
+/// The "unknown entity" message shared by every mutate/curate tool, with a
+/// "did you mean '<project>:mem-…'?" pointer when the caller passed a bare id.
+/// Keeps the literal "unknown entity" so callers (and tests) can still key on it.
+fn unknown_entity_msg(s: &EventStore, given: &str) -> String {
+    match suggest_full_id(s, given) {
+        Some(full) => format!(
+            "unknown entity '{}': did you mean '{}'? Memory ids include their project prefix \
+             (`<project>:mem-…`) - pass the full id remember/recall gave you. If the fact is \
+             genuinely new, store it with remember.",
+            given, full
+        ),
+        None => format!("unknown entity: {}", given),
+    }
+}
+
 /// Typed-conflict rendering for revise/retract: the agent gets the fresh
 /// head-set to retry with, instead of an opaque error.
-fn render_mutate_err(e: anyhow::Error) -> String {
+fn render_mutate_err(s: &EventStore, given: &str, e: anyhow::Error) -> String {
     match e.downcast_ref::<MutateConflict>() {
+        // No live head = unknown entity: the head-set is empty, so the generic
+        // "Current head-set: []" reads as noise. Offer the prefixed id instead.
+        Some(c) if c.current_heads.is_empty() => unknown_entity_msg(s, given),
         Some(c) => format!(
             "rejected: {}. Current head-set for {}: {:?}. Re-read the fact (get) and retry with \
              the right parent_rev, or resolve the divergence first.",
@@ -1657,6 +1764,78 @@ mod tests {
             .revise(Parameters(ReviseArgs { entity_id: "nope".into(), body: "x".into(), parent_rev: None }))
             .await;
         assert!(err.contains("unknown entity"), "got: {err}");
+    }
+
+    #[tokio::test]
+    async fn test_revise_bare_id_suggests_full_prefixed_id() {
+        // A memory minted for a project carries a `<project>:mem-…` id. An agent
+        // that revises by the bare local part (`mem-…`) must get the exact full
+        // id echoed back, not a bare "unknown entity" it has to reverse-engineer.
+        let mut store = seed();
+        store
+            .append_event("s", "l", "a", EventKind::FactCreated, "acme-shop:mem-abc", None, "a scoped fact")
+            .unwrap();
+        let (server, _d) = server_with(store);
+
+        let err = server
+            .revise(Parameters(ReviseArgs { entity_id: "mem-abc".into(), body: "fix".into(), parent_rev: None }))
+            .await;
+        assert!(err.contains("unknown entity"), "still names the failure: {err}");
+        assert!(err.contains("acme-shop:mem-abc"), "echoes the full id to retry with: {err}");
+
+        // retract shares the same path.
+        let err = server
+            .retract(Parameters(RetractArgs { entity_id: "mem-abc".into(), parent_rev: None, reason: None }))
+            .await;
+        assert!(err.contains("acme-shop:mem-abc"), "retract suggests it too: {err}");
+
+        // A genuinely-unknown bare id has no match: no misleading suggestion.
+        let err = server
+            .revise(Parameters(ReviseArgs { entity_id: "mem-zzz".into(), body: "x".into(), parent_rev: None }))
+            .await;
+        assert!(err.contains("unknown entity"), "{err}");
+        assert!(!err.contains("did you mean"), "no guess when nothing matches: {err}");
+    }
+
+    #[test]
+    fn tags_as_string_gives_a_self_explanatory_error() {
+        // serde's stock message is "expected a sequence"; ours names the field
+        // and says "JSON array" so a wrong-shaped call retries right.
+        let err = serde_json::from_value::<RememberArgs>(
+            serde_json::json!({ "body": "x", "tags": "note" }),
+        )
+        .err()
+        .expect("a string tags value must be rejected")
+        .to_string();
+        assert!(err.contains("tags"), "names the field: {err}");
+        assert!(err.contains("JSON array"), "says what's expected: {err}");
+        // anchors/triggers carry the same contract.
+        let err = serde_json::from_value::<RememberArgs>(
+            serde_json::json!({ "body": "x", "anchors": "deploy.sh" }),
+        )
+        .err()
+        .expect("a string anchors value must be rejected")
+        .to_string();
+        assert!(err.contains("anchors") && err.contains("JSON array"), "{err}");
+    }
+
+    #[test]
+    fn tags_accept_array_null_and_absence() {
+        let ok = serde_json::from_value::<RememberArgs>(
+            serde_json::json!({ "body": "x", "tags": ["a", "b"] }),
+        )
+        .unwrap();
+        assert_eq!(ok.tags.unwrap(), vec!["a".to_string(), "b".to_string()]);
+
+        let absent =
+            serde_json::from_value::<RememberArgs>(serde_json::json!({ "body": "x" })).unwrap();
+        assert!(absent.tags.is_none());
+
+        let null = serde_json::from_value::<RememberArgs>(
+            serde_json::json!({ "body": "x", "tags": null }),
+        )
+        .unwrap();
+        assert!(null.tags.is_none(), "explicit null is still 'no tags'");
     }
 
     #[tokio::test]

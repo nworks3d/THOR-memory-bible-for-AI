@@ -13,12 +13,13 @@
 //! as the MCP endpoint); the token is the sole transport-level gate otherwise.
 
 use crate::event_store::{Event, EventStore, IngestOutcome, ShippedEvent};
+use crate::inbox::InboxOp;
 use axum::extract::State;
 use axum::http::{header, HeaderMap, StatusCode};
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use serde::{Deserialize, Serialize};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -41,6 +42,9 @@ const MAX_BODY_BYTES: usize = 12 * 1024 * 1024;
 struct HubState {
     store: Arc<Mutex<EventStore>>,
     token: Arc<String>,
+    /// When set (a replica with THOR_CAPTURE_INBOX), the /inbox routes rotate and
+    /// serve captures from this file so the authority can drain them over HTTP.
+    inbox: Option<PathBuf>,
 }
 
 /// The receiver's resume cursor: its hole-proof contiguous tip.
@@ -172,13 +176,79 @@ async fn append_handler(
     Ok((code, Json(resp)))
 }
 
-/// The receiver's axum router: GET /ship/cursor + POST /ship/append, both
-/// bearer-gated. Shared with the integration tests (no live socket needed).
-fn ship_router(store: Arc<Mutex<EventStore>>, token: String) -> Router {
-    let state = HubState { store, token: Arc::new(token) };
+/// The draining slot next to the inbox: the pull rotates `inbox.jsonl` into
+/// `inbox.jsonl.draining` (an atomic rename) so new captures land in a fresh file
+/// while this frozen batch is served and, once the authority applied it, acked.
+fn draining_path(inbox: &Path) -> PathBuf {
+    let mut s = inbox.as_os_str().to_owned();
+    s.push(".draining");
+    PathBuf::from(s)
+}
+
+/// Rotate (once) and read the pending captures. If a prior batch was pulled but
+/// never acked, the draining file still exists - re-serve it (at-least-once; the
+/// authority's apply is idempotent on create). Empty when there are no captures.
+fn rotate_and_read(inbox: &Path) -> anyhow::Result<Vec<InboxOp>> {
+    let draining = draining_path(inbox);
+    if !draining.exists() {
+        if inbox.exists() {
+            std::fs::rename(inbox, &draining)?;
+        } else {
+            return Ok(Vec::new());
+        }
+    }
+    crate::inbox::read_all(&draining)
+}
+
+/// GET /inbox/pull - serve (and rotate) the replica's pending captures so the
+/// authority can replay them. Bearer-gated. Empty when the server has no inbox.
+async fn inbox_pull_handler(
+    State(st): State<HubState>,
+    headers: HeaderMap,
+) -> Result<Json<Vec<InboxOp>>, StatusCode> {
+    if !authorized(&headers, st.token.as_str()) {
+        return Err(StatusCode::UNAUTHORIZED);
+    }
+    let Some(inbox) = st.inbox.clone() else {
+        return Ok(Json(Vec::new()));
+    };
+    let ops = tokio::task::spawn_blocking(move || rotate_and_read(&inbox))
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    Ok(Json(ops))
+}
+
+/// POST /inbox/ack - the authority applied the pulled batch; drop the draining
+/// file so it is not served again. Bearer-gated. A no-op without an inbox.
+async fn inbox_ack_handler(
+    State(st): State<HubState>,
+    headers: HeaderMap,
+) -> Result<StatusCode, StatusCode> {
+    if !authorized(&headers, st.token.as_str()) {
+        return Err(StatusCode::UNAUTHORIZED);
+    }
+    if let Some(inbox) = st.inbox.clone() {
+        let draining = draining_path(&inbox);
+        tokio::task::spawn_blocking(move || {
+            let _ = std::fs::remove_file(&draining);
+        })
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    }
+    Ok(StatusCode::OK)
+}
+
+/// The receiver's axum router: GET /ship/cursor + POST /ship/append, plus the
+/// bearer-gated GET /inbox/pull + POST /inbox/ack capture-inbox drain routes.
+/// Shared with the integration tests (no live socket needed).
+fn ship_router(store: Arc<Mutex<EventStore>>, token: String, inbox: Option<PathBuf>) -> Router {
+    let state = HubState { store, token: Arc::new(token), inbox };
     Router::new()
         .route("/ship/cursor", get(cursor_handler))
         .route("/ship/append", post(append_handler))
+        .route("/inbox/pull", get(inbox_pull_handler))
+        .route("/inbox/ack", post(inbox_ack_handler))
         // Explicit, shared body limit: a shipment over this is a clear 413, and
         // the shipper's SHIP_BYTE_BUDGET is set below it so budgeted batches fit.
         .layer(axum::extract::DefaultBodyLimit::max(MAX_BODY_BYTES))
@@ -201,10 +271,16 @@ fn require_token() -> anyhow::Result<String> {
 /// runtime. Ingests shipped batches into the store at `db`.
 pub fn run_recv(db: &Path, bind: &str) -> anyhow::Result<()> {
     let token = require_token()?;
+    // On a replica the mobile MCP diverts writes to THOR_CAPTURE_INBOX; the
+    // /inbox routes let the authority drain them over the same bearer channel.
+    let inbox = std::env::var("THOR_CAPTURE_INBOX")
+        .ok()
+        .filter(|s| !s.is_empty())
+        .map(PathBuf::from);
     let store = Arc::new(Mutex::new(EventStore::new(db)?));
     let runtime = tokio::runtime::Runtime::new()?;
     runtime.block_on(async move {
-        let app = ship_router(store, token);
+        let app = ship_router(store, token, inbox);
         let listener = tokio::net::TcpListener::bind(bind).await?;
         println!("thor sync receiver listening on http://{bind}/ship (bearer-gated)");
         axum::serve(listener, app).await?;
@@ -252,6 +328,36 @@ fn get_cursor(client: &reqwest::blocking::Client, base: &str, auth: &str) -> any
         anyhow::bail!("receiver rejected the token (401) - THOR_TOKEN must match on both sides");
     }
     Ok(resp.error_for_status()?.json::<CursorResponse>()?.contiguous_seq)
+}
+
+/// Pull (and rotate) a replica's pending captures over the bearer channel. The
+/// authority applies them, then calls `ack_inbox` so they are not served again.
+pub fn pull_inbox(base: &str, token: &str) -> anyhow::Result<Vec<InboxOp>> {
+    let base = base.trim_end_matches('/');
+    let client = build_client()?;
+    let resp = client
+        .get(format!("{base}/inbox/pull"))
+        .header(header::AUTHORIZATION, format!("Bearer {token}"))
+        .send()?;
+    if resp.status() == reqwest::StatusCode::UNAUTHORIZED {
+        anyhow::bail!("receiver rejected the token (401) - THOR_TOKEN must match on both sides");
+    }
+    Ok(resp.error_for_status()?.json::<Vec<InboxOp>>()?)
+}
+
+/// Ack a drained batch: the replica drops its draining file so it is not re-served.
+pub fn ack_inbox(base: &str, token: &str) -> anyhow::Result<()> {
+    let base = base.trim_end_matches('/');
+    let client = build_client()?;
+    let resp = client
+        .post(format!("{base}/inbox/ack"))
+        .header(header::AUTHORIZATION, format!("Bearer {token}"))
+        .send()?;
+    if resp.status() == reqwest::StatusCode::UNAUTHORIZED {
+        anyhow::bail!("receiver rejected the token (401) - THOR_TOKEN must match on both sides");
+    }
+    resp.error_for_status()?;
+    Ok(())
 }
 
 fn now_epoch() -> u64 {
@@ -549,13 +655,67 @@ mod tests {
     }
 
     async fn start_receiver(replica: Arc<Mutex<EventStore>>, token: &str) -> (String, tokio::task::JoinHandle<()>) {
-        let app = ship_router(replica, token.to_string());
+        let app = ship_router(replica, token.to_string(), None);
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         let handle = tokio::spawn(async move {
             let _ = axum::serve(listener, app).await;
         });
         (format!("http://{addr}"), handle)
+    }
+
+    #[tokio::test]
+    async fn test_inbox_pull_ack_roundtrip_over_http() {
+        let dir = tempfile::tempdir().unwrap();
+        let inbox = dir.path().join("inbox.jsonl");
+        crate::inbox::append(
+            &inbox,
+            &InboxOp {
+                op: "create".into(),
+                entity_id: "acme:mem-http".into(),
+                body: "captured over http\n\n[memory/note | project: acme]".into(),
+                parent_rev: None,
+                ts: "0".into(),
+                capture_id: "c1".into(),
+            },
+        )
+        .unwrap();
+
+        let replica = Arc::new(Mutex::new(EventStore::in_memory().unwrap()));
+        let app = ship_router(replica, "secret".to_string(), Some(inbox.clone()));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+
+        // Pull rotates the live inbox away and returns the frozen batch.
+        let b = base.clone();
+        let ops = tokio::task::spawn_blocking(move || pull_inbox(&b, "secret").unwrap()).await.unwrap();
+        assert_eq!(ops.len(), 1);
+        assert_eq!(ops[0].entity_id, "acme:mem-http");
+        assert!(!inbox.exists(), "pull rotated the live inbox away");
+        assert!(draining_path(&inbox).exists(), "the frozen batch waits for ack");
+
+        // A second pull WITHOUT an ack re-serves the same batch (at-least-once).
+        let b = base.clone();
+        let again = tokio::task::spawn_blocking(move || pull_inbox(&b, "secret").unwrap()).await.unwrap();
+        assert_eq!(again.len(), 1, "an un-acked batch is re-served");
+
+        // Ack drops the draining file; the next pull is empty.
+        let b = base.clone();
+        tokio::task::spawn_blocking(move || ack_inbox(&b, "secret").unwrap()).await.unwrap();
+        assert!(!draining_path(&inbox).exists(), "ack cleared the batch");
+        let b = base.clone();
+        let empty = tokio::task::spawn_blocking(move || pull_inbox(&b, "secret").unwrap()).await.unwrap();
+        assert!(empty.is_empty(), "nothing left after the ack");
+
+        // A wrong token is refused (401).
+        let b = base.clone();
+        let unauth = tokio::task::spawn_blocking(move || pull_inbox(&b, "wrong")).await.unwrap();
+        assert!(unauth.is_err(), "a bad token must be rejected");
+
+        server.abort();
     }
 
     #[tokio::test]

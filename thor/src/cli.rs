@@ -50,8 +50,27 @@ pub struct DrainSummary {
 pub fn run_drain_inbox(db: &Path, inbox: &Path) -> anyhow::Result<DrainSummary> {
     let ops = crate::inbox::read_all(inbox)?;
     let mut store = EventStore::new(db)?;
+    Ok(apply_ops(&mut store, &ops))
+}
+
+/// Pull a replica's captures over HTTP, apply them, and ack on a clean drain.
+pub fn run_drain_http(db: &Path, base: &str, token: &str) -> anyhow::Result<DrainSummary> {
+    let ops = crate::sync::pull_inbox(base, token)?;
+    let mut store = EventStore::new(db)?;
+    let s = apply_ops(&mut store, &ops);
+    // Ack only a clean, non-empty drain: a failed apply leaves the batch on the
+    // replica to retry (at-least-once). An empty pull created no draining file.
+    if s.total > 0 && s.errors == 0 {
+        crate::sync::ack_inbox(base, token)?;
+    }
+    Ok(s)
+}
+
+/// Apply captured inbox ops to an already-open authority store. Shared by the
+/// file drain and the HTTP pull drain.
+pub fn apply_ops(store: &mut EventStore, ops: &[crate::inbox::InboxOp]) -> DrainSummary {
     let mut s = DrainSummary { total: ops.len(), ..Default::default() };
-    for op in &ops {
+    for op in ops {
         match op.op.as_str() {
             "create" => {
                 // Reconstruct the exact dedup the live remember used: the footer is
@@ -119,7 +138,7 @@ pub fn run_drain_inbox(db: &Path, inbox: &Path) -> anyhow::Result<DrainSummary> 
             }
         }
     }
-    Ok(s)
+    s
 }
 
 /// True iff `db` is a Windows UNC / network path (\\server\share or the verbatim
@@ -402,11 +421,18 @@ enum Commands {
     },
     /// Drain a replica's capture inbox into THIS (authority) store: replay each
     /// captured remember/revise/retract as a real event in this log. Run from the
-    /// PC's ship job after fetching the replica's rotated inbox file. See inbox.rs.
+    /// PC's ship job. Pull over HTTP with --from, or apply a local file with --inbox.
     DrainInbox {
-        /// Path to the inbox jsonl file (a rotated copy fetched from the replica).
+        /// Apply a local inbox jsonl file (a rotated copy fetched out of band).
         #[arg(long)]
-        inbox: PathBuf,
+        inbox: Option<PathBuf>,
+        /// Pull over HTTP from a replica's bearer-gated /inbox endpoint
+        /// (e.g. --from http://replica:5555). Token from --token or THOR_TOKEN.
+        #[arg(long)]
+        from: Option<String>,
+        /// Bearer token for --from.
+        #[arg(long)]
+        token: Option<String>,
     },
     /// Show the sync status: this store's contiguous tip, and (with --to) the
     /// replica's tip + current lag, or that it is unreachable (honest degraded RPO).
@@ -1153,14 +1179,24 @@ steward review prepared: {}", path.display());
                 .filter(|t| !t.trim().is_empty());
             crate::sync::print_status(&db, to.as_deref(), token.as_deref())?;
         }
-        Commands::DrainInbox { inbox } => {
-            let s = run_drain_inbox(&db, &inbox)?;
+        Commands::DrainInbox { inbox, from, token } => {
+            let s = match (inbox, from) {
+                (Some(file), None) => run_drain_inbox(&db, &file)?,
+                (None, Some(url)) => {
+                    let token = token
+                        .or_else(|| std::env::var("THOR_TOKEN").ok())
+                        .filter(|t| !t.trim().is_empty())
+                        .ok_or_else(|| anyhow::anyhow!("no token: pass --token or set THOR_TOKEN"))?;
+                    run_drain_http(&db, &url, &token)?
+                }
+                _ => anyhow::bail!("pass exactly one of --inbox <file> or --from <url>"),
+            };
             println!(
                 "drain done: {} applied, {} skipped, {} error(s) of {} op(s)",
                 s.applied, s.skipped, s.errors, s.total
             );
             if s.errors > 0 {
-                anyhow::bail!("{} inbox op(s) failed to apply (file kept for inspection)", s.errors);
+                anyhow::bail!("{} inbox op(s) failed to apply (kept on the replica for retry)", s.errors);
             }
         }
         Commands::Vectors { action, model_dir, force } => {

@@ -22,7 +22,9 @@ EXPOSE 8078
 #   - REPLICA: set THOR_RECV_BIND (e.g. 0.0.0.0:5555) -> background `thor recv`
 #     so a remote authority can push its log into THIS store (this container is
 #     the replica). This is the setup when a PC is the authority.
+# Nothing enforces the "exactly one" rule: the two checks below are independent,
+# so setting both starts a shipper AND a receiver in the same container.
 # With neither set it is MCP-only, unchanged. Then serve Streamable-HTTP MCP. The
-# MCP transport carries NO auth - keep 8078 off the LAN and front it with the
-# Cloudflare Access gate (see DEPLOY.md); ship/recv both authenticate with the token.
+# MCP transport carries NO auth - keep 8078 off the LAN and front it with an
+# authenticating reverse proxy; ship/recv both authenticate with the token.
 CMD ["sh","-c","if [ ! -f /data/thor.db ] && [ -f /data/events.jsonl ]; then thor --db /data/thor.db restore --from /data/events.jsonl; fi; if [ -n \"$THOR_REPLICA_URL\" ] && [ -n \"$THOR_TOKEN\" ]; then thor --db /data/thor.db ship --to \"$THOR_REPLICA_URL\" --watch --interval 60 & fi; if [ -n \"$THOR_RECV_BIND\" ] && [ -n \"$THOR_TOKEN\" ]; then thor --db /data/thor.db recv --http \"$THOR_RECV_BIND\" & fi; exec thor --db /data/thor.db mcp --http 0.0.0.0:8078"]

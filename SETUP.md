@@ -64,9 +64,11 @@ thor install --with-courier --with-guard --with-daemon
 
 That is the full setup, and it is the one to run on the machine your agent works
 on. `--with-daemon` keeps a warm process holding the folded log and vector matrix
-resident: measured, that is ~60% of per-prompt latency (349 -> 120 ms) for about
-650 MB of RAM. Drop it if the RAM matters more than the wait; the courier then
-falls back to the cold path and still answers.
+resident: measured, that is ~60% of per-prompt latency (349 -> 120 ms). It costs a
+few hundred MB of RAM - the repo has never measured this process specifically, so
+watch your own task manager rather than trusting a number here. Drop it if the RAM
+matters more than the wait; the courier then falls back to the cold path and still
+answers.
 
 This edits your agent's `settings.json` **idempotently** (it backs up first and only
 adds THOR entries, never touching existing hooks), wiring:
@@ -167,4 +169,7 @@ it reports all three. If semantic recall "does nothing", doctor tells you which
 of them is missing.
 
 Full command reference is in [README.md](README.md); measured comparison + honest
-weaknesses in [BENCHMARKS.md](BENCHMARKS.md).
+weaknesses in [BENCHMARKS.md](BENCHMARKS.md). Everything this guide left out
+because it is optional - the reranker, sync, the guard rulebooks, the kill switch,
+the hygiene commands - is in [OPTIONAL-FEATURES.md](OPTIONAL-FEATURES.md), with
+the reason to turn each one on and the reason not to.

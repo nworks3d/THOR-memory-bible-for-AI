@@ -163,6 +163,9 @@ cargo build --release # build the binary (target/release/thor)
 
 Install the hooks into your agent's settings (backs up first, only adds THOR
 entries, idempotent). Full step-by-step, incl. project scoping: **[SETUP.md](SETUP.md)**.
+Not sure what to switch on? **[OPTIONAL-FEATURES.md](OPTIONAL-FEATURES.md)** goes
+through every optional piece one by one: what it buys you, what it costs, when to
+leave it alone, and how to undo it.
 
 ```sh
 thor install --with-courier          # auto-recall + SessionStart warm + project refresh/onboarding
@@ -335,8 +338,8 @@ overwrites your live compose file and never touches the data volume.
 | `thor fsck` | verify chain integrity + FTS projection, and report facts whose footer got lost (content health: it names them and never fails the run) |
 | `thor consolidate [--apply-dedup]` | metabolism report: duplicate twins, decay candidates, same-topic clusters (exit 1 when anything needs digesting; only the dedup pass is ever applied mechanically) |
 | `thor steward` | prepare a stewardship review: the consolidate report + the proven conservative rubric written to a file an agent session works through with the MCP tools (no writes itself) |
-| `thor symbols` | (re)build the derived symbol sidecar (`thor-symbols.db`): which names every code chunk defines and calls - powers `where_used`/`impact` and a deliberate-recall ranking bonus; refreshed automatically after `thor ingest`, safe to delete and rebuild |
-| `thor daemon` / `thor ensure-daemon` | warm injection daemon: `/inject` + `/health` on the HTTP server, discovered via a flag file; the courier answers warm and falls back cold on any failure. **Recommended** - it holds the folded log + vector matrix resident, which is ~60% of per-prompt latency (349 -> 120 ms measured), for ~650 MB of RAM. Wire it in with `thor install --with-daemon` (`ensure-daemon` is the SessionStart form) |
+| `thor symbols` | (re)build the derived symbol sidecar (`thor-symbols.db`): which names every code chunk defines and calls - powers `where_used`/`impact` and a deliberate-recall ranking bonus; refreshed automatically after `thor ingest`, but **not** after `thor init` (run it once yourself, or ingest again); safe to delete and rebuild |
+| `thor daemon` / `thor ensure-daemon` | warm injection daemon: `/inject` + `/health` on the HTTP server, discovered via a flag file; the courier answers warm and falls back cold on any failure. **Recommended** - it holds the folded log + vector matrix resident, which is ~60% of per-prompt latency (349 -> 120 ms measured). Expect a few hundred MB of RAM; the repo has no measurement of this daemon's own footprint (the measured ~650 MB below is the *embedder* daemon). It is the same server as `thor mcp --http`, so the full MCP toolset - writes included - is mounted on that port with no auth: keep the bind on loopback. Wire it in with `thor install --with-daemon` (`ensure-daemon` is the SessionStart form) |
 | `thor doctor` | one-line health per surface: store, semantic model + sidecars, injection daemon warm/cold, flags |
 | `thor pre-compact` | PreCompact hook: one advisory per session, right before a compaction, to persist durable decisions via remember (installed by `--with-courier`) |
 | `thor recall --rerank` | rescore the top hits with the local cross-encoder (feature `semantic` + downloaded reranker model; MCP recall takes `rerank: true`) |

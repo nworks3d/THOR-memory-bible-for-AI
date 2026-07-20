@@ -340,6 +340,14 @@ fn injection_with_store(
     // Running per-prompt budget in chars (~4 chars/token: ~8000 chars is the
     // ~2000-token ceiling the owner chose). A CEILING, not a target: slots
     // only spend what their content needs, and most prompts stay far below it.
+    // Confidence-aware recall (env-gated). When THOR_EXP_PROVENANCE is set, an
+    // `inferred` fact that resurfaces on NEW ACTIVITY (its own triggers authorize
+    // the current prompt) gets a reconcile hint appended to its served line, so the
+    // agent re-checks the source instead of building on an unconfirmed belief. The
+    // hint is appended to an EXISTING hit line only - it never adds or removes a
+    // hit, so surfacing and the silence/noise ratchet are untouched; and it fires
+    // only on facts explicitly marked inferred.
+    let provenance_hint = std::env::var("THOR_EXP_PROVENANCE").is_ok();
     let mut remaining = PROMPT_BUDGET_CHARS;
     for (slot, hit) in selected.iter().enumerate() {
         let short = &hit.rev[..hit.rev.len().min(8)];
@@ -383,9 +391,19 @@ fn injection_with_store(
             format!("[proj:{}]", hit.project.as_deref().unwrap_or("?"))
         };
         remaining = remaining.saturating_sub(snip.chars().count());
+        // Resurface-for-confirmation: an inferred fact coming back on new activity.
+        let recon = if provenance_hint
+            && crate::footer::provenance(&hit.body).as_deref() == Some("inferred")
+            && crate::recall::trigger_authorizes(&hit.body, &query)
+        {
+            " [provenance: inferred - not yet confirmed by a test or file read; \
+             new activity on this topic now - reconcile against the source before you rely on it]"
+        } else {
+            ""
+        };
         out.push_str(&format!(
-            "- {}{} {} ({}{}{}): {}\n",
-            scope_tag, type_tag, hit.entity_id, short, diverged, fresh_tag, snip
+            "- {}{} {} ({}{}{}): {}{}\n",
+            scope_tag, type_tag, hit.entity_id, short, diverged, fresh_tag, snip, recon
         ));
         // Show the other contested head(s) so the agent reconciles, not guesses.
         if hit.is_diverged {
@@ -988,6 +1006,37 @@ mod tests {
         store
             .append_event("s", "l", "a", EventKind::FactCreated, "e1", None, "the deploy watcher gotcha lives here")
             .unwrap();
+    }
+
+    #[test]
+    fn provenance_hint_resurfaces_an_inferred_fact_only_when_the_flag_is_on() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("prov.db");
+        {
+            let mut store = EventStore::new(&db).unwrap();
+            // An INFERRED fact whose fires-when vocabulary the prompt re-activates.
+            let inf = format!(
+                "the metrics server listens on port 9090\n\n{}",
+                crate::footer::compose_full(
+                    "gotcha", &[], "global", &["metrics".into(), "port".into()], &[], None, Some("inferred"),
+                )
+            );
+            store.append_event("s", "l", "a", EventKind::FactCreated, "mem-inf", None, &inf).unwrap();
+        }
+        let raw = r#"{"prompt":"what port does the metrics server use","cwd":"x","session_id":""}"#;
+        const HINT: &str = "reconcile against the source";
+
+        // Flag OFF = baseline: the fact surfaces, but no reconcile hint.
+        std::env::remove_var("THOR_EXP_PROVENANCE");
+        let off = injection_for_hook_json(&db, raw).expect("injects");
+        assert!(off.contains("mem-inf"), "the fact surfaces");
+        assert!(!off.contains(HINT), "no reconcile hint when the flag is off");
+
+        // Flag ON: an inferred fact resurfacing on new activity gets the hint.
+        std::env::set_var("THOR_EXP_PROVENANCE", "1");
+        let on = injection_for_hook_json(&db, raw).expect("injects");
+        assert!(on.contains(HINT), "inferred + re-activated fact gets the reconcile hint");
+        std::env::remove_var("THOR_EXP_PROVENANCE");
     }
 
     #[test]

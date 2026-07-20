@@ -230,6 +230,12 @@ pub struct RememberArgs {
     /// nothing is deleted. Omit for facts without a natural end date.
     #[serde(default)]
     pub expires: Option<String>,
+    /// Epistemic origin at write time: "verified" (a test ran / a file was read /
+    /// output was seen / the user confirmed it) or "inferred" (plausibly reasoned,
+    /// no tool between the claim and storing it). An inferred fact is resurfaced
+    /// with a reconcile hint when it comes back on new activity on its topic.
+    #[serde(default)]
+    pub provenance: Option<String>,
 }
 
 #[derive(Deserialize, schemars::JsonSchema)]
@@ -677,22 +683,29 @@ impl ThorServer {
                     ));
                 }
             }
+            if let Some(p) = args.provenance.as_deref() {
+                if !matches!(p, "verified" | "inferred") {
+                    return Err(format!("provenance must be 'verified' or 'inferred' (got '{p}')"));
+                }
+            }
             if args.fact_type.is_some()
                 || args.tags.as_deref().is_some_and(|t| !t.is_empty())
                 || !triggers.is_empty()
                 || !anchors.is_empty()
                 || args.expires.is_some()
+                || args.provenance.is_some()
             {
                 let scope_label = crate::repo::owner_project(&entity_id)
                     .map(str::to_string)
                     .unwrap_or_else(|| "global".into());
-                let footer = crate::footer::compose(
+                let footer = crate::footer::compose_full(
                     args.fact_type.as_deref().unwrap_or("note"),
                     &args.tags.unwrap_or_default(),
                     &scope_label,
                     &triggers,
                     &anchors,
                     args.expires.as_deref(),
+                    args.provenance.as_deref(),
                 );
                 body.push_str("\n\n");
                 body.push_str(&footer);
@@ -1398,6 +1411,7 @@ mod tests {
                 triggers: None,
                 anchors: None,
                 expires: None,
+                provenance: None,
             }))
             .await;
         assert!(reply.contains("queued to capture inbox"), "reply: {reply}");
@@ -1524,6 +1538,7 @@ mod tests {
             triggers: None,
             anchors: None,
             expires: None,
+            provenance: None,
         }
     }
 
@@ -1580,6 +1595,7 @@ mod tests {
                 triggers: None,
                 anchors: None,
                 expires: None,
+                provenance: None,
             }))
             .await;
         assert!(stored.starts_with("stored entity mcp-"), "got: {stored}");
@@ -1616,6 +1632,7 @@ mod tests {
                 triggers: None,
                 anchors: None,
                 expires: None,
+                provenance: None,
             }))
             .await;
         assert!(first.starts_with("stored entity"), "{first}");
@@ -1630,6 +1647,7 @@ mod tests {
                 triggers: None,
                 anchors: None,
                 expires: None,
+                provenance: None,
             }))
             .await;
         assert!(dup.contains("NOT stored"), "typed footer must not defeat dup detection: {dup}");
@@ -1646,6 +1664,7 @@ mod tests {
                 triggers: None,
                 anchors: None,
                 expires: None,
+                provenance: None,
             }))
             .await;
         assert!(a.starts_with("stored entity"), "{a}");
@@ -1659,6 +1678,7 @@ mod tests {
                 triggers: None,
                 anchors: None,
                 expires: None,
+                provenance: None,
             }))
             .await;
         assert!(
@@ -1680,6 +1700,7 @@ mod tests {
                 triggers: None,
                 anchors: None,
                 expires: None,
+                provenance: None,
             }))
             .await;
         assert!(
@@ -1703,6 +1724,7 @@ mod tests {
                 triggers: None,
                 anchors: None,
                 expires: None,
+                provenance: None,
             }))
             .await;
         assert!(out.contains("NOT stored"), "{out}");
@@ -1720,6 +1742,7 @@ mod tests {
                 triggers: None,
                 anchors: None,
                 expires: None,
+                provenance: None,
             }))
             .await;
         assert!(chunk.contains("chunk"), "{chunk}");

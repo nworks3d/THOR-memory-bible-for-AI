@@ -28,6 +28,24 @@ pub fn compose(
     anchors: &[String],
     expires: Option<&str>,
 ) -> String {
+    compose_full(fact_type, tags, project_label, triggers, anchors, expires, None)
+}
+
+/// Like `compose`, plus an optional `provenance` field (verified | inferred) -
+/// the epistemic origin of the fact at write time. Written BEFORE the `project`
+/// field so project stays the footer's last field (the project parser keys on
+/// that). Stripped for ranking like every other footer field; only the courier
+/// reads it, to append a reconcile hint to an inferred fact when it resurfaces.
+#[allow(clippy::too_many_arguments)]
+pub fn compose_full(
+    fact_type: &str,
+    tags: &[String],
+    project_label: &str,
+    triggers: &[String],
+    anchors: &[String],
+    expires: Option<&str>,
+    provenance: Option<&str>,
+) -> String {
     let ty = {
         let t = field_safe(fact_type).to_lowercase();
         if t.is_empty() { "note".to_string() } else { t }
@@ -58,8 +76,23 @@ pub fn compose(
             out.push_str(&format!(" | expires: {}", exp));
         }
     }
+    if let Some(p) = provenance {
+        let p = field_safe(p);
+        if !p.is_empty() {
+            out.push_str(&format!(" | provenance: {}", p));
+        }
+    }
     out.push_str(&format!(" | project: {}]", project_label));
     out
+}
+
+/// Parse the footer's `| provenance: <verified|inferred>` field: the fact's
+/// epistemic origin at write time. None when absent. Read only by the courier.
+pub fn provenance(body: &str) -> Option<String> {
+    let idx = body.find("| provenance: ")?;
+    let rest = &body[idx + "| provenance: ".len()..];
+    let v = rest.split(" |").next()?.trim().trim_end_matches(']').trim();
+    (!v.is_empty()).then(|| v.to_string())
 }
 
 /// Parse the footer's `| expires: YYYY-MM-DD` field: the date after which the
@@ -604,6 +637,31 @@ mod tests {
         assert!(has_project_field(&body));
         assert_eq!(fires_when(&body), None, "no triggers = no field");
         assert_eq!(strip(&body), "never open the db over SMB");
+    }
+
+    #[test]
+    fn compose_full_roundtrips_provenance_and_keeps_project_last() {
+        let footer = compose_full("gotcha", &["k".into()], "ProjA", &[], &[], None, Some("inferred"));
+        let body = format!("the metrics port is 9090\n\n{}", footer);
+        assert_eq!(provenance(&body).as_deref(), Some("inferred"));
+        assert_eq!(project(&body).as_deref(), Some("ProjA"), "project stays last + parseable");
+        assert_eq!(fact_type(&body), Some(FactType::Gotcha));
+        assert_eq!(strip(&body), "the metrics port is 9090");
+        // plain compose writes no provenance field
+        let plain = format!("x\n\n{}", compose("note", &[], "g", &[], &[], None));
+        assert_eq!(provenance(&plain), None);
+    }
+
+    #[test]
+    fn carry_over_preserves_provenance_unless_the_new_body_overrides_it() {
+        // The promotion code-trap: a content-only revise keeps the OLD footer,
+        // including its provenance, so inferred->verified needs an explicit
+        // re-typed footer - never a silent flip.
+        let prev = format!("v1\n\n{}", compose_full("decision", &[], "P", &[], &[], None, Some("inferred")));
+        let carried = carry_over("v2 corrected", &prev).expect("footerless revise carries the old footer");
+        assert_eq!(provenance(&carried).as_deref(), Some("inferred"), "old provenance preserved");
+        let retyped = format!("v2\n\n{}", compose_full("decision", &[], "P", &[], &[], None, Some("verified")));
+        assert_eq!(carry_over(&retyped, &prev), None, "a re-typed footer wins");
     }
 
     #[test]

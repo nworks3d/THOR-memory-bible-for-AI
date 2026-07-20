@@ -1,0 +1,441 @@
+diff --git a/thor/Cargo.toml b/thor/Cargo.toml
+index b50f867..7ac87fb 100644
+--- a/thor/Cargo.toml
++++ b/thor/Cargo.toml
+@@ -58,5 +58,9 @@ name = "drift_eval"
+ 
+ # The benchmark hit-dump harness (BENCHMARKS.md, Method) prefers the fused path
+ # but cfg-degrades to bm25, so it compiles on both feature sets too.
++[[example]]
++name = "resident_bench"
++required-features = ["semantic"]
++
+ [[example]]
+ name = "hits_dump"
+diff --git a/thor/src/courier.rs b/thor/src/courier.rs
+index 3250d58..1df8f8b 100644
+--- a/thor/src/courier.rs
++++ b/thor/src/courier.rs
+@@ -886,8 +886,15 @@ fn try_semantic_recall(
+     } else {
+         None
+     };
++    // EXPERIMENT (THOR_EXP_LAMBDA=<f>): override the fusion lambda the courier
++    // passes, so a drift A/B can measure a retuned lambda without a rebuild.
++    // Unset = the production FUSION_LAMBDA, so behaviour is unchanged by default.
++    let lambda = std::env::var("THOR_EXP_LAMBDA")
++        .ok()
++        .and_then(|v| v.parse::<f64>().ok())
++        .unwrap_or(crate::recall::FUSION_LAMBDA);
+     match crate::recall::recall_fused_scoped(
+-        store, query, &qvec, &vecs, limit, crate::recall::FUSION_LAMBDA, scope, boost_paths,
++        store, query, &qvec, &vecs, limit, lambda, scope, boost_paths,
+         symbols.as_ref(),
+     ) {
+         Ok(hits) if !hits.is_empty() => Some(hits),
+diff --git a/thor/src/guard.rs b/thor/src/guard.rs
+index c35213a..a30b7a4 100644
+--- a/thor/src/guard.rs
++++ b/thor/src/guard.rs
+@@ -694,6 +694,8 @@ fn try_stop_guard(db: &Path, rulebook: &Path) -> anyhow::Result<()> {
+ 
+     let reason = if !fired.is_empty() {
+         format!("[THOR] {}", fired.join("  ||  "))
++    } else if std::env::var("THOR_EXP_STALL").is_ok() && stall_detect(msg) {
++        STALL_REASON.to_string()
+     } else if let Some(r) = capture_nudge(db, &hook, &haystack) {
+         r
+     } else {
+@@ -707,6 +709,112 @@ fn try_stop_guard(db: &Path, rulebook: &Path) -> anyhow::Result<()> {
+     Ok(())
+ }
+ 
++/// Stall-after-commitment detector (idea adoption: mann1x/claude-hooks
++/// `stop_guard`). Fires when the reply's LAST paragraph makes a first-person
++/// FUTURE-INTENT commitment to act ("I'll run X", "let me update Y", "ik ga Z
++/// doen") yet the turn is ending - a promise never executed. Tail-only, so a
++/// commitment earlier in a long reply that WAS carried out does not trip it; a
++/// trailing question is exempt (handing control back is deliberate), and the
++/// common ask/hand-off forms ("I'll wait", "let me know", "I'll need you") are
++/// excluded. Dep-free substring logic, conservative markers only, since the
++/// Stop guard blocks by default and a false positive costs a forced extra turn.
++fn stall_detect(msg: &str) -> bool {
++    let trimmed = msg.trim_end();
++    let tail = trimmed.rsplit("\n\n").next().unwrap_or(trimmed).trim();
++    if tail.is_empty() || tail.ends_with('?') {
++        return false;
++    }
++    let lower = tail.to_lowercase();
++    const NOT_STALL: &[&str] = &[
++        "i'll wait", "i'll need you", "i'll let you", "i'll be here",
++        "let me know", "ik wacht", "laat me weten", "laat het me weten",
++    ];
++    if NOT_STALL.iter().any(|n| lower.contains(n)) {
++        return false;
++    }
++    const COMMITMENTS: &[&str] = &[
++        "i'll ", "i will ", "let me ", "i'm going to ", "i am going to ",
++        "next i'll ", "now i'll ", "i'm now going to ",
++        "ik ga ", "ik zal ", "laat me ", "ik ga nu ",
++    ];
++    COMMITMENTS.iter().any(|c| lower.contains(c))
++}
++
++const STALL_REASON: &str = "[THOR stall-guard] Your reply commits to an action \
++    (\"I'll ...\" / \"let me ...\") but the turn is ending without doing it. If you \
++    intended to act, take the action now instead of stopping; if you meant to ask \
++    or hand off, phrase it as a question.";
++
++/// Secret-at-capture detector (idea adoption: agentmemory privacy filter, but
++/// dep-free and entropy-backed since a denylist alone trails new token formats).
++/// Returns labels of secret-shaped spans in a to-be-stored body so `remember`
++/// can WARN before a credential enters the lossless log (where it can never be
++/// deleted). Detection only, never rewrites. Tuned so THOR's own ID-heavy text
++/// (ULIDs are UPPER+digit, git hashes are lower+digit) does NOT false-fire: the
++/// entropy backstop requires all three character classes, which real mixed
++/// credentials have but ULIDs/hex hashes/UUIDs do not.
++fn scan_secrets(body: &str) -> Vec<&'static str> {
++    let mut hits: Vec<&'static str> = Vec::new();
++    let lower = body.to_lowercase();
++    const PREFIXES: &[(&str, &str)] = &[
++        ("sk-ant-", "anthropic-key"),
++        ("sk-proj-", "openai-proj-key"),
++        ("ghp_", "github-pat"),
++        ("gho_", "github-oauth"),
++        ("ghs_", "github-server"),
++        ("github_pat_", "github-fine-pat"),
++        ("xoxb-", "slack-bot"),
++        ("xoxp-", "slack-user"),
++        ("glpat-", "gitlab-pat"),
++        ("-----begin", "private-key-block"),
++    ];
++    for (p, label) in PREFIXES {
++        if lower.contains(p) {
++            hits.push(label);
++        }
++    }
++    // AWS/Google keys are case-sensitive prefixes on a specific length.
++    for tok in body.split(|c: char| !(c.is_ascii_alphanumeric() || c == '_' || c == '-')) {
++        if (tok.starts_with("AKIA") || tok.starts_with("ASIA")) && tok.len() >= 20 {
++            hits.push("aws-access-key");
++        }
++        if tok.starts_with("AIza") && tok.len() >= 30 {
++            hits.push("google-api-key");
++        }
++        // Entropy backstop for prefix-less credentials. Requires >= 24 chars AND
++        // all three classes (lower+upper+digit) AND high Shannon entropy, so a
++        // ULID (upper+digit) or a hex hash (lower+digit) never trips it.
++        if tok.len() >= 24 && has_all_classes(tok) && shannon_bits(tok) >= 3.7 {
++            hits.push("high-entropy-token");
++        }
++    }
++    hits.sort_unstable();
++    hits.dedup();
++    hits
++}
++
++fn has_all_classes(s: &str) -> bool {
++    s.chars().any(|c| c.is_ascii_lowercase())
++        && s.chars().any(|c| c.is_ascii_uppercase())
++        && s.chars().any(|c| c.is_ascii_digit())
++}
++
++fn shannon_bits(s: &str) -> f64 {
++    use std::collections::HashMap;
++    let mut counts: HashMap<char, usize> = HashMap::new();
++    for c in s.chars() {
++        *counts.entry(c).or_insert(0) += 1;
++    }
++    let n = s.chars().count() as f64;
++    -counts
++        .values()
++        .map(|&c| {
++            let p = c as f64 / n;
++            p * p.log2()
++        })
++        .sum::<f64>()
++}
++
+ /// The capture safety net: when the final reply contains a hard trigger
+ /// (decision / gotcha / migration / new-project language), block the stop ONCE
+ /// per session with a "store it or say it's stored" reason. Keyword-gated and
+@@ -746,6 +854,102 @@ mod tests {
+     use super::*;
+     use serde_json::json;
+ 
++    #[test]
++    fn test_stall_detect_edge_cases() {
++        // (message, should_fire)
++        let cases: &[(&str, bool)] = &[
++            // POSITIVES: first-person future commitment, turn ending, no action.
++            ("I'll write the script now.", true),
++            ("Let me update the config and run the tests.", true),
++            ("Ik ga de sync-refactor nu doen.", true),
++            ("Looks good. Now I'll implement the fix.", true),
++            ("I will add the missing test.", true),
++            ("Ik zal het bestand aanpassen.", true),
++            // NEGATIVES: past / status / question / hand-off / no marker.
++            ("I ran the tests, all pass.", false),
++            ("The build is running now.", false),
++            ("Should I write the script?", false),
++            ("Done. Everything is committed.", false),
++            ("I'll wait for your confirmation.", false),
++            ("Let me know if you want changes.", false),
++            ("I'll need you to run the sudo command in an admin shell.", false),
++            ("Here are the results. Want me to continue?", false),
++            // TAIL-ONLY: commitment early, last paragraph summarises done work.
++            ("I'll start with the parser.\n\nDone - parser updated, tests green.", false),
++        ];
++        let (mut pos, mut pos_hit, mut neg, mut neg_fp) = (0, 0, 0, 0);
++        let mut wrong = Vec::new();
++        for (msg, want) in cases {
++            let got = stall_detect(msg);
++            if *want {
++                pos += 1;
++                if got {
++                    pos_hit += 1;
++                }
++            } else {
++                neg += 1;
++                if got {
++                    neg_fp += 1;
++                }
++            }
++            if got != *want {
++                wrong.push(format!("want {} got {}: {:?}", want, got, msg));
++            }
++        }
++        eprintln!(
++            "STALL-GUARD: catch {}/{} positives, {} false-positive / {} negatives",
++            pos_hit, pos, neg_fp, neg
++        );
++        assert!(wrong.is_empty(), "stall_detect mismatches:\n{}", wrong.join("\n"));
++    }
++
++    #[test]
++    fn test_scan_secrets_edge_cases() {
++        // POSITIVES: real credential shapes must be caught.
++        let pos: &[&str] = &[
++            "token is sk-ant-api03-abcDEF123456ghiJKL7890",
++            "export GH=ghp_ABCdef1234567890ABCdef1234567890abcd",
++            "creds: AKIAIOSFODNN7EXAMPLE",
++            "key AIzaSyD1234567890abcdefghijKLMNOPqrstuv",
++            "-----BEGIN OPENSSH PRIVATE KEY-----",
++            "pw Xk9mQ2vLp8ZrT4wNc7bYf3JhGaB5dCe", // prefix-less high-entropy mixed
++        ];
++        // NEGATIVES: THOR-realistic text must NOT false-fire, especially ULIDs
++        // and git hashes (the classic entropy false-positive).
++        let neg: &[&str] = &[
++            "We decided to refactor the sync module tomorrow.",
++            "The function recall_fused_scoped returns a Vec<RecallHit>.",
++            "Commit b70bf4f added the replica role for live sync.",
++            "See entity example-project:mem-00000000-0000-4000-8000-000000000000.",
++            "Pinned rule 01AAAAAAAAAAAAAAAAAAAAAAAA governs clean pushes.", // ULID
++            "thor.db and thor-vectors.db live under %LOCALAPPDATA%\\thor.",
++        ];
++        let (mut caught, mut fp) = (0, 0);
++        let mut wrong = Vec::new();
++        for s in pos {
++            if scan_secrets(s).is_empty() {
++                wrong.push(format!("MISSED secret: {:?}", s));
++            } else {
++                caught += 1;
++            }
++        }
++        for s in neg {
++            let h = scan_secrets(s);
++            if !h.is_empty() {
++                fp += 1;
++                wrong.push(format!("FALSE-POSITIVE {:?} on: {:?}", h, s));
++            }
++        }
++        eprintln!(
++            "SECRET-SCAN: caught {}/{} secrets, {} false-positive / {} clean-texts",
++            caught,
++            pos.len(),
++            fp,
++            neg.len()
++        );
++        assert!(wrong.is_empty(), "scan_secrets mismatches:\n{}", wrong.join("\n"));
++    }
++
+     #[test]
+     fn test_salient_command_tokens_precision() {
+         // structured composites and rare words survive; shell verbs and short
+diff --git a/thor/src/lib.rs b/thor/src/lib.rs
+index a22e1f1..06de260 100644
+--- a/thor/src/lib.rs
++++ b/thor/src/lib.rs
+@@ -28,6 +28,7 @@ pub mod guard;
+ pub mod install;
+ pub mod backup;
+ pub mod cli;
++pub mod experiments;
+ 
+ #[cfg(test)]
+ mod comprehensive_tests {
+diff --git a/thor/src/recall.rs b/thor/src/recall.rs
+index b815849..e5c0c2a 100644
+--- a/thor/src/recall.rs
++++ b/thor/src/recall.rs
+@@ -1271,6 +1271,27 @@ fn finalize_heads(
+ /// degrades to bm25. The bm25 relevance floor is deliberately NOT applied here -
+ /// under fusion a low-bm25 but high-cosine hit is precisely what we want to surface.
+ #[cfg(feature = "semantic")]
++/// EXPERIMENT (matrix-patch / M2 materialized heads): the per-query O(n) rebuild
++/// costs a warm daemon can hold resident and patch on new events - the whole-log
++/// fold (events + head-sets + projects) and the parsed vector matrix. Reusing
++/// this across queries drops ~125ms/query of re-reading unchanged data.
++pub struct ResidentCache {
++    pub events: Vec<Event>,
++    pub heads: HashMap<String, crate::cas::HeadSet>,
++    pub projects: HashMap<String, Option<String>>,
++    pub vectors: Vec<(i64, Vec<f32>)>,
++}
++
++impl ResidentCache {
++    pub fn build(store: &EventStore, vecs: &crate::vectors::VectorStore) -> anyhow::Result<Self> {
++        let events = store.get_all_events()?;
++        let heads = compute_head_sets(&events);
++        let projects = crate::cas::compute_projects(&events);
++        let vectors = vecs.all_vectors().unwrap_or_default();
++        Ok(ResidentCache { events, heads, projects, vectors })
++    }
++}
++
+ pub fn recall_fused_scoped(
+     store: &EventStore,
+     query: &str,
+@@ -1281,22 +1302,57 @@ pub fn recall_fused_scoped(
+     scope: &RecallScope,
+     boost_paths: bool,
+     symbols: Option<&crate::symbols::SymbolStore>,
++) -> anyhow::Result<Vec<RecallHit>> {
++    recall_fused_scoped_cached(store, query, qvec, vecs, limit, lambda, scope, boost_paths, symbols, None)
++}
++
++/// Like `recall_fused_scoped`, but reuses a `ResidentCache` when `cache = Some(..)`
++/// instead of re-reading events/heads/projects/vectors. `cache = None` is
++/// byte-identical to the previous behaviour.
++#[allow(clippy::too_many_arguments)]
++pub fn recall_fused_scoped_cached(
++    store: &EventStore,
++    query: &str,
++    qvec: &[f32],
++    vecs: &crate::vectors::VectorStore,
++    limit: usize,
++    lambda: f64,
++    scope: &RecallScope,
++    boost_paths: bool,
++    symbols: Option<&crate::symbols::SymbolStore>,
++    cache: Option<&ResidentCache>,
+ ) -> anyhow::Result<Vec<RecallHit>> {
+     if limit == 0 {
+         return Ok(vec![]);
+     }
+ 
+-    let events = store.get_all_events()?;
++    let owned_events;
++    let owned_heads;
++    let owned_projects;
++    let owned_vecs;
++    let (events, heads, projects, all): (
++        &[Event],
++        &HashMap<String, crate::cas::HeadSet>,
++        &HashMap<String, Option<String>>,
++        &[(i64, Vec<f32>)],
++    ) = match cache {
++        Some(c) => (&c.events, &c.heads, &c.projects, &c.vectors),
++        None => {
++            owned_events = store.get_all_events()?;
++            owned_heads = compute_head_sets(&owned_events);
++            owned_projects = crate::cas::compute_projects(&owned_events);
++            owned_vecs = vecs.all_vectors().unwrap_or_default();
++            (&owned_events, &owned_heads, &owned_projects, &owned_vecs)
++        }
++    };
+     let by_seq: HashMap<i64, &Event> = events.iter().map(|e| (e.seq, e)).collect();
+-    let heads = compute_head_sets(&events);
+-    let projects = crate::cas::compute_projects(&events);
+-    let filter = ScopeFilter { projects: &projects, scope, memories_only: false };
++    let filter = ScopeFilter { projects, scope, memories_only: false };
+ 
+     // Lexical leg: current-head candidates in bm25 rank order (streaming head-walk,
+     // NO fixed raw-row window - see lexical_head_pool). Empty if the query has no
+     // content tokens.
+     let lexical: Vec<(i64, f64)> = match fts_query(query) {
+-        Some(or_query) => lexical_head_pool(store, &or_query, &by_seq, &heads, &filter, FUSION_POOL),
++        Some(or_query) => lexical_head_pool(store, &or_query, &by_seq, heads, &filter, FUSION_POOL),
+         None => vec![],
+     };
+ 
+@@ -1308,7 +1364,7 @@ pub fn recall_fused_scoped(
+     // not be a candidate at all - dropped exactly where pure bm25 (AND-first)
+     // would have returned it first.
+     let and_pool: Vec<(i64, f64)> = match fts_query_and(query) {
+-        Some(aq) => lexical_head_pool(store, &aq, &by_seq, &heads, &filter, FUSION_POOL),
++        Some(aq) => lexical_head_pool(store, &aq, &by_seq, heads, &filter, FUSION_POOL),
+         None => vec![],
+     };
+     let mut strong: HashSet<i64> = and_pool.iter().map(|(s, _)| *s).collect();
+@@ -1320,10 +1376,9 @@ pub fn recall_fused_scoped(
+         bm_rank.entry(*seq).or_insert(*rank);
+     }
+ 
+-    // Dense leg: brute-force the query cosine over EVERY stored vector, keep the
+-    // top-M. Real dense retrieval (not a pool rerank), so a paraphrase gold with
++    // Dense leg: brute-force the query cosine over the (possibly resident) vector
++    // matrix. Real dense retrieval (not a pool rerank), so a paraphrase gold with
+     // no lexical overlap is reachable. An empty/absent sidecar leaves this empty.
+-    let all = vecs.all_vectors().unwrap_or_default();
+     let cos_by_seq: HashMap<i64, f64> = all.iter().map(|(s, v)| (*s, dot(qvec, v))).collect();
+     // Keep only in-scope CURRENT-HEAD dense candidates. The head check mirrors
+     // lexical_head_pool's guard: without it, the near-identical vectors of a
+@@ -1418,6 +1473,23 @@ pub fn recall_fused_scoped(
+         _ => std::collections::HashMap::new(),
+     };
+     let folded_query_sym = fold_diacritics(&query.to_lowercase());
++    // EXPERIMENT (THOR_EXP_RECENCY=<weight>): a seq-position recency prior. THOR
++    // events carry no wall-clock timestamp, only the append seq, so "recency" is
++    // events-behind-tip (the same signal strength.rs decays on). A/B only: the
++    // default weight 0.0 makes the term vanish, so ranking stays byte-identical
++    // to the baseline unless the flag is set.
++    let tip_seq = events.iter().map(|e| e.seq).max().unwrap_or(0) as f64;
++    let recency_w: f64 =
++        std::env::var("THOR_EXP_RECENCY").ok().and_then(|v| v.parse().ok()).unwrap_or(0.0);
++    // Default: recency applies ONLY on the deliberate path (boost_paths=true =
++    // MCP recall / recall_eval), NOT the courier (boost_paths=false), so the
++    // drift-catching pool keeps its balance. THOR_EXP_RECENCY_ALLPATHS=1 applies
++    // it everywhere (the earlier, drift-costing variant).
++    let recency_allpaths = std::env::var("THOR_EXP_RECENCY_ALLPATHS").is_ok();
++    let recency_halflife: f64 = std::env::var("THOR_EXP_RECENCY_HL")
++        .ok()
++        .and_then(|v| v.parse().ok())
++        .unwrap_or(2000.0);
+     let mut scored: Vec<(i64, f64, f64)> = cand
+         .into_iter()
+         .map(|seq| {
+@@ -1450,7 +1522,13 @@ pub fn recall_fused_scoped(
+                 Some(ev) => symbol_def_bonus(&sym_defs, &ev.entity_id, &qterms, &folded_query_sym),
+                 None => 0.0,
+             };
+-            (seq, rank.unwrap_or(0.0), bm_norm + lambda * cos + delta + coverage + trigger + path_aff + sym)
++            let recency = if recency_w > 0.0 && (boost_paths || recency_allpaths) {
++                let age = (tip_seq - seq as f64).max(0.0);
++                recency_w * 2f64.powf(-age / recency_halflife)
++            } else {
++                0.0
++            };
++            (seq, rank.unwrap_or(0.0), bm_norm + lambda * cos + delta + coverage + trigger + path_aff + sym + recency)
+         })
+         .collect();
+     // Same-file sibling vote: the measured code-structure failure mode is
+@@ -1502,7 +1580,7 @@ pub fn recall_fused_scoped(
+     Ok(finalize_heads(
+         scored.into_iter().map(|(seq, rank, _)| (seq, rank)),
+         &by_seq,
+-        &heads,
++        heads,
+         &filter,
+         &strong,
+         limit,

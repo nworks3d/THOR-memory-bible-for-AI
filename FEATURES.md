@@ -187,19 +187,54 @@ set of tools for that, none of which delete anything behind your back:
 - **An expiry date** for facts you know are temporary ("pin to this version
   until the upstream fix lands"). After the date it stops surfacing; it is not
   deleted.
-- **A how-do-we-know label** (`verified` or `inferred`). Turn on the matching
-  setting and a fact that was never checked announces itself when it comes back:
-  "reconcile this against the source before you rely on it". It matters most
-  where cheap models do the writing. On a 20-scenario test a weak model built on
-  a stale belief 12 times out of 20 without the reminder and 5 times with it; a
-  strong model got 1 wrong without it and none with it. That test is not part of
-  this repository, so you cannot re-run it here.
+- **A how-do-we-know label** on each fact - `verified` or `inferred`. This one
+  has its own section below.
 
 **Worth it?** The health check and the integrity check: yes, keep them in your
 back pocket. The rest: only once your store is big enough that you start
 wondering what is still true in there.
 
 ---
+
+## Facts that admit they were never checked
+
+The newest piece, and the one most worth understanding before you decide about
+it. Every fact can carry a label saying **how it was learned**: `verified` means
+something was actually checked - a test was run, a file or an error message was
+read, or you confirmed it - and `inferred` means it was reasoned out and never
+checked against anything.
+
+On its own that label does nothing. Switch on the matching setting and it starts
+earning its keep: when a fact marked `inferred` comes back later, *and the
+conversation is about its topic again*, the line it appears on carries a
+reminder - check this against the source before you build on it.
+
+**Why you would care:** this is the failure that costs you a day. An agent
+reasons its way to something plausible, writes it down, and from then on every
+session treats it as established fact. Nothing about a stored note tells you
+which ones were actually checked. This makes that visible at the one moment it
+matters: when the thing resurfaces and you are about to act on it.
+
+It is deliberately narrow. It does not try to work out whether a fact is *true* -
+that is undecidable at the moment of writing. It only records what the writer
+already knew: did I check this, yes or no.
+
+**What it costs:** nothing you can measure. It reads one setting per prompt and
+scans the text of facts it was already showing you. It never adds or removes a
+search result, so it cannot make recall noisier - it only annotates a line that
+was already there. And it only fires on facts explicitly marked `inferred`, so a
+store where nobody labels anything sees no change at all.
+
+**Worth it?** Yes if other people's agents, or cheap fast models, write into your
+memory - that is where it pays. On a 20-scenario test a weak model built on a
+stale belief 12 times out of 20 without the reminder and 5 times with it; a
+strong model got 1 wrong without it and none with it, and neither was made worse.
+Fair warning: that test is not part of this repository, so it is not something
+you can re-run here. Also fair warning: it is still marked as an experiment, and
+the setting name says so.
+
+It only works if the labels get written. That is the honest catch - a memory full
+of unlabelled facts gives the reminder nothing to fire on.
 
 ## Not losing it
 

@@ -1,4 +1,4 @@
-use rusqlite::{Connection, Result as SqlResult, params};
+use rusqlite::{Connection, OpenFlags, Result as SqlResult, params};
 use sha2::{Sha256, Digest};
 use uuid::Uuid;
 use std::collections::HashSet;
@@ -411,6 +411,35 @@ impl EventStore {
         conn.execute_batch("PRAGMA synchronous = FULL")?;
         Self::init_schema(&conn)?;
         Self::sync_fts(&conn)?;
+        Ok(EventStore { conn })
+    }
+
+    /// Open an EXISTING store to look at it: no create, no schema work, no FTS
+    /// heal. `new` is the right constructor for anything that writes, but the
+    /// inspection commands (doctor, fsck, status) went through it too, and it
+    /// CREATES the file when it is missing. A typo in `--db` therefore produced a
+    /// brand-new empty store that then looked like a healthy but empty THOR -
+    /// the worst possible answer to "why is my memory not coming back". Skipping
+    /// the FTS heal also lets fsck report a broken projection instead of quietly
+    /// repairing it during its own open and then declaring itself OK; a normal
+    /// command still heals it, because every writer keeps using `new`.
+    /// Not the same as read-only: SQLite touches the -wal and -shm companions on
+    /// any open. What this guarantees is narrower and is what matters - it never
+    /// creates your store and never changes what is in it.
+    pub fn open_existing(path: &Path) -> anyhow::Result<Self> {
+        anyhow::ensure!(
+            path.exists(),
+            "no THOR store at {} - this command never creates one; check the path (--db) \
+             or store your first memory to create it",
+            path.display()
+        );
+        let conn = Connection::open_with_flags(
+            path,
+            OpenFlags::SQLITE_OPEN_READ_WRITE
+                | OpenFlags::SQLITE_OPEN_URI
+                | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        )?;
+        conn.busy_timeout(Duration::from_secs(5))?;
         Ok(EventStore { conn })
     }
 

@@ -241,8 +241,11 @@ cargo build --release --features semantic
   prompt.
 - **You have no model and do not want to fetch one** (~235 MB, see below).
 
-- Put the embedding model files under `%LOCALAPPDATA%\thor\model\` (or point
-  `thor vectors build --model-dir <dir>` at them). Any local ONNX sentence-
+- Put the embedding model files in `model/` inside THOR's per-user home:
+  `%LOCALAPPDATA%\thor\model\` on Windows, `$XDG_DATA_HOME/thor/model/` or
+  `$HOME/.local/share/thor/model/` elsewhere - the same home the store uses.
+  (`thor vectors build --model-dir <dir>` overrides it for that one command; the
+  courier and the daemon always read the default.) Any local ONNX sentence-
   embedding model with its tokenizer works; a multilingual MiniLM is a good
   default.
 - Build the precomputed vector sidecar, then check it:
@@ -274,7 +277,8 @@ never touches the per-prompt courier. MCP recall takes `rerank: true`, the CLI
 takes `thor recall --rerank`.
 
 - Put a reranker model (ONNX + tokenizer, five files, onnx named `model.onnx`)
-  under `%LOCALAPPDATA%\thor\reranker\`; a multilingual base reranker is a good
+  under `reranker/` in the same per-user home as the model (`%LOCALAPPDATA%\thor\reranker\`
+  on Windows, `$HOME/.local/share/thor/reranker/` elsewhere); a multilingual base reranker is a good
   default. Nothing auto-downloads.
 - Contract mirrors the semantic layer: model missing or any failure = the
   normal order is returned with an explicit note, never an error.
@@ -338,12 +342,12 @@ overwrites your live compose file and never touches the data volume.
 | `thor fsck` | verify chain integrity + FTS projection, and report facts whose footer got lost (content health: it names them and never fails the run) |
 | `thor consolidate [--apply-dedup]` | metabolism report: duplicate twins, decay candidates, same-topic clusters (exit 1 when anything needs digesting; only the dedup pass is ever applied mechanically) |
 | `thor steward` | prepare a stewardship review: the consolidate report + the proven conservative rubric written to a file an agent session works through with the MCP tools (no writes itself) |
-| `thor symbols` | (re)build the derived symbol sidecar (`thor-symbols.db`): which names every code chunk defines and calls - powers `where_used`/`impact` and a deliberate-recall ranking bonus; refreshed automatically after `thor ingest`, but **not** after `thor init` (run it once yourself, or ingest again); safe to delete and rebuild |
+| `thor symbols` | (re)build the derived symbol sidecar (`thor-symbols.db`): which names every code chunk defines and calls - powers `where_used`/`impact` and a deliberate-recall ranking bonus; refreshed automatically by every ingest, including the one `thor init` runs, so you only need this command by hand for a store that was filled some other way (a shipped replica), or after deleting the sidecar |
 | `thor daemon` / `thor ensure-daemon` | warm injection daemon: `/inject` + `/health` on the HTTP server, discovered via a flag file; the courier answers warm and falls back cold on any failure. **Recommended** - it holds the folded log + vector matrix resident, which is ~60% of per-prompt latency (349 -> 120 ms measured). Expect a few hundred MB of RAM; the repo has no measurement of this daemon's own footprint (the measured ~650 MB below is the *embedder* daemon). It is the same server as `thor mcp --http`, so the full MCP toolset - writes included - is mounted on that port with no auth: keep the bind on loopback. Wire it in with `thor install --with-daemon` (`ensure-daemon` is the SessionStart form) |
 | `thor doctor` | one-line health per surface: store, semantic model + sidecars, injection daemon warm/cold, flags |
 | `thor pre-compact` | PreCompact hook: one advisory per session, right before a compaction, to persist durable decisions via remember (installed by `--with-courier`) |
 | `thor recall --rerank` | rescore the top hits with the local cross-encoder (feature `semantic` + downloaded reranker model; MCP recall takes `rerank: true`) |
-| `thor mcp [--http <bind>]` | run as an MCP server (stdio or Streamable-HTTP) exposing the full stewardship toolset: recall (`kind:"memory"` filter, `detail:"index"` for a compact id list) / get / history / remember (typed, duplicate-refusing, optional `expires: YYYY-MM-DD` after which a fact stops surfacing - history keeps it) / revise / retract / resolve / mark / pin / unpin / reproject / brief / outline (a file's signature map) / where_used / impact (symbol callers + change blast-radius on the derived sidecar) |
+| `thor mcp [--http <bind>]` | run as an MCP server (stdio or Streamable-HTTP) exposing the full stewardship toolset: recall (`kind:"memory"` filter, `detail:"index"` for a compact id list) / get / history / remember (typed, duplicate-refusing, optional `expires: YYYY-MM-DD` after which a fact stops surfacing - history keeps it; a later revise that carries no footer of its own keeps that date, and says so in its reply) / revise / retract / resolve / mark / pin / unpin / reproject / brief / outline (a file's signature map) / where_used / impact (symbol callers + change blast-radius on the derived sidecar) |
 
 ## Build features
 

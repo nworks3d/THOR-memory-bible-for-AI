@@ -509,21 +509,31 @@ fn observe(state: &mut ReconcileState, outcome: &TickResult, now: u64) -> String
     }
 }
 
-fn reconcile_once(db: &Path, url: &str, token: &str) -> anyhow::Result<PushSummary> {
+fn reconcile_once(db: &Path, url: &str, token: &str, batch: usize) -> anyhow::Result<PushSummary> {
     // Reopen per tick so newly-written local events are picked up.
     let store = EventStore::new(db)?;
-    push_to(&store, url, token, SHIP_BATCH)
+    push_to(&store, url, token, batch)
 }
 
 /// The reconcile tick: every `interval_secs`, push the local backlog and print an
 /// honest status line. Never returns; a transient failure is logged (offline
 /// since T), not fatal - a partition heals on a later tick with no new write.
-pub fn run_reconcile(db: &Path, url: &str, token: &str, interval_secs: u64) -> anyhow::Result<()> {
+/// `batch` is the caller's shipment size and is threaded into every tick: the
+/// resident shipper is exactly where a smaller batch matters (a slow or memory
+/// tight replica), and this loop used to hardcode SHIP_BATCH, which made
+/// `--batch` look accepted while it was ignored.
+pub fn run_reconcile(
+    db: &Path,
+    url: &str,
+    token: &str,
+    batch: usize,
+    interval_secs: u64,
+) -> anyhow::Result<()> {
     let interval = Duration::from_secs(interval_secs.max(1));
     let mut state = ReconcileState::default();
     println!("thor reconcile: shipping to {url} every {interval_secs}s (Ctrl-C to stop)");
     loop {
-        let outcome = match reconcile_once(db, url, token) {
+        let outcome = match reconcile_once(db, url, token, batch) {
             Ok(sum) => TickResult::Synced { cursor: sum.final_cursor, applied: sum.applied },
             Err(e) => TickResult::Failed { error: e.to_string() },
         };
@@ -536,7 +546,8 @@ pub fn run_reconcile(db: &Path, url: &str, token: &str, interval_secs: u64) -> a
 /// receiver URL - the replica's tip and the current lag, or that the replica is
 /// unreachable (RPO degraded). Live probe, no persisted state, no standing alarm.
 pub fn print_status(db: &Path, url: Option<&str>, token: Option<&str>) -> anyhow::Result<()> {
-    let store = EventStore::new(db)?;
+    // Reporting on a store must never bring one into existence (see open_existing).
+    let store = EventStore::open_existing(db)?;
     let (local_seq, local_hash) = store.contiguous_tip()?;
     println!("local:   contiguous_seq {local_seq} (tip {})", short(&local_hash));
 
@@ -662,6 +673,54 @@ mod tests {
             let _ = axum::serve(listener, app).await;
         });
         (format!("http://{addr}"), handle)
+    }
+
+    /// Reporting on a store must not conjure one up. `thor status` opened with
+    /// EventStore::new, which CREATES the file, so a typo in --db printed a
+    /// healthy-looking status for a store that had just been invented.
+    #[test]
+    fn print_status_refuses_to_create_a_missing_store() {
+        let dir = tempfile::tempdir().unwrap();
+        let missing = dir.path().join("nope.db");
+        assert!(print_status(&missing, None, None).is_err(), "status must refuse a path with no store");
+        assert!(!missing.exists(), "status must not create the store file");
+    }
+
+    /// `--batch` used to be accepted and then ignored by the resident shipper:
+    /// the tick hardcoded SHIP_BATCH, so a user who asked for small shipments
+    /// silently got 256. This pins the forwarding down to push_to.
+    /// Honest scope: it covers the tick path, NOT the CLI dispatch line that
+    /// hands `--batch` to run_reconcile. Nothing in the build can catch a
+    /// regression there - passing SHIP_BATCH again would still type-check - so
+    /// that one line stays guarded by review only.
+    #[tokio::test]
+    async fn test_reconcile_tick_honours_the_requested_batch_size() {
+        let replica = Arc::new(Mutex::new(EventStore::in_memory().unwrap()));
+        let (base, server) = start_receiver(replica.clone(), "secret").await;
+
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("authority.db");
+        {
+            let mut a = EventStore::new(&db).unwrap();
+            let e1 = a.append_event("s", "l", "act", EventKind::FactCreated, "e1", None, "first").unwrap();
+            a.append_event("s", "l", "act", EventKind::FactRevised, "e1", Some(&e1.this_hash), "second").unwrap();
+            a.append_event("s", "l", "act", EventKind::FactCreated, "e2", None, "third").unwrap();
+        }
+        // Dropped before the tick: it reopens the store itself, and on Windows an
+        // open handle plus the tempdir cleanup is the usual trap.
+
+        let b = base.clone();
+        let dbp = db.clone();
+        let summary = tokio::task::spawn_blocking(move || reconcile_once(&dbp, &b, "secret", 1).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(summary.applied, 3, "all three events still reach the replica");
+        assert_eq!(
+            summary.batches, 3,
+            "batch 1 must mean one event per request; the old code shipped SHIP_BATCH regardless"
+        );
+
+        server.abort();
     }
 
     #[tokio::test]

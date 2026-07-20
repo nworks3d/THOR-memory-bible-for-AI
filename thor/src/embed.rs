@@ -69,9 +69,12 @@ impl Embedder {
         Ok(Self { inner })
     }
 
-    /// Load from the default per-user model dir (`%LOCALAPPDATA%\thor\model\`).
+    /// Load from the per-user model dir (`model/` inside THOR's data home).
     pub fn load_default() -> Result<Self> {
-        Self::load(&default_model_dir())
+        let dir = default_model_dir().context(
+            "no per-user data directory for the model: LOCALAPPDATA, XDG_DATA_HOME and HOME are all unset",
+        )?;
+        Self::load(&dir)
     }
 
     /// Embed one text into a unit-norm `DIM` vector.
@@ -114,11 +117,17 @@ pub fn normalize(v: &mut [f32]) {
 
 /// The default per-user model directory. THOR's OWN copy of the model files, so
 /// the semantic layer never depends on a Python/fastembed cache being present.
-pub fn default_model_dir() -> PathBuf {
-    if let Ok(local) = std::env::var("LOCALAPPDATA") {
-        return Path::new(&local).join("thor").join("model");
-    }
-    PathBuf::from("thor-model")
+/// `model/` inside the same per-user THOR home the store resolves to, so the
+/// model sits next to the data it belongs with and every surface agrees on
+/// where it is. This used to key on LOCALAPPDATA alone and fall back to the
+/// CWD-relative "thor-model", which meant that off Windows the answer depended
+/// on which directory the process happened to start in: the courier, the daemon
+/// and `thor doctor` could each look somewhere else, and doctor could report the
+/// model present while recall found nothing. None when no home resolves at all
+/// (the same contract ledger::data_dir has for the store); callers treat that as
+/// "no model" and stay on bm25 rather than guessing a relative path.
+pub fn default_model_dir() -> Option<PathBuf> {
+    crate::ledger::data_dir().map(|d| d.join("model"))
 }
 
 /// True iff every required model file is present in `dir` (so a caller can decide
@@ -155,5 +164,28 @@ mod tests {
     fn test_model_present_false_on_empty_dir() {
         let dir = tempfile::tempdir().unwrap();
         assert!(!model_present(dir.path()));
+    }
+
+    /// The model has to sit in the same per-user home as the store, or the
+    /// surfaces that read it (courier, resident embedder, doctor) can each end
+    /// up somewhere else. The old resolver keyed on LOCALAPPDATA alone and fell
+    /// back to a CWD-relative folder, so off Windows this assertion fails on it:
+    /// the store resolves through HOME while the model resolves to a relative
+    /// path. On Windows both resolvers agree either way, so this guard bites on
+    /// the Linux and macOS CI jobs rather than locally.
+    #[test]
+    fn model_dir_lives_in_the_same_home_as_the_store() {
+        match (crate::ledger::data_dir(), default_model_dir()) {
+            (Some(home), Some(model)) => assert_eq!(
+                model,
+                home.join("model"),
+                "the model folder must be `model` inside THOR's data home"
+            ),
+            (None, None) => {}
+            (home, model) => panic!(
+                "the store home and the model folder must agree on whether a home exists \
+                 (home {home:?}, model {model:?})"
+            ),
+        }
     }
 }

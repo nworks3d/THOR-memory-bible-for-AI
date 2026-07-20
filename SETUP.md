@@ -96,12 +96,17 @@ The release binaries for Windows and Linux already have the feature compiled in.
 What it needs from you is a model:
 
 ```sh
-thor vectors build      # embed every stored fact once (needs the model under %LOCALAPPDATA%\thor\model\)
+thor vectors build      # embed every stored fact once (needs the model in model/ inside THOR's home)
 thor vectors status      # confirm model id + vector count
 ```
 
-Any local ONNX sentence-embedding model + tokenizer works; a multilingual MiniLM is a
-good default. The per-prompt courier never pays the model load: a warm `thor
+The model folder is `model/` inside THOR's per-user home - the same home the store
+lives in: `%LOCALAPPDATA%\thor\model\` on Windows, `$XDG_DATA_HOME/thor/model/` or
+`$HOME/.local/share/thor/model/` on Linux and macOS.
+
+Any local ONNX sentence-embedding model + tokenizer works, as long as it produces
+384 numbers per text (that width is fixed in THOR and a different one is refused);
+a multilingual MiniLM is a good default. The per-prompt courier never pays the model load: a warm `thor
 embed-daemon` (started by `thor warm`) holds it, and recall degrades cleanly to bm25
 whenever anything is missing.
 
@@ -113,7 +118,8 @@ cross-cutting knowledge that surfaces **everywhere**.
 - **The project = the session's working directory** - a `.thor` marker if present,
   else the git repo-root name. So: start each session in the project's own folder.
 - **Set up a project:** `thor init` in its folder (writes `.thor` + indexes the
-  tracked files - tracked-only, so gitignored secrets are never read). A project you
+  tracked files - tracked-only, so gitignored secrets are never read - and builds
+  the symbol sidecar that the `where_used` and `impact` tools read). A project you
   have not set up triggers a `<thor-setup>` cue at SessionStart, so the agent offers
   to run this instead of indexing silently.
 - **Recall is scoped by default** to the current project + the global tier, across the

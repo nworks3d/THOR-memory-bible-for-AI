@@ -128,21 +128,25 @@ comparing those. The model runs entirely on your machine; nothing is sent anywhe
   cargo build --release --features semantic
   ```
 
-  Then supply the model. On Windows, put the model files in the per-user model folder:
+  Then supply the model. It goes in a `model` folder inside THOR's per-user home -
+  the same folder your store lives in, so both travel together:
 
   ```
-  %LOCALAPPDATA%\thor\model\
+  %LOCALAPPDATA%\thor\model\        # Windows
+  $XDG_DATA_HOME/thor/model/        # Linux and macOS, when XDG_DATA_HOME is set
+  $HOME/.local/share/thor/model/    # Linux and macOS otherwise
   ```
 
-  On Linux and macOS the repo documents no per-user model folder, and the code default
-  is not one: when `LOCALAPPDATA` is not set, the model folder resolves to `thor-model`
-  relative to the current working directory (`thor/src/embed.rs:117-122`). That path is
-  used by the per-prompt recall path and by the resident model process, and neither of
-  them accepts an override flag. If you want one fixed model folder on Linux or macOS,
-  set `LOCALAPPDATA` in the environment that starts THOR: it is a plain environment
-  variable read on every platform, and it also decides where the store lives (see
-  `XDG_DATA_HOME` below), so setting it makes both agree. `thor vectors build` does
-  accept `--model-dir <dir>`, but that only covers that one command.
+  **This changed:** older builds only understood `%LOCALAPPDATA%` and, when that was
+  unset, fell back to a folder called `thor-model` relative to whatever directory the
+  process happened to start in. On Linux and macOS that meant the answer moved with
+  your shell, and `thor doctor` could report the model present while recall looked
+  somewhere else and quietly stayed on keyword search. If you put a model in a
+  `thor-model` folder before, move it to the location above.
+
+  `thor vectors build` accepts `--model-dir <dir>`, but that override applies to that
+  one command only - recall and the resident model process always read the folder
+  above. The command now says so when you pass it.
 - **How to check it worked:** run `thor doctor`. It prints one health line per surface
   (store, semantic, symbols sidecar, injection daemon); the one to read here is the
   semantic line. A keyword-only build prints exactly one:
@@ -151,13 +155,18 @@ comparing those. The model runs entirely on your machine; nothing is sent anywhe
   semantic: not built in (bm25-only binary)
   ```
 
-  A semantic build prints two lines instead, `semantic model: present` or
-  `semantic model: absent (bm25-only recall)`, and the same for `vectors sidecar:`.
-  Both must say `present` before meaning-based recall actually runs. One caveat on Linux
-  and macOS: `thor doctor` looks for the model in a `model` folder next to the store file
-  (`thor/src/doctor.rs:18`), while recall looks in the folder described above. With
-  `LOCALAPPDATA` unset those are two different places, so the two can disagree - one more
-  reason to set `LOCALAPPDATA` there.
+  A semantic build prints two lines instead, one for the model and one for
+  `vectors sidecar:`. Both must say `present` before meaning-based recall actually
+  runs. The model line names the folder it looked in, so you can check it against
+  where you put the files:
+
+  ```
+  semantic model: present (C:\Users\<you>\AppData\Local\thor\model)
+  semantic model: absent (bm25-only recall; expected the 5 model files in <folder>)
+  ```
+
+  Doctor asks exactly the question recall asks - same folder, and the same
+  all-five-files test - so the two can no longer disagree with each other.
 - **How to turn it off again:** rebuild without the flag, or put the `-bm25` asset in
   place. Nothing is lost: your memory is an append-only log, and everything the semantic
   layer produces lives in separate derived files you can delete and rebuild.
@@ -358,11 +367,20 @@ global flag, so it goes before the subcommand, not after it.
 - **How to check it worked:** the first line of `thor doctor` echoes the file it opened:
 
   ```
-  store: OK (0 events at /path/to/scratch/thor.db)
+  store: OK (1483 events at /path/to/scratch/thor.db)
   ```
 
-  Read the path, and read the event count. A brand new file opens cleanly with 0 events,
-  which is exactly what a typo looks like too.
+  Read the path, and read the event count. If the path does not exist, doctor says so
+  rather than inventing a store:
+
+  ```
+  store: UNREACHABLE (no THOR store at /path/to/scratch/thor.db - this command never
+  creates one; check the path (--db) or store your first memory to create it)
+  ```
+
+  That is the safety net for a typo. It only covers the reporting commands, though:
+  a `--db` typo on a command that WRITES still creates a new store at that path,
+  because writing is what those commands are for.
 - **How to turn it off again:** omit the flag. Nothing is persisted, so the next command
   goes straight back to your normal store, which was never touched.
 
@@ -493,20 +511,27 @@ yourself, and until you do, the semantic layer stays off.
   the code names as the model it was tuned on. If your download calls the ONNX
   file something else, rename it to `model_optimized.onnx`.
 
-  The folder is:
+  The folder is a `model` folder inside THOR's per-user home, the same home the
+  store lives in:
 
   ```text
-  %LOCALAPPDATA%\thor\model\      # Windows
+  %LOCALAPPDATA%\thor\model\        # Windows
+  $XDG_DATA_HOME/thor/model/        # Linux and macOS, when XDG_DATA_HOME is set
+  $HOME/.local/share/thor/model/    # Linux and macOS otherwise
   ```
 
-  On a system where `LOCALAPPDATA` is not set (Linux, macOS), be careful: for the
-  model folder THOR falls back to a folder literally named `thor-model` resolved
-  against the directory you run `thor` from, not against your home directory. A
-  one-off command can be pointed anywhere with `--model-dir`, but the per-prompt
-  hook and the resident embedder always use the default and take no such flag. So
-  on those systems, set `LOCALAPPDATA` yourself to a fixed per-user directory, or
-  accept that the model is only found when you run from one specific working
-  directory.
+  **This changed:** older builds resolved this from `LOCALAPPDATA` alone and, when
+  that was unset, fell back to a folder named `thor-model` relative to the directory
+  you happened to run `thor` from. On Linux and macOS the model was therefore only
+  found from one specific working directory. It now follows the same home as the
+  store on every platform. Windows is unaffected. If you have a `thor-model` folder
+  from before, move its contents to the location above.
+
+  A one-off command can still be pointed elsewhere with `--model-dir`, but the
+  per-prompt hook and the resident embedder always read the default folder, so a
+  sidecar built from a model that only exists somewhere else is one recall can
+  never load. `thor vectors build` prints a note reminding you of that whenever you
+  pass the flag.
 
 - **How to check it worked:** the model alone produces no output. The real check
   is the next step, `thor vectors build`: if a file is missing it fails loudly and
@@ -805,13 +830,15 @@ your results. The set of results can change, not only their sequence. Only the f
   folder is:
 
   ```text
-  %LOCALAPPDATA%\thor\reranker\      # Windows
+  %LOCALAPPDATA%\thor\reranker\        # Windows
+  $XDG_DATA_HOME/thor/reranker/        # Linux and macOS, when XDG_DATA_HOME is set
+  $HOME/.local/share/thor/reranker/    # Linux and macOS otherwise
   ```
 
-  On a system where `LOCALAPPDATA` is not set (Linux, macOS), THOR falls back to a
-  folder literally named `thor-reranker` resolved against the directory you run
-  `thor` from - so put it in your working directory, or set `LOCALAPPDATA` yourself
-  to get a fixed per-user location.
+  **This changed:** like the embedding model, this used to fall back to a folder
+  named `thor-reranker` relative to the directory you ran `thor` from whenever
+  `LOCALAPPDATA` was unset. It now sits in THOR's per-user home on every platform.
+  If you have a `thor-reranker` folder from before, move its contents.
 
   Then use it, per call:
 
@@ -1742,13 +1769,24 @@ missing. It is the "is anything obviously wrong" command.
 - **What it costs:** no extra process, no network port, no download, and no
   change to the binary (the command is compiled into every build whether you
   use it or not). What it does cost when you run it: it opens the store and
-  counts every single event, so it is not instant on a large store. Opening the
-  store is also not purely a read. If THOR's full-text search index disagrees
-  with the log about how many rows it holds, opening the store rebuilds that
-  index from scratch, once. Opening the store also creates an empty store file
-  if none exists yet - so on a brand new machine `thor doctor` reports
-  `store: OK (0 events ...)` rather than an unreachable store. The repo states
-  no timing measurement for any of this.
+  counts every single event, so it is not instant on a large store. The repo
+  states no timing measurement for that.
+
+  **This changed:** `thor doctor` used to open the store the same way a write
+  command does, which meant it CREATED an empty store when the path was wrong.
+  A typo in `--db` then reported `store: OK (0 events ...)`, which reads like a
+  healthy THOR that has forgotten everything - the worst possible answer to "why
+  is my memory not coming back". It now refuses instead:
+
+  ```
+  store: UNREACHABLE (no THOR store at <path> - this command never creates one;
+  check the path (--db) or store your first memory to create it)
+  ```
+
+  On a machine where you have not stored anything yet, that line is correct
+  rather than a fault. `thor init` in a project folder, or your first
+  `remember`, creates the store. The same change applies to `thor fsck` and
+  `thor status`.
 - **How to turn it on:**
 
   ```sh
@@ -1811,11 +1849,16 @@ tells you whether it still adds up.
   fsck: all checks passed
   ```
 
-  Two honest notes on that output. First, the four integrity checks stop at the
-  first failure: if one fails you get its error line and nothing after it, so a
-  short output means "stopped early", not "fewer things to check". Second, the
-  `FTS projection` line is weaker than it looks, because a row-count mismatch
-  was already repaired when the store was opened, moments earlier.
+  One honest note on that output: the four integrity checks stop at the first
+  failure, so if one fails you get its error line and nothing after it. A short
+  output means "stopped early", not "fewer things to check".
+
+  **This changed:** the `FTS projection` line used to be weaker than it looked,
+  because opening the store repaired a row-count mismatch moments before the
+  check ran, so it could only ever report OK. `fsck` now opens the store without
+  that repair, so the line means what it says. If it reports a mismatch, any
+  ordinary command that writes (a `remember`, an ingest) rebuilds the index on
+  its next open - you do not have to repair it by hand.
 
   The fifth line is content health, not log integrity. Some facts carry a
   metadata footer (the bracketed tail that records their type and tags). If a
@@ -1831,12 +1874,21 @@ Builds a sidecar named `thor-symbols.db` next to the store, recording which
 names each stored code chunk defines and which names it calls. It reads the code
 already inside the store, not your working directory.
 
-- **Default:** absent. A fresh store has no symbol sidecar. `thor init` does not
-  create one either - it indexes the repo but skips the sidecar refresh. The
-  sidecar appears once a `thor ingest` runs, which refreshes it automatically.
-  If you installed THOR's SessionStart hook (`thor install --with-courier`),
-  that hook starts an ingest by itself for any folder carrying a `.thor` marker
-  file, and that ingest builds the sidecar with no action from you.
+- **Default:** absent on a fresh store, then built for you. Every ingest refreshes
+  it, and that includes the ingest `thor init` runs, so setting a project up the
+  way SETUP.md describes already gives you a sidecar. If you installed THOR's
+  SessionStart hook (`thor install --with-courier`), that hook starts an ingest by
+  itself for any folder carrying a `.thor` marker file, and that ingest refreshes
+  the sidecar with no action from you.
+
+  **This changed:** older builds refreshed the sidecar only from `thor ingest`, so
+  a project set up with `thor init` was left without one and `where_used` and
+  `impact` answered on nothing. If you set a project up that way before, run
+  `thor symbols` once to catch up.
+
+  Two cases where you still run it by hand: a store that was filled some other way
+  than by indexing (a replica that received its events over log shipping never
+  ingests anything), and after you delete the sidecar yourself.
 - **Turn it on if:** you have ingested source code and want the `where_used` and
   `impact` tools (who calls this symbol, what does changing it touch). It also
   gives a small ranking bonus in deliberate recall to code chunks that define
@@ -1856,8 +1908,11 @@ already inside the store, not your working directory.
   ```
 
 - **How to check it worked:** it prints
-  `symbols rebuilt: N source chunks -> N definitions, N call edges (<path>)`,
-  and `thor doctor` then prints `symbols sidecar: present`.
+  `symbols rebuilt: N source chunks -> N definitions, N call edges (<path>)`.
+  Read those counts, not `thor doctor`: doctor's `symbols sidecar: present` only
+  means the file exists, and the file is created the moment anything opens it,
+  so a rebuild that found nothing still reports `present`. A count of zero
+  definitions means there is no code in the store to extract from.
 - **How to turn it off again:** delete `thor-symbols.db` next to the store.
   Nothing is lost. The sidecar sits outside the hash-chained log by design, so
   `fsck`, `export`, log shipping and the auditors never look at it, and
@@ -2045,7 +2100,7 @@ a follow-up like "carry on" shares no words with the rule).
   tax. The cap is 8 lines total, and pins past the cap are silently skipped, so
   an over-pinned list quietly drops its own tail without telling you.
 - **What it costs:** no extra process, no port, no download, no change in binary
-  size. A pin is one row in a local SQLite sidecar next to the store
+  size. All your pins live in one row of a local SQLite sidecar next to the store
   (`thor-ledger.db`). The injected text is up to 400 characters per pin, with
   whitespace collapsed and the metadata footer stripped, cut off with "..."
   past that; at most 8 lines in total across all pins.
@@ -2056,6 +2111,14 @@ a follow-up like "carry on" shares no words with the rule).
   log shipping and are not included in a `thor export` backup. Re-pin by hand on
   a second machine. The repo states the re-injection benefit as design
   reasoning, not as a measurement.
+
+  One more thing, if you go looking for the pins on disk: older builds of THOR
+  printed a line in `thor pin --help` saying pins lived in a file called
+  `thor-pins.json`. That was wrong, and the help no longer says it - your pins
+  have always been in `thor-ledger.db`. If a `thor-pins.json` really is sitting
+  next to your store, it is a leftover from a THOR old enough to predate the
+  ledger; run `thor pin --list` first, check that every rule you expect is in
+  the list, and only then delete the file.
 - **How to turn it on:** the automatic re-injection needs THOR's SessionStart
   hook, and the only installer flag that writes it is
   `thor install --with-courier` (plain `thor install` installs the Stop
@@ -2176,10 +2239,34 @@ returned by recall. It is not deleted - the log still holds it, and
   the fact with a body that simply leaves the footer out does **not** remove the
   expiry. On every revision, if the new body brings no footer of its own, the
   previous version's entire footer is re-attached automatically - including
-  `expires`. To actually remove it, revise with a body that carries its own
-  complete footer, with the `expires` field omitted. A caller-supplied footer
-  wins. Nothing is lost either way: the expired revision stays in history like
-  any other.
+  `expires`. That default protects your tags and your fact type, so it stays.
+
+  Step by step, the route that works:
+
+  1. `thor get <id>` and look at the last line of the body: the bracketed
+     footer, something like
+     `[memory/gotcha | tags: deploy | expires: 2027-01-15 | project: acme]`.
+     Do not copy the `Rev:` or `Kind:` lines that `get` prints around it - those
+     are not part of the body.
+  2. Write your new text, a blank line, then that same footer re-typed with the
+     `| expires: ...` field left out. A footer you supply always wins over the
+     carried one.
+  3. Revise with that body.
+
+  You no longer have to remember this by heart. If you revise without a footer
+  and the fact you are revising has an expiry date, the MCP `revise` tool now
+  says so in its reply:
+
+  ```
+  revised acme:mem-1234 -> rev 8f2c...
+  note: this fact still expires on 2027-01-15. Your body carried no footer, so
+  the previous one was kept, expiry included. To change or drop the date, send
+  the body with the full footer re-typed (leave the expires field out to
+  remove it).
+  ```
+
+  That note comes from the MCP tool. The `thor revise` command line does not
+  print it. Nothing is lost either way: every revision stays in history.
 
 ## Backup, restore and import
 
@@ -2493,9 +2580,11 @@ hash-checked before it is appended, so the copy cannot silently drift.
     `POST /ship/append`, `GET /inbox/pull` and `POST /inbox/ack`. All four are
     behind the token, and the two `/inbox` ones return nothing useful unless a
     capture inbox is configured, but they are always mounted;
-  - inside the Docker template the receiver is started in the background with a bare
-    `&` next to the MCP server. Nothing supervises it: if it dies, the container stays
-    up and simply stops accepting pushes until you restart it;
+  - inside the Docker template the receiver runs in the background next to the MCP
+    server, in a restart loop: if it dies it comes back after five seconds and logs
+    one line saying so. **This changed** - it used to be started with a bare `&` and
+    nothing watched it, so a dead receiver left the container looking healthy while
+    it had silently stopped accepting pushes;
   - no model download, and no increase in binary size.
 - **How to turn it on:** first do the one-time seeding step, then start the receiver.
   Seeding matters: the receiver only accepts a push when its log is already a prefix
@@ -2543,10 +2632,11 @@ local event past that point. Without `--watch` it ships once and exits; with
   container), and it keeps the shared token in its environment the whole time.
 - **What it costs:** no listening port is opened here - shipping is outbound only,
   the port belongs to `thor recv` on the other machine. No download, no change in
-  binary size. With `--watch`: one permanently resident process, one network round
-  trip every interval, and it reopens the store on every tick (that is deliberate,
-  so newly written events are picked up). The repo states no measurement of its CPU
-  or memory use.
+  binary size. With `--watch`: one permanently resident process, a network round
+  trip every interval (more than one while a backlog drains, or if you lower
+  `--batch`), and it reopens the store on every tick (that is deliberate, so newly
+  written events are picked up). The repo states no measurement of its CPU or
+  memory use.
 - **How to turn it on:** one-shot, then the resident form. Both need the token, so
   either pass `--token` or export `THOR_TOKEN` first - a `--watch` line without
   either exits before it makes any network call.
@@ -2565,9 +2655,12 @@ local event past that point. Without `--watch` it ships once and exits; with
   - `--batch N` - how many events go in one HTTP request. Default 256. A shipment
     also stops at about 4 MiB of serialized data, whichever limit is hit first, and
     a single event larger than that still ships on its own rather than stalling.
-    Be aware of one real defect: **`--batch` is silently ignored when `--watch` is
-    used.** The watch loop always uses the built-in default of 256. Only the one-shot
-    form honours the flag.
+    Both forms honour it. **This changed:** until recently `--batch` was accepted
+    and then ignored in `--watch` mode, which always sent 256. If you run a resident
+    shipper with a `--batch` value, it now finally does what you asked, so expect
+    more and smaller requests while a backlog drains. Nothing changes if you never
+    passed the flag - the default is still 256, and the container entrypoint passes
+    no `--batch` at all.
 - **How to check it worked:** a one-shot run prints
 
   ```
@@ -2580,6 +2673,26 @@ local event past that point. Without `--watch` it ships once and exits; with
   thor reconcile: shipping to http://<replica-host>:<recv-port> every 60s (Ctrl-C to stop)
   synced: replica at seq 4211 (+12 this tick)
   ```
+
+  To see for yourself that `--batch` is honoured, you need something to ship, so
+  make a small backlog first. Stop any resident shipper, write three facts, then
+  ship once with a batch of one:
+
+  ```sh
+  thor remember "batch check one"
+  thor remember "batch check two"
+  thor remember "batch check three"
+  thor ship --to http://<replica-host>:<recv-port> --token '<shared-token>' --batch 1
+  ```
+
+  The summary line should report three batches rather than one:
+
+  ```
+  shipped 3 event(s) in 3 batch(es); receiver now at contiguous_seq 4214
+  ```
+
+  If it says `shipped 0 event(s) in 0 batch(es)`, the replica was already current
+  and there was nothing to split up - write a fact and try again.
 
   If the replica is down it says so plainly instead of crashing - "replica offline
   since epoch ... - RPO degraded, last synced seq ..." - and repairs itself on a
@@ -2602,9 +2715,11 @@ replica and prints the difference.
   position and "(no --to given: local status only)", which tells you nothing you need.
 - **What it costs:** no process, no port, no download. It does open a network
   connection when `--to` is given, and that probe blocks for up to 30 seconds if the
-  replica does not answer. It is also not purely read-only in the strict sense: it
-  opens the store the normal way, which touches the database file. It never appends
-  an event.
+  replica does not answer. It never appends an event, and it never creates a store:
+  point it at a path with no store and it says so instead of quietly making one.
+  It is still not read-only in the strict sense - opening any SQLite database
+  touches its companion files (`thor.db-wal` and `thor.db-shm`) - but nothing in
+  your memory changes.
 - **How to turn it on:**
 
   ```sh
@@ -2896,10 +3011,14 @@ this store. This is the common topology.
 - **What it costs:**
   - One extra long-lived process inside the container, with its own async
     runtime and its own connection to the same `/data/thor.db`.
-  - That process is **unsupervised**. The entrypoint starts it with a bare `&`
-    and then `exec`s the MCP server as process 1. If the receiver dies, the
-    container keeps running and nothing restarts it - `restart: always` only
-    watches process 1. Check the log after a restart rather than assuming.
+  - That process is restarted for you if it falls over. The entrypoint runs it in
+    a loop and prints `thor: receiver exited (<code>), restarting in 5s` each
+    time, so a crash loop is visible in `docker logs` instead of silent.
+    **This changed:** it used to be started with a bare `&` and then the MCP
+    server was `exec`ed as process 1, so nothing watched the receiver at all -
+    `restart: always` only ever watched process 1. A replica could go stale for
+    days while looking perfectly healthy. If your container image predates this,
+    check the log rather than assuming.
   - You must publish the port so the authority can reach it, which is real
     network exposure. Publishing it exposes **four** routes, not one:
     `GET /ship/cursor`, `POST /ship/append`, `GET /inbox/pull` and
@@ -2977,7 +3096,8 @@ required on `thor ship`; the entrypoint fills it in from the variable.)
   a supported topology.
 - **What it costs:**
   - One extra long-lived process inside the container. It never returns, and it
-    is unsupervised in the same way described above.
+    runs in the same restart loop described above, logging
+    `thor: shipper exited (<code>), restarting in 5s` if it ever falls over.
   - A network round trip to the replica every 60 seconds, and the shared token
     sitting in the container's environment.
   - No listening port of its own - shipping is outbound only. The port belongs

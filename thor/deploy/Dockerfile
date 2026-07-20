@@ -27,4 +27,13 @@ EXPOSE 8078
 # With neither set it is MCP-only, unchanged. Then serve Streamable-HTTP MCP. The
 # MCP transport carries NO auth - keep 8078 off the LAN and front it with an
 # authenticating reverse proxy; ship/recv both authenticate with the token.
-CMD ["sh","-c","if [ ! -f /data/thor.db ] && [ -f /data/events.jsonl ]; then thor --db /data/thor.db restore --from /data/events.jsonl; fi; if [ -n \"$THOR_REPLICA_URL\" ] && [ -n \"$THOR_TOKEN\" ]; then thor --db /data/thor.db ship --to \"$THOR_REPLICA_URL\" --watch --interval 60 & fi; if [ -n \"$THOR_RECV_BIND\" ] && [ -n \"$THOR_TOKEN\" ]; then thor --db /data/thor.db recv --http \"$THOR_RECV_BIND\" & fi; exec thor --db /data/thor.db mcp --http 0.0.0.0:8078"]
+#
+# Both roles run in a restart loop rather than as a bare `&`. The MCP server is
+# exec'd as PID 1, so after that nothing supervises a backgrounded role: if the
+# receiver died the container stayed "healthy" while replication had silently
+# stopped, which is the worst failure shape for a replica - it keeps answering
+# recall, just with an ever more stale store. The loop restarts the role after a
+# 5 second pause and prints one line per restart, so the reason is in the
+# container log instead of being invisible. Restarting the CONTAINER is not an
+# option here: that would take the MCP endpoint down with it.
+CMD ["sh","-c","if [ ! -f /data/thor.db ] && [ -f /data/events.jsonl ]; then thor --db /data/thor.db restore --from /data/events.jsonl; fi; if [ -n \"$THOR_REPLICA_URL\" ] && [ -n \"$THOR_TOKEN\" ]; then (while : ; do thor --db /data/thor.db ship --to \"$THOR_REPLICA_URL\" --watch --interval 60; echo \"thor: shipper exited ($?), restarting in 5s\" >&2; sleep 5; done) & fi; if [ -n \"$THOR_RECV_BIND\" ] && [ -n \"$THOR_TOKEN\" ]; then (while : ; do thor --db /data/thor.db recv --http \"$THOR_RECV_BIND\"; echo \"thor: receiver exited ($?), restarting in 5s\" >&2; sleep 5; done) & fi; exec thor --db /data/thor.db mcp --http 0.0.0.0:8078"]

@@ -72,7 +72,7 @@ is right and this page is wrong - please open an issue.
 - [Projects and scoping](#projects-and-scoping)  
   covers: thor init (and the .thor marker file); thor ingest; thor ingest --global; thor ingest --project &lt;key&gt;; thor recall --all-projects and thor recall --project &lt;key&gt; (MCP: all_projects / project); the project argument on the MCP remember tool; thor reproject &lt;id&gt; --project &lt;key&gt; | --global; thor review-scope; thor backfill-projects
 - [Keeping the memory healthy](#keeping-the-memory-healthy)  
-  covers: thor doctor; thor fsck; thor symbols; thor consolidate; thor consolidate --apply-dedup; thor consolidate --min-age-events &lt;N&gt;; thor steward; thor pin &lt;id&gt; / thor unpin &lt;id&gt;; thor mark &lt;id&gt; (and --noise); expires: YYYY-MM-DD (on the MCP remember tool)
+  covers: thor doctor; thor fsck; thor symbols; thor consolidate; thor consolidate --apply-dedup; thor consolidate --min-age-events &lt;N&gt;; thor steward; thor pin &lt;id&gt; / thor unpin &lt;id&gt;; thor mark &lt;id&gt; (and --noise); expires: YYYY-MM-DD (on the MCP remember tool); provenance: verified | inferred (and THOR_EXP_PROVENANCE)
 - [Backup, restore and import](#backup-restore-and-import)  
   covers: thor export; thor restore --from &lt;file&gt;; thor backup --repo &lt;path&gt; [--force]; thor import &lt;path&gt;
 - [Syncing two machines](#syncing-two-machines)  
@@ -2269,6 +2269,68 @@ returned by recall. It is not deleted - the log still holds it, and
 
   That note comes from the MCP tool. The `thor revise` command line does not
   print it. Nothing is lost either way: every revision stays in history.
+
+### provenance: verified | inferred (and THOR_EXP_PROVENANCE)
+
+An optional label on a fact recording **how it was learned**: `verified` means
+something was actually checked - a test was run, a file or command output was
+read, or you confirmed it - and `inferred` means it was reasoned out and never
+checked. It is one more field on the `remember` tool, stored in the fact's
+metadata footer.
+
+On its own the label is just a note. Setting the environment variable
+`THOR_EXP_PROVENANCE` switches on what it is for: when a fact marked `inferred`
+comes back in auto-recall **and the current prompt is about its topic**, the
+injected line gets a reminder attached telling the agent to check the source
+before building on it.
+
+- **Default:** no label on a fact unless the writer passes one, and the reminder
+  is off. Without the variable set, the label is inert - stored, stripped for
+  ranking, never shown.
+- **Turn it on if:** your agents write facts you will later depend on, and you
+  want the shaky ones to announce themselves rather than quietly harden into
+  truth. It is most useful where cheap models do the writing. On a 20-scenario
+  test, a weak model built on the stale belief 12 times out of 20 without the
+  reminder and 5 times with it; a strong model got 1 wrong without it and none
+  with it. Neither arm was made worse by it. Fair warning on that number: the
+  scenario set is not part of this repository, so it is not something you can
+  re-run here - the same caveat as the category numbers in BENCHMARKS.md.
+- **Leave it off if:** you write your facts yourself, or nobody is labelling
+  anything - a store with no `inferred` facts gives the reminder nothing to fire
+  on, so it costs you a wasted setting rather than noise. It is also honest to
+  say this is an experiment: the flag name says so.
+- **What it costs:** one environment-variable read per prompt and one small text
+  scan per served fact, both far below anything you could notice. No process, no
+  port, no download. The reminder is appended to a line that was already being
+  shown, so it never adds or removes a result and never changes what gets
+  surfaced.
+- **How to turn it on:**
+
+  ```sh
+  # Windows, for your user account (then restart your agent)
+  setx THOR_EXP_PROVENANCE 1
+
+  # Linux and macOS: export it in the environment that starts your agent
+  export THOR_EXP_PROVENANCE=1
+  ```
+
+  Then label facts as you write them, through the MCP tool:
+
+  ```
+  remember(body: "the deploy watcher ticks every five minutes",
+           fact_type: "gotcha",
+           provenance: "verified")
+  ```
+
+- **How to check it worked:** ask your agent something that touches a fact you
+  marked `inferred`. The `<thor-recall>` block should show that fact with
+  `[provenance: inferred - not yet confirmed by a test or file read; new activity
+  on this topic now - reconcile against the source before you rely on it]` at the
+  end of its line. Facts with no label, or marked `verified`, look exactly as
+  before.
+- **How to turn it off again:** clear the variable and restart your agent. The
+  labels already written stay in the footers and do nothing - they are stripped
+  before ranking, so they cannot affect recall.
 
 ## Backup, restore and import
 

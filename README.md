@@ -163,9 +163,10 @@ cargo build --release # build the binary (target/release/thor)
 
 Install the hooks into your agent's settings (backs up first, only adds THOR
 entries, idempotent). Full step-by-step, incl. project scoping: **[SETUP.md](SETUP.md)**.
-Not sure what to switch on? **[OPTIONAL-FEATURES.md](OPTIONAL-FEATURES.md)** goes
-through every optional piece one by one: what it buys you, what it costs, when to
-leave it alone, and how to undo it.
+New here? **[FEATURES.md](FEATURES.md)** explains in plain words what each part
+does and whether it is worth your time - read that first. When you have decided,
+**[OPTIONAL-FEATURES.md](OPTIONAL-FEATURES.md)** has the exact commands, the real
+costs, and how to undo every one of them.
 
 The flags combine; the Stop response guard is installed whatever flags you pass.
 

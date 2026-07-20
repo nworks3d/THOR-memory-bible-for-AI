@@ -162,11 +162,15 @@ jobs:
 
             **Install**
 
-            Unpack, put the binary on your PATH, then `thor install --with-courier` to wire
-            the hooks into your agent (it backs up settings.json first and only adds THOR's
-            own entries). Run `thor doctor` first if anything looks off - it reports the
-            store, model, sidecars and daemon, which is what recall behaviour depends on.
-            Full walkthrough: SETUP.md.
+            Unpack, put the binary where it will stay, then `thor install --with-courier` to
+            wire the hooks into your agent (it backs up settings.json first and only adds
+            THOR's own entries; it writes the binary's current path, so move it before you
+            install). Run `thor doctor` if anything looks off - it reports the store, model,
+            sidecars and daemon, which is what recall behaviour depends on.
+
+            New here? FEATURES.md explains in plain words what each part does and whether it
+            is worth turning on. Full walkthrough: SETUP.md. Exact costs and undo steps for
+            every optional piece: OPTIONAL-FEATURES.md.
 
             **What has actually been run**
 

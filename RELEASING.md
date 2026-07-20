@@ -45,7 +45,13 @@ Each ships with a `.sha256`.
    ```
 
    The chart is generated from the measured numbers - never hand-edited. Its
-   width guard fails the build on overflow, so a green run means it renders.
+   width guard only aborts the script run: on overflow it writes no file, and
+   nothing in CI invokes the script, so a green CI run is not evidence that the
+   chart renders. Read the script's own last line - it prints
+   `wrote <path> (height N)` on success - and check that the run exited zero.
+   Do not judge it by opening `assets/benchmark.svg`: an aborted run leaves the
+   PREVIOUS chart in place, which looks perfectly fine. Then open it anyway, to
+   see that the new numbers are the ones on the page.
 
    Numbers age in both directions. THOR is compute-bound and slows as the store
    grows; the rival ships too. Re-measure both sides, at their live size, on the

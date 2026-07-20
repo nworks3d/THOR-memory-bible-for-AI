@@ -807,7 +807,30 @@ impl ThorServer {
                 args.parent_rev.as_deref(),
                 body,
             ) {
-                Ok(ev) => Ok(format!("revised {} -> rev {}", args.entity_id, ev.this_hash)),
+                Ok(ev) => {
+                    // A body with no footer of its own inherits the previous
+                    // one (footer::carry_over) - protective for tags and type,
+                    // but it silently carries an `expires` date the caller may
+                    // well have been trying to drop. The write succeeds either
+                    // way, and the difference only shows up weeks later when the
+                    // fact stops surfacing, so say it now, at the only moment
+                    // the caller can act on it.
+                    let carried = if crate::footer::extract(body).is_none() {
+                        crate::footer::extract(&ev.body).and_then(crate::footer::expires)
+                    } else {
+                        None
+                    };
+                    match carried {
+                        Some(exp) => Ok(format!(
+                            "revised {} -> rev {}\nnote: this fact still expires on {exp}. Your body \
+                             carried no footer, so the previous one was kept, expiry included. To \
+                             change or drop the date, send the body with the full footer re-typed \
+                             (leave the expires field out to remove it).",
+                            args.entity_id, ev.this_hash
+                        )),
+                        None => Ok(format!("revised {} -> rev {}", args.entity_id, ev.this_hash)),
+                    }
+                }
                 Err(e) => Err(render_mutate_err(s, &args.entity_id, e)),
             }
         })
@@ -1379,6 +1402,46 @@ mod tests {
             .append_event("s", "l", "a", EventKind::FactCreated, "e1", None, "the deploy watcher gotcha")
             .unwrap();
         store
+    }
+
+    /// Dropping an expiry date is the one footer edit a plain revise cannot do:
+    /// a body with no footer inherits the previous one, expiry included, and the
+    /// write still reports success. The reply has to say so, or the fact quietly
+    /// stops surfacing weeks later and nobody connects it to this call.
+    #[tokio::test]
+    async fn revise_says_when_it_carried_an_expiry_the_caller_did_not_retype() {
+        let mut store = EventStore::in_memory().unwrap();
+        let dated = format!(
+            "pin to the 1.9 line until upstream lands the fix\n\n{}",
+            crate::footer::compose("gotcha", &["deploy".into()], "global", &[], &[], Some("2027-01-15"))
+        );
+        store
+            .append_event("s", "l", "a", EventKind::FactCreated, "e-exp", None, &dated)
+            .unwrap();
+        let (server, _dir) = server_with(store);
+
+        // No footer in the new body: the old one is carried, expiry and all.
+        let out = server
+            .revise(Parameters(ReviseArgs {
+                entity_id: "e-exp".into(),
+                body: "pin to the 1.9 line - upstream fix has landed, unpin at will".into(),
+                parent_rev: None,
+            }))
+            .await;
+        assert!(out.starts_with("revised e-exp"), "{out}");
+        assert!(out.contains("still expires on 2027-01-15"), "the carried date must be named: {out}");
+
+        // Re-typing the footer WITHOUT expires is the documented route, and a
+        // caller who did that must not be nagged about a date they just removed.
+        let cleared = format!(
+            "pin to the 1.9 line - upstream fix has landed\n\n{}",
+            crate::footer::compose("gotcha", &["deploy".into()], "global", &[], &[], None)
+        );
+        let out2 = server
+            .revise(Parameters(ReviseArgs { entity_id: "e-exp".into(), body: cleared, parent_rev: None }))
+            .await;
+        assert!(out2.starts_with("revised e-exp"), "{out2}");
+        assert!(!out2.contains("still expires"), "a re-typed footer clears it silently: {out2}");
     }
 
     fn server_with(store: EventStore) -> (ThorServer, tempfile::TempDir) {

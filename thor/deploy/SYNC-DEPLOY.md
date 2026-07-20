@@ -3,7 +3,9 @@
 THOR keeps one **authority** store on a machine's local disk. Other machines run
 a **replica** that the authority pushes its event log into, so they serve fresh
 recall without ever sharing a database file over the network (a shared network
-`thor.db` corrupts the WAL - `thor` refuses UNC/NFS paths for exactly this).
+`thor.db` corrupts the WAL). On Windows `thor` refuses to open a store over a UNC
+path for exactly this reason; on Linux and macOS there is no such check, so an
+NFS or SMB mount is your responsibility - never point a store at one.
 
 Replication is a thin, append-only reconcile: the authority's `thor ship` sends
 new events; the replica's `thor recv` verifies each hash and appends. Both ends
@@ -22,7 +24,10 @@ optional roles, each gated on its env var **plus** `THOR_TOKEN`:
 | REPLICA | `THOR_RECV_BIND` | `thor recv --http <bind>` | a remote authority pushes into this store |
 | (neither) | - | MCP only | unchanged, no replication |
 
-Set exactly one. Leave the other empty.
+Set at most one, and leave the other empty (neither is a valid choice too - that is
+the MCP-only row). Nothing enforces this: the entrypoint checks the two variables
+independently, so setting both starts a shipper AND a receiver in the same
+container. Keeping them exclusive is up to you.
 
 ## Topology A: a PC is the authority, the container is the replica
 
@@ -43,8 +48,11 @@ it to the PC's `thor ship`. Never commit it.
 
 ### 2. Container = replica
 
-In your host-local `docker-compose.override.yml` (or the compose you keep on the
-host, gitignored), set:
+In a `docker-compose.override.yml` that sits **next to** `deploy/docker-compose.yml`
+on the host (docker compose only merges it automatically when it is in the same
+directory; anywhere else it is silently ignored and the container just stays
+MCP-only). It holds the real token, so add it to your `.gitignore` - nothing in
+this repo ignores it for you. Set:
 
 ```yaml
 services:
@@ -87,12 +95,18 @@ thor ship --to http://<container-host>:<recv-port> --watch --interval 60
 From the PC:
 
 ```
-thor status --to http://<container-host>:<recv-port>
+thor status --to http://<container-host>:<recv-port> --token <shared-token>
 ```
 
+Pass the token (or export `THOR_TOKEN` first): without it the receiver answers 401
+and `status` reports the replica as UNREACHABLE. Read the rest of that line before
+you go hunting for a network fault - it names the 401 and says the token must match
+on both sides.
+
 It prints the local tip, the replica tip, and the current lag (or that the
-replica is unreachable - an honest degraded RPO). Lag should settle at 0. Confirm
-from the connector side that recall now returns the authority's newest facts.
+replica is unreachable - an honest degraded RPO). Once the replica has caught up
+the line reads `replica: contiguous_seq <n> (reachable) - in sync`. Confirm from
+the connector side that recall now returns the authority's newest facts.
 
 ## Topology B: the container is the authority
 
@@ -110,23 +124,49 @@ those writes happen anyway without ever touching the log:
 
 - Set `THOR_CAPTURE_INBOX=/data/inbox.jsonl` on the **replica** container. Its MCP
   server then *diverts* every write to that append-only file instead of appending
-  to `thor.db`, and answers the client `queued to capture inbox (pending sync)`.
-  Reads (recall / get) are unchanged. The stdio (local authority) server never
-  diverts - only the HTTP server reads this env.
+  to `thor.db`, and answers the client
+  `queued to capture inbox: entity <id> (pending sync to the authority)` (and the
+  same shape for `revise` and `retract`). Reads (recall / get) are unchanged. The
+  stdio (local authority) server never diverts - only the HTTP server reads this
+  env. Note that the `/inbox` routes are served by the `thor recv` process, which
+  reads the same variable: if `recv` runs somewhere that does not have it set,
+  `drain-inbox --from` politely reports 0 ops and exits 0 while draining nothing.
 - On the **authority**, drain the inbox back into the real log with
-  `thor drain-inbox --inbox <file>`: it replays each captured op as a proper event,
-  preserving the entity id so revisions chain correctly, and re-running the same
-  duplicate check `remember` does (so a re-drain is idempotent).
+  `thor drain-inbox`: it replays each captured op as a proper event, preserving
+  the entity id so revisions chain correctly, and re-running the same duplicate
+  check `remember` does. That idempotency covers **creates** only: a `revise` or
+  `retract` that was already applied counts as an error, not a skip, and the drain
+  only acknowledges a batch when there were no errors - so such a batch is served
+  again on every run and the command keeps exiting non-zero. A phone that only
+  writes new facts never hits this; one that edits an existing fact twice can.
 
 Wire it into the authority's ship job so captures round-trip automatically. Because
 the drain mints the facts on the authority, the next ship replicates them straight
-back to the container the normal, non-forking way:
+back to the container the normal, non-forking way.
+
+**Use the HTTP route.** One command does the whole round trip over the same
+bearer-gated port the ship already uses, so the job needs no ssh, no file share
+and no second credential:
+
+```
+thor drain-inbox --from http://<container-host>:<recv-port> --token <shared-token>
+thor ship --to http://<container-host>:<recv-port> --token <shared-token>
+```
+
+`--from` rotates the replica's inbox, pulls the pending batch, applies it locally,
+and only then acknowledges - so a batch that fails to apply is served again on the
+next run rather than lost.
+
+By hand, if you cannot reach the port. Steps 1 to 4 are what `--from` does for you;
+step 5 is the separate `thor ship` either way:
 
 1. rotate the inbox on the replica so new captures land in a fresh file:
-   `mv /data/inbox.jsonl /data/inbox.draining.jsonl` (skip if absent/empty)
-2. fetch `inbox.draining.jsonl` to the authority
-3. `thor drain-inbox --inbox inbox.draining.jsonl`
-4. on success, delete `inbox.draining.jsonl` on the replica
+   `mv /data/inbox.jsonl /data/inbox.jsonl.draining` (skip if absent/empty). Use
+   exactly that name: the code appends `.draining` to the whole filename, and a
+   file named differently is invisible to a later `--from` pull.
+2. fetch `inbox.jsonl.draining` to the authority
+3. `thor drain-inbox --inbox inbox.jsonl.draining`
+4. on success, delete `inbox.jsonl.draining` on the replica
 5. ship as usual
 
 **Trade-off:** a capture is not visible in the replica's own recall until the next

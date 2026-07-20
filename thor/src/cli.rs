@@ -410,6 +410,8 @@ enum Commands {
         to: String,
         #[arg(long)]
         token: Option<String>,
+        /// Upper bound on events per HTTP shipment (a byte budget caps it too).
+        /// Honoured by both the one-shot form and --watch.
         #[arg(long, default_value_t = crate::sync::SHIP_BATCH)]
         batch: usize,
         /// Keep shipping on a timer (the reconcile tick) instead of once.
@@ -490,8 +492,9 @@ enum Commands {
     },
     /// Pin a fact: `thor session-start` then re-injects its full body at every
     /// session start (and right after a compaction) via a <thor-brief> block - the
-    /// memory version of CLAUDE.md, per project, without editing any file. Pins are
-    /// a local sidecar (thor-pins.json), never part of the synced log.
+    /// memory version of CLAUDE.md, per project, without editing any file. The
+    /// whole pin list is one row in the local ledger sidecar (thor-ledger.db,
+    /// next to the store), never part of the synced log.
     Pin {
         /// The entity id to pin (omit with --list).
         entity_id: Option<String>,
@@ -903,13 +906,6 @@ pub fn run() -> Result<()> {
                 spawn_detached_ingest(&db, &paths, override_key.as_deref())?;
             } else {
                 run_ingest(&db, &paths, override_key.as_deref())?;
-                // Derived sidecar refresh, best-effort: a symbols failure must
-                // never fail an ingest (delete + `thor symbols` rebuilds it).
-                if let Ok(store) = EventStore::new(&db) {
-                    if let Ok(mut sy) = crate::symbols::SymbolStore::open_default(&db) {
-                        let _ = sy.rebuild(&store);
-                    }
-                }
             }
         }
         Commands::Init { path, key } => {
@@ -953,7 +949,10 @@ pub fn run() -> Result<()> {
             }
         }
         Commands::Fsck => {
-            let store = EventStore::new(&db)?;
+            // open_existing, not new: `new` heals the FTS projection on open, so
+            // fsck would repair the very thing it is about to check and then
+            // report OK. It also must not create a store for a mistyped --db.
+            let store = EventStore::open_existing(&db)?;
             let events = store.get_all_events()?;
 
             if let Err(e) = verify_chain_integrity(&events) {
@@ -1163,7 +1162,7 @@ steward review prepared: {}", path.display());
                 .filter(|t| !t.trim().is_empty())
                 .ok_or_else(|| anyhow::anyhow!("no token: pass --token or set THOR_TOKEN"))?;
             if watch {
-                crate::sync::run_reconcile(&db, &to, &token, interval)?;
+                crate::sync::run_reconcile(&db, &to, &token, batch, interval)?;
             } else {
                 let store = EventStore::new(&db)?;
                 let summary = crate::sync::push_to(&store, &to, &token, batch)?;
@@ -1518,6 +1517,21 @@ fn run_ingest(db: &Path, paths: &[PathBuf], project_override: Option<&str>) -> R
         Ok(())
     })();
     let _ = std::fs::remove_file(&lock);
+    // Derived sidecar refresh, best-effort: a symbols failure must never fail an
+    // ingest (delete + `thor symbols` rebuilds it). It lives HERE rather than in
+    // the Ingest match arm because `thor init` and the SessionStart detached
+    // ingest also come through run_ingest, and a path that indexes code but
+    // leaves the sidecar stale makes where_used/impact answer on nothing.
+    // Deliberately outside the lock: the rebuild is a full pass over the stored
+    // chunks, and widening the lock window would make a concurrent ingest skip
+    // itself for longer.
+    if result.is_ok() {
+        if let Ok(store) = EventStore::new(db) {
+            if let Ok(mut sy) = crate::symbols::SymbolStore::open_default(db) {
+                let _ = sy.rebuild(&store);
+            }
+        }
+    }
     result
 }
 
@@ -1719,7 +1733,32 @@ fn run_vectors(db: &Path, action: &str, model_dir: Option<PathBuf>, force: bool)
         other => anyhow::bail!("unknown vectors action '{}': use build | sync | status", other),
     }
 
-    let model_dir = model_dir.unwrap_or_else(embed::default_model_dir);
+    let default_dir = embed::default_model_dir();
+    let model_dir = match model_dir {
+        Some(explicit) => {
+            // --model-dir is a one-shot override for THIS command. The per-prompt
+            // courier and the resident embed daemon always read the default
+            // directory, so a sidecar built from a model that only exists here is
+            // one recall can never load - and that failure is silent, recall just
+            // stays on bm25. Say it out loud rather than let a doomed build look
+            // like it worked.
+            eprintln!(
+                "note: --model-dir applies to this command only - recall and `thor embed-daemon` \
+                 load the model from {}.",
+                default_dir
+                    .as_deref()
+                    .map(|d| d.display().to_string())
+                    .unwrap_or_else(|| "(nowhere: LOCALAPPDATA, XDG_DATA_HOME and HOME are all unset)".into())
+            );
+            explicit
+        }
+        None => default_dir.ok_or_else(|| {
+            anyhow::anyhow!(
+                "no per-user data directory for the model (LOCALAPPDATA, XDG_DATA_HOME and HOME \
+                 are all unset): set one, or pass --model-dir <dir>"
+            )
+        })?,
+    };
     if !embed::model_present(&model_dir) {
         anyhow::bail!(
             "model files not found in {} (need: {}). Put THOR's own copy there, or pass --model-dir.",
@@ -1989,5 +2028,53 @@ mod tests {
         let store = EventStore::new(&db).unwrap();
         let heads = crate::cas::compute_head_sets(&store.get_all_events().unwrap());
         assert_eq!(heads.get("acme:mem-x").unwrap().heads.len(), 1, "still exactly one head");
+    }
+
+    /// `thor init` is the command SETUP.md tells a new user to run, so it must
+    /// leave where_used/impact with a sidecar to answer from - not just a marker
+    /// file. The refresh used to sit in the Ingest match arm, which init bypassed.
+    #[test]
+    fn init_and_ingest_both_refresh_the_symbol_sidecar() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("thor.db");
+        let proj = dir.path().join("proj");
+        std::fs::create_dir(&proj).unwrap();
+        std::fs::write(proj.join("lib.rs"), "pub fn pack_blocks(x: u32) {}\n").unwrap();
+        std::fs::write(proj.join("main.rs"), "fn main() { pack_blocks(7); }\n").unwrap();
+
+        run_init(&db, &proj, Some("initproj".to_string())).unwrap();
+        {
+            let sy = crate::symbols::SymbolStore::open_default(&db).unwrap();
+            assert_eq!(sy.definers_of("pack_blocks", Some("initproj")), vec!["initproj:lib.rs#0"]);
+            assert_eq!(sy.callers_of("pack_blocks", Some("initproj")), vec!["initproj:main.rs#0"]);
+        }
+        // The refresh is unconditional, so a DELETED sidecar is healed by the next
+        // ingest even though that run changes nothing in the log.
+        std::fs::remove_file(crate::symbols::default_symbols_path(&db)).unwrap();
+        run_ingest(&db, &[proj.clone()], None).unwrap();
+        let sy = crate::symbols::SymbolStore::open_default(&db).unwrap();
+        assert_eq!(sy.definers_of("pack_blocks", Some("initproj")), vec!["initproj:lib.rs#0"]);
+    }
+
+    /// The pin help is the only place a user is ever told WHERE pins live, so a
+    /// stale filename there sends people hunting for a file no install has. Pins
+    /// moved into the SQLite ledger sidecar (ledger::ledger_path) and the help has
+    /// to follow, which nothing else in the build checks.
+    #[test]
+    fn pin_help_names_the_ledger_sidecar_pins_really_live_in() {
+        use clap::CommandFactory;
+        let help = Cli::command()
+            .find_subcommand_mut("pin")
+            .expect("the pin subcommand exists")
+            .render_long_help()
+            .to_string();
+        assert!(
+            !help.contains("thor-pins.json"),
+            "the help must not name the pre-SQLite pin file: {help}"
+        );
+        assert!(
+            help.contains("thor-ledger.db"),
+            "the help must name the ledger sidecar pins live in: {help}"
+        );
     }
 }

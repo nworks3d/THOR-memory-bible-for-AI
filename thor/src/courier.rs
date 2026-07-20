@@ -932,7 +932,8 @@ fn try_semantic_recall(
 ) -> Option<Vec<RecallHit>> {
     use crate::vectors::{default_vectors_path, VectorStore};
 
-    if !crate::embed::model_present(&crate::embed::default_model_dir()) {
+    let model_dir = crate::embed::default_model_dir()?;
+    if !crate::embed::model_present(&model_dir) {
         return None; // no local model -> nothing to warm, stay on bm25
     }
     let vpath = default_vectors_path(db);

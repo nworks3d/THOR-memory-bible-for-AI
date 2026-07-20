@@ -163,10 +163,18 @@ cargo build --release # build the binary (target/release/thor)
 
 Install the hooks into your agent's settings (backs up first, only adds THOR
 entries, idempotent). Full step-by-step, incl. project scoping: **[SETUP.md](SETUP.md)**.
+Not sure what to switch on? **[OPTIONAL-FEATURES.md](OPTIONAL-FEATURES.md)** goes
+through every optional piece one by one: what it buys you, what it costs, when to
+leave it alone, and how to undo it.
+
+The flags combine; the Stop response guard is installed whatever flags you pass.
 
 ```sh
-thor install --with-courier          # auto-recall + SessionStart warm + project refresh/onboarding
-thor install --with-guard            # + the moment-of-action guard
+thor install                                             # the Stop response guard only
+thor install --with-courier                              # + auto-recall, SessionStart warm, project refresh/onboarding, the pre-compact nudge
+thor install --with-guard                                # + the moment-of-action guard
+thor install --with-daemon                               # + the warm injection daemon (recommended, see below)
+thor install --with-courier --with-guard --with-daemon   # the full setup on the machine your agent works on
 ```
 
 Use it:
@@ -208,10 +216,14 @@ thor backfill-projects          # attribute legacy memories from their import fo
 - Chunk ids are `<project>:<path>#<n>`; scoped memories `<project>:mem-<uuid>`; global
   facts are unprefixed or under `@global:`. Recall (courier, CLI, MCP) scopes to the
   current project + the global tier by default.
-- Wire `thor session-start` into your `SessionStart` hook: it refreshes a known project
-  in the background, and for a new project it asks the agent to offer setup rather than
-  indexing silently. Mis-scoped a fact? `thor reproject` moves it (it travels as an event,
-  so a replica agrees after sync).
+- `thor install --with-courier` wires `thor session-start` into your `SessionStart`
+  hook. No other flag installs that particular entry, so without `--with-courier` you
+  add it by hand (other flags do write their own SessionStart entries - `--with-daemon`
+  and `--backup-repo` - they just do not write this one). It refreshes a known project
+  in the background, and for a **git** project you have not set up yet it asks the
+  agent to offer setup rather than indexing silently; a plain non-git folder gets no
+  cue and no index. Mis-scoped a fact? `thor reproject` moves it (it travels as an
+  event, so a replica agrees after sync).
 
 ## Semantic recall (recommended on a client)
 
@@ -238,8 +250,11 @@ cargo build --release --features semantic
   prompt.
 - **You have no model and do not want to fetch one** (~235 MB, see below).
 
-- Put the embedding model files under `%LOCALAPPDATA%\thor\model\` (or point
-  `thor vectors build --model-dir <dir>` at them). Any local ONNX sentence-
+- Put the embedding model files in `model/` inside THOR's per-user home:
+  `%LOCALAPPDATA%\thor\model\` on Windows, `$XDG_DATA_HOME/thor/model/` or
+  `$HOME/.local/share/thor/model/` elsewhere - the same home the store uses.
+  (`thor vectors build --model-dir <dir>` overrides it for that one command; the
+  courier and the daemon always read the default.) Any local ONNX sentence-
   embedding model with its tokenizer works; a multilingual MiniLM is a good
   default.
 - Build the precomputed vector sidecar, then check it:
@@ -271,7 +286,8 @@ never touches the per-prompt courier. MCP recall takes `rerank: true`, the CLI
 takes `thor recall --rerank`.
 
 - Put a reranker model (ONNX + tokenizer, five files, onnx named `model.onnx`)
-  under `%LOCALAPPDATA%\thor\reranker\`; a multilingual base reranker is a good
+  under `reranker/` in the same per-user home as the model (`%LOCALAPPDATA%\thor\reranker\`
+  on Windows, `$HOME/.local/share/thor/reranker/` elsewhere); a multilingual base reranker is a good
   default. Nothing auto-downloads.
 - Contract mirrors the semantic layer: model missing or any failure = the
   normal order is returned with an explicit note, never an error.
@@ -294,9 +310,10 @@ thor ship --to http://<replica>:5555 --token <shared-token> --watch
 thor status --to http://<replica>:5555 --token <shared-token>
 ```
 
-Keep the authority's `thor.db` on a **local disk** - it is never opened over a
-network share (SQLite WAL requires real shared memory). Other machines get a
-replica via ship/recv, never a shared network file.
+Keep the authority's `thor.db` on a **local disk**. SQLite WAL requires real
+shared memory, so on Windows `thor` refuses to open a store over a UNC path; on
+Linux and macOS there is no such check, so avoiding an NFS or SMB mount is up to
+you. Other machines get a replica via ship/recv, never a shared network file.
 
 ## Deploy as a remote MCP server
 
@@ -335,12 +352,12 @@ overwrites your live compose file and never touches the data volume.
 | `thor fsck` | verify chain integrity + FTS projection, and report facts whose footer got lost (content health: it names them and never fails the run) |
 | `thor consolidate [--apply-dedup]` | metabolism report: duplicate twins, decay candidates, same-topic clusters (exit 1 when anything needs digesting; only the dedup pass is ever applied mechanically) |
 | `thor steward` | prepare a stewardship review: the consolidate report + the proven conservative rubric written to a file an agent session works through with the MCP tools (no writes itself) |
-| `thor symbols` | (re)build the derived symbol sidecar (`thor-symbols.db`): which names every code chunk defines and calls - powers `where_used`/`impact` and a deliberate-recall ranking bonus; refreshed automatically after `thor ingest`, safe to delete and rebuild |
-| `thor daemon` / `thor ensure-daemon` | warm injection daemon: `/inject` + `/health` on the HTTP server, discovered via a flag file; the courier answers warm and falls back cold on any failure. **Recommended** - it holds the folded log + vector matrix resident, which is ~60% of per-prompt latency (349 -> 120 ms measured), for ~650 MB of RAM. Wire it in with `thor install --with-daemon` (`ensure-daemon` is the SessionStart form) |
+| `thor symbols` | (re)build the derived symbol sidecar (`thor-symbols.db`): which names every code chunk defines and calls - powers `where_used`/`impact` and a deliberate-recall ranking bonus; refreshed automatically by every ingest, including the one `thor init` runs, so you only need this command by hand for a store that was filled some other way (a shipped replica), or after deleting the sidecar |
+| `thor daemon` / `thor ensure-daemon` | warm injection daemon: `/inject` + `/health` on the HTTP server, discovered via a flag file; the courier answers warm and falls back cold on any failure. **Recommended** - it holds the folded log + vector matrix resident, which is ~60% of per-prompt latency (349 -> 120 ms measured). Expect a few hundred MB of RAM; the repo has no measurement of this daemon's own footprint (the measured ~650 MB below is the *embedder* daemon). It is the same server as `thor mcp --http`, so the full MCP toolset - writes included - is mounted on that port with no auth: keep the bind on loopback. Wire it in with `thor install --with-daemon` (`ensure-daemon` is the SessionStart form) |
 | `thor doctor` | one-line health per surface: store, semantic model + sidecars, injection daemon warm/cold, flags |
 | `thor pre-compact` | PreCompact hook: one advisory per session, right before a compaction, to persist durable decisions via remember (installed by `--with-courier`) |
 | `thor recall --rerank` | rescore the top hits with the local cross-encoder (feature `semantic` + downloaded reranker model; MCP recall takes `rerank: true`) |
-| `thor mcp [--http <bind>]` | run as an MCP server (stdio or Streamable-HTTP) exposing the full stewardship toolset: recall (`kind:"memory"` filter, `detail:"index"` for a compact id list) / get / history / remember (typed, duplicate-refusing, optional `expires: YYYY-MM-DD` after which a fact stops surfacing - history keeps it) / revise / retract / resolve / mark / pin / unpin / reproject / brief / outline (a file's signature map) / where_used / impact (symbol callers + change blast-radius on the derived sidecar) |
+| `thor mcp [--http <bind>]` | run as an MCP server (stdio or Streamable-HTTP) exposing the full stewardship toolset: recall (`kind:"memory"` filter, `detail:"index"` for a compact id list) / get / history / remember (typed, duplicate-refusing, optional `expires: YYYY-MM-DD` after which a fact stops surfacing - history keeps it; a later revise that carries no footer of its own keeps that date, and says so in its reply) / revise / retract / resolve / mark / pin / unpin / reproject / brief / outline (a file's signature map) / where_used / impact (symbol callers + change blast-radius on the derived sidecar) |
 
 ## Build features
 

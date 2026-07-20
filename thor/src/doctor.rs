@@ -1,11 +1,13 @@
-//! `thor doctor`: one read-only health line per warm/cold surface, so "why is
-//! recall slow/silent" is a single command instead of an investigation.
+//! `thor doctor`: one health line per warm/cold surface, so "why is recall
+//! slow/silent" is a single command instead of an investigation. It opens the
+//! store with `open_existing`, so a wrong `--db` reports UNREACHABLE instead of
+//! creating an empty store that then looks like a healthy but forgetful THOR.
 
 use crate::event_store::EventStore;
 use std::path::Path;
 
 pub fn print_doctor(db: &Path) {
-    match EventStore::new(db) {
+    match EventStore::open_existing(db) {
         Ok(store) => match store.get_all_events() {
             Ok(evs) => println!("store: OK ({} events at {})", evs.len(), db.display()),
             Err(e) => println!("store: OPENS but read failed ({e})"),
@@ -15,11 +17,24 @@ pub fn print_doctor(db: &Path) {
 
     #[cfg(feature = "semantic")]
     {
-        let model_dir = db.with_file_name("model");
-        println!(
-            "semantic model: {}",
-            if model_dir.exists() { "present" } else { "absent (bm25-only recall)" }
-        );
+        // Ask the same question recall asks, in the same folder, with the same
+        // predicate: this used to derive its own path from the store file and
+        // only check that the folder existed, so on Linux and macOS doctor could
+        // report the model present while the courier looked elsewhere and found
+        // nothing. Print the folder too, so the answer is checkable.
+        match crate::embed::default_model_dir() {
+            Some(dir) if crate::embed::model_present(&dir) => {
+                println!("semantic model: present ({})", dir.display())
+            }
+            Some(dir) => println!(
+                "semantic model: absent (bm25-only recall; expected the {} model files in {})",
+                crate::embed::MODEL_FILES.len(),
+                dir.display()
+            ),
+            None => println!(
+                "semantic model: nowhere to look (bm25-only recall; LOCALAPPDATA, XDG_DATA_HOME and HOME are all unset)"
+            ),
+        }
         let vectors = db.with_file_name("thor-vectors.db");
         println!(
             "vectors sidecar: {}",

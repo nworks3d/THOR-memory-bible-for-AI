@@ -74,7 +74,10 @@ impl Reranker {
     }
 
     pub fn load_default() -> Result<Self> {
-        Self::load(&default_reranker_dir())
+        let dir = default_reranker_dir().context(
+            "no per-user data directory for the reranker: LOCALAPPDATA, XDG_DATA_HOME and HOME are all unset",
+        )?;
+        Self::load(&dir)
     }
 
     /// Score `docs` against `query`; returns indices into `docs`, best first.
@@ -89,12 +92,14 @@ impl Reranker {
     }
 }
 
-/// The default per-user reranker directory, next to the embedder's `model/`.
-pub fn default_reranker_dir() -> PathBuf {
-    if let Ok(local) = std::env::var("LOCALAPPDATA") {
-        return Path::new(&local).join("thor").join("reranker");
-    }
-    PathBuf::from("thor-reranker")
+/// The per-user reranker directory, next to the embedder's `model/` inside
+/// THOR's data home. Same reasoning as embed::default_model_dir: keying on
+/// LOCALAPPDATA alone left every non-Windows machine with a CWD-relative path,
+/// so the answer depended on where the process was started. None when no home
+/// resolves - callers then keep the fused order, which is the documented
+/// behaviour whenever the reranker is unavailable.
+pub fn default_reranker_dir() -> Option<PathBuf> {
+    crate::ledger::data_dir().map(|d| d.join("reranker"))
 }
 
 /// True iff every required file is present (callers decide to rerank or keep
@@ -143,8 +148,11 @@ pub fn rerank_hits(query: &str, hits: Vec<crate::recall::RecallHit>) -> (Vec<cra
     }
     static WARM: OnceLock<Mutex<Option<Reranker>>> = OnceLock::new();
     let warm = WARM.get_or_init(|| {
-        let dir = default_reranker_dir();
-        Mutex::new(if model_present(&dir) { Reranker::load(&dir).ok() } else { None })
+        Mutex::new(
+            default_reranker_dir()
+                .filter(|dir| model_present(dir))
+                .and_then(|dir| Reranker::load(&dir).ok()),
+        )
     });
     let mut guard = warm.lock().unwrap_or_else(|p| p.into_inner());
     match guard.as_mut() {

@@ -4,7 +4,8 @@
 # commit, and the binary is built by CI on a clean machine - never uploaded from
 # a maintainer's laptop, where "works here" proves nothing.
 #
-# Two assets, because THOR ships in two shapes and they are not interchangeable:
+# Three assets, because THOR ships in two shapes that are not interchangeable and
+# the client shape is built for two platforms:
 #   thor-<ver>-windows-x86_64.zip  - semantic (dense recall). The client build.
 #   thor-<ver>-linux-x86_64.tar.gz - semantic (dense recall). The client build.
 #   thor-<ver>-linux-x86_64-bm25.tar.gz - default. No ONNX: the server/NAS build.

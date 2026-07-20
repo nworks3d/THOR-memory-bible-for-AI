@@ -49,7 +49,13 @@ fn startfile(db: &Path) -> PathBuf {
 /// Run the resident embedder. Loads the model, binds a localhost port, publishes
 /// it, then serves query-embed requests until idle for `IDLE_TIMEOUT`.
 pub fn run_embed_daemon(db: &Path) -> Result<()> {
-    let mut embedder = Embedder::load(&embed::default_model_dir())?;
+    let model_dir = embed::default_model_dir().ok_or_else(|| {
+        anyhow::anyhow!(
+            "no per-user data directory for the model: LOCALAPPDATA, XDG_DATA_HOME and HOME are \
+             all unset, so there is nowhere to load it from"
+        )
+    })?;
+    let mut embedder = Embedder::load(&model_dir)?;
     let listener = TcpListener::bind(("127.0.0.1", 0))?;
     let port = listener.local_addr()?.port();
     std::fs::write(

@@ -31,7 +31,7 @@ Find your situation. If two rows fit, do both.
 | I run it on a server, a NAS or in a container | The bm25-only build | Semantic recall, the embedder, the warm daemon, the hooks |
 | I have a laptop and a desktop | Sync: one machine is the authority, the other holds a replica | The capture inbox, unless a phone or web client writes to the replica |
 | I want to reach my memory from a phone or the web | A remote server plus the capture inbox | Nothing else changes on your workstation |
-| I have very little RAM | The hooks, but leave out `--with-daemon` and do not install an embedding model | Both resident processes. They are separate, and the repo states about 650 MB for each |
+| I have very little RAM | The hooks, but leave out `--with-daemon` and do not install an embedding model | Both resident processes. They are separate: the embedding model process is measured at about 650 MB, the injection daemon has never been measured |
 | I am contributing to THOR itself | The evaluation harnesses | Nothing, but be aware two of them write to a live store |
 
 If you only read one line: on the machine where your agent runs, install the
@@ -537,13 +537,13 @@ yourself, and until you do, the semantic layer stays off.
   is the next step, `thor vectors build`: if a file is missing it fails loudly and
   names every file it wanted.
 
-  `thor doctor` prints a line about this, but read it carefully. It only checks
-  that a folder named `model` exists next to the store. It does not look inside,
-  so it prints `semantic model: present` for an empty folder, and it does not
-  know about a folder you pointed at with `--model-dir`:
+  `thor doctor` prints a line about this too. It looks in the same folder recall
+  reads and checks that all five files are there, so an empty folder reads as
+  `absent`, and the line names the folder it looked in. It still does not know
+  about a folder you pointed at with `--model-dir`:
 
   ```text
-  semantic model: present
+  semantic model: present (<folder>)
   ```
 
 - **How to turn it off again:** delete the model folder. Recall silently returns
@@ -672,7 +672,8 @@ so it is not what you want in a hook or a script.
 - **What it costs:**
   - Memory: the repo states about 650 MB for the resident model, both in the README
     and in the source. If you also run the injection daemon described elsewhere in
-    this guide, note these are two separate processes, each stated at about 650 MB.
+    this guide, note these are two separate processes. The 650 MB above is this one,
+  the embedder; the injection daemon's own footprint has never been measured.
   - A second long-lived process. It is started detached, with its input and output
     disconnected, so it outlives the session that started it. It stops by itself
     after 20 minutes with no request, and removes its port file on the way out.
@@ -906,7 +907,7 @@ Starts one long-lived local web server that holds THOR's read state in memory an
 - **What it costs:**
   - One extra process, running until you stop it or reboot.
   - One open TCP port on the loopback interface, `127.0.0.1:8765` by default. Loopback means only programs on this same machine can reach it. This matters more than it first looks: `thor daemon` is not an inject-only server. It is exactly the same server as `thor mcp --http`, so the full MCP tool surface, including the tools that write to your memory, is mounted at `/mcp` on that same port, and the port carries no authentication of its own. Anything that can open a socket on your machine can read and write your store through it. Never bind it beyond loopback. If you do, the daemon prints a warning at startup and keeps running.
-  - Memory. README and SETUP both put the resident cost at about 650 MB. Be careful with that number: the only place the repo says 650 MB was actually measured is about a different process, the embedding-model daemon. The repo states no measurement of this daemon's own memory use, so treat 650 MB as an order-of-magnitude expectation and read the real figure off your own task manager once it is up.
+  - Memory. README and SETUP both put the resident cost at a few hundred MB, and both say plainly that the repo has never measured this process. Be careful with any 650 MB figure you meet: the only place the repo says 650 MB was actually measured is about a different process, the embedding-model daemon. Read the real figure off your own task manager once it is up.
   - A worst case when the daemon is alive but stuck. The courier waits at most 450 ms for an answer, then spends up to another 150 ms checking whether the daemon is really dead, then does the cold path anyway. How often you pay that depends on what the check finds. If the daemon does not answer the check either, the discovery file is deleted and every later prompt goes straight to the cold path, so you pay it once. If it does answer, which is what a daemon that is alive but still building its resident state does, the discovery file is kept on purpose, and a prompt sent while it is still busy can pay the same wait again. A daemon that is simply gone costs almost nothing here: the connection is refused immediately.
   - It holds the `thor` binary open. To install a new THOR build you have to stop and restart the daemon.
   - No download, no extra dependency, no larger binary.
@@ -1180,10 +1181,10 @@ text is the same either way.
   - A listening port on the loopback interface, by default `127.0.0.1:8765`. It is not a
     recall-only endpoint: the same server mounts THOR's full tool surface, so anything that
     can reach that port can read and write your memory. Keep it on loopback.
-  - RAM: the repo states no measurement for this daemon. SETUP.md quotes about 650 MB, but
-    the only place the repo says that figure was measured is the separate embedding-model
-    process, so do not read it as this daemon's cost. Budget for it being significant and
-    check `thor doctor` on your own machine.
+  - RAM: the repo states no measurement for this daemon. The one measured 650 MB
+    figure in the tree belongs to the separate embedding-model process, so do not
+    read it as this daemon's cost. Budget for it being significant and read the real
+    number off your own task manager once it is up.
 - **How to turn it on:**
   ```sh
   thor install --with-daemon
@@ -1797,7 +1798,7 @@ missing. It is the "is anything obviously wrong" command.
 
   ```
   store: OK (12345 events at <store path>)
-  semantic model: present
+  semantic model: present (<model folder>)
   vectors sidecar: present
   symbols sidecar: absent (run `thor symbols`; where_used/impact and the symbol recall bonus stay off)
   injection daemon: COLD (hook falls back to the in-process path; run `thor daemon` or install with --with-daemon to warm it)
@@ -1827,10 +1828,10 @@ tells you whether it still adds up.
   large store this is a full scan for every run.
 - **What it costs:** no extra process, no port, no download, no change in binary
   size. Per run: one full pass over the log, plus a second full derivation of
-  the current set of facts. It appends nothing to the log. It does open the
-  store read-write, like every other command, so the same one-off search-index
-  rebuild described under `thor doctor` can happen here too. The repo states no
-  timing measurement.
+  the current set of facts. It appends nothing to the log, and it opens the store
+  without the schema and search-index work an ordinary command does - which is the
+  point: otherwise it would repair the search index during its own open and then
+  report that index as healthy. The repo states no timing measurement.
 - **How to turn it on:**
 
   ```sh
@@ -1942,8 +1943,9 @@ is changed unless you add the flag described in the next block.
   says so: "cosine pass skipped: vectors sidecar unavailable - lexical bands
   only"). Without `--apply-dedup` it writes nothing to the hash-chained
   log, though it does read the local ledger sidecar (pins and usage counters),
-  and opening the store can trigger the same one-off search-index repair as any
-  other command. The repo states no timing measurement.
+  and opening the store can trigger the one-off search-index repair that any
+  ordinary command does (`doctor`, `fsck` and `status` are the exceptions - they
+  open without it). The repo states no timing measurement.
 - **Honest limit:** the report is a worklist, not a cleanup. Only duplicate
   twins can ever be acted on mechanically, and only with the flag below.
   Everything else - the decay candidates, the topic clusters - is something you
@@ -2890,11 +2892,16 @@ app, a web connector) can reach it.
     injection. Local hooks discover that flag and send their prompts to this
     HTTP server instead of starting their own. That is intended for the daemon;
     it happens with `thor mcp --http` too.
-  - Recall from an HTTP client is **unscoped by default**. A remote client has
-    no working directory, so THOR cannot tell which project you mean and
-    searches everything unless the call passes an explicit `project`.
-    Correspondingly, a `remember` from a remote client can land in the global
-    tier; `thor review-scope` and `thor reproject` exist to clean that up.
+  - Recall from an HTTP client sees **the global tier only**, and this catches
+    people out. The HTTP server is started with no current project (the local
+    stdio server derives one from the folder it was started in; the HTTP one
+    never does), and a search with no current project keeps global-tier facts
+    and hides every project's facts. So a remote `recall` that finds nothing is
+    usually not an empty memory - it is a search that was never pointed at your
+    project. Pass `project: "<key>"` for one project, or `all_projects: true`
+    to search them all. Correspondingly, a `remember` from a remote client can
+    land in the global tier; `thor review-scope` and `thor reproject` exist to
+    clean that up.
   - If the bind is already held by a healthy THOR daemon on the same store, it
     adopts that process and exits cleanly instead of failing.
 - **How to turn it on:**
@@ -3569,7 +3576,7 @@ An end-to-end comparison rig. In one command it builds the release binary, expor
 - **Default:** never runs. Nothing references it: no hook, no CI workflow, no cargo target, no other document. It is a script you type by hand.
 - **Turn it on if:** you are porting from mimir and want to see, prompt by prompt, what each side surfaces before you commit to the switch.
 - **Leave it off if:** almost always. It assumes Windows PowerShell, Python, a Rust toolchain and a mimir database, and it is a maintainer's rig rather than part of using THOR.
-- **What it costs:** read this one before you run it. The data directory defaults to the ordinary per-user THOR directory, which means the script targets your real store. With `-Reseed` it deletes and rebuilds that store. Without `-Reseed`, the import reconciles into whatever store is already there: an existing memory becomes a revision or a retraction, or is skipped as already present. Always pass `-DataDir <a scratch directory>` if you value what is in your store. Also be aware that mimir's column does not appear at defaults: the path to the mimir executable defaults to a placeholder that cannot exist, so unless you pass `-MimirExe` you only see THOR's side.
+- **What it costs:** read this one before you run it. The data directory defaults to the ordinary per-user THOR directory, which means the script targets your real store. With `-Reseed` it deletes that store (and the marker beside it that would otherwise refuse the import) and rebuilds it from the snapshot. Without `-Reseed`, a store that was ever seeded refuses the import outright and the run simply carries on to the next step, so nothing is merged. Either way, **always pass `-DataDir <a scratch directory>`** if you value what is in your store. Two more things worth knowing before a `-Reseed`: the sidecars next to the store (`thor-ledger.db`, which holds your pins, plus the vectors and symbols sidecars) are not removed, so they end up pointing at events that no longer exist; and mimir's column only appears when the path in `-MimirExe` actually exists - it is existence that decides, not passing the flag, so a wrong path silently gives you THOR's side only.
 - **How to turn it on:**
 
 ```

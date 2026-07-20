@@ -5,18 +5,29 @@
   End to end, non-destructive to mimir:
     1. build the release binary
     2. export the useful mimir content READ-ONLY to a JSONL snapshot
-    3. seed a fresh THOR store from that snapshot
+    3. import that snapshot into the THOR store under -DataDir. With -Reseed the
+       store file and the SEEDED.flag next to it are deleted first, so the import
+       can rebuild from scratch. Without -Reseed an already-seeded store refuses
+       the import outright (`thor import` bails while SEEDED.flag exists), so the
+       snapshot is NOT merged - the run continues to the next steps regardless.
     4. fsck the THOR store (chain + fork + differential auditor)
-    5. run a battery of real prompts through `thor courier` and, when mimir is
-       present, show mimir's recall for the same prompt right next to it.
+    5. run a battery of real prompts through `thor courier` and, when the path in
+       -MimirExe exists, show mimir's recall for the same prompt right next to it.
+       It is existence that decides, not passing the parameter: a -MimirExe that
+       points at the wrong place silently produces no mimir column.
+
+  ALWAYS PASS -DataDir <a scratch folder>. The default is your real per-user store,
+  and with -Reseed that is your live memory being deleted. The sidecars beside it
+  (thor-ledger.db with your pins, thor-vectors.db, thor-symbols.db) are NOT removed
+  by -Reseed, so after one they still point at events that no longer exist.
 
   THOR never opens the live mimir DB; only the read-only Python exporter does.
-  All data (snapshot + store) lives under -DataDir (default %LOCALAPPDATA%\thor),
-  OUTSIDE the repo, so private memories are never committed.
+  All data (snapshot + store) lives under -DataDir, OUTSIDE the repo, so private
+  memories are never committed.
 
 .EXAMPLE
-  pwsh thor/tools/run_sidebyside.ps1
-  pwsh thor/tools/run_sidebyside.ps1 -Reseed -SkipBuild
+  pwsh thor/tools/run_sidebyside.ps1 -DataDir C:\scratch\thor-sbs
+  pwsh thor/tools/run_sidebyside.ps1 -DataDir C:\scratch\thor-sbs -Reseed -SkipBuild
 #>
 [CmdletBinding()]
 param(
@@ -66,10 +77,15 @@ Section "export mimir (read-only) -> snapshot"
 if (-not (Test-Path $MimirDb)) { throw "mimir DB not found: $MimirDb" }
 python (Join-Path $repo 'tools\export_mimir.py') --mimir-db $MimirDb --out $snap
 
-# 3. seed a fresh THOR store
+# 3. seed the THOR store under -DataDir (a fresh one only with -Reseed)
 Section "seed THOR store"
 if ($Reseed) {
-  Remove-Item -Force -ErrorAction SilentlyContinue $store, "$store-wal", "$store-shm"
+  # SEEDED.flag has to go with the store file. `thor import` checks the FLAG, not
+  # the store (importer::refuse_when_seeded runs before the store is even opened),
+  # so deleting only the db left -Reseed destroying the store and then being
+  # refused the import that was supposed to rebuild it.
+  Remove-Item -Force -ErrorAction SilentlyContinue `
+    $store, "$store-wal", "$store-shm", (Join-Path $DataDir 'SEEDED.flag')
 }
 & $thorEx --db $store import $snap
 

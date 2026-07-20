@@ -167,9 +167,14 @@ Not sure what to switch on? **[OPTIONAL-FEATURES.md](OPTIONAL-FEATURES.md)** goe
 through every optional piece one by one: what it buys you, what it costs, when to
 leave it alone, and how to undo it.
 
+The flags combine; the Stop response guard is installed whatever flags you pass.
+
 ```sh
-thor install --with-courier          # auto-recall + SessionStart warm + project refresh/onboarding
-thor install --with-guard            # + the moment-of-action guard
+thor install                                             # the Stop response guard only
+thor install --with-courier                              # + auto-recall, SessionStart warm, project refresh/onboarding, the pre-compact nudge
+thor install --with-guard                                # + the moment-of-action guard
+thor install --with-daemon                               # + the warm injection daemon (recommended, see below)
+thor install --with-courier --with-guard --with-daemon   # the full setup on the machine your agent works on
 ```
 
 Use it:
@@ -211,10 +216,14 @@ thor backfill-projects          # attribute legacy memories from their import fo
 - Chunk ids are `<project>:<path>#<n>`; scoped memories `<project>:mem-<uuid>`; global
   facts are unprefixed or under `@global:`. Recall (courier, CLI, MCP) scopes to the
   current project + the global tier by default.
-- Wire `thor session-start` into your `SessionStart` hook: it refreshes a known project
-  in the background, and for a new project it asks the agent to offer setup rather than
-  indexing silently. Mis-scoped a fact? `thor reproject` moves it (it travels as an event,
-  so a replica agrees after sync).
+- `thor install --with-courier` wires `thor session-start` into your `SessionStart`
+  hook. No other flag installs that particular entry, so without `--with-courier` you
+  add it by hand (other flags do write their own SessionStart entries - `--with-daemon`
+  and `--backup-repo` - they just do not write this one). It refreshes a known project
+  in the background, and for a **git** project you have not set up yet it asks the
+  agent to offer setup rather than indexing silently; a plain non-git folder gets no
+  cue and no index. Mis-scoped a fact? `thor reproject` moves it (it travels as an
+  event, so a replica agrees after sync).
 
 ## Semantic recall (recommended on a client)
 
@@ -301,9 +310,10 @@ thor ship --to http://<replica>:5555 --token <shared-token> --watch
 thor status --to http://<replica>:5555 --token <shared-token>
 ```
 
-Keep the authority's `thor.db` on a **local disk** - it is never opened over a
-network share (SQLite WAL requires real shared memory). Other machines get a
-replica via ship/recv, never a shared network file.
+Keep the authority's `thor.db` on a **local disk**. SQLite WAL requires real
+shared memory, so on Windows `thor` refuses to open a store over a UNC path; on
+Linux and macOS there is no such check, so avoiding an NFS or SMB mount is up to
+you. Other machines get a replica via ship/recv, never a shared network file.
 
 ## Deploy as a remote MCP server
 

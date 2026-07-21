@@ -12,7 +12,14 @@ FG = "#e6edf3"
 MUT = "#8b949e"
 SOFT = "#c9d1d9"
 PX_PER_PCT = 3.3
-BAR_X = 196
+# Bars start far enough right that a row label has real room. At 196 the labels
+# ran straight through the THOR/mimir tags - the old width guard only checked the
+# right-hand canvas edge and was blind to a collision on the left.
+BAR_X = 268
+TAG_X = 256          # right edge of the THOR / mimir tag
+LABEL_X = 20
+LABEL_FS = 13
+CHAR_W = 0.58        # rough advance width per character, in em
 
 out = []
 y = 0
@@ -30,19 +37,28 @@ def header(title, sub):
 def pair(label, thor, mimir, delta, delta_color=None, unit="%", scale=PX_PER_PCT,
          thor_tag="THOR", mimir_tag="mimir"):
     global y
+    # A row label sits vertically between the two bars and horizontally to the
+    # left of both tags, so it has to clear the WIDER of the two. Checked here,
+    # per row, because it is the one collision the canvas-edge guard cannot see.
+    label_w = len(label) * CHAR_W * LABEL_FS
+    tag_w = max(len(thor_tag), len(mimir_tag)) * CHAR_W * 10.5
+    assert LABEL_X + label_w + 8 <= TAG_X - tag_w, (
+        f'row label "{label}" ({label_w:.0f}px) runs into the "{thor_tag}"/"{mimir_tag}" '
+        f"tag - shorten it or move BAR_X right"
+    )
     tw = thor * scale
     mw = mimir * scale
     out.append(f'<rect x="{BAR_X}" y="{y}" width="{tw:.1f}" height="14" rx="7" fill="{CYAN}"/>')
     out.append(f'<text x="{BAR_X + tw + 7:.2f}" y="{y + 11.5}" fill="{FG}" font-size="11.5" font-weight="700">{round(thor)}{unit}</text>')
-    out.append(f'<text x="184" y="{y + 11.5}" fill="{CYAN}" font-size="10.5" font-weight="700" text-anchor="end">{esc(thor_tag)}</text>')
+    out.append(f'<text x="{TAG_X}" y="{y + 11.5}" fill="{CYAN}" font-size="10.5" font-weight="700" text-anchor="end">{esc(thor_tag)}</text>')
     label_y = y + 22
-    out.append(f'<text x="20" y="{label_y}" fill="{FG}" font-size="13" font-weight="700">{esc(label)}</text>')
+    out.append(f'<text x="{LABEL_X}" y="{label_y}" fill="{FG}" font-size="{LABEL_FS}" font-weight="700">{esc(label)}</text>')
     color = delta_color or (CYAN if not delta.startswith("-") else AMBER)
     out.append(f'<text x="838" y="{label_y + 1}" fill="{color}" font-size="15" font-weight="800" text-anchor="end">{esc(delta)}</text>')
     y += 20
     out.append(f'<rect x="{BAR_X}" y="{y}" width="{mw:.1f}" height="14" rx="7" fill="{GREY}"/>')
     out.append(f'<text x="{BAR_X + mw + 7:.2f}" y="{y + 11.5}" fill="{MUT}" font-size="11.5">{round(mimir)}{unit}</text>')
-    out.append(f'<text x="184" y="{y + 11.5}" fill="{MUT}" font-size="10.5" text-anchor="end">{esc(mimir_tag)}</text>')
+    out.append(f'<text x="{TAG_X}" y="{y + 11.5}" fill="{MUT}" font-size="10.5" text-anchor="end">{esc(mimir_tag)}</text>')
     y += 30
 
 def rule():
@@ -110,10 +126,8 @@ y += 14
 
 # ---- drift ----
 header("SESSION DRIFT  (73 fresh-session scenarios)", "post-compaction, empty context: does memory surface the fact that stops the drift? silence scores zero")
-pair("Preventer surfaced vs mimir's BEST channel", 67.1, 74.0, "-7%",
-     mimir_tag="recall --all")
-pair("Preventer surfaced vs mimir's HOOK", 67.1, 37.0, "+30%",
-     mimir_tag="recall-inject")
+pair("Vs mimir at its best", 67.1, 74.0, "-7%", mimir_tag="mimir full")
+pair("Vs mimir's auto hook", 67.1, 37.0, "+30%", mimir_tag="mimir hook")
 note("Both gaps ARE significant (p 0.043 against the best channel, p <0.0001 against the hook) and they point opposite ways.", color=SOFT)
 note("The comparison splits in two and both halves are real. On CAPABILITY mimir wins: its full recall beats THOR's courier", color=SOFT)
 note("(21 wins to 9) and ties THOR's deliberate channel at 72.6%. On WHAT RUNS UNASKED THOR wins 37 to 6: mimir's hook", color=SOFT)
@@ -123,8 +137,8 @@ y += 14
 
 # ---- speed ----
 header("SPEED  (per-prompt cost, lower is better)", "as-deployed, correct invocation each side (THOR stdin hook, mimir prompt arg) . median of 20, warm-up discarded")
-pair("Automatic channel vs mimir's full recall", 125, 334, "2.7x faster",
-     delta_color=CYAN, unit=" ms", scale=330 / 334, mimir_tag="recall --all")
+pair("Cost per prompt", 125, 334, "2.7x faster",
+     delta_color=CYAN, unit=" ms", scale=330 / 334, mimir_tag="mimir full")
 note("THOR's courier answers EVERY prompt in 125 ms - 0 of 20 empty. mimir's hook is three times faster at 41 ms but", color=SOFT)
 note("returns nothing on 6 of 20: it is fast because it often serves nothing. The mimir channel that WINS the drift test", color=SOFT)
 note("costs 334 ms and is not a hook. That trade - always-on and adequate, versus on-demand and better - is the whole", color=SOFT)

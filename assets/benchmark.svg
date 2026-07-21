@@ -4,54 +4,54 @@
 <text x="20" y="54" fill="#8b949e" font-size="12">Same machine, blind-judged, re-measured fresh 2026-07-21 vs mimir v0.15.0. Sign test on per-question wins.</text>
 <text x="20" y="84" fill="#c9d1d9" font-size="12.5" font-weight="700" letter-spacing="0.4">TEST 1 - COVERAGE  (200 questions: shared-knowledge + category-stratified)</text>
 <text x="20" y="100" fill="#8b949e" font-size="11">deliberate recall over the live store . higher is better . only ONE gap here is statistically real</text>
-<rect x="196" y="110" width="272.2" height="14" rx="7" fill="#22d3ee"/>
-<text x="475.25" y="121.5" fill="#e6edf3" font-size="11.5" font-weight="700">82%</text>
-<text x="184" y="121.5" fill="#22d3ee" font-size="10.5" font-weight="700" text-anchor="end">THOR</text>
+<rect x="268" y="110" width="272.2" height="14" rx="7" fill="#22d3ee"/>
+<text x="547.25" y="121.5" fill="#e6edf3" font-size="11.5" font-weight="700">82%</text>
+<text x="256" y="121.5" fill="#22d3ee" font-size="10.5" font-weight="700" text-anchor="end">THOR</text>
 <text x="20" y="132" fill="#e6edf3" font-size="13" font-weight="700">Doc reference</text>
 <text x="838" y="133" fill="#22d3ee" font-size="15" font-weight="800" text-anchor="end">+14%</text>
-<rect x="196" y="130" width="227.0" height="14" rx="7" fill="#484f58"/>
-<text x="430.04" y="141.5" fill="#8b949e" font-size="11.5">69%</text>
-<text x="184" y="141.5" fill="#8b949e" font-size="10.5" text-anchor="end">mimir</text>
-<rect x="196" y="160" width="250.5" height="14" rx="7" fill="#22d3ee"/>
-<text x="453.47" y="171.5" fill="#e6edf3" font-size="11.5" font-weight="700">76%</text>
-<text x="184" y="171.5" fill="#22d3ee" font-size="10.5" font-weight="700" text-anchor="end">THOR</text>
+<rect x="268" y="130" width="227.0" height="14" rx="7" fill="#484f58"/>
+<text x="502.04" y="141.5" fill="#8b949e" font-size="11.5">69%</text>
+<text x="256" y="141.5" fill="#8b949e" font-size="10.5" text-anchor="end">mimir</text>
+<rect x="268" y="160" width="250.5" height="14" rx="7" fill="#22d3ee"/>
+<text x="525.47" y="171.5" fill="#e6edf3" font-size="11.5" font-weight="700">76%</text>
+<text x="256" y="171.5" fill="#22d3ee" font-size="10.5" font-weight="700" text-anchor="end">THOR</text>
 <text x="20" y="182" fill="#e6edf3" font-size="13" font-weight="700">Decision</text>
 <text x="838" y="183" fill="#22d3ee" font-size="15" font-weight="800" text-anchor="end">+7%</text>
-<rect x="196" y="180" width="226.0" height="14" rx="7" fill="#484f58"/>
-<text x="429.05" y="191.5" fill="#8b949e" font-size="11.5">68%</text>
-<text x="184" y="191.5" fill="#8b949e" font-size="10.5" text-anchor="end">mimir</text>
-<rect x="196" y="210" width="271.9" height="14" rx="7" fill="#22d3ee"/>
-<text x="474.92" y="221.5" fill="#e6edf3" font-size="11.5" font-weight="700">82%</text>
-<text x="184" y="221.5" fill="#22d3ee" font-size="10.5" font-weight="700" text-anchor="end">THOR</text>
+<rect x="268" y="180" width="226.0" height="14" rx="7" fill="#484f58"/>
+<text x="501.05" y="191.5" fill="#8b949e" font-size="11.5">68%</text>
+<text x="256" y="191.5" fill="#8b949e" font-size="10.5" text-anchor="end">mimir</text>
+<rect x="268" y="210" width="271.9" height="14" rx="7" fill="#22d3ee"/>
+<text x="546.92" y="221.5" fill="#e6edf3" font-size="11.5" font-weight="700">82%</text>
+<text x="256" y="221.5" fill="#22d3ee" font-size="10.5" font-weight="700" text-anchor="end">THOR</text>
 <text x="20" y="232" fill="#e6edf3" font-size="13" font-weight="700">Config how-to</text>
 <text x="838" y="233" fill="#c9d1d9" font-size="15" font-weight="800" text-anchor="end">tie</text>
-<rect x="196" y="230" width="271.9" height="14" rx="7" fill="#484f58"/>
-<text x="474.92" y="241.5" fill="#8b949e" font-size="11.5">82%</text>
-<text x="184" y="241.5" fill="#8b949e" font-size="10.5" text-anchor="end">mimir</text>
-<rect x="196" y="260" width="233.6" height="14" rx="7" fill="#22d3ee"/>
-<text x="436.64" y="271.5" fill="#e6edf3" font-size="11.5" font-weight="700">71%</text>
-<text x="184" y="271.5" fill="#22d3ee" font-size="10.5" font-weight="700" text-anchor="end">THOR</text>
+<rect x="268" y="230" width="271.9" height="14" rx="7" fill="#484f58"/>
+<text x="546.92" y="241.5" fill="#8b949e" font-size="11.5">82%</text>
+<text x="256" y="241.5" fill="#8b949e" font-size="10.5" text-anchor="end">mimir</text>
+<rect x="268" y="260" width="233.6" height="14" rx="7" fill="#22d3ee"/>
+<text x="508.64" y="271.5" fill="#e6edf3" font-size="11.5" font-weight="700">71%</text>
+<text x="256" y="271.5" fill="#22d3ee" font-size="10.5" font-weight="700" text-anchor="end">THOR</text>
 <text x="20" y="282" fill="#e6edf3" font-size="13" font-weight="700">Code behavior</text>
 <text x="838" y="283" fill="#c9d1d9" font-size="15" font-weight="800" text-anchor="end">tie</text>
-<rect x="196" y="280" width="233.6" height="14" rx="7" fill="#484f58"/>
-<text x="436.64" y="291.5" fill="#8b949e" font-size="11.5">71%</text>
-<text x="184" y="291.5" fill="#8b949e" font-size="10.5" text-anchor="end">mimir</text>
-<rect x="196" y="310" width="251.1" height="14" rx="7" fill="#22d3ee"/>
-<text x="454.13" y="321.5" fill="#e6edf3" font-size="11.5" font-weight="700">76%</text>
-<text x="184" y="321.5" fill="#22d3ee" font-size="10.5" font-weight="700" text-anchor="end">THOR</text>
+<rect x="268" y="280" width="233.6" height="14" rx="7" fill="#484f58"/>
+<text x="508.64" y="291.5" fill="#8b949e" font-size="11.5">71%</text>
+<text x="256" y="291.5" fill="#8b949e" font-size="10.5" text-anchor="end">mimir</text>
+<rect x="268" y="310" width="251.1" height="14" rx="7" fill="#22d3ee"/>
+<text x="526.13" y="321.5" fill="#e6edf3" font-size="11.5" font-weight="700">76%</text>
+<text x="256" y="321.5" fill="#22d3ee" font-size="10.5" font-weight="700" text-anchor="end">THOR</text>
 <text x="20" y="332" fill="#e6edf3" font-size="13" font-weight="700">Gotcha</text>
 <text x="838" y="333" fill="#e3b341" font-size="15" font-weight="800" text-anchor="end">-2%</text>
-<rect x="196" y="330" width="258.4" height="14" rx="7" fill="#484f58"/>
-<text x="461.39" y="341.5" fill="#8b949e" font-size="11.5">78%</text>
-<text x="184" y="341.5" fill="#8b949e" font-size="10.5" text-anchor="end">mimir</text>
-<rect x="196" y="360" width="190.1" height="14" rx="7" fill="#22d3ee"/>
-<text x="393.08" y="371.5" fill="#e6edf3" font-size="11.5" font-weight="700">58%</text>
-<text x="184" y="371.5" fill="#22d3ee" font-size="10.5" font-weight="700" text-anchor="end">THOR</text>
+<rect x="268" y="330" width="258.4" height="14" rx="7" fill="#484f58"/>
+<text x="533.39" y="341.5" fill="#8b949e" font-size="11.5">78%</text>
+<text x="256" y="341.5" fill="#8b949e" font-size="10.5" text-anchor="end">mimir</text>
+<rect x="268" y="360" width="190.1" height="14" rx="7" fill="#22d3ee"/>
+<text x="465.08" y="371.5" fill="#e6edf3" font-size="11.5" font-weight="700">58%</text>
+<text x="256" y="371.5" fill="#22d3ee" font-size="10.5" font-weight="700" text-anchor="end">THOR</text>
 <text x="20" y="382" fill="#e6edf3" font-size="13" font-weight="700">Code structure</text>
 <text x="838" y="383" fill="#e3b341" font-size="15" font-weight="800" text-anchor="end">-17%</text>
-<rect x="196" y="380" width="244.9" height="14" rx="7" fill="#484f58"/>
-<text x="447.86" y="391.5" fill="#8b949e" font-size="11.5">74%</text>
-<text x="184" y="391.5" fill="#8b949e" font-size="10.5" text-anchor="end">mimir</text>
+<rect x="268" y="380" width="244.9" height="14" rx="7" fill="#484f58"/>
+<text x="519.86" y="391.5" fill="#8b949e" font-size="11.5">74%</text>
+<text x="256" y="391.5" fill="#8b949e" font-size="10.5" text-anchor="end">mimir</text>
 <line x1="20" y1="410" x2="840" y2="410" stroke="#21262d" stroke-width="1"/>
 <text x="20" y="428" fill="#e6edf3" font-size="13" font-weight="700">Test 1 overall  <tspan fill="#22d3ee">THOR 73.2%</tspan> vs <tspan fill="#8b949e">mimir 72.5%</tspan>  (n=200) - a TIE: 33 wins to 34, p = 1.00</text>
 <text x="20" y="444" fill="#8b949e" font-size="11">133 of 200 questions score identically. Only code-structure survives a significance test (p 0.013) and it is mimir's:</text>
@@ -59,72 +59,72 @@
 <text x="20" y="476" fill="#8b949e" font-size="11">(p 0.17 and p 0.45) - read those bars as noise. The previous round published 77.0 vs 70.5 as a lead; retracted.</text>
 <text x="20" y="506" fill="#c9d1d9" font-size="12.5" font-weight="700" letter-spacing="0.4">TEST 2 - SAME KNOWLEDGE  (facts both systems verifiably hold)</text>
 <text x="20" y="522" fill="#8b949e" font-size="11">cuts over the judged Test 1 medians . the equal-corpus comparison</text>
-<rect x="196" y="532" width="311.2" height="14" rx="7" fill="#22d3ee"/>
-<text x="514.19" y="543.5" fill="#e6edf3" font-size="11.5" font-weight="700">94%</text>
-<text x="184" y="543.5" fill="#22d3ee" font-size="10.5" font-weight="700" text-anchor="end">THOR</text>
+<rect x="268" y="532" width="311.2" height="14" rx="7" fill="#22d3ee"/>
+<text x="586.19" y="543.5" fill="#e6edf3" font-size="11.5" font-weight="700">94%</text>
+<text x="256" y="543.5" fill="#22d3ee" font-size="10.5" font-weight="700" text-anchor="end">THOR</text>
 <text x="20" y="554" fill="#e6edf3" font-size="13" font-weight="700">Strict dual-written (n=53)</text>
 <text x="838" y="555" fill="#e3b341" font-size="15" font-weight="800" text-anchor="end">-2%</text>
-<rect x="196" y="552" width="317.5" height="14" rx="7" fill="#484f58"/>
-<text x="520.46" y="563.5" fill="#8b949e" font-size="11.5">96%</text>
-<text x="184" y="563.5" fill="#8b949e" font-size="10.5" text-anchor="end">mimir</text>
-<rect x="196" y="582" width="268.0" height="14" rx="7" fill="#22d3ee"/>
-<text x="470.96" y="593.5" fill="#e6edf3" font-size="11.5" font-weight="700">81%</text>
-<text x="184" y="593.5" fill="#22d3ee" font-size="10.5" font-weight="700" text-anchor="end">THOR</text>
+<rect x="268" y="552" width="317.5" height="14" rx="7" fill="#484f58"/>
+<text x="592.46" y="563.5" fill="#8b949e" font-size="11.5">96%</text>
+<text x="256" y="563.5" fill="#8b949e" font-size="10.5" text-anchor="end">mimir</text>
+<rect x="268" y="582" width="268.0" height="14" rx="7" fill="#22d3ee"/>
+<text x="542.96" y="593.5" fill="#e6edf3" font-size="11.5" font-weight="700">81%</text>
+<text x="256" y="593.5" fill="#22d3ee" font-size="10.5" font-weight="700" text-anchor="end">THOR</text>
 <text x="20" y="604" fill="#e6edf3" font-size="13" font-weight="700">Broad shared (n=152)</text>
 <text x="838" y="605" fill="#e3b341" font-size="15" font-weight="800" text-anchor="end">-3%</text>
-<rect x="196" y="602" width="276.9" height="14" rx="7" fill="#484f58"/>
-<text x="479.87" y="613.5" fill="#8b949e" font-size="11.5">84%</text>
-<text x="184" y="613.5" fill="#8b949e" font-size="10.5" text-anchor="end">mimir</text>
+<rect x="268" y="602" width="276.9" height="14" rx="7" fill="#484f58"/>
+<text x="551.87" y="613.5" fill="#8b949e" font-size="11.5">84%</text>
+<text x="256" y="613.5" fill="#8b949e" font-size="10.5" text-anchor="end">mimir</text>
 <text x="20" y="632" fill="#c9d1d9" font-size="11">Both are ties with mimir nominally ahead (p 0.73 and p 0.39). The previous round published 97.2 vs 94.3 and 88.8 vs</text>
 <text x="20" y="648" fill="#c9d1d9" font-size="11">86.2 and claimed THOR won both cuts - retracted. Pure ranking over an equal corpus is not a THOR advantage.</text>
 <text x="20" y="678" fill="#c9d1d9" font-size="12.5" font-weight="700" letter-spacing="0.4">TEST 3 - MULTI-PROJECT  (three private project repos)</text>
 <text x="20" y="694" fill="#8b949e" font-size="11">45 questions written from each repo itself, scoped per project, top-5 full chunks, blind-judged</text>
-<rect x="196" y="704" width="307.9" height="14" rx="7" fill="#22d3ee"/>
-<text x="510.89" y="715.5" fill="#e6edf3" font-size="11.5" font-weight="700">93%</text>
-<text x="184" y="715.5" fill="#22d3ee" font-size="10.5" font-weight="700" text-anchor="end">THOR</text>
+<rect x="268" y="704" width="307.9" height="14" rx="7" fill="#22d3ee"/>
+<text x="582.89" y="715.5" fill="#e6edf3" font-size="11.5" font-weight="700">93%</text>
+<text x="256" y="715.5" fill="#22d3ee" font-size="10.5" font-weight="700" text-anchor="end">THOR</text>
 <text x="20" y="726" fill="#e6edf3" font-size="13" font-weight="700">Project 1</text>
 <text x="838" y="727" fill="#c9d1d9" font-size="15" font-weight="800" text-anchor="end">tie</text>
-<rect x="196" y="724" width="307.9" height="14" rx="7" fill="#484f58"/>
-<text x="510.89" y="735.5" fill="#8b949e" font-size="11.5">93%</text>
-<text x="184" y="735.5" fill="#8b949e" font-size="10.5" text-anchor="end">mimir</text>
-<rect x="196" y="754" width="286.1" height="14" rx="7" fill="#22d3ee"/>
-<text x="489.11" y="765.5" fill="#e6edf3" font-size="11.5" font-weight="700">87%</text>
-<text x="184" y="765.5" fill="#22d3ee" font-size="10.5" font-weight="700" text-anchor="end">THOR</text>
+<rect x="268" y="724" width="307.9" height="14" rx="7" fill="#484f58"/>
+<text x="582.89" y="735.5" fill="#8b949e" font-size="11.5">93%</text>
+<text x="256" y="735.5" fill="#8b949e" font-size="10.5" text-anchor="end">mimir</text>
+<rect x="268" y="754" width="286.1" height="14" rx="7" fill="#22d3ee"/>
+<text x="561.11" y="765.5" fill="#e6edf3" font-size="11.5" font-weight="700">87%</text>
+<text x="256" y="765.5" fill="#22d3ee" font-size="10.5" font-weight="700" text-anchor="end">THOR</text>
 <text x="20" y="776" fill="#e6edf3" font-size="13" font-weight="700">Project 2</text>
 <text x="838" y="777" fill="#e3b341" font-size="15" font-weight="800" text-anchor="end">-7%</text>
-<rect x="196" y="774" width="307.9" height="14" rx="7" fill="#484f58"/>
-<text x="510.89" y="785.5" fill="#8b949e" font-size="11.5">93%</text>
-<text x="184" y="785.5" fill="#8b949e" font-size="10.5" text-anchor="end">mimir</text>
-<rect x="196" y="804" width="274.9" height="14" rx="7" fill="#22d3ee"/>
-<text x="477.89" y="815.5" fill="#e6edf3" font-size="11.5" font-weight="700">83%</text>
-<text x="184" y="815.5" fill="#22d3ee" font-size="10.5" font-weight="700" text-anchor="end">THOR</text>
+<rect x="268" y="774" width="307.9" height="14" rx="7" fill="#484f58"/>
+<text x="582.89" y="785.5" fill="#8b949e" font-size="11.5">93%</text>
+<text x="256" y="785.5" fill="#8b949e" font-size="10.5" text-anchor="end">mimir</text>
+<rect x="268" y="804" width="274.9" height="14" rx="7" fill="#22d3ee"/>
+<text x="549.89" y="815.5" fill="#e6edf3" font-size="11.5" font-weight="700">83%</text>
+<text x="256" y="815.5" fill="#22d3ee" font-size="10.5" font-weight="700" text-anchor="end">THOR</text>
 <text x="20" y="826" fill="#e6edf3" font-size="13" font-weight="700">Project 3</text>
 <text x="838" y="827" fill="#e3b341" font-size="15" font-weight="800" text-anchor="end">-13%</text>
-<rect x="196" y="824" width="319.1" height="14" rx="7" fill="#484f58"/>
-<text x="522.11" y="835.5" fill="#8b949e" font-size="11.5">97%</text>
-<text x="184" y="835.5" fill="#8b949e" font-size="10.5" text-anchor="end">mimir</text>
+<rect x="268" y="824" width="319.1" height="14" rx="7" fill="#484f58"/>
+<text x="594.11" y="835.5" fill="#8b949e" font-size="11.5">97%</text>
+<text x="256" y="835.5" fill="#8b949e" font-size="10.5" text-anchor="end">mimir</text>
 <line x1="20" y1="854" x2="840" y2="854" stroke="#21262d" stroke-width="1"/>
 <text x="20" y="872" fill="#e6edf3" font-size="13" font-weight="700">Test 3 overall  <tspan fill="#22d3ee">THOR 87.8%</tspan> vs <tspan fill="#8b949e">mimir 94.4%</tspan>  (n=45) - mimir ahead, p = 0.11, not significant</text>
 <text x="20" y="888" fill="#8b949e" font-size="11">One question moves a 15-question project by 6.7 points, so read the split as noisy. The previous round published</text>
 <text x="20" y="904" fill="#8b949e" font-size="11">96.7 vs 95.6 in THOR's favour - also retracted.</text>
 <text x="20" y="934" fill="#c9d1d9" font-size="12.5" font-weight="700" letter-spacing="0.4">SESSION DRIFT  (73 fresh-session scenarios)</text>
 <text x="20" y="950" fill="#8b949e" font-size="11">post-compaction, empty context: does memory surface the fact that stops the drift? silence scores zero</text>
-<rect x="196" y="960" width="221.4" height="14" rx="7" fill="#22d3ee"/>
-<text x="424.43" y="971.5" fill="#e6edf3" font-size="11.5" font-weight="700">67%</text>
-<text x="184" y="971.5" fill="#22d3ee" font-size="10.5" font-weight="700" text-anchor="end">THOR</text>
-<text x="20" y="982" fill="#e6edf3" font-size="13" font-weight="700">Preventer surfaced vs mimir's BEST channel</text>
+<rect x="268" y="960" width="221.4" height="14" rx="7" fill="#22d3ee"/>
+<text x="496.43" y="971.5" fill="#e6edf3" font-size="11.5" font-weight="700">67%</text>
+<text x="256" y="971.5" fill="#22d3ee" font-size="10.5" font-weight="700" text-anchor="end">THOR</text>
+<text x="20" y="982" fill="#e6edf3" font-size="13" font-weight="700">Vs mimir at its best</text>
 <text x="838" y="983" fill="#e3b341" font-size="15" font-weight="800" text-anchor="end">-7%</text>
-<rect x="196" y="980" width="244.2" height="14" rx="7" fill="#484f58"/>
-<text x="447.20" y="991.5" fill="#8b949e" font-size="11.5">74%</text>
-<text x="184" y="991.5" fill="#8b949e" font-size="10.5" text-anchor="end">recall --all</text>
-<rect x="196" y="1010" width="221.4" height="14" rx="7" fill="#22d3ee"/>
-<text x="424.43" y="1021.5" fill="#e6edf3" font-size="11.5" font-weight="700">67%</text>
-<text x="184" y="1021.5" fill="#22d3ee" font-size="10.5" font-weight="700" text-anchor="end">THOR</text>
-<text x="20" y="1032" fill="#e6edf3" font-size="13" font-weight="700">Preventer surfaced vs mimir's HOOK</text>
+<rect x="268" y="980" width="244.2" height="14" rx="7" fill="#484f58"/>
+<text x="519.20" y="991.5" fill="#8b949e" font-size="11.5">74%</text>
+<text x="256" y="991.5" fill="#8b949e" font-size="10.5" text-anchor="end">mimir full</text>
+<rect x="268" y="1010" width="221.4" height="14" rx="7" fill="#22d3ee"/>
+<text x="496.43" y="1021.5" fill="#e6edf3" font-size="11.5" font-weight="700">67%</text>
+<text x="256" y="1021.5" fill="#22d3ee" font-size="10.5" font-weight="700" text-anchor="end">THOR</text>
+<text x="20" y="1032" fill="#e6edf3" font-size="13" font-weight="700">Vs mimir's auto hook</text>
 <text x="838" y="1033" fill="#22d3ee" font-size="15" font-weight="800" text-anchor="end">+30%</text>
-<rect x="196" y="1030" width="122.1" height="14" rx="7" fill="#484f58"/>
-<text x="325.10" y="1041.5" fill="#8b949e" font-size="11.5">37%</text>
-<text x="184" y="1041.5" fill="#8b949e" font-size="10.5" text-anchor="end">recall-inject</text>
+<rect x="268" y="1030" width="122.1" height="14" rx="7" fill="#484f58"/>
+<text x="397.10" y="1041.5" fill="#8b949e" font-size="11.5">37%</text>
+<text x="256" y="1041.5" fill="#8b949e" font-size="10.5" text-anchor="end">mimir hook</text>
 <text x="20" y="1060" fill="#c9d1d9" font-size="11">Both gaps ARE significant (p 0.043 against the best channel, p <0.0001 against the hook) and they point opposite ways.</text>
 <text x="20" y="1076" fill="#c9d1d9" font-size="11">The comparison splits in two and both halves are real. On CAPABILITY mimir wins: its full recall beats THOR's courier</text>
 <text x="20" y="1092" fill="#c9d1d9" font-size="11">(21 wins to 9) and ties THOR's deliberate channel at 72.6%. On WHAT RUNS UNASKED THOR wins 37 to 6: mimir's hook</text>
@@ -132,14 +132,14 @@
 <text x="20" y="1124" fill="#c9d1d9" font-size="11">Separately reproducible in-repo, no judge needed: cargo run --example drift_eval (catches AND false fires).</text>
 <text x="20" y="1154" fill="#c9d1d9" font-size="12.5" font-weight="700" letter-spacing="0.4">SPEED  (per-prompt cost, lower is better)</text>
 <text x="20" y="1170" fill="#8b949e" font-size="11">as-deployed, correct invocation each side (THOR stdin hook, mimir prompt arg) . median of 20, warm-up discarded</text>
-<rect x="196" y="1180" width="123.5" height="14" rx="7" fill="#22d3ee"/>
-<text x="326.50" y="1191.5" fill="#e6edf3" font-size="11.5" font-weight="700">125 ms</text>
-<text x="184" y="1191.5" fill="#22d3ee" font-size="10.5" font-weight="700" text-anchor="end">THOR</text>
-<text x="20" y="1202" fill="#e6edf3" font-size="13" font-weight="700">Automatic channel vs mimir's full recall</text>
+<rect x="268" y="1180" width="123.5" height="14" rx="7" fill="#22d3ee"/>
+<text x="398.50" y="1191.5" fill="#e6edf3" font-size="11.5" font-weight="700">125 ms</text>
+<text x="256" y="1191.5" fill="#22d3ee" font-size="10.5" font-weight="700" text-anchor="end">THOR</text>
+<text x="20" y="1202" fill="#e6edf3" font-size="13" font-weight="700">Cost per prompt</text>
 <text x="838" y="1203" fill="#22d3ee" font-size="15" font-weight="800" text-anchor="end">2.7x faster</text>
-<rect x="196" y="1200" width="330.0" height="14" rx="7" fill="#484f58"/>
-<text x="533.00" y="1211.5" fill="#8b949e" font-size="11.5">334 ms</text>
-<text x="184" y="1211.5" fill="#8b949e" font-size="10.5" text-anchor="end">recall --all</text>
+<rect x="268" y="1200" width="330.0" height="14" rx="7" fill="#484f58"/>
+<text x="605.00" y="1211.5" fill="#8b949e" font-size="11.5">334 ms</text>
+<text x="256" y="1211.5" fill="#8b949e" font-size="10.5" text-anchor="end">mimir full</text>
 <text x="20" y="1230" fill="#c9d1d9" font-size="11">THOR's courier answers EVERY prompt in 125 ms - 0 of 20 empty. mimir's hook is three times faster at 41 ms but</text>
 <text x="20" y="1246" fill="#c9d1d9" font-size="11">returns nothing on 6 of 20: it is fast because it often serves nothing. The mimir channel that WINS the drift test</text>
 <text x="20" y="1262" fill="#c9d1d9" font-size="11">costs 334 ms and is not a hook. That trade - always-on and adequate, versus on-demand and better - is the whole</text>

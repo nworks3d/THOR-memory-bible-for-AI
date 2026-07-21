@@ -205,6 +205,27 @@ fn try_guard(db: &Path, rulebook: &Path) -> anyhow::Result<()> {
 
 /// How many file-naming memories to surface per (session, file).
 const FILE_MEMORY_HITS: usize = 2;
+
+/// Up to this many PROSE chunks ride along after the memories in the file
+/// advisory. Bounded separately so ingested docs can never crowd a typed
+/// constraint out of its slot. Three, not two: a CHANGELOG names a busy file
+/// in many paragraphs and the one that matters is rarely the bm25 top hit.
+const DOC_CHUNK_HITS: usize = 3;
+
+/// Fair-share char budget for the bodies of one advisory's entries. The fixed
+/// 200-char snippet was the same decisive-details killer the courier's fixed
+/// caps were (measured there: fair-share bought +9.5pp gold-term coverage):
+/// the right CHANGELOG paragraph was served and then truncated past the point
+/// of usefulness. One advisory fires at most once per (session, file), so the
+/// bound is per-moment, not per-prompt.
+const ADVISORY_BUDGET_CHARS: usize = 2400;
+
+/// Per-entry snippet cap: the budget fair-shared over the entries, floored so
+/// a crowded advisory still says something per entry, capped so one entry can
+/// never be a wall of text.
+fn advisory_snippet_cap(entries: usize) -> usize {
+    (ADVISORY_BUDGET_CHARS / entries.max(1)).clamp(200, 1200)
+}
 /// How long a "no memory names this file" answer is cached (seconds). Without
 /// it every tool call on a memory-less file - the overwhelmingly common case -
 /// re-pays a full store open + O(n) recall on the per-tool-call hot path. Short
@@ -318,7 +339,41 @@ fn file_memory_advisory(db: &Path, hook: &Value) -> Option<String> {
         })
         .collect();
     let named = merge_anchored(anchored, heuristic, FILE_MEMORY_HITS);
-    if named.is_empty() {
+
+    // The ingested prose knows files too: a CHANGELOG paragraph or design doc
+    // that NAMES this file documents decisions the agent cannot see in the
+    // file itself. Measured on the live drift corpus (2026-07-22): 32 of 59
+    // preventers are chunks, invisible to a memories-only advisory. A
+    // dedicated doc-chunks-only lane (never a shared pool: raw recall over a
+    // tool call is 8/8 code chunks, measured, so prose would never survive
+    // the crowding). Never a chunk OF the touched file - its content is
+    // already on the agent's screen. Fail-soft: a chunk-pass error costs the
+    // chunks, never the memory advisory. (Second O(n) fold per uncached
+    // touch, same bounded class as the anchored_memories fold above.)
+    let mut doc_chunks: Vec<crate::recall::RecallHit> =
+        crate::recall::recall_doc_chunks_scoped(&store, &query, 8, &scope)
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|h| {
+                crate::repo::chunk_rel(&h.entity_id)
+                    .and_then(|r| Path::new(r).file_name())
+                    .and_then(|f| f.to_str())
+                    .map_or(true, |f| !f.eq_ignore_ascii_case(name))
+            })
+            .filter(|h| {
+                let b = h.body.to_lowercase();
+                b.contains(&name_l)
+                    || (stem_l.chars().count() >= 3 && b.contains(&stem_l))
+                    || symbols_l.iter().any(|s| b.contains(s.as_str()))
+            })
+            .collect();
+    // A paragraph that spells out the file NAME beats one reached via a stem
+    // or symbol coincidence - "about printers.js" over "mentions a printers
+    // symbol". Stable sort keeps bm25 order within each class.
+    doc_chunks.sort_by_key(|h| !h.body.to_lowercase().contains(&name_l));
+    doc_chunks.truncate(DOC_CHUNK_HITS);
+
+    if named.is_empty() && doc_chunks.is_empty() {
         // Cache the miss briefly (NEG_CACHE_SECS) so repeated touches of a
         // memory-less file stop re-paying the recall; a memory stored later
         // still surfaces once the negative entry expires. Per-key upsert: a
@@ -328,11 +383,13 @@ fn file_memory_advisory(db: &Path, hook: &Value) -> Option<String> {
         return None;
     }
 
+    let cap = advisory_snippet_cap(named.len() + doc_chunks.len());
     let lines: Vec<String> = named
         .iter()
+        .chain(doc_chunks.iter())
         .map(|h| {
             let ty = h.fact_type.map(|t| format!("[{}] ", t.as_str())).unwrap_or_default();
-            format!("{}{}: {}", ty, h.entity_id, crate::recall::snippet(&h.body, 200, &query))
+            format!("{}{}: {}", ty, h.entity_id, crate::recall::snippet(&h.body, cap, &query))
         })
         .collect();
 
@@ -429,18 +486,9 @@ pub fn command_memory_advisory_for_eval(db: &Path, hook: &Value) -> Option<Strin
     command_memory_advisory(db, hook)
 }
 
-/// Shell verbs and generic words too common to identify a constraint: a salient
-/// command token must clear these AND the recall stopword lists. Precision over
-/// recall by design - the advisory interrupts, so a false fire costs trust.
-const COMMAND_NOISE: &[&str] = &[
-    "sudo", "bash", "powershell", "cmd", "echo", "cat", "type", "grep", "find", "ls", "dir",
-    "cd", "cp", "mv", "rm", "mkdir", "touch", "head", "tail", "curl", "wget", "python", "node",
-    "npm", "cargo", "git", "docker", "compose", "build", "run", "test", "install", "update",
-    "status", "start", "stop", "restart", "list", "show", "get", "set", "add", "remove", "push",
-    "pull", "commit", "checkout", "branch", "log", "diff", "clone", "fetch", "merge", "config",
-    "select", "where", "print", "write", "read", "file", "files", "output", "input", "true",
-    "false", "null", "name", "force", "quiet", "verbose", "version", "help",
-];
+/// Shell verbs and generic words too common to identify a constraint: see
+/// `vocab::COMMAND_NOISE` (a salient token must clear these AND the stopwords).
+use crate::vocab::COMMAND_NOISE;
 
 /// Distinctive tokens of a shell command: what could plausibly NAME a stored
 /// constraint. Kept when len >= 5 and not noise/stopword, or when the token
@@ -588,11 +636,12 @@ fn command_memory_advisory(db: &Path, hook: &Value) -> Option<String> {
         crate::ledger::upsert(db, "guard-seen", &key, &serde_json::json!({ "ts": now, "neg": true }));
         return None;
     }
+    let cap = advisory_snippet_cap(named.len());
     let lines: Vec<String> = named
         .iter()
         .map(|h| {
             let ty = h.fact_type.map(|t| format!("[{}] ", t.as_str())).unwrap_or_default();
-            format!("{}{}: {}", ty, h.entity_id, crate::recall::snippet(&h.body, 200, &query))
+            format!("{}{}: {}", ty, h.entity_id, crate::recall::snippet(&h.body, cap, &query))
         })
         .collect();
     crate::ledger::upsert(db, "guard-seen", &key, &serde_json::json!(now));
@@ -1204,6 +1253,55 @@ mod tests {
             "tool_input": { "file_path": proj.join("src/courier.rs").to_string_lossy() }
         });
         assert!(file_memory_advisory(&db, &hook3).is_none(), "THOR-SILENT.flag silences the guard advisory");
+    }
+
+    #[test]
+    fn test_file_advisory_serves_doc_chunks_naming_the_file() {
+        use crate::event_store::{EventKind, EventStore};
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("thor.db");
+        {
+            let mut store = EventStore::new(&db).unwrap();
+            // a CHANGELOG paragraph that documents a decision about printers.js
+            store
+                .append_event(
+                    "s", "l", "a", EventKind::FactCreated, "Proj:docs/CHANGELOG.md#0", None,
+                    "Removed the hardcoded VALID_MODELS list from printers.js in favor of a DB query.",
+                )
+                .unwrap();
+            // a code chunk that also names it: still never served
+            store
+                .append_event(
+                    "s", "l", "a", EventKind::FactCreated, "Proj:src/other.js#0", None,
+                    "const routes = require('./printers.js'); // wiring",
+                )
+                .unwrap();
+            // a chunk OF the touched file: its content is on the agent's screen
+            store
+                .append_event(
+                    "s", "l", "a", EventKind::FactCreated, "Proj:src/printers.js#0", None,
+                    "module.exports = { validate }; // printers.js body",
+                )
+                .unwrap();
+        }
+        let proj = dir.path().join("Proj");
+        std::fs::create_dir_all(proj.join(".git")).unwrap();
+        let hook = json!({
+            "session_id": "s1",
+            "cwd": proj.to_string_lossy(),
+            "tool_name": "Edit",
+            "tool_input": { "file_path": proj.join("src/printers.js").to_string_lossy() }
+        });
+
+        // No memory names the file - the doc chunk alone must carry the advisory.
+        let adv = file_memory_advisory(&db, &hook).expect("a doc chunk naming the file advises");
+        assert!(adv.contains("Proj:docs/CHANGELOG.md#0"), "the CHANGELOG paragraph serves: {adv}");
+        assert!(adv.contains("VALID_MODELS"), "snippet carries the decision: {adv}");
+        assert!(!adv.contains("Proj:src/other.js#0"), "code chunks still never serve: {adv}");
+        assert!(
+            !adv.contains("Proj:src/printers.js#0"),
+            "a chunk of the touched file itself never serves: {adv}"
+        );
     }
 
     #[test]

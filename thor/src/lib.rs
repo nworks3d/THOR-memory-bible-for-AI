@@ -9,6 +9,7 @@ pub mod ledger;
 pub mod review;
 pub mod consolidate;
 pub mod strength;
+pub mod vocab;
 #[cfg(feature = "semantic")]
 pub mod embed;
 #[cfg(feature = "semantic")]

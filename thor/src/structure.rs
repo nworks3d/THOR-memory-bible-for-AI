@@ -28,23 +28,7 @@ use std::collections::BTreeMap;
 /// vocabulary of ASKING ABOUT shape - "calls", "callers", "defined", "impact" -
 /// not generic code words: the second gate (sidecar resolution) does the real
 /// filtering, this one only keeps the card off plain knowledge questions.
-const STRUCTURE_WORDS: &[&str] = &[
-    // EN
-    "call", "calls", "called", "caller", "callers", "uses", "used", "usage", "define",
-    "defines", "defined", "definition", "declared", "declaration", "implemented",
-    "implements", "impact", "structure", "where", "blast", "radius",
-    // NL
-    "aanroept", "aangeroepen", "roept", "gebruikt", "definieert", "gedefinieerd",
-    "geimplementeerd", "waar", "structuur",
-];
-
-/// Words never tried as a symbol, however identifier-shaped the tokenizer finds
-/// them: the structure vocabulary itself plus question glue.
-const NOT_A_SYMBOL: &[&str] = &[
-    "the", "this", "that", "what", "which", "who", "how", "does", "are", "is", "in", "of",
-    "for", "from", "and", "function", "functions", "method", "methods", "symbol", "file",
-    "code", "wat", "wie", "hoe", "welke", "functie", "functies", "bestand", "waarom",
-];
+use crate::vocab::{NOT_A_SYMBOL, STRUCTURE_WORDS};
 
 /// The query names structure AND a symbol the sidecar resolves: return that
 /// symbol. Both gates are required - vocabulary alone fires on prose questions,

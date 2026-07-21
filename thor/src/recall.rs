@@ -178,17 +178,7 @@ const DEDUP_PREFIX_CHARS: usize = 120;
 /// not a substitute for it: measured on a 5,586-head store, 19 of these sit below
 /// 10% document frequency ("what" 9.1%, "which" 6.9%, "zijn" 6.2%) and would still
 /// count as evidence, while "repo" at 89% needs the frequency cut to be caught.
-pub const STOPWORDS: &[&str] = &[
-    // English
-    "the", "a", "an", "and", "or", "of", "to", "in", "on", "at", "for", "with", "is", "are", "was",
-    "were", "be", "been", "do", "did", "does", "how", "what", "why", "when", "where", "which",
-    "that", "this", "it", "we", "you", "about", "from", "have", "has", "had", "not", "no", "our",
-    "my", "your", "as", "by", "so", "if", "up", "out", "did", "was",
-    // Dutch
-    "de", "het", "een", "en", "of", "van", "voor", "met", "zijn", "was", "waren", "hoe", "wat",
-    "waarom", "wanneer", "waar", "welke", "dat", "dit", "ook", "er", "al", "nog", "dan", "dus",
-    "maar", "die", "naar", "niet", "geen", "ons", "mijn", "jij", "over", "om", "te", "op", "aan",
-];
+pub use crate::vocab::STOPWORDS;
 
 /// Alphanumeric tokens (>= 2 chars), FTS5-escaped (embedded quotes doubled).
 fn tokens(text: &str) -> Vec<String> {
@@ -291,10 +281,9 @@ enum SourceClass {
     Code,
 }
 
-/// Extensions whose chunks are prose, not code. Everything else under a chunk id
-/// counts as code (the conservative default: code never gets a knowledge boost).
+/// Extensions whose chunks are prose, not code: see `vocab::DOC_EXTS`.
 #[cfg(feature = "semantic")]
-const DOC_EXTS: &[&str] = &["md", "markdown", "txt", "rst", "adoc", "org"];
+use crate::vocab::DOC_EXTS;
 
 #[cfg(feature = "semantic")]
 fn source_class(entity_id: &str) -> SourceClass {
@@ -329,16 +318,9 @@ enum QueryRoute {
     Neutral,
 }
 
-/// Decision/constraint vocabulary (EN + NL), matched on word boundaries over the
-/// lowercased query. Deliberately narrow: generic verbs ("use", "werkt") must
-/// not route ordinary code questions to knowledge.
+/// Decision/constraint vocabulary for the knowledge route: see `vocab::KNOWLEDGE_WORDS`.
 #[cfg(feature = "semantic")]
-const KNOWLEDGE_WORDS: &[&str] = &[
-    "beslissing", "besloten", "besluit", "beslist", "afspraak", "afgesproken", "regel",
-    "voorkeur", "werkvoorkeur", "gotcha", "waarom", "conventie", "beleid", "werkwijze",
-    "decision", "decided", "agreed", "agreement", "rule", "preference", "convention",
-    "policy", "why", "rationale", "constraint",
-];
+use crate::vocab::KNOWLEDGE_WORDS;
 
 #[cfg(feature = "semantic")]
 fn route_query(query: &str) -> QueryRoute {
@@ -938,16 +920,26 @@ impl RecallScope {
     }
 }
 
+/// Which head class a recall may spend slots on: everything, hand-written
+/// memories only, or prose doc chunks only. One enum instead of ad-hoc bools
+/// so a new caller must pick its channel deliberately. The two narrow classes
+/// exist for the moment-of-action surfaces: raw recall over a tool call is
+/// 8/8 code chunks (measured), so the guard asks for memories and prose in
+/// separate, guaranteed lanes instead of fishing them out of a crowded pool.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum HeadClass {
+    All,
+    MemoriesOnly,
+    DocChunksOnly,
+}
+
 /// Bundles the per-entity effective-project map with the scope, plus the "a
 /// retracted head is not live" rule, so every candidate path filters identically
-/// with a single `keep(ev)` check. `memories_only` additionally drops repo
-/// chunks, for callers (the file-touch guard) where a code chunk is by
-/// construction noise - the empirically-verified failure of raw tool-call
-/// recall is chunks crowding out the one governing memory.
+/// with a single `keep(ev)` check.
 struct ScopeFilter<'a> {
     projects: &'a HashMap<String, Option<String>>,
     scope: &'a RecallScope,
-    memories_only: bool,
+    class: HeadClass,
 }
 
 impl ScopeFilter<'_> {
@@ -955,8 +947,18 @@ impl ScopeFilter<'_> {
         if matches!(ev.kind, EventKind::FactRetracted) {
             return false; // a retracted head is not live: never surface it
         }
-        if self.memories_only && crate::repo::is_chunk_id(&ev.entity_id) {
-            return false; // chunks never spend a slot in a memories-only recall
+        match self.class {
+            HeadClass::All => {}
+            HeadClass::MemoriesOnly => {
+                if crate::repo::is_chunk_id(&ev.entity_id) {
+                    return false; // chunks never spend a memories-only slot
+                }
+            }
+            HeadClass::DocChunksOnly => {
+                if !crate::repo::is_doc_chunk_id(&ev.entity_id) {
+                    return false; // memories and code chunks never spend a doc slot
+                }
+            }
         }
         // Expiry is RANK-TIME only: an `| expires: YYYY-MM-DD |` footer field
         // past its date stops surfacing (history and the chain keep the fact -
@@ -980,7 +982,20 @@ pub fn recall_scoped(
     limit: usize,
     scope: &RecallScope,
 ) -> anyhow::Result<Vec<RecallHit>> {
-    recall_scoped_inner(store, query, limit, scope, false)
+    recall_scoped_inner(store, query, limit, scope, HeadClass::All)
+}
+
+/// Doc-chunks-only bm25 recall: only PROSE chunks (vocab::DOC_EXTS) occupy
+/// slots. The file-touch guard's second lane - ingested CHANGELOGs and design
+/// docs that name a file are knowledge about it, and they would never survive
+/// the code-chunk crowding of an unfiltered pool.
+pub fn recall_doc_chunks_scoped(
+    store: &EventStore,
+    query: &str,
+    limit: usize,
+    scope: &RecallScope,
+) -> anyhow::Result<Vec<RecallHit>> {
+    recall_scoped_inner(store, query, limit, scope, HeadClass::DocChunksOnly)
 }
 
 /// Memories-only bm25 recall: identical to `recall_scoped` but repo chunks never
@@ -992,7 +1007,7 @@ pub fn recall_memories_scoped(
     limit: usize,
     scope: &RecallScope,
 ) -> anyhow::Result<Vec<RecallHit>> {
-    recall_scoped_inner(store, query, limit, scope, true)
+    recall_scoped_inner(store, query, limit, scope, HeadClass::MemoriesOnly)
 }
 
 fn recall_scoped_inner(
@@ -1000,7 +1015,7 @@ fn recall_scoped_inner(
     query: &str,
     limit: usize,
     scope: &RecallScope,
-    memories_only: bool,
+    class: HeadClass,
 ) -> anyhow::Result<Vec<RecallHit>> {
     if limit == 0 {
         return Ok(vec![]);
@@ -1019,7 +1034,7 @@ fn recall_scoped_inner(
     let by_seq: HashMap<i64, &Event> = events.iter().map(|e| (e.seq, e)).collect();
     let heads = compute_head_sets(&events);
     let projects = crate::cas::compute_projects(&events);
-    let filter = ScopeFilter { projects: &projects, scope, memories_only };
+    let filter = ScopeFilter { projects: &projects, scope, class };
 
     // AND-first: prefer memories that match the WHOLE question over a single-word
     // coincidence; fall back to the OR query only when the strict pass finds no
@@ -1469,7 +1484,7 @@ pub fn recall_fused_scoped_cached(
         }
     };
     let by_seq: HashMap<i64, &Event> = events.iter().map(|e| (e.seq, e)).collect();
-    let filter = ScopeFilter { projects, scope, memories_only: false };
+    let filter = ScopeFilter { projects, scope, class: HeadClass::All };
 
     // Lexical leg: current-head candidates in bm25 rank order (streaming head-walk,
     // NO fixed raw-row window - see lexical_head_pool). Empty if the query has no

@@ -471,6 +471,24 @@ pub fn is_chunk_id(entity_id: &str) -> bool {
     }
 }
 
+/// The rel path inside a chunk id (`<project>:<rel>#<n>`), if it parses.
+pub fn chunk_rel(entity_id: &str) -> Option<&str> {
+    if !is_chunk_id(entity_id) {
+        return None;
+    }
+    let rel = entity_id.split_once(':')?.1;
+    Some(rel.rsplit_once('#').map_or(rel, |(r, _)| r))
+}
+
+/// A PROSE chunk (vocab::DOC_EXTS) - the only chunk kind moment-of-action
+/// surfaces may serve (code chunks crowd out everything else, measured).
+pub fn is_doc_chunk_id(entity_id: &str) -> bool {
+    chunk_rel(entity_id)
+        .and_then(|r| std::path::Path::new(r).extension())
+        .and_then(|e| e.to_str())
+        .is_some_and(|e| crate::vocab::DOC_EXTS.contains(&e.to_ascii_lowercase().as_str()))
+}
+
 /// The constraint class of a hand-written fact, so the courier / guard / brief
 /// can label (and later prioritize) the facts that prevent drift. Only these
 /// three classes get a tag; anything else (note, insight, plain text) is None.

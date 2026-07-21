@@ -14,3 +14,23 @@ guard-response-rulebook.json
 # The committed drift-eval corpus is SYNTHETIC (no real memories) - the only
 # jsonl that belongs in the repo.
 !eval/drift_scenarios.jsonl
+
+# Measurement corpora and their outputs. These are built FROM a live store, so a
+# gold body is a real memory, an entity id names a real project, and a per-item
+# dump carries both. They live in the per-user data directory and belong nowhere
+# near a public repo - but the eval harness reads and writes files by name, so it
+# is one careless copy into eval/ away from being staged by `git add -A`. Deny by
+# name rather than trusting that nobody will ever put one here.
+#
+# Deliberately NOT a blanket eval/*.json: drift_noise_baseline.json is a committed
+# one-way ratchet and has to stay tracked.
+golds*.json
+percategory_queries*.json
+queries*.json
+items*.json
+strata*.json
+scores*.json
+hits*.json
+*_hits.json
+thor-src-*.tar.gz
+*.npy

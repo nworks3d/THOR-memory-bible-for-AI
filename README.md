@@ -230,8 +230,25 @@ thor backfill-projects          # attribute legacy memories from their import fo
 
 Lexical bm25 is always on. A dense **score-fusion** layer adds meaning-based
 retrieval on top, so a paraphrased question still finds the right memory. Turn it
-on unless you have one of the reasons below: it degrades to bm25 whenever
-anything is missing, so it can never make recall worse.
+on unless you have one of the reasons below. If the model, the sidecar or the
+daemon is missing it falls back to plain bm25, so a broken setup costs you the
+feature and nothing else.
+
+**What it is measured to buy, and where.** On 53 hand-written memory facts - the
+thing THOR exists to recall - it moves the right fact from a mean rank of 4.6 to
+2.5, with 14 facts moving up and 4 moving down. Every one of those four drops is
+exactly one place (rank 1 to rank 2), while the gains include a fact rescued from
+rank 50 to rank 8. Paired Wilcoxon p = 0.006; the cruder sign test, which ignores
+how far each fact moved, gives 0.03.
+
+Two honest limits on that. On indexed **repo code chunks** it is a wash: 84 golds
+up, 89 down at the shipped weight, and turning the dense weight up to 3.0 makes it
+measurably worse (p = 0.004). And the win is invisible to a hit@5 score, because
+bm25 already puts 46 of those 53 facts in the top five - the fusion layer mostly
+reorders inside the set the agent already reads, which is why it is measured by
+rank rather than by a hit rate. Numbers from
+`cargo run --release --features semantic --example recall_eval`; the corpus is
+private, so they are not reproducible from this repo alone.
 
 The **release binaries for Windows and Linux are already built with it** - you
 only need to supply a model (below). If you build from source, add the feature:

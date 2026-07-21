@@ -3560,9 +3560,16 @@ cd thor
 cargo run --release --features semantic --example recall_eval
 ```
 
-  It expects `eval/percategory_queries.json` and `eval/golds52.json` inside the per-user data directory (`%LOCALAPPDATA%\thor\` on Windows). Neither file is in the repo; you have to write them.
+  It expects `eval/percategory_queries.json` and `eval/golds52.json` inside the per-user data directory (`%LOCALAPPDATA%\thor\` on Windows). Neither file is in the repo; you have to write them. Point it at a different battery with `--queries`, `--golds` and `--golds-content`, and get per-item outcomes for every arm with `--out <file>`.
 
 - **How to check it worked:** it prints a table headed `REAL recall.rs recall_fused - normalized-fusion lambda sweep (cells = recall@5 per category)`. Read the cells as recall@5 only; the header says so. One caveat about the comparison row: the baseline arm is produced by feeding the same fused function an all-zero query vector, so the meaning term drops out, but path boosting and the coverage term stay switched on. It is a baseline, not a clean keyword-only arm.
+
+  **Do not decide anything from that table alone**, and this is the hardest-won lesson in this file. Two arms that differ by a couple of percent on a battery of this size are indistinguishable from noise, and worse, a hit rate is the wrong instrument entirely once bm25 already puts most golds in the top five: it cannot see a gold moving from rank 4 to rank 2, which is most of what a ranking change actually does. Use `--out` and compare the arms per item. The dense layer's measured benefit is a rank effect (mean rank 4.6 to 2.5 on hand-written memory facts) that the printed hit@5 column shows as almost nothing.
+
+  Three traps that cost real measurements here, in case you build your own battery:
+    - **Freeze each gold's text at the body of the seq it came from, not at the entity's current head.** Heads change. Re-chunking has replaced a 93-word gold with a one-line comment, and that short gold was then "found" in 2256 of 5433 unrelated stored facts, silently inflating every arm.
+    - **Match whole words, drop very common ones.** Substring matching makes `test` fire on `latest`, and without a frequency filter words like `repo` (in roughly 90% of stored bodies here) count as evidence that a specific fact was found.
+    - **Split repo chunks from hand-written facts before reporting.** They behave oppositely: the dense layer helps on facts and is a wash on chunks, so a single combined number reports neither.
 - **How to turn it off again:** stop running it. Nothing to undo.
 
 ### cargo run --release --features semantic --example cache_correctness

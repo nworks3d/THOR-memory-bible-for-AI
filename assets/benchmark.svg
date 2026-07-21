@@ -125,7 +125,7 @@
 <rect x="268" y="1030" width="122.1" height="14" rx="7" fill="#484f58"/>
 <text x="397.10" y="1041.5" fill="#8b949e" font-size="11.5">37%</text>
 <text x="256" y="1041.5" fill="#8b949e" font-size="10.5" text-anchor="end">mimir hook</text>
-<text x="20" y="1060" fill="#c9d1d9" font-size="11">Both gaps ARE significant (p 0.043 against the best channel, p <0.0001 against the hook) and they point opposite ways.</text>
+<text x="20" y="1060" fill="#c9d1d9" font-size="11">Both gaps ARE significant (p 0.043 against the best channel, p below 0.0001 against the hook) and point opposite ways.</text>
 <text x="20" y="1076" fill="#c9d1d9" font-size="11">The comparison splits in two and both halves are real. On CAPABILITY mimir wins: its full recall beats THOR's courier</text>
 <text x="20" y="1092" fill="#c9d1d9" font-size="11">(21 wins to 9) and ties THOR's deliberate channel at 72.6%. On WHAT RUNS UNASKED THOR wins 37 to 6: mimir's hook</text>
 <text x="20" y="1108" fill="#c9d1d9" font-size="11">misses 46 of 73 scenarios and returns nothing at all on 2. mimir's winning channel is not a hook - you must call it.</text>

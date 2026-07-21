@@ -128,7 +128,7 @@ y += 14
 header("SESSION DRIFT  (73 fresh-session scenarios)", "post-compaction, empty context: does memory surface the fact that stops the drift? silence scores zero")
 pair("Vs mimir at its best", 67.1, 74.0, "-7%", mimir_tag="mimir full")
 pair("Vs mimir's auto hook", 67.1, 37.0, "+30%", mimir_tag="mimir hook")
-note("Both gaps ARE significant (p 0.043 against the best channel, p <0.0001 against the hook) and they point opposite ways.", color=SOFT)
+note("Both gaps ARE significant (p 0.043 against the best channel, p below 0.0001 against the hook) and point opposite ways.", color=SOFT)
 note("The comparison splits in two and both halves are real. On CAPABILITY mimir wins: its full recall beats THOR's courier", color=SOFT)
 note("(21 wins to 9) and ties THOR's deliberate channel at 72.6%. On WHAT RUNS UNASKED THOR wins 37 to 6: mimir's hook", color=SOFT)
 note("misses 46 of 73 scenarios and returns nothing at all on 2. mimir's winning channel is not a hook - you must call it.", color=SOFT)
@@ -192,6 +192,17 @@ svg = (
     f'<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 860 {H}" font-family="Segoe UI, Helvetica Neue, Arial, sans-serif">\n'
     f'<rect x="0" y="0" width="860" height="{H}" rx="10" fill="#0d1117"/>\n' + "\n".join(out) + "\n</svg>\n"
 )
+# Parse what we are about to write. note() and bullet() pass their text through
+# unescaped so a line can carry <tspan> colouring, which means one stray "<" in
+# prose - "p <0.0001" - silently produces a file GitHub refuses to render. The
+# generator happily wrote it and every other check passed.
+import xml.etree.ElementTree as _ET
+try:
+    _ET.fromstring(svg)
+except _ET.ParseError as exc:
+    raise SystemExit(f"generated SVG is not well-formed XML: {exc}\n"
+                     "usually a raw '<' or '&' in a note()/bullet() string") from exc
+
 path = os.path.join(os.path.dirname(__file__), "..", "..", "assets", "benchmark.svg")
 with open(path, "w", encoding="utf-8", newline="\n") as f:
     f.write(svg)

@@ -1831,7 +1831,9 @@ tells you whether it still adds up.
   the current set of facts. It appends nothing to the log, and it opens the store
   without the schema and search-index work an ordinary command does - which is the
   point: otherwise it would repair the search index during its own open and then
-  report that index as healthy. The repo states no timing measurement.
+  report that index as healthy. Measured once, on one machine: 0.5 s over a store
+  of 19,157 events on an NVMe SSD. Treat that as an order of magnitude, not a
+  promise - it is a full scan, so expect it to grow with the log.
 - **How to turn it on:**
 
   ```sh

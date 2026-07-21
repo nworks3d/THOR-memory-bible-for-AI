@@ -32,7 +32,7 @@ const STRUCTURE_WORDS: &[&str] = &[
     // EN
     "call", "calls", "called", "caller", "callers", "uses", "used", "usage", "define",
     "defines", "defined", "definition", "declared", "declaration", "implemented",
-    "implements", "impact", "structure", "where",
+    "implements", "impact", "structure", "where", "blast", "radius",
     // NL
     "aanroept", "aangeroepen", "roept", "gebruikt", "definieert", "gedefinieerd",
     "geimplementeerd", "waar", "structuur",

@@ -28,6 +28,18 @@
 //! entity-id hit (primary) plus gold key-term coverage (proxy) - expect the
 //! judged 54.8% / 39.7% to be bracketed, not hit exactly.
 //!
+//! Live guard channel: a scenario may carry `expected_files` / `expected_commands`
+//! - the tool calls an agent doing this task would plausibly make. AUTHORING
+//! RULE (anti-circularity): those calls are written from the drift_prompt
+//! ALONE, never from the gold - authoring from the gold would measure the
+//! answer against itself. Each call is replayed through the REAL guard
+//! advisories (file + command memory advisory, the PreToolUse paths). The
+//! guard must write debounce state to the ledger sidecar, so it runs against a
+//! TEMP COPY of thor.db + thor-symbols.db: identical data, and the live store
+//! and its sidecars stay untouched (the read-only contract holds by
+//! construction, not by discipline). Courier metrics are computed exactly as
+//! before; guard and either(courier|guard) are reported next to them.
+//!
 //! Run:  cargo run --example drift_eval              (human table)
 //!       cargo run --example drift_eval -- --json    (machine-readable)
 //!       cargo run --example drift_eval -- --live "%LOCALAPPDATA%/thor/eval/drift_scenarios.json"
@@ -514,6 +526,15 @@ struct LiveScenario {
     gold: String,
     #[serde(default)]
     category: String,
+    /// Blind-authored from the drift_prompt ALONE (never the gold): the file
+    /// paths an agent doing this task would plausibly Read/Edit. Empty when
+    /// the prompt names no file - the guard then simply cannot fire, which is
+    /// the honest shape of that scenario.
+    #[serde(default)]
+    expected_files: Vec<String>,
+    /// Same authoring rule, for the shell commands the task implies.
+    #[serde(default)]
+    expected_commands: Vec<String>,
 }
 
 /// Key terms of a gold description: lowercase alphanumeric tokens of >= 4
@@ -538,7 +559,67 @@ fn key_terms(text: &str) -> Vec<String> {
         .collect()
 }
 
-fn run_live(corpus: &Path, cwd_override: Option<&Path>, json_out: bool) -> anyhow::Result<()> {
+/// Gold-term coverage of an already-lowercased text.
+fn coverage_of(lower: &str, terms: &[String]) -> f64 {
+    if terms.is_empty() {
+        return 0.0;
+    }
+    let hit = terms.iter().filter(|t| lower.contains(t.as_str())).count();
+    hit as f64 / terms.len() as f64
+}
+
+/// Content-addressed hit: ONE served segment (courier hit line / guard entry,
+/// split on `sep`) carries >= 50% of the gold's key terms - a spread of
+/// fragments across unrelated segments does not count.
+fn content_hit(lower: &str, sep: &str, terms: &[String]) -> bool {
+    !terms.is_empty()
+        && lower.split(sep).any(|seg| {
+            let got = terms.iter().filter(|t| seg.contains(t.as_str())).count();
+            got as f64 / terms.len() as f64 >= 0.5
+        })
+}
+
+/// One channel's score for one live scenario, same three metrics everywhere.
+#[derive(Clone, Copy)]
+struct Chan {
+    surfaced: bool,
+    content_surfaced: bool,
+    coverage: f64,
+}
+
+/// A guard-eligible scenario where the guard stayed silent scores as a miss,
+/// never as "not measured" - the channel HAD its moment and said nothing.
+const CHAN_MISS: Chan = Chan { surfaced: false, content_surfaced: false, coverage: 0.0 };
+
+/// The guard replay needs a db it may WRITE next to (debounce/neg-cache land
+/// in the ledger sidecar beside its db path), so it gets a disposable copy of
+/// the store + the symbol sidecar (the symbol bridge's other half). WAL/SHM
+/// siblings ride along when present so a mid-checkpoint store copies
+/// consistently. The live files are never opened writable by this run.
+/// `symbol_bridge: false` leaves the symbol sidecar out of the copy (the
+/// guard then sees an empty one) - the ablation arm that isolates what the
+/// symbol bridge itself contributes to the live guard numbers.
+fn copy_store_for_guard(db: &Path, dir: &Path, symbol_bridge: bool) -> anyhow::Result<PathBuf> {
+    for name in
+        ["thor.db", "thor.db-wal", "thor.db-shm", "thor-symbols.db", "thor-symbols.db-wal", "thor-symbols.db-shm"]
+    {
+        if !symbol_bridge && name.starts_with("thor-symbols") {
+            continue;
+        }
+        let src = db.with_file_name(name);
+        if src.exists() {
+            std::fs::copy(&src, dir.join(name))?;
+        }
+    }
+    Ok(dir.join("thor.db"))
+}
+
+fn run_live(
+    corpus: &Path,
+    cwd_override: Option<&Path>,
+    json_out: bool,
+    symbol_bridge: bool,
+) -> anyhow::Result<()> {
     let db = thor::ledger::data_dir()
         .ok_or_else(|| anyhow::anyhow!("no per-user data dir resolvable"))?
         .join("thor.db");
@@ -566,14 +647,30 @@ fn run_live(corpus: &Path, cwd_override: Option<&Path>, json_out: bool) -> anyho
     struct Row {
         seq: i64,
         category: String,
-        surfaced: bool,
-        content_surfaced: bool,
-        coverage: f64,
+        courier: Chan,
+        /// None = the scenario carries no expected calls, so the action
+        /// channel never had a moment - excluded from the where-eligible
+        /// denominator, a plain miss in the all-scenarios one.
+        guard: Option<Chan>,
+        either: Chan,
     }
     let mut rows: Vec<Row> = Vec::new();
     let mut skipped = 0usize;
 
-    for s in &scenarios {
+    // One disposable store copy for the whole run, only when the corpus
+    // carries expected calls at all (older corpora without them run exactly
+    // as before, no copy paid).
+    let any_calls =
+        scenarios.iter().any(|s| !s.expected_files.is_empty() || !s.expected_commands.is_empty());
+    let guard_db: Option<PathBuf> = if any_calls {
+        let gdir = dirs.path().join("guard-store");
+        std::fs::create_dir_all(&gdir)?;
+        Some(copy_store_for_guard(&db, &gdir, symbol_bridge)?)
+    } else {
+        None
+    };
+
+    for (idx, s) in scenarios.iter().enumerate() {
         let Some(entity) = seq_to_entity.get(&s.seq) else {
             skipped += 1; // gold seq not in this store: count it, never guess
             continue;
@@ -599,34 +696,86 @@ fn run_live(corpus: &Path, cwd_override: Option<&Path>, json_out: bool) -> anyho
         // identity, so the live sidecars stay untouched (read-only contract).
         let raw = json!({ "prompt": s.drift_prompt, "cwd": cwd.to_string_lossy() }).to_string();
         let block = thor::courier::injection_for_hook_json(&db, &raw).unwrap_or_default();
-        let surfaced = block.contains(&format!(" {} (", entity));
         let terms = key_terms(&s.gold);
-        let lower = block.to_lowercase();
-        let hit = terms.iter().filter(|t| lower.contains(t.as_str())).count();
-        let coverage = if terms.is_empty() { 0.0 } else { hit as f64 / terms.len() as f64 };
+        let block_lower = block.to_lowercase();
         // Content-addressed surfaced: ONE served hit (not the whole injection)
         // carries >= half of the gold's key terms. Survives store metabolism -
         // a distilled/revised successor of the gold still counts, a spread of
         // fragments across unrelated hits does not. The entity metric stays
         // reported for continuity; ids are informative, content is the truth.
-        let content_surfaced = !terms.is_empty()
-            && lower.split("\n- ").any(|segment| {
-                let got = terms.iter().filter(|t| segment.contains(t.as_str())).count();
-                got as f64 / terms.len() as f64 >= 0.5
-            });
-        rows.push(Row { seq: s.seq, category: s.category.clone(), surfaced, content_surfaced, coverage });
+        let courier = Chan {
+            surfaced: block.contains(&format!(" {} (", entity)),
+            content_surfaced: content_hit(&block_lower, "\n- ", &terms),
+            coverage: coverage_of(&block_lower, &terms),
+        };
+
+        // Guard replay: every blind-authored call gets its PreToolUse moment
+        // against the disposable copy. The index (not seq - one seq appears
+        // twice) keys the session identity, so debounce state never leaks
+        // between scenarios.
+        let has_calls = !s.expected_files.is_empty() || !s.expected_commands.is_empty();
+        let guard = match (&guard_db, has_calls) {
+            (Some(gdb), true) => {
+                let session = format!("drift-live-{}", idx);
+                let mut advisories: Vec<String> = Vec::new();
+                for f in &s.expected_files {
+                    let hook = json!({
+                        "tool_name": "Edit",
+                        "tool_input": { "file_path": cwd.join(f).to_string_lossy() },
+                        "session_id": session,
+                        "cwd": cwd.to_string_lossy(),
+                    });
+                    if let Some(a) = thor::guard::file_memory_advisory_for_eval(gdb, &hook) {
+                        advisories.push(a);
+                    }
+                }
+                for c in &s.expected_commands {
+                    let hook = json!({
+                        "tool_name": "Bash",
+                        "tool_input": { "command": c },
+                        "session_id": session,
+                        "cwd": cwd.to_string_lossy(),
+                    });
+                    if let Some(a) = thor::guard::command_memory_advisory_for_eval(gdb, &hook) {
+                        advisories.push(a);
+                    }
+                }
+                let text = advisories.join("  ||  ");
+                let lower = text.to_lowercase();
+                Some(Chan {
+                    surfaced: text.contains(&format!("{}: ", entity)),
+                    content_surfaced: content_hit(&lower, "  ||  ", &terms),
+                    coverage: coverage_of(&lower, &terms),
+                })
+            }
+            _ => None,
+        };
+
+        // What one real session sees: both hooks are installed at once, so
+        // the union is the deployed number. Coverage takes the stronger
+        // channel - the advisory's 200-char snippets would otherwise dilute a
+        // full courier hit.
+        let either = {
+            let g = guard.as_ref();
+            Chan {
+                surfaced: courier.surfaced || g.map_or(false, |c| c.surfaced),
+                content_surfaced: courier.content_surfaced || g.map_or(false, |c| c.content_surfaced),
+                coverage: courier.coverage.max(g.map_or(0.0, |c| c.coverage)),
+            }
+        };
+        rows.push(Row { seq: s.seq, category: s.category.clone(), courier, guard, either });
     }
 
     let mut cats: Vec<String> = rows.iter().map(|r| r.category.clone()).collect();
     cats.sort();
     cats.dedup();
-    let summarize = |rows: &[&Row]| -> serde_json::Value {
-        let n = rows.len();
-        let surfaced = rows.iter().filter(|r| r.surfaced).count();
-        let content = rows.iter().filter(|r| r.content_surfaced).count();
-        let either = rows.iter().filter(|r| r.surfaced || r.content_surfaced).count();
-        let half = rows.iter().filter(|r| r.coverage >= 0.5).count();
-        let mean = if n == 0 { 0.0 } else { rows.iter().map(|r| r.coverage).sum::<f64>() / n as f64 };
+    let summarize = |sel: &[(&str, Chan)]| -> serde_json::Value {
+        let n = sel.len();
+        let surfaced = sel.iter().filter(|(_, c)| c.surfaced).count();
+        let content = sel.iter().filter(|(_, c)| c.content_surfaced).count();
+        let either = sel.iter().filter(|(_, c)| c.surfaced || c.content_surfaced).count();
+        let half = sel.iter().filter(|(_, c)| c.coverage >= 0.5).count();
+        let mean = if n == 0 { 0.0 } else { sel.iter().map(|(_, c)| c.coverage).sum::<f64>() / n as f64 };
         json!({
             "n": n,
             "entity_surfaced": surfaced,
@@ -638,16 +787,30 @@ fn run_live(corpus: &Path, cwd_override: Option<&Path>, json_out: bool) -> anyho
             "gold_terms_mean_coverage": (mean * 1000.0).round() / 1000.0,
         })
     };
+    let channel = |pick: &dyn Fn(&Row) -> Option<Chan>| -> (serde_json::Value, serde_json::Map<String, serde_json::Value>) {
+        let all: Vec<(&str, Chan)> =
+            rows.iter().filter_map(|r| pick(r).map(|c| (r.category.as_str(), c))).collect();
+        let per: serde_json::Map<String, serde_json::Value> = cats
+            .iter()
+            .map(|c| {
+                let sel: Vec<(&str, Chan)> =
+                    all.iter().filter(|(cat, _)| cat == c).copied().collect();
+                (c.clone(), summarize(&sel))
+            })
+            .collect();
+        (summarize(&all), per)
+    };
 
-    let all: Vec<&Row> = rows.iter().collect();
-    let overall = summarize(&all);
-    let per_cat: serde_json::Map<String, serde_json::Value> = cats
-        .iter()
-        .map(|c| {
-            let sel: Vec<&Row> = rows.iter().filter(|r| &r.category == c).collect();
-            (c.clone(), summarize(&sel))
-        })
-        .collect();
+    // Courier over every scenario (the pre-guard baseline, byte-identical
+    // selection to before); guard twice - over every scenario (a call-less
+    // scenario is a miss: the deployed channel really catches nothing there)
+    // and over only the call-carrying ones (what the channel does when it
+    // gets its moment); either over every scenario.
+    let n_with_calls = rows.iter().filter(|r| r.guard.is_some()).count();
+    let (courier_overall, courier_per) = channel(&|r: &Row| Some(r.courier));
+    let (guard_all_overall, guard_all_per) = channel(&|r: &Row| Some(r.guard.unwrap_or(CHAN_MISS)));
+    let (guard_ran_overall, _) = channel(&|r: &Row| r.guard);
+    let (either_overall, either_per) = channel(&|r: &Row| Some(r.either));
 
     if json_out {
         println!(
@@ -656,13 +819,28 @@ fn run_live(corpus: &Path, cwd_override: Option<&Path>, json_out: bool) -> anyho
                 "mode": "live",
                 "db": db.to_string_lossy(),
                 "skipped_missing_seq": skipped,
-                "overall": overall,
-                "per_category": per_cat,
+                "n_with_calls": n_with_calls,
+                // "overall"/"per_category" stay the courier channel, so every
+                // consumer of the pre-guard output keeps reading the same
+                // numbers under the same keys.
+                "overall": courier_overall,
+                "per_category": courier_per,
+                "channels": {
+                    "guard": { "overall": guard_all_overall, "overall_where_ran": guard_ran_overall, "per_category": guard_all_per },
+                    "either": { "overall": either_overall, "per_category": either_per },
+                },
                 "scenarios": rows.iter().map(|r| json!({
                     "seq": r.seq, "category": r.category,
-                    "surfaced": r.surfaced,
-                    "content_surfaced": r.content_surfaced,
-                    "coverage": (r.coverage * 1000.0).round() / 1000.0,
+                    "entity": seq_to_entity.get(&r.seq),
+                    "surfaced": r.courier.surfaced,
+                    "content_surfaced": r.courier.content_surfaced,
+                    "coverage": (r.courier.coverage * 1000.0).round() / 1000.0,
+                    "guard": r.guard.map(|g| json!({
+                        "surfaced": g.surfaced,
+                        "content_surfaced": g.content_surfaced,
+                        "coverage": (g.coverage * 1000.0).round() / 1000.0,
+                    })),
+                    "either_surfaced": r.either.surfaced || r.either.content_surfaced,
                 })).collect::<Vec<_>>(),
             }))?
         );
@@ -673,10 +851,12 @@ fn run_live(corpus: &Path, cwd_override: Option<&Path>, json_out: bool) -> anyho
     println!("entity-surfaced = the gold's entity id is in the injection (mechanical, undercounts after");
     println!("store metabolism); content-surfaced = one served hit carries >= 50% of the gold's key terms");
     println!("(metabolism-proof); gold-term metrics proxy the judged score.\n");
-    println!(
-        "{:10} {:>4} {:>16} {:>17} {:>8} {:>11} {:>9}",
-        "category", "n", "entity-surfaced", "content-surfaced", "either", "terms>=50%", "mean cov"
-    );
+    let print_header = || {
+        println!(
+            "{:10} {:>4} {:>16} {:>17} {:>8} {:>11} {:>9}",
+            "category", "n", "entity-surfaced", "content-surfaced", "either", "terms>=50%", "mean cov"
+        );
+    };
     let print_row = |name: &str, v: &serde_json::Value| {
         println!(
             "{:10} {:>4} {:>10} {:4.1}% {:>11} {:4.1}% {:>7.1}% {:>10.1}% {:>9.3}",
@@ -691,10 +871,33 @@ fn run_live(corpus: &Path, cwd_override: Option<&Path>, json_out: bool) -> anyho
             v["gold_terms_mean_coverage"].as_f64().unwrap_or(0.0),
         );
     };
+    println!("courier (prompt channel):");
+    print_header();
     for c in &cats {
-        print_row(c, &per_cat[c]);
+        print_row(c, &courier_per[c]);
     }
-    print_row("overall", &overall);
+    print_row("overall", &courier_overall);
+    if n_with_calls > 0 {
+        println!();
+        println!(
+            "guard (action channel; {}/{} scenarios carry blind-authored expected calls, the rest score miss):",
+            n_with_calls,
+            rows.len()
+        );
+        print_header();
+        for c in &cats {
+            print_row(c, &guard_all_per[c]);
+        }
+        print_row("overall", &guard_all_overall);
+        print_row("where-ran", &guard_ran_overall);
+        println!();
+        println!("either (courier OR guard - what one real session gets, both hooks installed):");
+        print_header();
+        for c in &cats {
+            print_row(c, &either_per[c]);
+        }
+        print_row("overall", &either_overall);
+    }
     Ok(())
 }
 
@@ -703,6 +906,7 @@ fn main() -> anyhow::Result<()> {
     let mut live: Option<PathBuf> = None;
     let mut cwd_override: Option<PathBuf> = None;
     let mut max_noise: Option<usize> = None;
+    let mut symbol_bridge = true;
     let mut args = std::env::args().skip(1);
     while let Some(a) = args.next() {
         match a.as_str() {
@@ -722,14 +926,17 @@ fn main() -> anyhow::Result<()> {
                 let n = args.next().ok_or_else(|| anyhow::anyhow!("--max-noise needs a count"))?;
                 max_noise = Some(n.parse()?);
             }
+            // Ablation arm (live mode): run the guard replay WITHOUT the
+            // symbol sidecar, isolating what the symbol bridge itself adds.
+            "--no-symbol-bridge" => symbol_bridge = false,
             other => anyhow::bail!(
-                "unknown argument '{}' (expected --json, --live <path>, --cwd <dir>, --max-noise <n>)",
+                "unknown argument '{}' (expected --json, --live <path>, --cwd <dir>, --max-noise <n>, --no-symbol-bridge)",
                 other
             ),
         }
     }
     match live {
-        Some(corpus) => run_live(&corpus, cwd_override.as_deref(), json_out),
+        Some(corpus) => run_live(&corpus, cwd_override.as_deref(), json_out, symbol_bridge),
         None => run_committed(json_out, max_noise),
     }
 }

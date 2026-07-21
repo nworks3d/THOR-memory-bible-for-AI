@@ -98,7 +98,10 @@ you meet a [DIVERGED] fact: resolve it (keep_rev wins) as soon as you know the r
 an injected/recalled fact actually helped you: mark it (improves future ranking). pin/unpin \
 manage the standing rules re-injected at every session start; brief shows what THOR knows about \
 the current project (counts, recent facts, pins, diverged). reproject moves a mis-scoped fact to \
-another project or global.";
+another project or global. ROUTING - pick the surface by the question's shape: recall for facts \
+and prose (\"what did we decide about X\"), where_used when a question names a symbol (\"who \
+calls X\"), impact before changing one (\"what breaks if I touch X\"), outline for a file's \
+shape, get to expand any id the others return.";
 
 /// The current project for a stdio server, from its launch cwd (Claude Code starts
 /// the connector in the project dir). `None` for the HTTP server (no cwd).
@@ -339,7 +342,7 @@ impl ThorServer {
         }
     }
 
-    #[tool(description = "Search THOR memory and return the best-matching CURRENT-HEAD facts, ranked. Read-only. kind:\"memory\" excludes repo code chunks.")]
+    #[tool(description = "Search THOR memory and return the best-matching CURRENT-HEAD facts, ranked. Read-only. kind:\"memory\" excludes repo code chunks. This is the TEXT surface - for \"who calls X\" use where_used, for \"what breaks if I change X\" use impact, for a file's shape use outline (the call graph lives in the symbol sidecar, not in ranking).")]
     async fn recall(&self, Parameters(args): Parameters<RecallArgs>) -> String {
         let server_project = self.project.clone();
         let db = self.db.clone();
@@ -468,7 +471,7 @@ impl ThorServer {
         .await
     }
 
-    #[tool(description = "Show the current head(s) of one THOR entity by id (DIVERGED shows every contested head).")]
+    #[tool(description = "Show the current head(s) of one THOR entity by id (DIVERGED shows every contested head). The follow-up tool: recall/where_used/impact/outline hand out ids, get turns one id into its full body.")]
     async fn get(&self, Parameters(args): Parameters<GetArgs>) -> String {
         let db = self.db.clone();
         self.blocking(move |s| {
@@ -483,7 +486,7 @@ impl ThorServer {
         .await
     }
 
-    #[tool(description = "Who calls this symbol? Name-based lookup on the derived symbol sidecar: the chunks that DEFINE the symbol and the chunks that CALL it. Follow with `get <chunk id>` for a caller's full body. Run `thor symbols` once if the sidecar is missing.")]
+    #[tool(description = "Who calls this symbol? Name-based lookup on the derived symbol sidecar: the chunks that DEFINE the symbol and the chunks that CALL it. Reach for this - not recall - the moment a question names a function/symbol (\"who calls X\", \"where is X used\"). Follow with `get <chunk id>` for a caller's full body. Run `thor symbols` once if the sidecar is missing.")]
     async fn where_used(&self, Parameters(args): Parameters<WhereUsedArgs>) -> String {
         let server_project = self.project.clone();
         let db = self.db.clone();
@@ -525,7 +528,7 @@ impl ThorServer {
         .await
     }
 
-    #[tool(description = "Change blast-radius of a symbol: reverse-walks the call edges (who calls it, who calls THOSE definers) up to depth 3. Name-based and heuristic - a triage map, not a type-checked proof. Needs the symbol sidecar (`thor symbols`).")]
+    #[tool(description = "Change blast-radius of a symbol: reverse-walks the call edges (who calls it, who calls THOSE definers) up to depth 3. Reach for this - not recall - before touching a widely-used symbol (\"what breaks if I change X\", \"is this safe to rename\"). Name-based and heuristic - a triage map, not a type-checked proof. Needs the symbol sidecar (`thor symbols`).")]
     async fn impact(&self, Parameters(args): Parameters<ImpactArgs>) -> String {
         let server_project = self.project.clone();
         let db = self.db.clone();
@@ -576,7 +579,7 @@ impl ThorServer {
         .await
     }
 
-    #[tool(description = "Signature map of one indexed file: per chunk its id and first line - a file overview at a fraction of Read's tokens. Follow with `get <chunk id>` (peek) for one chunk's full body. Idea credit: mimir's outline/peek.")]
+    #[tool(description = "Signature map of one indexed file: per chunk its id and first line - a file overview at a fraction of Read's tokens. Reach for this - not recall, not a full Read - when you need a file's shape (\"what is in courier.rs\") rather than a fact or a specific body. Follow with `get <chunk id>` (peek) for one chunk's full body. Idea credit: mimir's outline/peek.")]
     async fn outline(&self, Parameters(args): Parameters<OutlineArgs>) -> String {
         let server_project = self.project.clone();
         self.blocking(move |s| {

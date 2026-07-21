@@ -10,7 +10,7 @@
 //!   cargo run --release --features semantic --example hits_dump -- \
 //!     --queries <in.json> --out <out.json> \
 //!     [--limit 5] [--scope all|global|project:<key>] [--full] \
-//!     [--channel fused|courier] [--cwd <dir>] [--rerank]
+//!     [--channel fused|courier|pool] [--cwd <dir>] [--rerank]
 //!
 //! `--rerank` (fused channel, semantic build): rescores the fused top pool
 //! with the local cross-encoder before cutting to --limit, and prints the
@@ -131,6 +131,44 @@ fn main() -> anyhow::Result<()> {
                 thor::courier::injection_for_hook_json(&db, &hook.to_string())
                     .map(|block| vec![block])
                     .unwrap_or_default()
+            }
+            "pool" => {
+                // The courier's WORKING POOL, reproduced exactly (courier.rs:
+                // project scope from --cwd, path boosting off, 8 deep) - the pool
+                // the 3-slot injection then cuts down. The warm daemon is proven
+                // byte-identical to this cold call. Answers "is the preventer
+                // already in the pool the courier refuses to show?", which is the
+                // go/no-go for serving a pool tail.
+                let project =
+                    cwd.as_deref().and_then(|c| thor::repo::project_key(std::path::Path::new(c)));
+                let pscope = RecallScope::current(project);
+                let hits = {
+                    #[cfg(feature = "semantic")]
+                    {
+                        match (embedder.as_mut(), vecs.as_ref()) {
+                            (Some(e), Some(v)) => {
+                                let qvec = e.embed_one(query)?;
+                                thor::recall::recall_fused_scoped(
+                                    &store,
+                                    query,
+                                    &qvec,
+                                    v,
+                                    8,
+                                    thor::recall::FUSION_LAMBDA,
+                                    &pscope,
+                                    false, // courier pool: no path boosting
+                                    symbols.as_ref(),
+                                )?
+                            }
+                            _ => thor::recall::recall_scoped(&store, query, 8, &pscope)?,
+                        }
+                    }
+                    #[cfg(not(feature = "semantic"))]
+                    {
+                        thor::recall::recall_scoped(&store, query, 8, &pscope)?
+                    }
+                };
+                hits.iter().map(|h| format!("{}\n{}", h.entity_id, h.body)).collect()
             }
             _ => {
                 // With --rerank: fetch the rescore pool, reorder, cut back to

@@ -23,10 +23,6 @@ const MAX_PROMPT_CHARS: usize = 500;
 /// chosen ~2000-token ceiling). A hard ceiling, never a target - typical
 /// prompts stay in the hundreds; report the measured average alongside it.
 const PROMPT_BUDGET_CHARS: usize = 8000;
-/// Per-fact ceiling for full-body typed serving: one long fact must never eat
-/// the whole prompt budget - fragmentation is exactly the case where MULTIPLE
-/// facts need to surface together. Distillation keeps typed facts under this.
-const TYPED_FULL_BODY_CAP_CHARS: usize = 1200;
 
 /// Words that, when they make up the WHOLE prompt, mean "no recall worth doing"
 /// (acks / git verbs / greetings). Ported 1:1 from hook_recall.ps1 so THOR's
@@ -366,20 +362,41 @@ fn injection_with_store(
         // class: most live replay misses were CHUNK golds whose decisive
         // lines fell outside the old 700/220 windows). The per-prompt budget
         // (8000 chars) stays the hard ceiling.
-        let cap = if !crate::repo::is_chunk_id(&hit.entity_id) {
-            TYPED_FULL_BODY_CAP_CHARS
-        } else if slot == 0 {
-            1200
-        } else {
-            500
-        };
-        let cap = cap.min(remaining.max(220)); // budget floor: never serve less than the old minimum
         let diverged = if hit.is_diverged { " [DIVERGED]" } else { "" };
-        // Freshness: a chunk of the CURRENT project is re-read from disk, so the
-        // agent sees today's code (tagged [refreshed]) - or a warning when the
-        // stored chunk no longer exists ([stale?]). Memories pass through.
-        let (fresh_tag, snip) =
-            fresh_snippet(&hit.entity_id, &hit.body, &query, cap, project.as_deref(), cwd.as_deref());
+        // ONE serving stack. The courier used to run its own snippet pipeline
+        // (windowed caps: memories 1200, chunks 1200/500) next to the deliberate
+        // path's serve_deliberate (memories full-body, chunks neighbor-stitched).
+        // Measured on the same 73 drift scenarios, the deliberate form catches
+        // more (72.6% vs 67.1% preventer-surfaced) from the SAME pool - the
+        // courier's own comment above names the failure mode: right fact
+        // injected, actionable details cut. So the courier now serves through
+        // serve_deliberate too (which does its own freshness re-read), and the
+        // per-prompt budget is the only limiter left: a serving that does not
+        // fit what remains falls back to the query-centered window over the
+        // same stitched text - never a blind truncation.
+        // Each slot's ceiling is its FAIR SHARE of what remains, not a fixed
+        // number: one long fact must never eat the whole budget, because
+        // fragmentation is exactly the case where multiple facts need to
+        // surface together. A short serving donates its unused share to the
+        // slots after it; a long one is windowed at its share, never blindly
+        // truncated. Derived from the budget, so there is no cap left to tune.
+        let slots_left = selected.len() - slot;
+        let fair_share = (remaining / slots_left.max(1)).max(220);
+        let (fresh_tag, snip) = {
+            let (tag, full) = serve_deliberate(
+                &store,
+                &hit.entity_id,
+                &hit.body,
+                &query,
+                project.as_deref(),
+                cwd.as_deref(),
+            );
+            if full.chars().count() <= fair_share {
+                (tag, full)
+            } else {
+                (tag, crate::recall::snippet(&full, fair_share, &query))
+            }
+        };
         // Type tag for hand-written constraints, so a gotcha/decision reads as
         // one at a glance instead of blending in with chunks.
         let type_tag = hit.fact_type.map(|t| format!(" [{}]", t.as_str())).unwrap_or_default();
@@ -414,7 +431,11 @@ fn injection_with_store(
                             continue;
                         }
                         if let Some((body, retracted)) = by_rev.get(rev) {
-                            let s = crate::recall::snippet(body, cap, &query);
+                            // A contested head is context for reconciling, not
+                            // the primary serving: a compact window suffices and
+                            // must not eat the budget the winning head needs.
+                            let s =
+                                crate::recall::snippet(body, remaining.clamp(220, 500), &query);
                             let label = if *retracted { ", retracted" } else { "" };
                             out.push_str(&format!(
                                 "    | contested head ({}{}): {}\n",
@@ -605,27 +626,6 @@ pub fn clear_session_ledger(db: &Path, session_id: &str) {
 }
 
 // ---- Freshness ----------------------------------------------------------------
-
-/// Freshness tag + display snippet for one hit, shared by every surface that
-/// shows recall hits (courier injection, MCP recall, CLI recall): the tag is
-/// "" / " [refreshed]" / " [stale?]" and the snippet is cut from the LIVE text
-/// when the file changed since ingest.
-pub(crate) fn fresh_snippet(
-    entity_id: &str,
-    body: &str,
-    query: &str,
-    cap: usize,
-    project: Option<&str>,
-    cwd: Option<&str>,
-) -> (String, String) {
-    match freshness(entity_id, body, project, cwd) {
-        Freshness::Current => (String::new(), crate::recall::snippet(body, cap, query)),
-        Freshness::Refreshed(live) => {
-            (" [refreshed]".to_string(), crate::recall::snippet(&live, cap, query))
-        }
-        Freshness::Stale => (" [stale?]".to_string(), crate::recall::snippet(body, cap, query)),
-    }
-}
 
 /// Wide query-focused window for repo chunks on the deliberate path (MCP/CLI
 /// recall): matches what the benchmark's fused channel measures, so the
@@ -1186,6 +1186,41 @@ mod tests {
         assert!(out.contains("<thor-recall>"));
         assert!(out.contains("e1"));
         assert!(out.contains("deploy watcher"));
+    }
+
+    #[test]
+    fn test_fair_share_budget_one_long_fact_cannot_starve_the_rest() {
+        // The unified serving stack serves full bodies, so a single long fact
+        // could eat the whole prompt budget - and fragmentation is exactly the
+        // case where MULTIPLE facts must surface together. Each slot is capped
+        // at its fair share of what remains: the long fact gets windowed, the
+        // short ones still serve whole.
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("m.db");
+        {
+            let mut store = EventStore::new(&db).unwrap();
+            let long =
+                format!("deploy watcher rule number one {}", "padding words here ".repeat(600));
+            for (eid, body) in [
+                ("mem-long", long.as_str()),
+                ("mem-two", "deploy watcher rule number two: never restart during a build"),
+                ("mem-three", "deploy watcher rule number three: check the flag file first"),
+            ] {
+                store.append_event("s", "l", "a", EventKind::FactCreated, eid, None, body).unwrap();
+            }
+        }
+        let raw = r#"{"prompt":"deploy watcher rule","cwd":"x","session_id":"s1"}"#;
+        let out = injection_for_hook_json(&db, raw).expect("should inject");
+        for id in ["mem-long", "mem-two", "mem-three"] {
+            assert!(out.contains(id), "{id} must be present in the injection");
+        }
+        assert!(out.contains("never restart during a build"), "short fact 2 serves whole");
+        assert!(out.contains("check the flag file first"), "short fact 3 serves whole");
+        assert!(
+            out.chars().count() < 10_000,
+            "the ~11k-char fact was windowed to its share, not served whole ({} chars)",
+            out.chars().count()
+        );
     }
 
     #[test]

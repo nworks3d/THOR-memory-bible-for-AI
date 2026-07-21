@@ -1,4 +1,4 @@
-﻿use rusqlite::{Connection, OpenFlags, Result as SqlResult, params};
+use rusqlite::{Connection, OpenFlags, Result as SqlResult, params};
 use sha2::{Sha256, Digest};
 use uuid::Uuid;
 use std::collections::HashSet;

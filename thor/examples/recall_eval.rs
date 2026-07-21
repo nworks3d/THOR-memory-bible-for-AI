@@ -1,7 +1,10 @@
 //! Honest production measurement of `recall::recall_fused` (feature `semantic`).
 //!
 //! Runs the REAL recall path - not a python re-implementation - over a private
-//! battery and reports recall@1/@3/@5 per category, fused vs bm25. The bm25
+//! battery, fused vs bm25. The printed table is recall@5 per category with @3/@5
+//! totals; @1 and the gold's rank go to the `--out` dump, because a hit rate at
+//! rank 1 is too coarse to read off a table but is where the arms differ most.
+//! The bm25
 //! baseline goes through the SAME `recall_fused` with an all-zero query vector, so
 //! the cosine term vanishes and the order is pure bm25 (identical candidate pool,
 //! head projection and dedup) - isolating exactly what fusion adds.
@@ -400,4 +403,103 @@ fn main() -> anyhow::Result<()> {
         );
     }
     Ok(())
+}
+
+/// The scoring rule is the measurement. Every recall figure this project
+/// publishes is whatever these four functions say it is, so a silent change here
+/// moves published numbers with nothing to catch it - and the looseness they
+/// replaced did exactly that for months before it was found.
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Document frequencies for `heads` documents, from (term, count) pairs.
+    fn df_of(pairs: &[(&str, usize)]) -> HashMap<String, usize> {
+        pairs.iter().map(|(t, n)| (t.to_string(), *n)).collect()
+    }
+
+    #[test]
+    fn tokens_lowercases_dedupes_and_drops_short_words() {
+        let t = tokens("Fsck FSCK fsck an is of Rebuild-FTS 42 seventeen");
+        assert!(t.contains("fsck"), "case is folded and the three collapse to one");
+        assert!(t.contains("rebuild") && t.contains("seventeen"));
+        for short in ["an", "is", "of", "42"] {
+            assert!(!t.contains(short), "{short} is under 4 chars and must not be a term");
+        }
+    }
+
+    #[test]
+    fn key_terms_drops_stopwords_that_the_frequency_cut_would_keep() {
+        // "which" sits below 10% document frequency on the real store, so the
+        // frequency cut alone leaves it in. This is the case that made me put
+        // both filters back after assuming one would do.
+        let df = df_of(&[("which", 5), ("rebuild", 5)]);
+        let terms = key_terms("which rebuild", &df, 1000);
+        assert_eq!(terms, vec!["rebuild".to_string()], "a rare stopword is still a stopword");
+    }
+
+    #[test]
+    fn key_terms_drops_common_words_that_are_not_stopwords() {
+        // "repo" is no stopword but appears in ~90% of stored bodies, so it is
+        // evidence for nothing in particular.
+        let df = df_of(&[("repo", 900), ("directional", 3)]);
+        let terms = key_terms("repo directional", &df, 1000);
+        assert_eq!(terms, vec!["directional".to_string()], "the frequency cut catches it");
+    }
+
+    #[test]
+    fn key_terms_cut_is_inclusive_at_the_boundary() {
+        // cap = 10% of 1000 = 100. A term AT the cap is kept; one above is not.
+        let df = df_of(&[("atcap", 100), ("overcap", 101)]);
+        let terms = key_terms("atcap overcap", &df, 1000);
+        assert_eq!(terms, vec!["atcap".to_string()]);
+    }
+
+    #[test]
+    fn key_terms_of_an_unseen_word_treats_it_as_maximally_rare() {
+        // A gold frozen at its source seq can contain words no live head has any
+        // more. Absent from the df map must mean "rare", never "unknown, drop it".
+        let terms = key_terms("vanished", &df_of(&[]), 1000);
+        assert_eq!(terms, vec!["vanished".to_string()]);
+    }
+
+    #[test]
+    fn chunk_file_identifies_siblings_and_leaves_plain_facts_alone() {
+        assert_eq!(chunk_file("proj:src/recall.rs#12"), Some("proj:src/recall.rs"));
+        assert_eq!(
+            chunk_file("proj:src/recall.rs#12"),
+            chunk_file("proj:src/recall.rs#3"),
+            "two chunks of one file must compare equal, that is what suppresses them"
+        );
+        assert_ne!(chunk_file("proj:src/recall.rs#1"), chunk_file("proj:src/cli.rs#1"));
+        assert_eq!(chunk_file("proj:mem-abc"), None, "a hand-written fact has no siblings");
+    }
+
+    #[test]
+    fn a_content_match_needs_more_than_half_the_terms() {
+        // The threshold moved from 50% to 60% after the loose rule was measured
+        // to fire on unrelated bodies; pin it so it cannot drift back silently.
+        assert!(CONTENT_THRESHOLD > 0.5, "50% was measured too loose");
+        let terms = key_terms("alpha bravo charlie delta echo", &df_of(&[]), 1000);
+        assert_eq!(terms.len(), 5);
+        let carried = |body: &str| {
+            let b = tokens(body);
+            terms.iter().filter(|t| b.contains(t.as_str())).count() as f64 / terms.len() as f64
+        };
+        // 3 of 5 is exactly 60%, and the comparison is >=, so the boundary counts
+        // as a match. Pinned explicitly because it is the kind of off-by-one that
+        // moves every published figure by a question or two without any error.
+        assert!(carried("alpha bravo") < CONTENT_THRESHOLD, "2 of 5 is not a match");
+        assert!(carried("alpha bravo charlie") >= CONTENT_THRESHOLD, "3 of 5 sits ON the bar");
+        assert!(carried("bravo charlie delta echo") >= CONTENT_THRESHOLD, "4 of 5 clears it");
+    }
+
+    #[test]
+    fn terms_match_whole_tokens_not_substrings() {
+        // The old rule matched substrings, so "test" scored against "latest".
+        let terms = key_terms("test", &df_of(&[]), 1000);
+        assert_eq!(terms, vec!["test".to_string()]);
+        assert!(!tokens("the latest greatest").contains("test"), "must not fire on 'latest'");
+        assert!(tokens("a test case").contains("test"));
+    }
 }

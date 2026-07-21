@@ -60,17 +60,27 @@ jobs:
 
       # The library suite runs WITHOUT a local embedding model or a daemon (the
       # semantic path degrades to bm25 when they are absent), so a clean runner
-      # is a valid place to run it. Verified: 243/243 pass with no model present.
+      # is a valid place to run it. This step runs across the feature matrix, so
+      # there is no single test count: measured 2026-07-21, the default build has
+      # 234 tests and the semantic build 280, all passing with no model present.
       - name: Test
         working-directory: thor
         run: cargo test --release ${{ matrix.features }} --lib
 
       # The eval harnesses are part of the argument this repo makes, so they must
-      # at least compile. They are not RUN here: they need a real store, a model
-      # and a warm daemon.
+      # at least compile. The harnesses themselves are not RUN here: they need a
+      # real store, a model and a warm daemon.
       - name: Build examples
         working-directory: thor
         run: cargo build --release ${{ matrix.features }} --examples
+
+      # ...but their SCORING rules are unit-tested, and those tests do run. Every
+      # recall figure this project publishes is whatever the scoring rule says it
+      # is, so an untested scoring rule is an unmeasured claim. `--lib` above does
+      # not reach them, because they live beside the harness they define.
+      - name: Test examples
+        working-directory: thor
+        run: cargo test --release ${{ matrix.features }} --examples
 
   # The one claim in this repo a stranger can reproduce without our private
   # corpus: drift compensation over the committed synthetic scenarios. If this

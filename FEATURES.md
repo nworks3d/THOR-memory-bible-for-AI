@@ -21,8 +21,11 @@ no cloud service behind it and no database server to run.
 Two things are true of everything below, and they are why the rest is safe to
 try:
 
-- **Nothing here can make search worse.** Every optional layer falls back to
-  plain keyword search when a piece is missing or broken.
+- **Nothing here breaks if a piece is missing.** Every optional layer falls back
+  to plain keyword search when something is absent or broken, so a half-finished
+  setup costs you that layer and nothing else. That is a promise about failure,
+  not about quality: two of the layers below are measured to help in some places
+  and not others, and each says so in its own section.
 - **Nothing here deletes a fact.** The store only ever appends. Correcting a
   fact adds a new version; the old one stays in history.
 
@@ -241,10 +244,12 @@ of unlabelled facts gives the reminder nothing to fire on.
 One command, `thor fsck`, reads the whole memory and answers one question: is any
 of this damaged? It re-checks every entry's fingerprint, and it asks the search
 index to verify its own structure. On a healthy memory it prints six `OK` lines
-and stops. If something is wrong it says so and exits with an error code, which
+and stops. If something is damaged it says so and exits with an error code, which
 is the part that matters: you can put it in a backup script or a nightly job and
 have it actually stop you, instead of printing a scary red line into a log nobody
-reads.
+reads. One exception, and it is deliberate: a fact whose little metadata tag went
+missing is reported but does not raise the alarm, because nothing is corrupt -
+it just needs tidying.
 
 There are two kinds of bad news it can give you, and they are not equally bad.
 A broken fingerprint means someone or something altered a past entry - that is

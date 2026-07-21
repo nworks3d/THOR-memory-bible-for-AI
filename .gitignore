@@ -10,3 +10,18 @@ __pycache__/
 *.zip
 # Local MCP connector config (machine-specific absolute path)
 .mcp.json
+# Measurement corpora and their outputs, mirrored from thor/.gitignore. A gold
+# body is a real memory and an entity id names a real project, so these belong in
+# the per-user data directory and never here. Mirrored because the eval harness
+# writes relative to wherever it was started, and the repo root is a plausible
+# place to start it.
+golds*.json
+percategory_queries*.json
+queries*.json
+items*.json
+strata*.json
+scores*.json
+hits*.json
+*_hits.json
+thor-src-*.tar.gz
+*.npy

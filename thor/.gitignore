@@ -22,8 +22,15 @@ guard-response-rulebook.json
 # is one careless copy into eval/ away from being staged by `git add -A`. Deny by
 # name rather than trusting that nobody will ever put one here.
 #
-# Deliberately NOT a blanket eval/*.json: drift_noise_baseline.json is a committed
-# one-way ratchet and has to stay tracked.
+# Inside eval/ the default flips: deny every json and name the one exception.
+# A name-based list only stops the names someone thought of, and the harness lets
+# you choose any output name you like (`--out <file>`), so eval/ needs the
+# catch-all. drift_noise_baseline.json is a committed one-way ratchet.
+/eval/*.json
+!/eval/drift_noise_baseline.json
+
+# Outside eval/ a catch-all would be wrong, so deny by name instead - these are
+# what the harness produces when it is run from the crate root.
 golds*.json
 percategory_queries*.json
 queries*.json

@@ -513,10 +513,10 @@ enum Commands {
     /// Remove a pinned fact from the session-start brief.
     Unpin { entity_id: String },
     /// Metabolism report: duplicate twins (same normalized prefix the
-    /// remember/import gates refuse on), decay candidates (untyped, never
-    /// marked, never read, long inactive) and same-topic clusters for agent
-    /// review. Report-only by default; exits 1 when anything is found (CI
-    /// gate), 0 when clean. Lossless: nothing is ever deleted.
+    /// remember/import gates refuse on), decay candidates (untyped, never read,
+    /// long inactive) and same-topic clusters for agent review. Report-only by
+    /// default; exits 1 when anything is found (CI gate), 0 when clean.
+    /// Lossless: nothing is ever deleted.
     Consolidate {
         /// Retract the duplicate twins from the report (keeps the pinned /
         /// import-synced / oldest copy). Decay and cluster candidates are

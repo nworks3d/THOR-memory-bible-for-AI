@@ -517,8 +517,18 @@ struct LiveScenario {
 }
 
 /// Key terms of a gold description: lowercase alphanumeric tokens of >= 4
-/// chars, deduped. Crude but stable; short function words drop out on length
-/// alone, so no stopword list can drift out of sync with recall's.
+/// chars, deduped. Crude but stable, and deliberately unchanged: every published
+/// drift number and the committed noise ratchet were measured with exactly this
+/// recipe, so touching it moves the baseline rather than improving it.
+///
+/// The old note here claimed short function words drop out on length alone, so
+/// no stopword list could drift out of sync with recall's. That is false, and
+/// measured so: 27 of the 88 entries in `recall::STOPWORDS` are 4 chars or
+/// longer ("what", "which", "zijn", "waarom", ...) and survive this filter.
+/// Matching is also substring rather than whole-token, so "test" fires on
+/// "latest". `recall_eval` fixed both for its own scoring after the looseness
+/// was measured to inflate every arm; porting the fix here would move published
+/// numbers, so it is a decision to take deliberately, not a cleanup to slip in.
 fn key_terms(text: &str) -> Vec<String> {
     let mut seen = std::collections::HashSet::new();
     text.split(|c: char| !c.is_alphanumeric())

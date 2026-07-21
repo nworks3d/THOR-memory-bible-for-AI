@@ -41,7 +41,8 @@ one thing the agent can search automatically. Measured against
   log; a conflicting edit *branches* (both heads kept) instead of overwriting, and
   `fsck` recomputes the chain so tampering is detectable.
 - **It degrades cleanly.** Semantic off, model missing, sidecar deleted, daemon
-  down - each path falls back to bm25 and can never make recall worse.
+  down - each path falls back to bm25, so a broken setup costs you the extra
+  layer and nothing else.
 
 Where mimir stays ahead: a **first-class code-symbol graph** for "which
 functions call X" - THOR has a derived `where_used`/`impact` sidecar, but

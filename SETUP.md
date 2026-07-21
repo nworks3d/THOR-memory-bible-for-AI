@@ -112,8 +112,10 @@ Optional daily GitHub backup: add `--backup-repo <path-to-a-git-clone>`.
 Lexical bm25 is always on; the dense score-fusion layer goes on top and is what
 you want on the machine your agent runs on. Skip it only for a server/NAS (the
 bm25 build carries no ONNX), or if you cannot spare ~650 MB of RAM for the warm
-model daemon. It degrades to bm25 whenever anything is missing, so turning it on
-cannot make recall worse.
+model daemon. It degrades to bm25 whenever anything is missing, so a broken setup
+costs you the layer and nothing else. What it buys, and where it does not, is
+measured in the README's "Semantic recall" section - briefly: it clearly helps on
+hand-written memory facts and is a wash on indexed code.
 
 The release binaries for Windows and Linux already have the feature compiled in.
 What it needs from you is a model:

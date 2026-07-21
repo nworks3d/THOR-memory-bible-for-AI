@@ -11,10 +11,12 @@ of guessing.
 Two promises hold throughout, and both are in the code rather than in this
 sentence:
 
-- **Nothing here can break recall.** Every optional layer degrades to plain
-  keyword search when a piece is missing. A missing model, a deleted sidecar, a
-  daemon that is not running - none of them produce an error, they produce
-  ordinary results.
+- **Nothing here breaks recall when a piece is missing.** Every optional layer
+  degrades to plain keyword search. A missing model, a deleted sidecar, a daemon
+  that is not running - none of them produce an error, they produce ordinary
+  results. Read that as a promise about FAILURE, not about quality: a layer that
+  is working can still reorder results, and where each one has been measured to
+  help or not is stated in its own section rather than promised here.
 - **Nothing here deletes a fact.** The event log is append-only and
   hash-chained. Turning a feature off removes a derived file or stops a process;
   it never removes history. Where an exception exists, the block below says so
@@ -296,8 +298,9 @@ you are building from source.
   ```
 - **How to check it worked:** cargo prints a line like `test result: ok. N passed;
   0 failed` per test binary and exits 0. SETUP.md describes the expected outcome as
-  "should be all green". The project's CI workflow records one measurement:
-  243 of 243 tests pass with no model present.
+  "should be all green". There is no single expected N, because the count depends
+  on how you built: measured 2026-07-21, the default build runs 234 tests and the
+  `semantic` build 280, all passing with no model present.
 - **How to turn it off again:** just do not run it. It is a one-shot check with no
   persistent state, and it works in throwaway temporary folders, so it never touches
   your real memory store.
@@ -1885,7 +1888,13 @@ tells you whether it still adds up.
   `CHAIN INTEGRITY ERROR` in red and then exit 0, which meant no script, no
   scheduled job and no release step could ever act on it - a backup verifier
   would have reported success on a corrupt store. A footer defect still exits 0
-  (see below), so the exit code means exactly one thing: something is corrupt.
+  (see below), so a non-zero exit means exactly one thing: something is corrupt.
+
+  Read the zero the other way round, though: exit 0 means "nothing is corrupt
+  right now". Adding `--rebuild-fts` to the same run repairs a damaged index and
+  then exits 0, so a job that always passes the flag can never tell you it had
+  something to repair. If you want to be told, run `thor fsck` on its own and
+  only pass `--rebuild-fts` when it complains.
 
   The sixth line is content health, not log integrity. Some facts carry a
   metadata footer (the bracketed tail that records their type and tags). If a

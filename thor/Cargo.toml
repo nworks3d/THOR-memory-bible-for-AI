@@ -37,7 +37,9 @@ fastembed = { version = "5.17", optional = true }
 
 [features]
 # Turn on the dense score-fusion recall path (client-only). Degrades to bm25
-# whenever the sidecar or model is absent, so enabling it can never break recall.
+# whenever the sidecar or model is absent, so a missing piece costs the layer and
+# nothing else. Enabled and working it does reorder results: measured to help on
+# hand-written memory facts and to be a wash on indexed code (see the README).
 semantic = ["dep:fastembed"]
 
 [dev-dependencies]

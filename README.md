@@ -95,8 +95,9 @@ mimir's graph is why it wins the code-structure category. See
 - **Drift hooks.** Pin standing rules (`thor pin`) and SessionStart re-injects
   their full body at every start - including right after a compaction, when
   prompt-recall has nothing to match against. The first time a session touches a
-  file, the guard surfaces stored memories that *name* that file (memories only,
-  never code chunks). A Stop-hook capture nudge fires (once per session, claimed
+  file, the guard surfaces stored memories that *name* that file, plus up to
+  three prose doc chunks (CHANGELOG/design-doc paragraphs) that name it - never
+  code chunks, and never a chunk of the touched file itself. A Stop-hook capture nudge fires (once per session, claimed
   atomically) when a reply contains an unstored decision/gotcha, so durable facts
   stop depending on the model remembering to remember; its trigger list is
   tunable via `guard-capture-triggers.json` next to the store (built-in list as

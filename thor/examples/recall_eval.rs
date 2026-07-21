@@ -54,6 +54,15 @@ fn local(sub: &[&str]) -> PathBuf {
     p
 }
 
+/// How deep to look when recording where the gold landed.
+///
+/// A binary hit@5 throws away almost everything an arm did: moving a gold from
+/// rank 40 to rank 6 scores exactly the same as not moving it at all. That is why
+/// small strata cannot be decided - McNemar needs at least 8 items where the arms
+/// DISAGREE, and on 53 memory facts they disagree about 4 times. The rank is the
+/// same measurement without the information thrown away, and a paired rank test
+/// uses every item instead of only the discordant ones.
+const RANK_LIMIT: usize = 50;
 /// Share of live heads a term may appear in before it stops being evidence.
 const MAX_DF: f64 = 0.10;
 /// Share of a gold's key terms a body must carry to count as the same content.
@@ -277,9 +286,15 @@ fn main() -> anyhow::Result<()> {
             let (e, c) = score(hits, k);
             e || c
         };
+        // 1-based rank of the first hit, or None when the gold is nowhere in the
+        // first RANK_LIMIT. Censored items are kept and handled by the analysis;
+        // dropping them would bias every arm toward whatever it already finds.
+        let rank_of = |hits: &[thor::recall::RecallHit]| -> Option<usize> {
+            (1..=hits.len().min(RANK_LIMIT)).find(|&k| count(hits, k))
+        };
 
         // bm25 baseline: a zero query vector -> cosine 0 -> pure bm25 order.
-        let base = recall_fused_scoped(&store, query, &zero, &vecs, 5, 1.0,
+        let base = recall_fused_scoped(&store, query, &zero, &vecs, RANK_LIMIT, 1.0,
             &thor::recall::RecallScope::everything(), true, symbols.as_ref())?;
         // @1 as well as @3/@5: the measured discordance between arms is several
         // times larger at rank 1 than at rank 5, so a report that starts at @3
@@ -292,6 +307,8 @@ fn main() -> anyhow::Result<()> {
                 "at5": e5 || c5,
                 "entity_at5": e5,
                 "content_at5": c5,
+                "rank": rank_of(hits),
+                "served": hits.len(),
             })
         };
         let (b3, b5) = (count(&base, 3), count(&base, 5));
@@ -308,7 +325,7 @@ fn main() -> anyhow::Result<()> {
 
         // fused, one accumulator per lambda.
         for (i, &lam) in lambdas.iter().enumerate() {
-            let hits = recall_fused_scoped(&store, query, &qvec, &vecs, 5, lam,
+            let hits = recall_fused_scoped(&store, query, &qvec, &vecs, RANK_LIMIT, lam,
                 &thor::recall::RecallScope::everything(), true, symbols.as_ref())?;
             let (h3, h5) = (count(&hits, 3), count(&hits, 5));
             item_arms.insert(format!("fused_L{lam}"), arm_json(&hits));

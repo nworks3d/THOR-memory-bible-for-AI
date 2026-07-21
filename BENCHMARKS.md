@@ -18,7 +18,7 @@ One run, no re-rolls. New this round: every comparison carries an **exact sign
 test** on per-question wins, so "ahead" and "measurably ahead" stop being the
 same sentence.
 
-![THOR vs mimir - coverage, quality, drift and speed](assets/benchmark.svg)
+![THOR vs mimir - coverage, quality, drift and speed](assets/benchmark.svg?v=20260721)
 
 ## What changed, and why you should trust this round more than the last
 

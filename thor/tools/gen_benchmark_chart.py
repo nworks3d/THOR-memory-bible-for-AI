@@ -70,29 +70,31 @@ out.append(f'<text x="20" y="{y}" fill="{MUT}" font-size="12">Same machine, blin
 y += 30
 
 # ---- test 1 ----
-header("TEST 1 - COVERAGE  (200 questions: shared-knowledge + category-stratified)", "deliberate recall over the live store . higher is better . p = exact sign test")
-for label, t, m, p in [
-    ("Doc reference", 82.5, 68.8, "p 0.17"),
-    ("Decision", 75.9, 68.5, "p 0.45"),
-    ("Config how-to", 82.4, 82.4, "tie"),
-    ("Code behavior", 70.8, 70.8, "tie"),
-    ("Gotcha", 76.1, 78.3, "n/a"),
-    ("Code structure", 57.6, 74.2, "p 0.013"),
+header("TEST 1 - COVERAGE  (200 questions: shared-knowledge + category-stratified)", "deliberate recall over the live store . higher is better . only ONE gap here is statistically real")
+for label, t, m in [
+    ("Doc reference", 82.5, 68.8),
+    ("Decision", 75.9, 68.5),
+    ("Config how-to", 82.4, 82.4),
+    ("Code behavior", 70.8, 70.8),
+    ("Gotcha", 76.1, 78.3),
+    ("Code structure", 57.6, 74.2),
 ]:
-    pair(label, t, m, p, delta_color=SOFT if p in ("tie", "n/a") else (AMBER if t < m else None))
+    d = round(t - m)
+    delta = f"+{d}%" if d > 0 else (f"{d}%" if d < 0 else "tie")
+    pair(label, t, m, delta, delta_color=SOFT if d == 0 else None)
 rule()
 note(f'Test 1 overall  <tspan fill="{CYAN}">THOR 73.2%</tspan> vs <tspan fill="{MUT}">mimir 72.5%</tspan>  (n=200) - a TIE: 33 wins to 34, p = 1.00', color=FG, size=13, bold=True)
-note("133 of 200 questions score identically. One difference survives a significance test and it is mimir's: code-structure,")
-note("where it takes 12 of the 14 questions the two disagree on. The previous round published 77.0 vs 70.5 as a THOR lead;")
-note("that claim is retracted. doc-reference is the largest THOR-favouring gap but does not reach significance on n=40.")
+note("133 of 200 questions score identically. Only code-structure survives a significance test (p 0.013) and it is mimir's:")
+note("it takes 12 of the 14 questions the two disagree on. The +14 on doc-reference and +7 on decision do NOT reach it")
+note("(p 0.17 and p 0.45) - read those bars as noise. The previous round published 77.0 vs 70.5 as a lead; retracted.")
 y += 14
 
 # ---- test 2 ----
 header("TEST 2 - SAME KNOWLEDGE  (facts both systems verifiably hold)", "cuts over the judged Test 1 medians . the equal-corpus comparison")
-pair("Strict dual-written (n=53)", 94.3, 96.2, "p 0.73", delta_color=AMBER)
-pair("Broad shared (n=152)", 81.2, 83.9, "p 0.39", delta_color=AMBER)
-note("Both are ties, with mimir nominally ahead. The previous round published 97.2 vs 94.3 and 88.8 vs 86.2 and claimed", color=SOFT)
-note("THOR won both cuts - retracted. Pure ranking over an equal corpus is not a THOR advantage.", color=SOFT)
+pair("Strict dual-written (n=53)", 94.3, 96.2, "-2%")
+pair("Broad shared (n=152)", 81.2, 83.9, "-3%")
+note("Both are ties with mimir nominally ahead (p 0.73 and p 0.39). The previous round published 97.2 vs 94.3 and 88.8 vs", color=SOFT)
+note("86.2 and claimed THOR won both cuts - retracted. Pure ranking over an equal corpus is not a THOR advantage.", color=SOFT)
 y += 14
 
 # ---- test 3 ----
@@ -108,10 +110,11 @@ y += 14
 
 # ---- drift ----
 header("SESSION DRIFT  (73 fresh-session scenarios)", "post-compaction, empty context: does memory surface the fact that stops the drift? silence scores zero")
-pair("Preventer surfaced vs mimir's BEST channel", 67.1, 74.0, "p 0.043",
-     delta_color=AMBER, mimir_tag="recall --all")
-pair("Preventer surfaced vs mimir's HOOK", 67.1, 37.0, "p <0.0001",
+pair("Preventer surfaced vs mimir's BEST channel", 67.1, 74.0, "-7%",
+     mimir_tag="recall --all")
+pair("Preventer surfaced vs mimir's HOOK", 67.1, 37.0, "+30%",
      mimir_tag="recall-inject")
+note("Both gaps ARE significant (p 0.043 against the best channel, p <0.0001 against the hook) and they point opposite ways.", color=SOFT)
 note("The comparison splits in two and both halves are real. On CAPABILITY mimir wins: its full recall beats THOR's courier", color=SOFT)
 note("(21 wins to 9) and ties THOR's deliberate channel at 72.6%. On WHAT RUNS UNASKED THOR wins 37 to 6: mimir's hook", color=SOFT)
 note("misses 46 of 73 scenarios and returns nothing at all on 2. mimir's winning channel is not a hook - you must call it.", color=SOFT)

@@ -1992,8 +1992,17 @@ is changed unless you add the flag described in the next block.
 
   and exits 0. Otherwise you get a section per finding, for example
   `N duplicate group(s) ...` with a `keep <id>  retract <id> ...` line each, and
-  `N decay candidate(s) (untyped, never marked, never read, long inactive) - confirm each via retract:`,
+  `N decay candidate(s) (untyped, never read, long inactive) - confirm each via retract:`,
   and the process exits 1.
+
+  **This changed:** that line used to read "untyped, never marked, never read". It
+  was true and misleading at the same time. Marking a fact as having helped is a
+  deliberate act, and in practice almost nobody performs it - measured on this
+  project's own history, the mark tool had been called 3 times against 579
+  searches. So "never marked" describes nearly every fact you own and adds no
+  evidence. Naming it alongside "never read" suggested two independent checks had
+  agreed. This is a list of things to consider throwing away, so overstating the
+  evidence behind it is the wrong way to be wrong.
 - **How to turn it off again:** stop running it. Nothing is lost.
 
 ### thor consolidate --apply-dedup

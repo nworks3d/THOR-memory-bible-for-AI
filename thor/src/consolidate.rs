@@ -544,9 +544,16 @@ pub fn render_report(report: &Report) -> String {
         }
     }
     if !report.decay.is_empty() {
+        // "never marked" is technically true and practically empty: the mark tool
+        // is barely used in real sessions (3 calls against 579 recalls, measured
+        // 2026-07-21), so on any real store it says almost nothing about a fact.
+        // The signal actually separating these candidates is "never read". Naming
+        // both would suggest two independent checks agreed, when one of them has
+        // no data - and this list is a retraction suggestion, so overstating its
+        // evidence is exactly the wrong way to be wrong.
         line(format!(
             "
-{} decay candidate(s) (untyped, never marked, never read, long inactive) - confirm each via retract:",
+{} decay candidate(s) (untyped, never read, long inactive) - confirm each via retract:",
             report.decay.len()
         ));
         for d in &report.decay {

@@ -11,6 +11,26 @@
 //! carries no wall clock). Noise and access live in the LOCAL ledger only:
 //! "noise for me during this task" is not an institutional fact, and reads
 //! never belong in the synced log.
+//!
+//! WHAT IS ACTUALLY IN THOSE THREE TERMS, measured 2026-07-21 on a 19,166-event
+//! store, because the design above describes an intent that the data does not
+//! meet. The institutional term is empty: 2 fact_echoed events exist (0.01% of
+//! the log), both far enough behind the tip to have decayed to weight 0.15, and
+//! there is 1 noise mark. The `mark` tool that writes them had been called 3
+//! times in the entire transcript history against 579 recalls. So in practice
+//! this is the access counter alone - and that counter is self-reinforcing (a
+//! fact is read because it was served, then scores higher because it was read)
+//! and saturated: 355 of the 878 entities carrying a count sit at or above
+//! ACCESS_CAP, where they are all worth exactly the same 2.0.
+//!
+//! The consequence was measured rather than assumed, and it is small: disabling
+//! the courier's promotion entirely changed 3 of 74 live drift scenarios, none
+//! of them in whether the right fact surfaced - only in how much of it did, one
+//! scenario better and one worse. The lookup costs 0.076 ms per prompt, about
+//! 0.06% of the courier's warm budget. So there is nothing here worth removing
+//! or tuning; what is worth knowing is that the term the design leans on is not
+//! the term doing the work. To re-measure, make the courier pass an empty map
+//! and diff `drift_eval --live <corpus> --json` between the two builds.
 
 use crate::event_store::EventStore;
 use std::collections::HashMap;

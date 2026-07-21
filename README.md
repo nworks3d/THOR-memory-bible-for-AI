@@ -17,26 +17,28 @@ one thing the agent can search automatically. Measured against
 [mimir](https://github.com/MakerViking/mimir) on the same machine
 ([full method + weaknesses](BENCHMARKS.md)):
 
-- **It wins where knowledge lives.** On the 200-question as-deployed set THOR
-  leads overall **77.0% vs 70.5%** (mimir v0.14), winning four of six
-  categories - decision +20, doc-reference +11, config +9, code-behavior +8 -
-  and tying gotcha. Its one category loss is code-structure (63.6% vs 74.2%),
-  mimir's tree-sitter symbol graph.
-- **It wins the cleanest equal-corpus tests.** On the strict dual-written cut
-  (facts both stores verifiably hold, n=53) THOR leads **97.2% vs 94.3%**, and
-  the broad shared cut too (88.8% vs 86.2%) - pure memory recall was mimir's
-  home turf across earlier juries.
-- **It compensates for session drift.** After a compaction the agent starts blank;
-  THOR's as-deployed courier surfaces the governing gotcha/decision **86.3% vs
-  74.0%** (mimir's best case) and fully catches it **58.9% vs 50.7%**, judged
-  three-way blind. This is what the tool is *for*.
-- **On a like-for-like full recall it is 2.7x faster than mimir** with the
-  inject daemon up (120 ms vs mimir 0.14's 322 ms), injecting a full block on
-  every prompt. With the daemon stopped it is 349 ms - slightly slower than
-  mimir there, and it grows with store size. mimir's as-deployed hook is much
-  faster (~34 ms) but serves a single floor-gated memory (175 chars) and nothing
-  on 6 of 20 prompts - fast because it serves less. Full honest picture in
-  BENCHMARKS.md.
+- **On retrieval quality it is a tie, and that is the honest headline.** Over the
+  200-question as-deployed set THOR scores **73.2% vs 72.5%** (mimir v0.15) and
+  is *behind* on per-question wins, 33 to 34. Same-knowledge cuts: 94.3% vs 96.2%
+  and 81.2% vs 83.9%, both ties. Multi-project: 87.8% vs 94.4%, not significant.
+  An earlier round claimed a 6.5-point lead and wins on the equal-corpus cuts;
+  those claims are **retracted** - see BENCHMARKS.md.
+- **One difference is significant, and mimir wins it.** code-structure, 57.6% vs
+  74.2% (mimir takes 12 of the 14 questions the two disagree on, p = 0.013).
+- **On drift, the comparison splits in two and you should know both halves.**
+  After a compaction the agent starts blank. Against mimir's *best* channel -
+  full recall over every project, which you must call explicitly - mimir surfaces
+  the governing gotcha or decision **74.0%** against THOR's courier at 67.1%, and
+  wins the per-scenario comparison (p = 0.043). Against mimir's *hook*, the thing
+  that runs by itself on every prompt, THOR's courier wins 37 scenarios to 6
+  (p < 0.0001): that hook misses 46 of 73 and returns nothing on 2.
+- **So the defensible claim is about what runs unasked, not about who ranks
+  better.** THOR's courier answers **every** prompt in 125 ms and never stays
+  silent. mimir's hook is three times faster (41 ms) but empty on 6 of 20
+  prompts; the mimir channel that wins drift costs 334 ms and is not a hook.
+  Whether that trade suits you is a judgement about how you work, not something
+  this benchmark settles. Full picture, including four retracted claims and a
+  discarded run of our own, in BENCHMARKS.md.
 - **It never loses a write.** Every fact is an event in a hash-chained append-only
   log; a conflicting edit *branches* (both heads kept) instead of overwriting, and
   `fsck` recomputes the chain so tampering is detectable.
@@ -119,21 +121,24 @@ mimir's graph is why it wins the code-structure category. See
 ## Benchmarks
 
 A blind, judged head-to-head against [mimir](https://github.com/MakerViking/mimir),
-re-measured fresh 2026-07-14 against **mimir v0.14.0** with a 3-judge median on
-every test, fresh random blind maps and one-run-no-re-rolls, both stores
-hygiene-passed before the run: **coverage** THOR 77.0% vs 70.5% on the
-200-question balanced set (THOR wins four of six categories and loses only
-code-structure, 63.6% vs 74.2%), **same-knowledge quality** THOR wins both
-cuts (strict dual-written 97.2% vs 94.3%, broad shared 88.8% vs 86.2%),
-**multi-project** THOR edges it 96.7% vs 95.6%, **session drift** THOR-led on
-both metrics judged three-way blind (surfaces the preventing fact 86.3% vs
-74.0%, full catch 58.9% vs 50.7%), and on **speed** (re-measured 2026-07-15 vs
-mimir 0.14) a like-for-like full recall favours THOR with the daemon up (120 ms
-vs 322 ms) but not without it (349 ms), while mimir's as-deployed hook is much
-faster (~34 ms) by serving a single floor-gated memory and nothing on 6 of 20
-prompts. Full method, per-category tables and honest weaknesses - including why
-the code-structure loss is probably not the symbol-graph gap we first called it
-- in [BENCHMARKS.md](BENCHMARKS.md).
+re-measured fresh 2026-07-21 against **mimir v0.15.0** with a 3-judge median on
+every test, seeded blind maps, one run and no re-rolls, both stores hygiene-passed
+first - and mimir's own indexer re-run over the same repositories, because a stale
+code index was the single biggest unfairness in the previous round.
+
+**THOR leads no quality metric in this round.** Coverage is 73.2% vs 72.5% and
+behind on per-question wins; both same-knowledge cuts and the multi-project test
+are ties or nominal mimir wins; code-structure is a significant mimir win (57.6%
+vs 74.2%, p = 0.013). On drift, mimir's full recall beats THOR's courier
+(74.0% vs 67.1%, p = 0.043) while THOR's courier beats mimir's *hook* 37 to 6
+(p < 0.0001) - mimir's winning channel is not a hook, THOR's is. Speed: THOR's
+courier 125 ms and never empty; mimir's hook 41 ms but empty on 6 of 20; mimir's
+full recall 334 ms.
+
+Four claims from the previous round are **retracted** there, along with a run of
+our own that was discarded for giving mimir its weakest channel. Full method,
+per-category tables, significance tests and honest weaknesses in
+[BENCHMARKS.md](BENCHMARKS.md).
 
 Drift compensation is also measurable IN-REPO, no judge needed: `cargo run
 --example drift_eval` replays a committed synthetic corpus

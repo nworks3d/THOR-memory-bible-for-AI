@@ -172,7 +172,13 @@ const DEDUP_PREFIX_CHARS: usize = 120;
 /// Common English + Dutch function words. Dropped from the FTS query so a sum of
 /// stopword matches cannot outrank the one rare, content-bearing term. Never
 /// applied if it would empty the query (see `content_tokens`).
-const STOPWORDS: &[&str] = &[
+///
+/// Public so the eval harness scores with the same list rather than a second copy
+/// that drifts. It is not a substitute for a frequency cut and a frequency cut is
+/// not a substitute for it: measured on a 5,586-head store, 19 of these sit below
+/// 10% document frequency ("what" 9.1%, "which" 6.9%, "zijn" 6.2%) and would still
+/// count as evidence, while "repo" at 89% needs the frequency cut to be caught.
+pub const STOPWORDS: &[&str] = &[
     // English
     "the", "a", "an", "and", "or", "of", "to", "in", "on", "at", "for", "with", "is", "are", "was",
     "were", "be", "been", "do", "did", "does", "how", "what", "why", "when", "where", "which",

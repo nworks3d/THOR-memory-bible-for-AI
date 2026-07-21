@@ -311,6 +311,34 @@ impl SymbolStore {
         }
     }
 
+    /// Names defined in any chunk of a FILE, matched on the file's name at the
+    /// end of the chunk entity path (`project:dir/name.ext#idx`). Powers the
+    /// guard's symbol bridge: a memory about `serve_deliberate` that never
+    /// names courier.rs must still surface when courier.rs is touched. The
+    /// leading-wildcard LIKE cannot use the index; the symbol table is a few
+    /// thousand rows and this runs at most once per (session, file).
+    pub fn defined_in_file(&self, file_name: &str, project: Option<&str>) -> Vec<String> {
+        let pat = format!("%/{}#%", file_name);
+        let alt = format!("%:{}#%", file_name); // file at the project root
+        let mut sql = String::from(
+            "SELECT DISTINCT name FROM symbol WHERE (entity_id LIKE ? OR entity_id LIKE ?)",
+        );
+        if project.is_some() {
+            sql.push_str(" AND project = ?");
+        }
+        let Ok(mut stmt) = self.conn.prepare(&sql) else { return Vec::new() };
+        match project {
+            Some(p) => stmt
+                .query_map(params![pat, alt, p], |r| r.get::<_, String>(0))
+                .map(|rows| rows.flatten().collect())
+                .unwrap_or_default(),
+            None => stmt
+                .query_map(params![pat, alt], |r| r.get::<_, String>(0))
+                .map(|rows| rows.flatten().collect())
+                .unwrap_or_default(),
+        }
+    }
+
     /// Names DEFINED in a chunk (original casing) - `impact` walks these.
     pub fn defined_in(&self, entity_id: &str) -> Vec<String> {
         let Ok(mut stmt) =

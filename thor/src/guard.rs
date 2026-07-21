@@ -249,9 +249,31 @@ fn file_memory_advisory(db: &Path, hook: &Value) -> Option<String> {
     let p = Path::new(file_path);
     let name = p.file_name()?.to_str()?;
     let stem = p.file_stem().and_then(|s| s.to_str()).unwrap_or(name);
-    // Query = the file's name + its nearest two directory names, so bm25 can
-    // reach a memory that mentions any of them; precision comes from the
-    // name-check below, not from ranking.
+    let project = hook
+        .get("cwd")
+        .and_then(|v| v.as_str())
+        .and_then(|c| crate::repo::project_key(Path::new(c)));
+    // The SYMBOL BRIDGE. A gotcha about `serve_deliberate` that never names
+    // courier.rs was invisible to this advisory, yet touching courier.rs is
+    // exactly the moment it must surface - the drift corpus measured 14 of 73
+    // preventers reachable ONLY through action vocabulary the prompt lacks.
+    // The sidecar knows which names this file defines; memories naming those
+    // symbols are memories about this file. Distinctive names only: a memory
+    // containing "main" or "test" is not about this file because of it.
+    let symbols: Vec<String> = crate::symbols::SymbolStore::open_default(db)
+        .map(|sy| sy.defined_in_file(name, project.as_deref()))
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|s| {
+            s.contains('_')
+                || s.chars().count() >= 6
+                || (s.chars().any(|c| c.is_uppercase()) && s.chars().any(|c| c.is_lowercase()))
+        })
+        .take(12)
+        .collect();
+    // Query = the file's name + its nearest two directory names + the symbols
+    // it defines, so bm25 can reach a memory that mentions any of them;
+    // precision comes from the name-check below, not from ranking.
     let mut terms: Vec<&str> = vec![name];
     if stem != name {
         terms.push(stem);
@@ -261,12 +283,9 @@ fn file_memory_advisory(db: &Path, hook: &Value) -> Option<String> {
             terms.push(d);
         }
     }
+    terms.extend(symbols.iter().map(String::as_str));
     let query = terms.join(" ");
 
-    let project = hook
-        .get("cwd")
-        .and_then(|v| v.as_str())
-        .and_then(|c| crate::repo::project_key(Path::new(c)));
     let scope = crate::recall::RecallScope::current(project);
     let store = crate::event_store::EventStore::new(db).ok()?;
 
@@ -284,13 +303,18 @@ fn file_memory_advisory(db: &Path, hook: &Value) -> Option<String> {
     let hits = crate::recall::recall_memories_scoped(&store, &query, 6, &scope).ok()?;
 
     // Keep only memories that literally NAME the file (full name, or a stem of
-    // >= 3 chars) - "mentions the directory" is not "about this file".
+    // >= 3 chars) OR one of the distinctive symbols this file defines -
+    // "mentions the directory" is not "about this file", but "names a function
+    // that lives in it" is.
     let stem_l = stem.to_lowercase();
+    let symbols_l: Vec<String> = symbols.iter().map(|s| s.to_lowercase()).collect();
     let heuristic: Vec<_> = hits
         .into_iter()
         .filter(|h| {
             let b = h.body.to_lowercase();
-            b.contains(&name_l) || (stem_l.chars().count() >= 3 && b.contains(&stem_l))
+            b.contains(&name_l)
+                || (stem_l.chars().count() >= 3 && b.contains(&stem_l))
+                || symbols_l.iter().any(|s| b.contains(s.as_str()))
         })
         .collect();
     let named = merge_anchored(anchored, heuristic, FILE_MEMORY_HITS);
@@ -972,6 +996,58 @@ mod tests {
         // the THOR kill switch silences the nudge
         std::fs::write(dir.path().join("THOR-SILENT.flag"), "").unwrap();
         assert!(capture_nudge(&db, &hook("s6"), &hay).is_none(), "THOR-SILENT.flag silences capture");
+    }
+
+    #[test]
+    fn test_symbol_bridge_surfaces_a_memory_that_never_names_the_file() {
+        use crate::event_store::{EventKind, EventStore};
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("thor.db");
+        {
+            let mut store = EventStore::new(&db).unwrap();
+            // The file's chunk defines the symbol...
+            store
+                .append_event(
+                    "s", "l", "a", EventKind::FactCreated, "Proj:src/serving.rs#0", None,
+                    "pub fn serve_widgets() {\n    render();\n}",
+                )
+                .unwrap();
+            // ...and the gotcha names ONLY the symbol - never the file, never
+            // the directory. Before the bridge this was invisible at the exact
+            // moment it mattered: the drift corpus measured 14 of 73
+            // preventers reachable only through action vocabulary like this.
+            store
+                .append_event(
+                    "s", "l", "a", EventKind::FactCreated, "Proj:mem-sym", None,
+                    "gotcha: serve_widgets must never run during a rebuild - it reads the half-written index\n\n[memory/gotcha | tags: rendering | project: Proj]",
+                )
+                .unwrap();
+            let mut sy =
+                crate::symbols::SymbolStore::open(&crate::symbols::default_symbols_path(&db))
+                    .unwrap();
+            sy.rebuild(&store).unwrap();
+        }
+        let proj = dir.path().join("Proj");
+        std::fs::create_dir_all(proj.join(".git")).unwrap();
+        let hook = json!({
+            "session_id": "s-bridge",
+            "cwd": proj.to_string_lossy(),
+            "tool_name": "Edit",
+            "tool_input": { "file_path": proj.join("src/serving.rs").to_string_lossy() }
+        });
+        let adv = file_memory_advisory(&db, &hook).expect("the symbol bridge must advise");
+        assert!(adv.contains("Proj:mem-sym"), "the symbol-only gotcha surfaces: {adv}");
+        assert!(adv.contains("never run during a rebuild"), "with its content: {adv}");
+
+        // Control: a file defining nothing stays silent - the bridge must not
+        // turn every first touch into an advisory.
+        let hook2 = json!({
+            "session_id": "s-bridge2",
+            "cwd": proj.to_string_lossy(),
+            "tool_name": "Edit",
+            "tool_input": { "file_path": proj.join("src/unrelated.rs").to_string_lossy() }
+        });
+        assert!(file_memory_advisory(&db, &hook2).is_none(), "no symbols, no fire");
     }
 
     #[test]

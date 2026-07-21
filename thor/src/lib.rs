@@ -20,6 +20,7 @@ pub mod rerank;
 pub mod courier;
 pub mod daemon_client;
 pub mod doctor;
+pub mod structure;
 pub mod symbols;
 pub mod importer;
 pub mod mcp;

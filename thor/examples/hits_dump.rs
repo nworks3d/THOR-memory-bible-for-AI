@@ -223,22 +223,40 @@ fn main() -> anyhow::Result<()> {
                     anyhow::bail!("--rerank needs the semantic build");
                 }
                 hits.truncate(limit);
-                hits.iter()
-                    .map(|h| {
-                        if full {
-                            format!("{}\n{}", h.entity_id, h.body)
-                        } else {
-                            // Harness parity: exactly what the MCP/CLI recall
-                            // surface serves (memories full-body, chunks a wide
-                            // window) - the benchmark measures production, not
-                            // a third serving configuration.
-                            let (_, snip) = thor::courier::serve_deliberate(
-                                &store, &h.entity_id, &h.body, query, None, None,
-                            );
-                            format!("{}: {}", h.entity_id, snip)
-                        }
-                    })
-                    .collect()
+                // Structure card, exactly as the MCP recall surface prepends it:
+                // the benchmark must measure what production serves. Scope
+                // project mirrors the recall scope (project:<key> or none).
+                let card_project = match scope_arg.strip_prefix("project:") {
+                    Some(key) => Some(key.to_string()),
+                    None => None,
+                };
+                let card = thor::symbols::SymbolStore::open(&thor::symbols::default_symbols_path(
+                    &db,
+                ))
+                .ok()
+                .and_then(|sy| {
+                    thor::structure::detect(query, &sy, card_project.as_deref())
+                        .and_then(|sym| thor::structure::card(&store, &sy, &sym, card_project.as_deref()))
+                });
+                let mut served: Vec<String> = Vec::new();
+                if let Some(c) = card {
+                    served.push(c);
+                }
+                for h in &hits {
+                    served.push(if full {
+                        format!("{}\n{}", h.entity_id, h.body)
+                    } else {
+                        // Harness parity: exactly what the MCP/CLI recall
+                        // surface serves (memories full-body, chunks a wide
+                        // window) - the benchmark measures production, not
+                        // a third serving configuration.
+                        let (_, snip) = thor::courier::serve_deliberate(
+                            &store, &h.entity_id, &h.body, query, None, None,
+                        );
+                        format!("{}: {}", h.entity_id, snip)
+                    });
+                }
+                served
             }
         };
         let mut row: HashMap<String, serde_json::Value> = item

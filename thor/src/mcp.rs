@@ -390,10 +390,34 @@ impl ThorServer {
                 }
             }
             hits.truncate(limit);
+            // Structure card: a structure-shaped query naming a symbol the
+            // sidecar resolves gets ONE composed prose answer prepended -
+            // definition, signature, callers per file, the related memory.
+            // Additive by construction: the ranked hits follow unchanged, so a
+            // misfire costs a few lines of accurate derived text and nothing
+            // else. This is the serving-form answer to the measured
+            // code-structure loss: THOR found the right file more often than
+            // the rival and lost the category by serving raw code where prose
+            // was needed.
+            let structure_card = if memories_only {
+                None
+            } else {
+                let card_project =
+                    if args.all_projects { None } else { args.project.clone().or_else(|| server_project.clone()) };
+                crate::symbols::SymbolStore::open_default(&db).ok().and_then(|sy| {
+                    crate::structure::detect(&args.query, &sy, card_project.as_deref()).and_then(
+                        |sym| crate::structure::card(s, &sy, &sym, card_project.as_deref()),
+                    )
+                })
+            };
             // Index mode: one compact line per hit at a fraction of the full
             // serving cost - the agent gets the map and `get`s what it needs.
             if args.detail.as_deref().is_some_and(|d| d.eq_ignore_ascii_case("index")) {
                 let mut out = String::from(rerank_note);
+                if let Some(card) = &structure_card {
+                    out.push_str(card);
+                    out.push('\n');
+                }
                 for hit in hits {
                     crate::ledger::increment(&db, "access", &hit.entity_id);
                     let ty = hit.fact_type.map(|t| format!(" [{}]", t.as_str())).unwrap_or_default();
@@ -414,6 +438,10 @@ impl ThorServer {
             let cwd = std::env::current_dir().ok().map(|c| c.display().to_string());
             let fresh_project = cwd.as_deref().and_then(|c| crate::repo::project_key(Path::new(c)));
             let mut out = String::from(rerank_note);
+            if let Some(card) = &structure_card {
+                out.push_str(card);
+                out.push('\n');
+            }
             for hit in hits {
                 // A served hit is an access: counted in the LOCAL ledger (decay
                 // signal for consolidate), never in the synced hash-chained log.
@@ -459,7 +487,7 @@ impl ThorServer {
     async fn where_used(&self, Parameters(args): Parameters<WhereUsedArgs>) -> String {
         let server_project = self.project.clone();
         let db = self.db.clone();
-        self.blocking(move |_s| {
+        self.blocking(move |s| {
             let sy = crate::symbols::SymbolStore::open_default(&db)
                 .map_err(|e| format!("symbol sidecar unavailable ({e}); run `thor symbols`"))?;
             let project = resolve_symbol_project(args.project, server_project);
@@ -473,6 +501,13 @@ impl ThorServer {
                 ));
             }
             let mut out = String::new();
+            // The prose answer first - definition, signature, callers per file,
+            // related memory - then the raw id lists for `get`. A tool that
+            // answered with bare chunk ids made the reader do the composing.
+            if let Some(card) = crate::structure::card(s, &sy, &args.symbol, project.as_deref()) {
+                out.push_str(&card);
+                out.push_str("\n\n");
+            }
             out.push_str(&format!("defined in ({}):\n", defs.len()));
             for d in &defs {
                 out.push_str(&format!("  {d}\n"));

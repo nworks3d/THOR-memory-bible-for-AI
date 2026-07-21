@@ -72,7 +72,7 @@ is right and this page is wrong - please open an issue.
 - [Projects and scoping](#projects-and-scoping)  
   covers: thor init (and the .thor marker file); thor ingest; thor ingest --global; thor ingest --project &lt;key&gt;; thor recall --all-projects and thor recall --project &lt;key&gt; (MCP: all_projects / project); the project argument on the MCP remember tool; thor reproject &lt;id&gt; --project &lt;key&gt; | --global; thor review-scope; thor backfill-projects
 - [Keeping the memory healthy](#keeping-the-memory-healthy)  
-  covers: thor doctor; thor fsck; thor symbols; thor consolidate; thor consolidate --apply-dedup; thor consolidate --min-age-events &lt;N&gt;; thor steward; thor pin &lt;id&gt; / thor unpin &lt;id&gt;; thor mark &lt;id&gt; (and --noise); expires: YYYY-MM-DD (on the MCP remember tool); provenance: verified | inferred (and THOR_EXP_PROVENANCE)
+  covers: thor doctor; thor fsck; thor fsck --rebuild-fts; thor symbols; thor consolidate; thor consolidate --apply-dedup; thor consolidate --min-age-events &lt;N&gt;; thor steward; thor pin &lt;id&gt; / thor unpin &lt;id&gt;; thor mark &lt;id&gt; (and --noise); expires: YYYY-MM-DD (on the MCP remember tool); provenance: verified | inferred (and THOR_EXP_PROVENANCE)
 - [Backup, restore and import](#backup-restore-and-import)  
   covers: thor export; thor restore --from &lt;file&gt;; thor backup --repo &lt;path&gt; [--force]; thor import &lt;path&gt;
 - [Syncing two machines](#syncing-two-machines)  
@@ -1838,35 +1838,59 @@ tells you whether it still adds up.
   thor fsck
   ```
 
-- **How to check it worked:** a healthy store prints exactly five OK lines and a
-  summary:
+- **How to check it worked:** a healthy store prints exactly six OK lines and a
+  summary, and the command exits 0:
 
   ```
   Chain integrity: OK
   Fork detection: OK
   Differential auditor: OK
   FTS projection: OK
+  FTS integrity: OK
   Footer integrity: OK
   fsck: all checks passed
   ```
 
-  One honest note on that output: the four integrity checks stop at the first
+  One honest note on that output: the five integrity checks stop at the first
   failure, so if one fails you get its error line and nothing after it. A short
   output means "stopped early", not "fewer things to check".
 
-  **This changed:** the `FTS projection` line used to be weaker than it looked,
-  because opening the store repaired a row-count mismatch moments before the
-  check ran, so it could only ever report OK. `fsck` now opens the store without
-  that repair, so the line means what it says. If it reports a mismatch, any
-  ordinary command that writes (a `remember`, an ingest) rebuilds the index on
-  its next open - you do not have to repair it by hand.
+  **This changed (three things):**
 
-  The fifth line is content health, not log integrity. Some facts carry a
+  The `FTS projection` line used to be weaker than it looked, because opening the
+  store repaired a row-count mismatch moments before the check ran, so it could
+  only ever report OK. `fsck` now opens the store without that repair, so the
+  line means what it says. If it reports a mismatch, any ordinary command that
+  writes (a `remember`, an ingest) rebuilds the index on its next open - you do
+  not have to repair it by hand.
+
+  `FTS integrity` is new, and it exists because the projection line still could
+  not see the failure that actually hurts you. The projection check compares row
+  counts: how many facts are in the log versus how many are in the search index.
+  That catches a missing fact. It cannot catch a fact that is present but whose
+  index entry is damaged - a torn write, a bad sector, a half-finished copy. The
+  counts still match, the check still says OK, and searches quietly stop finding
+  things. This new line asks SQLite's own search engine to verify its index
+  structure, which is the only check that sees that damage. A repair is a single
+  command, and nothing can be lost by running it, because the index is derived
+  from the log rather than stored in it:
+
+  ```sh
+  thor fsck --rebuild-fts
+  ```
+
+  Third: **`fsck` now exits 1 when an integrity check fails.** It used to print
+  `CHAIN INTEGRITY ERROR` in red and then exit 0, which meant no script, no
+  scheduled job and no release step could ever act on it - a backup verifier
+  would have reported success on a corrupt store. A footer defect still exits 0
+  (see below), so the exit code means exactly one thing: something is corrupt.
+
+  The sixth line is content health, not log integrity. Some facts carry a
   metadata footer (the bracketed tail that records their type and tags). If a
   footer got lost, `fsck` names the facts and ends with
   `fsck: integrity checks passed; N fact(s) need a footer repair (see above)`.
-  A wiped footer never fails the run - nothing is corrupt, it just needs
-  repairing.
+  A wiped footer never fails the run and never changes the exit code - nothing is
+  corrupt, it just needs repairing.
 - **How to turn it off again:** stop running it. Nothing is lost.
 
 ### thor symbols

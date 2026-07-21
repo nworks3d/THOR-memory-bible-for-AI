@@ -201,7 +201,8 @@ front it with an authenticating reverse proxy (the transport has no auth of its 
 
 ```sh
 thor doctor                        # store, model, sidecars, daemon, flags - start here
-thor fsck                          # chain integrity + FTS/heads projection + footer health
+thor fsck                          # chain, heads, FTS projection + index structure, footers
+thor fsck --rebuild-fts            # only if fsck reports FTS INTEGRITY ERROR
 thor recall "how does X work"      # scoped to the current project + global
 thor recall --all-projects "X"     # search everything
 ```
@@ -210,6 +211,15 @@ thor recall --all-projects "X"     # search everything
 thing to paste into a bug report: recall behaviour depends almost entirely on
 whether the model, the vectors sidecar and the injection daemon are actually
 present, and it reports all three, naming the folder it looked in for the model.
+
+`thor fsck` prints six `OK` lines on a healthy store and **exits 1** if any
+integrity check fails, so it is safe to put in a backup script or a scheduled
+job and act on the result. If it reports `FTS INTEGRITY ERROR`, your search
+index has been damaged (a bad disk, a torn write, a copy that was interrupted).
+Your memory itself is fine: the index is rebuilt from the log, so run
+`thor fsck --rebuild-fts` and then `thor fsck` again to confirm. A footer
+complaint is different - it is content health, it never fails the run, and it
+does not change the exit code.
 
 One thing it does not report: the embedding-model process. Doctor's
 `injection daemon:` line is about the daemon from `--with-daemon`, not the

@@ -185,7 +185,7 @@ thor remember "<a durable fact>"     # (via the MCP tool in an agent session)
 thor ingest <repo-path>              # index a repo's tracked files (incremental)
 thor recall "how does X work"        # search memory (scoped to the current project)
 thor get <entity_id>                 # the authoritative head(s) for one fact
-thor fsck                            # verify chain integrity + footer health
+thor fsck                            # verify integrity (exits 1 on damage) + footer health
 ```
 
 The courier runs automatically per prompt and injects a `<thor-recall>` block.
@@ -350,7 +350,7 @@ overwrites your live compose file and never touches the data volume.
 | `thor embed-daemon` | warm embedder for the courier (feature `semantic`) |
 | `thor export` / `restore` / `backup` | JSONL backup + verified restore |
 | `thor ship` / `recv` / `status` | cross-machine log-shipping sync |
-| `thor fsck` | verify chain integrity + FTS projection, and report facts whose footer got lost (content health: it names them and never fails the run) |
+| `thor fsck` | verify chain integrity, FTS projection and FTS index structure - exits 1 on any of them, so a cron job or release step can gate on it. Repair a damaged index with `thor fsck --rebuild-fts` (derived from the log; nothing is lost). Also reports facts whose footer got lost (content health: it names them and never fails the run) |
 | `thor consolidate [--apply-dedup]` | metabolism report: duplicate twins, decay candidates, same-topic clusters (exit 1 when anything needs digesting; only the dedup pass is ever applied mechanically) |
 | `thor steward` | prepare a stewardship review: the consolidate report + the proven conservative rubric written to a file an agent session works through with the MCP tools (no writes itself) |
 | `thor symbols` | (re)build the derived symbol sidecar (`thor-symbols.db`): which names every code chunk defines and calls - powers `where_used`/`impact` and a deliberate-recall ranking bonus; refreshed automatically by every ingest, including the one `thor init` runs, so you only need this command by hand for a store that was filled some other way (a shipped replica), or after deleting the sidecar |

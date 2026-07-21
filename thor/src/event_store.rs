@@ -1,4 +1,4 @@
-use rusqlite::{Connection, OpenFlags, Result as SqlResult, params};
+﻿use rusqlite::{Connection, OpenFlags, Result as SqlResult, params};
 use sha2::{Sha256, Digest};
 use uuid::Uuid;
 use std::collections::HashSet;
@@ -996,6 +996,152 @@ pub fn verify_fts_projection(conn: &Connection) -> Result<(), String> {
         ));
     }
     Ok(())
+}
+
+/// Ask FTS5 to verify its own inverted index, which the row-set check above
+/// cannot do. The two are complements, not alternatives: verify_fts_projection
+/// catches a missing, extra or orphan ROW, this catches a row that is present
+/// but whose index blocks are damaged.
+///
+/// Why it matters: a corrupted segment inside event_fts_data leaves the row
+/// count, the rowid set and the orphan set all perfectly intact, so the check
+/// above reports OK - while MATCH silently returns FEWER rows, with no error.
+/// Measured on this crate's bundled SQLite: 500 events, one damaged block, and
+/// recall dropped to 259 of 500 while the row-set check passed. Nothing in THOR
+/// can cause that (each FTS row is written in the append transaction, under WAL
+/// and synchronous=FULL); it arrives from outside - a failing disk, a
+/// filesystem that lied about fsync, a bad copy of a shipped replica, or
+/// tampering. THOR ships stores over a wire and restores them from exports, so
+/// "the program cannot cause it" is not the same as "it cannot happen here".
+///
+/// The `rank` argument is 0 deliberately. On a contentless table there is no
+/// content table to compare against, and 1 (the "also compare the content"
+/// form) behaves identically here - claiming otherwise would be theatre.
+///
+/// The damage is repairable without touching history: the index is a projection
+/// of an append-only log, so rebuilding it loses nothing. `thor fsck --rebuild-fts`
+/// does exactly that. It is deliberately NOT automatic: sync_fts returns early
+/// when the counts match (which is the state after this kind of damage), and a
+/// silent rewrite of an index at the moment the disk under it is suspect is the
+/// wrong reflex.
+pub fn verify_fts_integrity(conn: &Connection) -> Result<(), String> {
+    conn.execute("INSERT INTO event_fts(event_fts, rank) VALUES('integrity-check', 0)", [])
+        .map(|_| ())
+        .map_err(|e| format!("FTS index is damaged: {}", e))
+}
+
+/// Rebuild the FTS index from the log, unconditionally. `sync_fts` is the
+/// cheap guard that runs on every open and returns early when the counts
+/// already match; this is the explicit repair for damage the counts cannot see
+/// (see verify_fts_integrity). Losing the index costs nothing - it is derived.
+pub fn rebuild_fts(conn: &Connection) -> Result<usize, String> {
+    let db_err = |e: rusqlite::Error| format!("FTS rebuild failed: {}", e);
+    conn.execute("INSERT INTO event_fts(event_fts) VALUES('delete-all')", [])
+        .map_err(db_err)?;
+    conn.execute(
+        "INSERT INTO event_fts(rowid, body_ch) SELECT seq, body_ch FROM event",
+        [],
+    )
+    .map_err(db_err)
+}
+
+#[cfg(test)]
+mod fts_integrity_tests {
+    use super::*;
+
+    /// Damage one index block the way a bad disk would: flip a byte inside
+    /// event_fts_data. Returns false when the table has no block to damage.
+    ///
+    /// It damages the LAST block on purpose. A contentless FTS5 index of a few
+    /// dozen rows is a single segment, so damaging it takes the whole index down
+    /// and even COUNT(*) fails - which proves nothing, because the row-set check
+    /// would then error too. The interesting case is the realistic one: a store
+    /// big enough to hold several segments, where one damaged segment leaves the
+    /// row set perfectly intact and only search goes quietly lossy.
+    fn damage_one_index_block(conn: &Connection) -> bool {
+        let id: Option<i64> = conn
+            .query_row("SELECT MAX(id) FROM event_fts_data", [], |r| r.get(0))
+            .unwrap_or(None);
+        let Some(id) = id else { return false };
+        let mut block: Vec<u8> = match conn.query_row(
+            "SELECT block FROM event_fts_data WHERE id = ?",
+            params![id],
+            |r| r.get(0),
+        ) {
+            Ok(b) => b,
+            Err(_) => return false,
+        };
+        if block.len() < 64 {
+            return false;
+        }
+        // Flip a byte AND drop a run of them: a lone flipped byte often lands in
+        // a region FTS5 does not have to trust, so it can survive its own check.
+        // Removing bytes changes the segment's structure, which is what a torn
+        // write or a bad sector actually looks like.
+        let mid = block.len() / 2;
+        block[mid] ^= 0xFF;
+        block.drain(mid + 1..mid + 20);
+        conn.execute("UPDATE event_fts_data SET block = ? WHERE id = ?", params![block, id])
+            .is_ok()
+    }
+
+    fn seeded(n: usize) -> EventStore {
+        let mut store = EventStore::in_memory().unwrap();
+        for i in 0..n {
+            store
+                .append_event(
+                    "s",
+                    "l",
+                    "a",
+                    EventKind::FactCreated,
+                    &format!("e{i}"),
+                    None,
+                    &format!("alpha beta gamma delta fact number {i} with enough words to index"),
+                )
+                .unwrap();
+        }
+        store
+    }
+
+    #[test]
+    fn healthy_store_passes_both_fts_checks() {
+        let store = seeded(40);
+        assert!(verify_fts_projection(&store.conn).is_ok(), "row set is intact");
+        assert!(verify_fts_integrity(&store.conn).is_ok(), "index is intact");
+    }
+
+    /// The load-bearing test. A damaged index block leaves the row count, the
+    /// rowid set and the orphan set perfectly intact, so the row-set check
+    /// reports OK - which is exactly how fsck used to print "FTS projection: OK"
+    /// over a store whose search had silently gone lossy.
+    #[test]
+    fn a_damaged_index_block_passes_the_row_set_check_and_fails_the_integrity_check() {
+        let store = seeded(500);
+        if !damage_one_index_block(&store.conn) {
+            return; // no block to damage on this SQLite build; nothing to assert
+        }
+        assert!(
+            verify_fts_projection(&store.conn).is_ok(),
+            "the row-set check cannot see block damage - that is the whole point"
+        );
+        assert!(
+            verify_fts_integrity(&store.conn).is_err(),
+            "FTS5's own integrity check must catch what the row-set check cannot"
+        );
+    }
+
+    #[test]
+    fn rebuild_repairs_a_damaged_index() {
+        let store = seeded(500);
+        if !damage_one_index_block(&store.conn) {
+            return;
+        }
+        assert!(verify_fts_integrity(&store.conn).is_err(), "damaged first");
+        let rows = rebuild_fts(&store.conn).expect("rebuild runs");
+        assert_eq!(rows, 500, "every event is re-indexed");
+        assert!(verify_fts_integrity(&store.conn).is_ok(), "repaired");
+        assert!(verify_fts_projection(&store.conn).is_ok(), "and still consistent");
+    }
 }
 
 #[cfg(test)]

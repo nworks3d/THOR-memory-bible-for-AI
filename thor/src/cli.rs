@@ -284,7 +284,15 @@ enum Commands {
         #[arg(long, default_value = "test_lineage")]
         lineage_id: String,
     },
-    Fsck,
+    Fsck {
+        /// Rebuild the full-text index from the log. The repair for a damaged
+        /// index (the "FTS integrity" check below); nothing is lost, the index
+        /// is derived from the log. Deliberately manual: the automatic heal
+        /// cannot see this damage, and rewriting an index while the disk under
+        /// it is suspect is the wrong reflex.
+        #[arg(long)]
+        rebuild_fts: bool,
+    },
     /// Per-hook recall courier: reads the UserPromptSubmit hook JSON on stdin
     /// and prints a THOR recall block to stdout. Hard fail-open, always exit 0.
     Courier,
@@ -711,6 +719,97 @@ fn read_hook_stdin() -> Option<serde_json::Value> {
     serde_json::from_str(raw).ok()
 }
 
+/// What fsck concluded, separated by what it means for the EXIT CODE.
+///
+/// The split is the whole point. The integrity checks assert the store is
+/// internally consistent, and a failure there is a hard stop: the log is the
+/// product. Footer defects are CONTENT health - a fact lost the metadata it was
+/// written with. Nothing is corrupt, an old binary elsewhere can still produce
+/// them, and blocking a release on one would be wrong. So footer defects report
+/// loudly and still exit 0.
+#[derive(Debug, PartialEq, Eq)]
+pub enum FsckOutcome {
+    Clean,
+    FooterDefects(usize),
+    IntegrityFailure,
+}
+
+/// Run every fsck check against `db`, printing the report as it goes, and say
+/// what it concluded. Split out of the CLI arm so the exit-code contract is
+/// testable: the arm itself only turns IntegrityFailure into a non-zero exit.
+///
+/// The integrity checks stop at the first failure on purpose - a store that
+/// fails the hash chain will fail everything downstream, and printing four
+/// errors for one cause is noise.
+pub fn fsck_report(db: &Path, rebuild_fts: bool) -> Result<FsckOutcome> {
+    // open_existing, not new: `new` heals the FTS projection on open, so
+    // fsck would repair the very thing it is about to check and then
+    // report OK. It also must not create a store for a mistyped --db.
+    let store = EventStore::open_existing(db)?;
+    let events = store.get_all_events()?;
+
+    if let Err(e) = verify_chain_integrity(&events) {
+        println!("CHAIN INTEGRITY ERROR: {}", e);
+        return Ok(FsckOutcome::IntegrityFailure);
+    }
+    println!("Chain integrity: OK");
+
+    if let Err(e) = detect_fork(&events) {
+        println!("FORK DETECTION ERROR: {}", e);
+        return Ok(FsckOutcome::IntegrityFailure);
+    }
+    println!("Fork detection: OK");
+
+    if let Err(e) = DifferentialAuditor::verify_consistency(&events) {
+        println!("AUDITOR ERROR: {}", e);
+        return Ok(FsckOutcome::IntegrityFailure);
+    }
+    println!("Differential auditor: OK");
+
+    if let Err(e) = crate::event_store::verify_fts_projection(store.conn()) {
+        println!("FTS PROJECTION ERROR: {}", e);
+        return Ok(FsckOutcome::IntegrityFailure);
+    }
+    println!("FTS projection: OK");
+
+    // The row-set check above cannot see a damaged index block: the counts and
+    // the rowid set stay perfect while MATCH silently returns fewer rows.
+    if let Err(e) = crate::event_store::verify_fts_integrity(store.conn()) {
+        println!("FTS INTEGRITY ERROR: {}", e);
+        if rebuild_fts {
+            match crate::event_store::rebuild_fts(store.conn()) {
+                Ok(n) => {
+                    println!("FTS index rebuilt from the log ({} rows). Re-run fsck to confirm.", n);
+                    return Ok(FsckOutcome::Clean);
+                }
+                Err(e) => println!("FTS rebuild failed: {}", e),
+            }
+        } else {
+            println!("Repair with: thor fsck --rebuild-fts (the index is derived; nothing is lost)");
+        }
+        return Ok(FsckOutcome::IntegrityFailure);
+    }
+    println!("FTS integrity: OK");
+
+    // Footer integrity is CONTENT health, not log integrity: the checks
+    // above assert the store is internally consistent, this one asserts
+    // that live facts still carry the metadata they were written with.
+    // A wiped footer can therefore never fail fsck - nothing is corrupt,
+    // and an old binary elsewhere writing one must not block a release.
+    let defects = crate::footer::defects(&events);
+    if defects.is_empty() {
+        println!("Footer integrity: OK");
+        println!("fsck: all checks passed");
+        return Ok(FsckOutcome::Clean);
+    }
+    print_footer_defects(&defects);
+    println!(
+        "fsck: integrity checks passed; {} fact(s) need a footer repair (see above)",
+        defects.len()
+    );
+    Ok(FsckOutcome::FooterDefects(defects.len()))
+}
+
 /// The fsck report for damaged footers. Written for someone who has never met
 /// the footer before: what broke, why it matters, and the exact way out - a
 /// bare "2 defects" would leave the reader with a store they cannot repair.
@@ -948,53 +1047,15 @@ pub fn run() -> Result<()> {
                 },
             }
         }
-        Commands::Fsck => {
-            // open_existing, not new: `new` heals the FTS projection on open, so
-            // fsck would repair the very thing it is about to check and then
-            // report OK. It also must not create a store for a mistyped --db.
-            let store = EventStore::open_existing(&db)?;
-            let events = store.get_all_events()?;
-
-            if let Err(e) = verify_chain_integrity(&events) {
-                println!("CHAIN INTEGRITY ERROR: {}", e);
-                return Ok(());
+        Commands::Fsck { rebuild_fts } => {
+            // A detected integrity failure MUST leave a non-zero exit code, or
+            // fsck cannot gate anything: a scheduled job, a release step or a CI
+            // run would all read "broken hash chain" as success. `thor
+            // consolidate` already sets this precedent below.
+            match fsck_report(&db, rebuild_fts)? {
+                FsckOutcome::IntegrityFailure => std::process::exit(1),
+                FsckOutcome::Clean | FsckOutcome::FooterDefects(_) => {}
             }
-            println!("Chain integrity: OK");
-
-            if let Err(e) = detect_fork(&events) {
-                println!("FORK DETECTION ERROR: {}", e);
-                return Ok(());
-            }
-            println!("Fork detection: OK");
-
-            if let Err(e) = DifferentialAuditor::verify_consistency(&events) {
-                println!("AUDITOR ERROR: {}", e);
-                return Ok(());
-            }
-            println!("Differential auditor: OK");
-
-            if let Err(e) = crate::event_store::verify_fts_projection(store.conn()) {
-                println!("FTS PROJECTION ERROR: {}", e);
-                return Ok(());
-            }
-            println!("FTS projection: OK");
-
-            // Footer integrity is CONTENT health, not log integrity: the checks
-            // above assert the store is internally consistent, this one asserts
-            // that live facts still carry the metadata they were written with.
-            // A wiped footer can therefore never fail fsck - nothing is corrupt,
-            // and an old binary elsewhere writing one must not block a release.
-            let defects = crate::footer::defects(&events);
-            if defects.is_empty() {
-                println!("Footer integrity: OK");
-                println!("fsck: all checks passed");
-                return Ok(());
-            }
-            print_footer_defects(&defects);
-            println!(
-                "fsck: integrity checks passed; {} fact(s) need a footer repair (see above)",
-                defects.len()
-            );
         }
         Commands::Courier => {
             // Never propagate: the courier must always let the prompt through.
@@ -2028,6 +2089,77 @@ mod tests {
         let store = EventStore::new(&db).unwrap();
         let heads = crate::cas::compute_head_sets(&store.get_all_events().unwrap());
         assert_eq!(heads.get("acme:mem-x").unwrap().heads.len(), 1, "still exactly one head");
+    }
+
+    /// The exit-code contract, and the reason it is worth a test: `thor fsck`
+    /// used to print "CHAIN INTEGRITY ERROR" and then exit 0, so no scheduled
+    /// job, release step or CI run could ever act on it. These three cases pin
+    /// the split - integrity fails hard, content health does not.
+    fn seed_store(dir: &std::path::Path) -> std::path::PathBuf {
+        let db = dir.join("thor.db");
+        let mut store = EventStore::new(&db).unwrap();
+        for i in 0..5 {
+            store
+                .append_event(
+                    "s",
+                    "l",
+                    "a",
+                    EventKind::FactCreated,
+                    &format!("e{i}"),
+                    None,
+                    &format!("a durable fact number {i}\n\n[memory/note | project: global]"),
+                )
+                .unwrap();
+        }
+        db
+    }
+
+    #[test]
+    fn fsck_reports_clean_on_a_healthy_store() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = seed_store(dir.path());
+        assert_eq!(fsck_report(&db, false).unwrap(), FsckOutcome::Clean);
+    }
+
+    #[test]
+    fn fsck_reports_an_integrity_failure_when_the_chain_is_tampered_with() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = seed_store(dir.path());
+        {
+            let conn = rusqlite::Connection::open(&db).unwrap();
+            conn.execute("UPDATE event SET body_ch = 'tampered' WHERE seq = 3", [])
+                .unwrap();
+        }
+        assert_eq!(
+            fsck_report(&db, false).unwrap(),
+            FsckOutcome::IntegrityFailure,
+            "a rewritten body must fail the hash chain, and that must reach the exit code"
+        );
+    }
+
+    #[test]
+    fn fsck_does_not_fail_on_footer_defects_alone() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("thor.db");
+        {
+            let mut store = EventStore::new(&db).unwrap();
+            // A footer followed by trailing text: content health, not corruption.
+            store
+                .append_event(
+                    "s",
+                    "l",
+                    "a",
+                    EventKind::FactCreated,
+                    "e-broken-footer",
+                    None,
+                    "a fact\n\n[memory/note | project: global]\nKind: fact_created",
+                )
+                .unwrap();
+        }
+        match fsck_report(&db, false).unwrap() {
+            FsckOutcome::FooterDefects(n) => assert_eq!(n, 1, "one defective footer"),
+            other => panic!("footer defects must not be an integrity failure, got {other:?}"),
+        }
     }
 
     /// `thor init` is the command SETUP.md tells a new user to run, so it must

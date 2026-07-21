@@ -236,6 +236,35 @@ the setting name says so.
 It only works if the labels get written. That is the honest catch - a memory full
 of unlabelled facts gives the reminder nothing to fire on.
 
+## Checking that nothing broke
+
+One command, `thor fsck`, reads the whole memory and answers one question: is any
+of this damaged? It re-checks every entry's fingerprint, and it asks the search
+index to verify its own structure. On a healthy memory it prints six `OK` lines
+and stops. If something is wrong it says so and exits with an error code, which
+is the part that matters: you can put it in a backup script or a nightly job and
+have it actually stop you, instead of printing a scary red line into a log nobody
+reads.
+
+There are two kinds of bad news it can give you, and they are not equally bad.
+A broken fingerprint means someone or something altered a past entry - that is
+serious, and it is why the fingerprints exist. A damaged search index is not
+serious at all: the index is built from your notes rather than being your notes,
+so `thor fsck --rebuild-fts` builds a fresh one and nothing is lost. It is worth
+knowing about anyway, because a damaged index does not announce itself - searches
+just quietly start missing things.
+
+**Why you would care:** this is the difference between "my backups are fine" and
+"my backups are verified". It is also the only thing that catches a search index
+that has gone half-blind.
+
+**Worth it?** Yes, and it costs nothing to have: it never runs on its own. Run it
+after restoring a backup, after a crash, after copying the memory to another
+machine, or on a timer if you like sleeping well. It reads the entire memory each
+time, so it is a maintenance command, not something to run on every prompt.
+
+---
+
 ## Not losing it
 
 Export the whole memory to a plain text file, and restore it back with every
@@ -313,7 +342,8 @@ If you take nothing else from this page:
 3. Add the meaning-based search layer on the machine you work on, if you can
    spare the memory.
 4. Pin your handful of hard rules.
-5. Point the backup at a private repository.
+5. Point the backup at a private repository, and run `thor fsck` once after the
+   first restore so you know the backup is real.
 
 Everything else on this page is worth reading once and turning on the day you
 have the problem it solves. The exact commands, costs and undo steps for each

@@ -1022,7 +1022,7 @@ impl ThorServer {
 
 /// When a mutate/curate targets an id that has no live head, look for the one
 /// live entity whose id differs only by its `<project>:` prefix - the caller
-/// pasted the bare local part (`mem-…`) instead of the full id remember/recall
+/// pasted the bare local part (`mem-â€¦`) instead of the full id remember/recall
 /// hands back. Return that full id so the retry is copy-paste, not a guess.
 /// `None` when the id is already prefixed, matches nothing, or is ambiguous (we
 /// never guess between two candidates).
@@ -1046,13 +1046,13 @@ fn suggest_full_id(s: &EventStore, given: &str) -> Option<String> {
 }
 
 /// The "unknown entity" message shared by every mutate/curate tool, with a
-/// "did you mean '<project>:mem-…'?" pointer when the caller passed a bare id.
+/// "did you mean '<project>:mem-â€¦'?" pointer when the caller passed a bare id.
 /// Keeps the literal "unknown entity" so callers (and tests) can still key on it.
 fn unknown_entity_msg(s: &EventStore, given: &str) -> String {
     match suggest_full_id(s, given) {
         Some(full) => format!(
             "unknown entity '{}': did you mean '{}'? Memory ids include their project prefix \
-             (`<project>:mem-…`) - pass the full id remember/recall gave you. If the fact is \
+             (`<project>:mem-â€¦`) - pass the full id remember/recall gave you. If the fact is \
              genuinely new, store it with remember.",
             given, full
         ),
@@ -1854,8 +1854,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_revise_bare_id_suggests_full_prefixed_id() {
-        // A memory minted for a project carries a `<project>:mem-…` id. An agent
-        // that revises by the bare local part (`mem-…`) must get the exact full
+        // A memory minted for a project carries a `<project>:mem-â€¦` id. An agent
+        // that revises by the bare local part (`mem-â€¦`) must get the exact full
         // id echoed back, not a bare "unknown entity" it has to reverse-engineer.
         let mut store = seed();
         store

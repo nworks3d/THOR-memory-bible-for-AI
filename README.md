@@ -8,6 +8,10 @@ index and gives the relevant pieces back **automatically, at the right moment** 
 so a session never starts from zero, even right after a compaction. It is a single
 Rust binary: no external services, no git required, and it never loses a write.
 
+> **Are you an AI agent setting THOR up for your user?** Start with
+> **[AGENTS.md](AGENTS.md)** - one page: how to walk your user through setup,
+> and the six rules of working with the memory correctly.
+
 ![THOR vs mimir - coverage, quality, multi-project, drift and speed](assets/benchmark.svg?v=20260721)
 
 ## Why THOR

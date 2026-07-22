@@ -132,6 +132,30 @@ pub fn apply_ops(store: &mut EventStore, ops: &[crate::inbox::InboxOp]) -> Drain
                     }
                 }
             }
+            "mark" => {
+                // A queued useful-mark: replay as the head-neutral echo the live
+                // mark would have appended. At-least-once semantics: a re-drained
+                // batch can double-count an echo - a bounded ranking nudge, never
+                // a head or content change, so no dedup key is kept for it.
+                match store.append_event(
+                    "drain-inbox",
+                    "drain-inbox",
+                    "mcp",
+                    EventKind::FactEchoed,
+                    &op.entity_id,
+                    None,
+                    "",
+                ) {
+                    Ok(ev) => {
+                        s.applied += 1;
+                        println!("mark {} (echo seq {})", op.entity_id, ev.seq);
+                    }
+                    Err(e) => {
+                        s.errors += 1;
+                        eprintln!("ERROR mark {}: {e}", op.entity_id);
+                    }
+                }
+            }
             other => {
                 s.errors += 1;
                 eprintln!("ERROR unknown inbox op '{other}' for {}", op.entity_id);
@@ -2113,6 +2137,35 @@ mod tests {
         assert!(head.body.contains("[memory/gotcha"), "footer preserved through the drain");
     }
 
+    /// Screw 3 drain side: a useful-mark queued on the replica replays as the
+    /// same head-neutral echo the live mark would have appended.
+    #[test]
+    fn drain_applies_a_queued_mark_as_an_echo() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("thor.db");
+        let mut store = EventStore::new(&db).unwrap();
+        store.append_event("s", "l", "a", EventKind::FactCreated, "P:mem-1", None, "a fact").unwrap();
+        drop(store);
+        let inbox = dir.path().join("inbox.jsonl");
+        crate::inbox::append(&inbox, &crate::inbox::InboxOp {
+            op: "mark".into(),
+            entity_id: "P:mem-1".into(),
+            body: String::new(),
+            parent_rev: None,
+            ts: "1".into(),
+            capture_id: "c1".into(),
+        }).unwrap();
+        let s = run_drain_inbox(&db, &inbox).unwrap();
+        assert_eq!((s.applied, s.errors), (1, 0), "{s:?}");
+        let store = EventStore::new(&db).unwrap();
+        let events = store.get_all_events().unwrap();
+        let last = events.last().unwrap();
+        assert!(matches!(last.kind, EventKind::FactEchoed), "an echo landed: {:?}", last.kind);
+        assert_eq!(last.entity_id, "P:mem-1");
+        let heads = crate::cas::compute_head_sets(&events);
+        assert_eq!(heads.get("P:mem-1").unwrap().heads.len(), 1, "echo is head-neutral");
+    }
+
     #[test]
     fn drain_is_idempotent_on_create() {
         let dir = tempfile::tempdir().unwrap();
@@ -2206,7 +2259,7 @@ mod tests {
         }
     }
 
-    /// `thor init` is the command SETUP.md tells a new user to run, so it must
+    /// `thor init` is the command docs/SETUP.md tells a new user to run, so it must
     /// leave where_used/impact with a sidecar to answer from - not just a marker
     /// file. The refresh used to sit in the Ingest match arm, which init bypassed.
     #[test]

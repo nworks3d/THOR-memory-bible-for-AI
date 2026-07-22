@@ -110,12 +110,13 @@ shape, get to expand any id the others return.";
 /// stale, which writes are safe (queued), and which tools to leave alone here.
 const REPLICA_NOTICE: &str = "\n\nTHIS SERVER IS A READ REPLICA of the authoritative store \
 (log-shipped copy, typically up to ~1 hour behind): recent facts may be missing and very recent \
-edits may not show yet. remember/revise/retract are SAFE here - they queue to a capture inbox \
-that the authority replays on its next sync, so expect 'queued to capture inbox', not 'stored'; \
-that is success, do not retry or re-store. Do NOT call mark, resolve, reproject, pin or unpin \
-here: those would change only this replica and the next sync overwrites them - run them on the \
-authority instead. If a local stdio THOR server is also connected in this session, prefer it \
-for everything: it is the authority and it is current.";
+edits may not show yet. remember/revise/retract and mark-as-useful are SAFE here - they queue to \
+a capture inbox that the authority replays on its next sync, so expect 'queued to capture \
+inbox', not 'stored'; that is success, do not retry or re-store. resolve, reproject, pin, unpin \
+and mark-as-noise are REFUSED on this replica (they would fork the replica's log or land in a \
+local ledger your real sessions never read) - run those on the authority. If a local stdio THOR \
+server is also connected in this session, prefer it for everything: it is the authority and it \
+is current.";
 
 /// The current project for a stdio server, from its launch cwd (Claude Code starts
 /// the connector in the project dir). `None` for the HTTP server (no cwd).
@@ -1048,7 +1049,21 @@ impl ThorServer {
 
     #[tool(description = "Settle a DIVERGED entity: keep_rev becomes the single head, every other contested head is discarded. Run when get/recall shows [DIVERGED] and you know which head is right.")]
     async fn resolve(&self, Parameters(args): Parameters<ResolveArgs>) -> String {
+        let inbox = self.inbox.clone();
         self.blocking(move |s| {
+            // Replica refusal (not a divert): a resolve is a decision against
+            // the CURRENT head-set, and this replica's heads can be an hour
+            // stale - queueing the decision could settle the wrong divergence.
+            // Appending it here would fork the log (the measured 2026-07-22
+            // class). The authority is the only correct place.
+            if inbox.is_some() {
+                return Err(format!(
+                    "not resolved: this is a read replica - a resolve appended here would fork \
+                     the replica's log and block the next sync, and this replica's head-set can \
+                     be stale. Run resolve({}) on the authority (the local stdio THOR).",
+                    args.entity_id
+                ));
+            }
             // Derive the discard set from the current heads; append_resolve
             // re-verifies the citation under the write lock, so a concurrent
             // change comes back as a conflict instead of a wrong resolve.
@@ -1080,16 +1095,47 @@ impl ThorServer {
     #[tool(description = "Mark a fact as USEFUL (it actually answered your question / prevented a mistake), or with noise:true as NOISE (it was injected/recalled but only distracted here). Marking honestly improves your own future recall: useful feeds the promotion prior, noise demotes and feeds decay. Useful is a synced head-neutral event; noise stays in the local ledger.")]
     async fn mark(&self, Parameters(args): Parameters<MarkArgs>) -> String {
         let db = self.db.clone();
+        let inbox = self.inbox.clone();
         self.blocking(move |s| {
             if s.get_events_by_entity(&args.entity_id).map_err(|e| format!("error: {e}"))?.is_empty() {
                 return Err(unknown_entity_msg(s, &args.entity_id));
             }
             if args.noise {
+                if inbox.is_some() {
+                    return Err(format!(
+                        "not marked: this is a read replica, and a noise mark is a LOCAL counter \
+                         by design (never synced) - here it would train a ledger your real \
+                         sessions never read. Run mark({}, noise: true) on the authority (the \
+                         local stdio THOR).",
+                        args.entity_id
+                    ));
+                }
                 // "Noise for me during this task" is a LOCAL judgement, not an
                 // institutional fact: it lives in the ledger, never the synced
                 // log (see crate::strength for how it counts against echoes).
                 crate::ledger::increment(&db, "noise", &args.entity_id);
                 return Ok(format!("marked {} as noise (local)", args.entity_id));
+            }
+            // Replica divert: a useful-mark is a SYNCED log event, and appending
+            // it here is exactly the measured fork class (2026-07-22: four
+            // fact_echoed events written straight into the replica log blocked
+            // shipping for half a day). Queue it like every other write.
+            if let Some(path) = &inbox {
+                let op = crate::inbox::InboxOp {
+                    op: "mark".into(),
+                    entity_id: args.entity_id.clone(),
+                    body: String::new(),
+                    parent_rev: None,
+                    ts: crate::inbox::now_ts(),
+                    capture_id: Uuid::new_v4().to_string(),
+                };
+                return match crate::inbox::append(path, &op) {
+                    Ok(()) => Ok(format!(
+                        "queued to capture inbox: mark {} (pending sync to the authority)",
+                        args.entity_id
+                    )),
+                    Err(e) => Err(format!("capture inbox write failed: {e}")),
+                };
             }
             s.append_event("mcp", "mcp-session", "mcp", EventKind::FactEchoed, &args.entity_id, None, "")
                 .map_err(|e| format!("error: {e}"))?;
@@ -1101,7 +1147,19 @@ impl ThorServer {
     #[tool(description = "Pin a fact: its full body is then re-injected at EVERY session start and right after a compaction (<thor-brief>). Use for standing rules the user states (\"never X on prod\").")]
     async fn pin(&self, Parameters(args): Parameters<EntityArgs>) -> String {
         let db = self.db.clone();
+        let inbox = self.inbox.clone();
         self.blocking(move |s| {
+            // Replica refusal: pins live in a LOCAL ledger next to the store
+            // (never shipped), so a pin here would silently train a brief your
+            // real sessions never see. Refusing beats a successful no-op.
+            if inbox.is_some() {
+                return Err(format!(
+                    "not pinned: this is a read replica, and pins are local to the machine they \
+                     are set on - a pin here would never appear in your real session briefs. Run \
+                     pin({}) on the authority (the local stdio THOR).",
+                    args.entity_id
+                ));
+            }
             if s.get_events_by_entity(&args.entity_id).map_err(|e| format!("error: {e}"))?.is_empty() {
                 return Err(unknown_entity_msg(s, &args.entity_id));
             }
@@ -1128,7 +1186,15 @@ impl ThorServer {
     #[tool(description = "Remove a fact from the pinned session-start brief.")]
     async fn unpin(&self, Parameters(args): Parameters<EntityArgs>) -> String {
         let db = self.db.clone();
+        let inbox = self.inbox.clone();
         self.blocking(move |_s| {
+            if inbox.is_some() {
+                return Err(format!(
+                    "not unpinned: this is a read replica, and pins are local to the machine they \
+                     are set on. Run unpin({}) on the authority (the local stdio THOR).",
+                    args.entity_id
+                ));
+            }
             let mut found = false;
             crate::ledger::mutate_pins(&db, |mut pins| {
                 let before = pins.len();
@@ -1147,7 +1213,18 @@ impl ThorServer {
 
     #[tool(description = "Move a mis-scoped fact to another project or to \"global\" (sync-safe fact_reprojected event). Memories only - repo chunks are managed by ingest.")]
     async fn reproject(&self, Parameters(args): Parameters<ReprojectArgs>) -> String {
+        let inbox = self.inbox.clone();
         self.blocking(move |s| {
+            // Replica refusal: a reproject is a synced log event; appending it
+            // here forks the chain (the measured 2026-07-22 class).
+            if inbox.is_some() {
+                return Err(format!(
+                    "not reprojected: this is a read replica - a reproject appended here would \
+                     fork the replica's log and block the next sync. Run reproject({}) on the \
+                     authority (the local stdio THOR).",
+                    args.entity_id
+                ));
+            }
             if crate::repo::is_chunk_id(&args.entity_id) {
                 return Err(format!(
                     "{} is a repo chunk (managed by ingest); reproject applies to memories",
@@ -1830,6 +1907,58 @@ mod tests {
         assert!(line.contains("\"parent_rev\":\""), "parent resolved before the divert: {line}");
     }
 
+    /// Screw 3, born from the measured 2026-07-22 fork (four fact_echoed events
+    /// written straight into the replica log blocked shipping for half a day):
+    /// on a replica, mark-as-useful QUEUES to the inbox and every other
+    /// non-divertable write is REFUSED with a pointer to the authority. The
+    /// notice (screw 2) advises; this makes the fork unrepresentable.
+    #[tokio::test]
+    async fn replica_diverts_mark_and_refuses_the_other_curation_writes() {
+        let mut store = EventStore::in_memory().unwrap();
+        store.append_event("s", "l", "a", EventKind::FactCreated, "P:mem-1", None, "a fact").unwrap();
+        let shared = Arc::new(Mutex::new(store));
+        let dir = tempfile::tempdir().unwrap();
+        let inbox = dir.path().join("inbox.jsonl");
+        let server =
+            ThorServer::from_shared(shared.clone(), None, dir.path().join("thor.db"), Some(inbox.clone()));
+
+        // mark-useful queues; the replica log gains nothing.
+        let out = server
+            .mark(Parameters(MarkArgs { entity_id: "P:mem-1".into(), noise: false }))
+            .await;
+        assert!(out.contains("queued to capture inbox: mark P:mem-1"), "{out}");
+        let ops = crate::inbox::read_all(&inbox).unwrap();
+        assert_eq!(ops.len(), 1);
+        assert_eq!(ops[0].op, "mark");
+        assert_eq!(ops[0].entity_id, "P:mem-1");
+
+        // Everything that cannot queue is refused, each naming the authority.
+        let refusals = [
+            server.mark(Parameters(MarkArgs { entity_id: "P:mem-1".into(), noise: true })).await,
+            server
+                .resolve(Parameters(ResolveArgs { entity_id: "P:mem-1".into(), keep_rev: "x".into() }))
+                .await,
+            server
+                .reproject(Parameters(ReprojectArgs {
+                    entity_id: "P:mem-1".into(),
+                    project: "global".into(),
+                }))
+                .await,
+            server.pin(Parameters(EntityArgs { entity_id: "P:mem-1".into() })).await,
+            server.unpin(Parameters(EntityArgs { entity_id: "P:mem-1".into() })).await,
+        ];
+        for out in &refusals {
+            assert!(out.contains("read replica"), "names what this server is: {out}");
+            assert!(out.contains("authority"), "points at the right place: {out}");
+        }
+        assert_eq!(crate::inbox::read_all(&inbox).unwrap().len(), 1, "refusals queued nothing");
+        assert_eq!(
+            shared.lock().unwrap().get_all_events().unwrap().len(),
+            1,
+            "the replica log never grew - the fork class is closed"
+        );
+    }
+
     /// Screw 2 of the agent-ergonomics pass: the hosted connector says WHAT it
     /// is. An agent talking to the NAS replica cannot see the topology, so the
     /// server instructions must carry it - and only in divert mode, because an
@@ -1846,7 +1975,7 @@ mod tests {
         let instructions = replica.get_info().instructions.unwrap();
         assert!(instructions.contains("READ REPLICA"), "divert mode must self-identify");
         assert!(instructions.contains("queued to capture inbox"), "teaches the queue semantics");
-        assert!(instructions.contains("Do NOT call mark"), "warns off the non-diverted writes");
+        assert!(instructions.contains("REFUSED on this replica"), "names the guarded writes");
     }
 
     fn server_with(store: EventStore) -> (ThorServer, tempfile::TempDir) {

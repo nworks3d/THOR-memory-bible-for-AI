@@ -126,11 +126,15 @@ those writes happen anyway without ever touching the log:
   server then *diverts* every write to that append-only file instead of appending
   to `thor.db`, and answers the client
   `queued to capture inbox: entity <id> (pending sync to the authority)` (and the
-  same shape for `revise` and `retract`). Reads (recall / get) are unchanged. The
-  stdio (local authority) server never diverts - only the HTTP server reads this
-  env. Note that the `/inbox` routes are served by the `thor recv` process, which
-  reads the same variable: if `recv` runs somewhere that does not have it set,
-  `drain-inbox --from` politely reports 0 ops and exits 0 while draining nothing.
+  same shape for `revise`, `retract` and a useful-`mark`). Reads (recall / get)
+  are unchanged. Writes that cannot be queued are refused with a message naming
+  the authority: `resolve` and `reproject` (they would fork the replica's log)
+  and `pin`/`unpin`/`mark noise` (they would land in the replica's local ledger,
+  invisible to your real sessions). The stdio (local authority) server never
+  diverts - only the HTTP server reads this env. Note that the `/inbox` routes
+  are served by the `thor recv` process, which reads the same variable: if
+  `recv` runs somewhere that does not have it set, `drain-inbox --from` politely
+  reports 0 ops and exits 0 while draining nothing.
 - On the **authority**, drain the inbox back into the real log with
   `thor drain-inbox`: it replays each captured op as a proper event, preserving
   the entity id so revisions chain correctly, and re-running the same duplicate

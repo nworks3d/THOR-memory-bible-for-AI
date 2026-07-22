@@ -417,6 +417,40 @@ fn anchored_memories(
     scope: &crate::recall::RecallScope,
     pred: &dyn Fn(&str) -> bool,
 ) -> Vec<crate::recall::RecallHit> {
+    // M2 fast path: walk the materialized heads (one indexed join) instead of
+    // folding the whole log. Same selection rules as the fold path below;
+    // stale projection = fall through to the authoritative fold.
+    if store.heads_projection_current() {
+        if let Ok(rows) = store.projected_head_events() {
+            let mut out = Vec::new();
+            for (head, head_count, project) in rows {
+                if crate::repo::is_chunk_id(&head.entity_id) || head_count != 1 {
+                    continue;
+                }
+                if matches!(head.kind, crate::event_store::EventKind::FactRetracted) {
+                    continue;
+                }
+                if !scope.allows(project.as_deref()) {
+                    continue;
+                }
+                if crate::footer::anchors(&head.body).iter().any(|a| pred(a)) {
+                    out.push(crate::recall::RecallHit {
+                        entity_id: head.entity_id.clone(),
+                        rev: head.this_hash.clone(),
+                        body: head.body.clone(),
+                        kind: head.kind,
+                        is_diverged: false, // head_count == 1 checked above
+                        rank: 0.0,
+                        project,
+                        fact_type: crate::repo::fact_type(&head.body),
+                        matched_and: true,
+                    });
+                }
+            }
+            out.sort_by(|a, b| a.entity_id.cmp(&b.entity_id));
+            return out;
+        }
+    }
     let Ok(events) = store.get_all_events() else { return Vec::new() };
     let heads = crate::cas::compute_head_sets(&events);
     let projects = crate::cas::compute_projects(&events);

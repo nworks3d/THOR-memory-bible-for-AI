@@ -787,12 +787,70 @@ fn fts_query_and(text: &str) -> Option<String> {
 /// a huge OR cursor).
 const FLOOR_TRIGGER_SCAN_CAP: usize = 200;
 
+/// Where collect_heads reads head/project state: the in-memory fold (always
+/// correct, O(n) to build) or the M2 projection tables (point lookups; used
+/// only when `heads_projection_current()`). Both express the SAME semantics;
+/// the shared class/expiry checks live in `keep_event_common` so the two
+/// backends cannot drift apart on anything but the state source itself.
+enum HeadSource<'a> {
+    Fold {
+        by_seq: &'a HashMap<i64, &'a Event>,
+        heads: &'a HashMap<String, crate::cas::HeadSet>,
+        projects: &'a HashMap<String, Option<String>>,
+    },
+    Projected,
+}
+
+/// Borrowed-or-owned event, so the fold path keeps its zero-copy candidate
+/// walk while the projected path fetches candidates point-wise.
+enum EvRef<'a> {
+    B(&'a Event),
+    O(Event),
+}
+
+impl EvRef<'_> {
+    fn get(&self) -> &Event {
+        match self {
+            EvRef::B(e) => e,
+            EvRef::O(e) => e,
+        }
+    }
+}
+
+/// The state-independent half of the keep() decision: liveness (a retracted
+/// head is not live), head class, and rank-time expiry. Shared by both
+/// backends and by the fold-path ScopeFilter.
+fn keep_event_common(ev: &Event, class: HeadClass) -> bool {
+    if matches!(ev.kind, EventKind::FactRetracted) {
+        return false;
+    }
+    match class {
+        HeadClass::All => {}
+        HeadClass::MemoriesOnly => {
+            if crate::repo::is_chunk_id(&ev.entity_id) {
+                return false;
+            }
+        }
+        HeadClass::DocChunksOnly => {
+            if !crate::repo::is_doc_chunk_id(&ev.entity_id) {
+                return false;
+            }
+        }
+    }
+    if let Some(exp) = crate::footer::expires(&ev.body) {
+        if exp.as_str() < crate::footer::today().as_str() {
+            return false;
+        }
+    }
+    true
+}
+
 fn collect_heads(
     store: &EventStore,
     fts: &str,
-    by_seq: &HashMap<i64, &Event>,
-    heads: &HashMap<String, crate::cas::HeadSet>,
-    filter: &ScopeFilter,
+    source: &HeadSource,
+    scope: &RecallScope,
+    class: HeadClass,
     query: &str,
     qterms: &[String],
     limit: usize,
@@ -817,19 +875,47 @@ fn collect_heads(
             Ok(pair) => pair,
             Err(_) => break, // fail-soft: return what we have
         };
-        let ev = match by_seq.get(&seq) {
-            Some(e) => *e,
-            None => continue,
+        let ev_ref = match source {
+            HeadSource::Fold { by_seq, .. } => match by_seq.get(&seq) {
+                Some(e) => EvRef::B(e),
+                None => continue,
+            },
+            HeadSource::Projected => match store.get_event_by_seq(seq) {
+                Ok(Some(e)) => EvRef::O(e),
+                _ => continue,
+            },
         };
-        let head_set = match heads.get(&ev.entity_id) {
-            Some(h) => h,
-            None => continue,
+        let ev = ev_ref.get();
+        // Current-head check + effective project, per backend.
+        let (is_head, is_diverged, project): (bool, bool, Option<String>) = match source {
+            HeadSource::Fold { heads, projects, .. } => match heads.get(&ev.entity_id) {
+                Some(h) => (
+                    h.heads.contains(&ev.this_hash),
+                    h.is_diverged,
+                    projects.get(&ev.entity_id).cloned().flatten(),
+                ),
+                None => continue,
+            },
+            HeadSource::Projected => {
+                if !store.projected_is_head(&ev.entity_id, &ev.this_hash) {
+                    (false, false, None)
+                } else {
+                    (
+                        true,
+                        store.projected_head_count(&ev.entity_id) > 1,
+                        store.projected_project(&ev.entity_id).flatten(),
+                    )
+                }
+            }
         };
-        if !head_set.heads.contains(&ev.this_hash) {
+        if !is_head {
             continue; // drop hits on revs that are no longer a current head
         }
-        if !filter.keep(ev) {
-            continue; // out of project scope, or a retracted (non-live) head
+        if !keep_event_common(ev, class) {
+            continue; // retracted head, wrong head class, or expired
+        }
+        if !scope.allows(project.as_deref()) {
+            continue; // out of project scope
         }
         if !seen.insert(ev.this_hash.clone()) {
             continue;
@@ -866,9 +952,9 @@ fn collect_heads(
             rev: ev.this_hash.clone(),
             body: ev.body.clone(),
             kind: ev.kind,
-            is_diverged: head_set.is_diverged,
+            is_diverged,
             rank,
-            project: filter.projects.get(&ev.entity_id).cloned().flatten(),
+            project,
             fact_type: crate::repo::fact_type(&ev.body),
             matched_and: false, // stamped true by the caller for the strict pass
         });
@@ -943,34 +1029,14 @@ struct ScopeFilter<'a> {
 }
 
 impl ScopeFilter<'_> {
+    // Expiry note lives on keep_event_common now: expiry is RANK-TIME only -
+    // an `| expires: YYYY-MM-DD |` footer field past its date stops surfacing
+    // (history and the chain keep the fact; get/history still show it).
     fn keep(&self, ev: &Event) -> bool {
-        if matches!(ev.kind, EventKind::FactRetracted) {
-            return false; // a retracted head is not live: never surface it
-        }
-        match self.class {
-            HeadClass::All => {}
-            HeadClass::MemoriesOnly => {
-                if crate::repo::is_chunk_id(&ev.entity_id) {
-                    return false; // chunks never spend a memories-only slot
-                }
-            }
-            HeadClass::DocChunksOnly => {
-                if !crate::repo::is_doc_chunk_id(&ev.entity_id) {
-                    return false; // memories and code chunks never spend a doc slot
-                }
-            }
-        }
-        // Expiry is RANK-TIME only: an `| expires: YYYY-MM-DD |` footer field
-        // past its date stops surfacing (history and the chain keep the fact -
-        // losslessness holds; `get`/`history` still show it). ISO dates order
-        // lexicographically, so a plain string compare suffices.
-        if let Some(exp) = crate::footer::expires(&ev.body) {
-            if exp.as_str() < crate::footer::today().as_str() {
-                return false;
-            }
-        }
-        let effective = self.projects.get(&ev.entity_id).and_then(|o| o.as_deref());
-        self.scope.allows(effective)
+        keep_event_common(ev, self.class)
+            && self
+                .scope
+                .allows(self.projects.get(&ev.entity_id).and_then(|o| o.as_deref()))
     }
 }
 
@@ -1026,15 +1092,25 @@ fn recall_scoped_inner(
     };
     let and_query = fts_query_and(query);
 
-    // Head projection. M1a folds the whole log per call (O(n)); a materialized
-    // heads table updated in the append tx is the M2 optimization. Loaded before
-    // the FTS cursor so the (owned) events/heads outlive the lazy iteration. The
-    // project fold rides the SAME pass over the events.
-    let events = store.get_all_events()?;
-    let by_seq: HashMap<i64, &Event> = events.iter().map(|e| (e.seq, e)).collect();
-    let heads = compute_head_sets(&events);
-    let projects = crate::cas::compute_projects(&events);
-    let filter = ScopeFilter { projects: &projects, scope, class };
+    // Head state (M2): when the materialized projection covers the whole log,
+    // candidates are resolved by point lookups and the O(n) fold is skipped
+    // entirely - this is what flattens recall latency against store growth.
+    // Any staleness (pre-M2 store, bulk write that bypassed append) falls
+    // back to the authoritative fold; correctness never depends on the table.
+    let projected = store.heads_projection_current();
+    let events;
+    let by_seq;
+    let heads;
+    let projects;
+    let source = if projected {
+        HeadSource::Projected
+    } else {
+        events = store.get_all_events()?;
+        by_seq = events.iter().map(|e| (e.seq, e)).collect::<HashMap<i64, &Event>>();
+        heads = compute_head_sets(&events);
+        projects = crate::cas::compute_projects(&events);
+        HeadSource::Fold { by_seq: &by_seq, heads: &heads, projects: &projects }
+    };
 
     // AND-first: prefer memories that match the WHOLE question over a single-word
     // coincidence; fall back to the OR query only when the strict pass finds no
@@ -1051,7 +1127,7 @@ fn recall_scoped_inner(
     };
     let fetch = limit.saturating_add(TRIGGER_POOL_EXTRA);
     if let Some(aq) = and_query {
-        let mut strict = collect_heads(store, &aq, &by_seq, &heads, &filter, query, &qterms, fetch);
+        let mut strict = collect_heads(store, &aq, &source, scope, class, query, &qterms, fetch);
         if !strict.is_empty() {
             for h in &mut strict {
                 h.matched_and = true; // every content term matched: strong evidence
@@ -1059,7 +1135,7 @@ fn recall_scoped_inner(
             return Ok(trigger_boost(strict, query, &qterms, limit));
         }
     }
-    let pool = collect_heads(store, &or_query, &by_seq, &heads, &filter, query, &qterms, fetch);
+    let pool = collect_heads(store, &or_query, &source, scope, class, query, &qterms, fetch);
     Ok(trigger_boost(pool, query, &qterms, limit))
 }
 

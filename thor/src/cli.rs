@@ -292,6 +292,12 @@ enum Commands {
         /// it is suspect is the wrong reflex.
         #[arg(long)]
         rebuild_fts: bool,
+        /// Rebuild the materialized heads projection from the log - the
+        /// explicit form of what the next append does automatically. For a
+        /// store upgraded from a pre-M2 binary that wants the fast recall
+        /// path before its first write. Derived state; nothing can be lost.
+        #[arg(long)]
+        rebuild_heads: bool,
     },
     /// Per-hook recall courier: reads the UserPromptSubmit hook JSON on stdin
     /// and prints a THOR recall block to stdout. Hard fail-open, always exit 0.
@@ -741,7 +747,7 @@ pub enum FsckOutcome {
 /// The integrity checks stop at the first failure on purpose - a store that
 /// fails the hash chain will fail everything downstream, and printing four
 /// errors for one cause is noise.
-pub fn fsck_report(db: &Path, rebuild_fts: bool) -> Result<FsckOutcome> {
+pub fn fsck_report(db: &Path, rebuild_fts: bool, rebuild_heads: bool) -> Result<FsckOutcome> {
     // open_existing, not new: `new` heals the FTS projection on open, so
     // fsck would repair the very thing it is about to check and then
     // report OK. It also must not create a store for a mistyped --db.
@@ -790,6 +796,44 @@ pub fn fsck_report(db: &Path, rebuild_fts: bool) -> Result<FsckOutcome> {
         return Ok(FsckOutcome::IntegrityFailure);
     }
     println!("FTS integrity: OK");
+
+    // Heads projection (M2): the stored fold must equal the from-scratch
+    // fold. STALE is not a failure - a pre-M2 store or a bulk write leaves
+    // the tip behind, readers fall back to the fold, and the next append
+    // rebuilds in-transaction. A CURRENT projection that disagrees with the
+    // fold is corruption of derived state and fails loudly.
+    match store.verify_heads_projection() {
+        Ok(issues) if issues.is_empty() => println!("Heads projection: OK"),
+        Ok(issues)
+            if issues.len() == 1 && issues[0].starts_with("heads projection not current") =>
+        {
+            if rebuild_heads {
+                // An explicit repair may create the projection tables on a
+                // pre-M2 store, so it opens a writing handle (new, not
+                // open_existing) - after the read-only checks above passed.
+                let mut wstore = EventStore::new(db)?;
+                match wstore.rebuild_heads_projection() {
+                    Ok(tip) => println!("Heads projection rebuilt from the log (tip seq {}).", tip),
+                    Err(e) => println!("Heads projection rebuild failed: {}", e),
+                }
+            } else {
+                println!("Heads projection: STALE (readers on the fold fallback; the next append rebuilds it, or run: thor fsck --rebuild-heads)");
+            }
+        }
+        Ok(issues) => {
+            println!(
+                "HEADS PROJECTION ERROR: {} mismatch(es), first: {}",
+                issues.len(),
+                issues[0]
+            );
+            println!("The projection is derived; any append rebuilds it from the log.");
+            return Ok(FsckOutcome::IntegrityFailure);
+        }
+        Err(e) => {
+            println!("HEADS PROJECTION ERROR: {}", e);
+            return Ok(FsckOutcome::IntegrityFailure);
+        }
+    }
 
     // Footer integrity is CONTENT health, not log integrity: the checks
     // above assert the store is internally consistent, this one asserts
@@ -1047,12 +1091,12 @@ pub fn run() -> Result<()> {
                 },
             }
         }
-        Commands::Fsck { rebuild_fts } => {
+        Commands::Fsck { rebuild_fts, rebuild_heads } => {
             // A detected integrity failure MUST leave a non-zero exit code, or
             // fsck cannot gate anything: a scheduled job, a release step or a CI
             // run would all read "broken hash chain" as success. `thor
             // consolidate` already sets this precedent below.
-            match fsck_report(&db, rebuild_fts)? {
+            match fsck_report(&db, rebuild_fts, rebuild_heads)? {
                 FsckOutcome::IntegrityFailure => std::process::exit(1),
                 FsckOutcome::Clean | FsckOutcome::FooterDefects(_) => {}
             }
@@ -2118,7 +2162,7 @@ mod tests {
     fn fsck_reports_clean_on_a_healthy_store() {
         let dir = tempfile::tempdir().unwrap();
         let db = seed_store(dir.path());
-        assert_eq!(fsck_report(&db, false).unwrap(), FsckOutcome::Clean);
+        assert_eq!(fsck_report(&db, false, false).unwrap(), FsckOutcome::Clean);
     }
 
     #[test]
@@ -2131,7 +2175,7 @@ mod tests {
                 .unwrap();
         }
         assert_eq!(
-            fsck_report(&db, false).unwrap(),
+            fsck_report(&db, false, false).unwrap(),
             FsckOutcome::IntegrityFailure,
             "a rewritten body must fail the hash chain, and that must reach the exit code"
         );
@@ -2156,7 +2200,7 @@ mod tests {
                 )
                 .unwrap();
         }
-        match fsck_report(&db, false).unwrap() {
+        match fsck_report(&db, false, false).unwrap() {
             FsckOutcome::FooterDefects(n) => assert_eq!(n, 1, "one defective footer"),
             other => panic!("footer defects must not be an integrity failure, got {other:?}"),
         }

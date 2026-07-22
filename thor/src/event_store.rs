@@ -382,6 +382,27 @@ fn insert_event(
         params![seq, &body_ch],
     )?;
 
+    // Heads projection (M2), SAME transaction. Incremental when the
+    // projection is exactly one event behind; any gap (fresh table, a store
+    // written by a pre-M2 binary, a bulk path that bypassed append) triggers
+    // a full in-transaction rebuild - amortized once, and the projection can
+    // never advance from a wrong base.
+    let tip: i64 = conn
+        .query_row("SELECT v FROM projection_meta WHERE k = 'tip_seq'", [], |r| r.get(0))
+        .unwrap_or(0);
+    if tip == seq - 1 {
+        EventStore::apply_projection_delta(
+            conn, seq, kind, entity_id, parent_rev, body, &this_hash,
+        )?;
+        conn.execute(
+            "INSERT INTO projection_meta (k, v) VALUES ('tip_seq', ?)
+             ON CONFLICT(k) DO UPDATE SET v = excluded.v",
+            params![seq],
+        )?;
+    } else {
+        EventStore::rebuild_projection(conn)?;
+    }
+
     Ok(Event {
         seq,
         event_uuid,
@@ -454,11 +475,13 @@ impl EventStore {
     }
 
     fn init_schema(conn: &Connection) -> SqlResult<()> {
-        // M0 stance: head-sets are a pure projection recomputed from the event
-        // log on every read (see cas::compute_head_sets). There are
-        // deliberately NO materialized projection tables yet. When they arrive
-        // (M1+), they must be written in the SAME transaction as the append,
-        // and fsck must assert stored projection == from-scratch fold.
+        // Projections stance: head-sets WERE a pure fold recomputed from the
+        // event log on every read (M0/M1a, see cas::compute_head_sets). M2
+        // materializes that fold - as the M0 comment here always prescribed:
+        // written in the SAME transaction as the append, and fsck asserts
+        // stored projection == from-scratch fold. The log stays the only
+        // truth; every projection table is derived, rebuildable, and readers
+        // fall back to the fold whenever the projection is not current.
         conn.execute_batch(
             "
             CREATE TABLE IF NOT EXISTS event (
@@ -476,6 +499,7 @@ impl EventStore {
                 this_hash TEXT NOT NULL
             );
             CREATE INDEX IF NOT EXISTS idx_event_entity ON event(entity_id);
+            CREATE INDEX IF NOT EXISTS idx_event_hash ON event(this_hash);
             -- Recall projection (M1): a contentless FTS5 index over body_ch,
             -- keyed by the event seq (rowid). Written in the SAME transaction as
             -- the event append (see insert_event), so the index can never lag the
@@ -484,9 +508,166 @@ impl EventStore {
             -- pre-M1 store or aborted backfill). Per-row text is not separately
             -- audited (contentless index), but it cannot drift from the code path.
             CREATE VIRTUAL TABLE IF NOT EXISTS event_fts USING fts5(body_ch, content='');
+            -- Heads projection (M2): cas::compute_head_sets and
+            -- compute_projects, materialized. head_state holds every CURRENT
+            -- head (one row per contested head; >1 rows = DIVERGED);
+            -- entity_meta holds the effective project per seen entity (NULL =
+            -- global); projection_meta.tip_seq records the last folded seq.
+            -- Maintained by apply_projection_delta inside the append
+            -- transaction; any writer that bypasses append (restore, a
+            -- pre-M2 binary) leaves tip_seq behind MAX(seq), which makes
+            -- every reader fall back to the full fold and the next append
+            -- rebuild the projection in-transaction. Nothing here is truth.
+            CREATE TABLE IF NOT EXISTS head_state (
+                entity_id TEXT NOT NULL,
+                rev_hash TEXT NOT NULL,
+                head_seq INTEGER NOT NULL,
+                PRIMARY KEY (entity_id, rev_hash)
+            );
+            CREATE INDEX IF NOT EXISTS idx_head_entity ON head_state(entity_id);
+            CREATE TABLE IF NOT EXISTS entity_meta (
+                entity_id TEXT PRIMARY KEY,
+                project TEXT
+            );
+            CREATE TABLE IF NOT EXISTS projection_meta (
+                k TEXT PRIMARY KEY,
+                v INTEGER NOT NULL
+            );
             ",
         )?;
         Ok(())
+    }
+
+    /// One event's delta on the heads projection - the incremental mirror of
+    /// the cas fold arms, applied inside the SAME transaction as the append.
+    /// cas::compute_head_sets/compute_projects stay the authority; the
+    /// differential fsck check and the equivalence tests pin this mirror to
+    /// them. Any change to the fold MUST change both places.
+    fn apply_projection_delta(
+        conn: &Connection,
+        seq: i64,
+        kind: EventKind,
+        entity_id: &str,
+        parent_rev: Option<&str>,
+        body: &str,
+        this_hash: &str,
+    ) -> SqlResult<()> {
+        // Project fold mirror: birth on first sight for every kind EXCEPT a
+        // reprojected event (whose arm only writes when its body parses -
+        // a malformed reproject is a full no-op, not a birth).
+        match kind {
+            EventKind::FactReprojected => {
+                if let Some(override_project) = crate::cas::parse_reproject_body(body) {
+                    conn.execute(
+                        "INSERT INTO entity_meta (entity_id, project) VALUES (?, ?)
+                         ON CONFLICT(entity_id) DO UPDATE SET project = excluded.project",
+                        params![entity_id, override_project],
+                    )?;
+                }
+            }
+            _ => {
+                conn.execute(
+                    "INSERT OR IGNORE INTO entity_meta (entity_id, project) VALUES (?, ?)",
+                    params![entity_id, crate::repo::owner_project(entity_id)],
+                )?;
+            }
+        }
+        // Head-set fold mirror.
+        match kind {
+            EventKind::FactCreated => {
+                conn.execute(
+                    "INSERT OR IGNORE INTO head_state (entity_id, rev_hash, head_seq) VALUES (?, ?, ?)",
+                    params![entity_id, this_hash, seq],
+                )?;
+            }
+            EventKind::FactRevised | EventKind::FactSuperseded | EventKind::FactRetracted => {
+                if let Some(parent) = parent_rev {
+                    // Fast-forward when the cited parent IS a current head;
+                    // the DELETE's row count is the membership test.
+                    conn.execute(
+                        "DELETE FROM head_state WHERE entity_id = ? AND rev_hash = ?",
+                        params![entity_id, parent],
+                    )?;
+                }
+                conn.execute(
+                    "INSERT OR IGNORE INTO head_state (entity_id, rev_hash, head_seq) VALUES (?, ?, ?)",
+                    params![entity_id, this_hash, seq],
+                )?;
+            }
+            EventKind::FactResolved => {
+                if let Some((keep_rev, discarded)) = crate::cas::parse_resolve_body(body) {
+                    let current: std::collections::HashSet<String> = {
+                        let mut stmt = conn.prepare(
+                            "SELECT rev_hash FROM head_state WHERE entity_id = ?",
+                        )?;
+                        let rows = stmt.query_map(params![entity_id], |r| r.get::<_, String>(0))?;
+                        rows.collect::<Result<_, _>>()?
+                    };
+                    let keep_also_discarded = discarded.iter().any(|d| *d == keep_rev);
+                    let mut cited: std::collections::HashSet<String> =
+                        discarded.iter().cloned().collect();
+                    cited.insert(keep_rev.clone());
+                    let valid =
+                        !keep_also_discarded && current.contains(&keep_rev) && cited == current;
+                    if valid {
+                        for rev in &discarded {
+                            conn.execute(
+                                "DELETE FROM head_state WHERE entity_id = ? AND rev_hash = ?",
+                                params![entity_id, rev],
+                            )?;
+                        }
+                    }
+                }
+            }
+            EventKind::FactReasserted | EventKind::FactEchoed | EventKind::FactReprojected => {}
+        }
+        Ok(())
+    }
+
+    /// Rebuild the heads projection from the whole log, inside the caller's
+    /// transaction. Same delta function per event, so incremental and rebuilt
+    /// state cannot diverge from each other by construction.
+    fn rebuild_projection(conn: &Connection) -> SqlResult<i64> {
+        conn.execute("DELETE FROM head_state", [])?;
+        conn.execute("DELETE FROM entity_meta", [])?;
+        let mut tip = 0i64;
+        let mut stmt = conn.prepare(
+            "SELECT seq, kind, entity_id, parent_rev, body, this_hash FROM event ORDER BY seq",
+        )?;
+        let rows = stmt.query_map([], |r| {
+            Ok((
+                r.get::<_, i64>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, String>(2)?,
+                r.get::<_, Option<String>>(3)?,
+                r.get::<_, String>(4)?,
+                r.get::<_, String>(5)?,
+            ))
+        })?;
+        for row in rows {
+            let (seq, kind_s, entity_id, parent_rev, body, this_hash) = row?;
+            let Some(kind) = EventKind::from_str(&kind_s) else {
+                // An unknown kind cannot be folded; leave the projection
+                // stale (tip stays behind), so readers keep falling back.
+                return Err(rusqlite::Error::InvalidQuery);
+            };
+            Self::apply_projection_delta(
+                conn,
+                seq,
+                kind,
+                &entity_id,
+                parent_rev.as_deref(),
+                &body,
+                &this_hash,
+            )?;
+            tip = seq;
+        }
+        conn.execute(
+            "INSERT INTO projection_meta (k, v) VALUES ('tip_seq', ?)
+             ON CONFLICT(k) DO UPDATE SET v = excluded.v",
+            params![tip],
+        )?;
+        Ok(tip)
     }
 
     /// Rebuild the FTS projection from the log if the two ever disagree in row
@@ -518,6 +699,174 @@ impl EventStore {
 
     pub fn get_prev_hash(&self) -> SqlResult<String> {
         last_hash(&self.conn)
+    }
+
+    // ---- Heads projection (M2) readers -------------------------------------
+    //
+    // Only meaningful when `heads_projection_current()` - every caller checks
+    // that first and falls back to the cas fold otherwise. The check is two
+    // index-only lookups (the contiguous-tip gap-scan mistake is deliberately
+    // not repeated here: MAX(seq), never a scan).
+
+    /// True when the heads projection covers the whole log.
+    pub fn heads_projection_current(&self) -> bool {
+        let tip: i64 = match self
+            .conn
+            .query_row("SELECT v FROM projection_meta WHERE k = 'tip_seq'", [], |r| r.get(0))
+        {
+            Ok(v) => v,
+            Err(_) => return false,
+        };
+        let max_seq: i64 = match self
+            .conn
+            .query_row("SELECT COALESCE(MAX(seq), 0) FROM event", [], |r| r.get(0))
+        {
+            Ok(v) => v,
+            Err(_) => return false,
+        };
+        tip == max_seq && max_seq > 0
+    }
+
+    /// Is this rev a CURRENT head of its entity? (Point lookup on the PK.)
+    pub fn projected_is_head(&self, entity_id: &str, rev_hash: &str) -> bool {
+        self.conn
+            .query_row(
+                "SELECT 1 FROM head_state WHERE entity_id = ? AND rev_hash = ?",
+                params![entity_id, rev_hash],
+                |_| Ok(()),
+            )
+            .is_ok()
+    }
+
+    /// Number of current heads (>1 = DIVERGED).
+    pub fn projected_head_count(&self, entity_id: &str) -> i64 {
+        self.conn
+            .query_row(
+                "SELECT COUNT(*) FROM head_state WHERE entity_id = ?",
+                params![entity_id],
+                |r| r.get(0),
+            )
+            .unwrap_or(0)
+    }
+
+    /// The entity's effective project. Outer None = entity never seen;
+    /// inner None = global.
+    pub fn projected_project(&self, entity_id: &str) -> Option<Option<String>> {
+        self.conn
+            .query_row(
+                "SELECT project FROM entity_meta WHERE entity_id = ?",
+                params![entity_id],
+                |r| r.get::<_, Option<String>>(0),
+            )
+            .ok()
+    }
+
+    /// Every current head as its full event row, with the head count and the
+    /// effective project of its entity - the anchored-pass workload (walk all
+    /// heads once) without the O(log) fold. Ordered by entity for determinism.
+    pub fn projected_head_events(&self) -> SqlResult<Vec<(Event, i64, Option<String>)>> {
+        let mut stmt = self.conn.prepare(&format!(
+            "SELECT {}, (SELECT COUNT(*) FROM head_state h2 WHERE h2.entity_id = h.entity_id),
+                    m.project
+             FROM head_state h
+             JOIN event e ON e.seq = h.head_seq
+             LEFT JOIN entity_meta m ON m.entity_id = h.entity_id
+             ORDER BY h.entity_id, h.rev_hash",
+            EVENT_COLUMNS
+                .split(", ")
+                .map(|c| format!("e.{}", c))
+                .collect::<Vec<_>>()
+                .join(", ")
+        ))?;
+        let rows = stmt.query_map([], |row| {
+            let ev = row_to_event(row)?;
+            let n: i64 = row.get(12)?;
+            let project: Option<String> = row.get(13)?;
+            Ok((ev, n, project))
+        })?;
+        rows.collect()
+    }
+
+    /// One event by seq (the projected recall path fetches candidates
+    /// point-wise instead of loading the whole log).
+    pub fn get_event_by_seq(&self, seq: i64) -> SqlResult<Option<Event>> {
+        let mut stmt = self
+            .conn
+            .prepare(&format!("SELECT {} FROM event WHERE seq = ?", EVENT_COLUMNS))?;
+        let mut rows = stmt.query_map(params![seq], row_to_event)?;
+        rows.next().transpose()
+    }
+
+    /// Rebuild the heads projection from the log, in one transaction. The
+    /// explicit form of what the next append would do anyway - for a store
+    /// upgraded from a pre-M2 binary that wants the fast path before its
+    /// first write (`thor fsck --rebuild-heads`).
+    pub fn rebuild_heads_projection(&mut self) -> anyhow::Result<i64> {
+        let tx = self
+            .conn
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let tip = Self::rebuild_projection(&tx)?;
+        tx.commit()?;
+        Ok(tip)
+    }
+
+    /// Differential audit: the stored projection must equal the from-scratch
+    /// fold (heads, divergence and projects). Returns a list of human-readable
+    /// mismatches; empty = consistent. `fsck` calls this; the M0 comment on
+    /// init_schema always promised it.
+    pub fn verify_heads_projection(&self) -> anyhow::Result<Vec<String>> {
+        let mut issues = Vec::new();
+        if !self.heads_projection_current() {
+            issues.push("heads projection not current (tip_seq behind the log) - readers are on the fold fallback; the next append rebuilds it".to_string());
+            return Ok(issues);
+        }
+        let events = self.get_all_events()?;
+        let folded = crate::cas::compute_head_sets(&events);
+        let folded_projects = crate::cas::compute_projects(&events);
+        // Stored heads.
+        let mut stored: std::collections::HashMap<String, std::collections::HashSet<String>> =
+            std::collections::HashMap::new();
+        {
+            let mut stmt = self.conn.prepare("SELECT entity_id, rev_hash FROM head_state")?;
+            let rows = stmt.query_map([], |r| {
+                Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
+            })?;
+            for row in rows {
+                let (e, h) = row?;
+                stored.entry(e).or_default().insert(h);
+            }
+        }
+        for (entity, hs) in &folded {
+            match stored.get(entity) {
+                Some(s) if *s == hs.heads => {}
+                Some(_) => issues.push(format!("head-set mismatch for {}", entity)),
+                None => issues.push(format!("entity {} missing from head_state", entity)),
+            }
+        }
+        for entity in stored.keys() {
+            if !folded.contains_key(entity) {
+                issues.push(format!("stale entity {} in head_state", entity));
+            }
+        }
+        // Stored projects.
+        {
+            let mut stmt = self.conn.prepare("SELECT entity_id, project FROM entity_meta")?;
+            let rows = stmt.query_map([], |r| {
+                Ok((r.get::<_, String>(0)?, r.get::<_, Option<String>>(1)?))
+            })?;
+            let mut stored_projects: std::collections::HashMap<String, Option<String>> =
+                std::collections::HashMap::new();
+            for row in rows {
+                let (e, p) = row?;
+                stored_projects.insert(e, p);
+            }
+            for (entity, project) in &folded_projects {
+                if stored_projects.get(entity) != Some(project) {
+                    issues.push(format!("project mismatch for {}", entity));
+                }
+            }
+        }
+        Ok(issues)
     }
 
     pub fn append_event(
@@ -1147,6 +1496,170 @@ mod fts_integrity_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The projection tables must equal the cas fold after EVERY append,
+    /// across the full torture set of fold arms: fast-forward, stale branch,
+    /// retract (both forms), valid resolve, partial/invalid resolve,
+    /// keep-in-discarded resolve, resolve-then-FF, reproject (valid,
+    /// malformed, before-birth), and the head-neutral kinds.
+    #[test]
+    fn heads_projection_equals_fold_after_every_append() {
+        let mut store = EventStore::in_memory().unwrap();
+        let assert_projection = |store: &EventStore, step: &str| {
+            assert!(store.heads_projection_current(), "projection current after {}", step);
+            let issues = store.verify_heads_projection().unwrap();
+            assert!(issues.is_empty(), "after {}: {:?}", step, issues);
+        };
+        let a = store
+            .append_event("s", "l", "t", EventKind::FactCreated, "P:mem-a", None, "a v1")
+            .unwrap();
+        assert_projection(&store, "create");
+        let a2 = store
+            .append_event("s", "l", "t", EventKind::FactRevised, "P:mem-a", Some(&a.this_hash), "a v2")
+            .unwrap();
+        assert_projection(&store, "fast-forward");
+        store
+            .append_event("s", "l", "t", EventKind::FactRevised, "P:mem-a", Some("stale"), "a branch")
+            .unwrap();
+        assert_projection(&store, "stale branch (diverged)");
+        assert_eq!(store.projected_head_count("P:mem-a"), 2, "diverged = two heads");
+        // invalid partial resolve = no-op
+        let bad = serde_json::json!({ "keep_rev": a2.this_hash, "discarded": ["nonsense"] }).to_string();
+        store
+            .append_event("s", "l", "t", EventKind::FactResolved, "P:mem-a", None, &bad)
+            .unwrap();
+        assert_projection(&store, "invalid resolve (no-op)");
+        assert_eq!(store.projected_head_count("P:mem-a"), 2);
+        // valid resolve down to one head
+        let heads: Vec<String> = {
+            let events = store.get_all_events().unwrap();
+            crate::cas::compute_head_sets(&events)["P:mem-a"].heads.iter().cloned().collect()
+        };
+        let discarded: Vec<&String> = heads.iter().filter(|h| **h != a2.this_hash).collect();
+        let good = serde_json::json!({ "keep_rev": a2.this_hash, "discarded": discarded }).to_string();
+        store
+            .append_event("s", "l", "t", EventKind::FactResolved, "P:mem-a", None, &good)
+            .unwrap();
+        assert_projection(&store, "valid resolve");
+        assert_eq!(store.projected_head_count("P:mem-a"), 1);
+        // resolve-then-FF
+        store
+            .append_event("s", "l", "t", EventKind::FactRevised, "P:mem-a", Some(&a2.this_hash), "a v3")
+            .unwrap();
+        assert_projection(&store, "FF from resolved winner");
+        // retract as fast-forward
+        let b = store
+            .append_event("s", "l", "t", EventKind::FactCreated, "01KGLOBALB", None, "b v1")
+            .unwrap();
+        store
+            .append_event("s", "l", "t", EventKind::FactRetracted, "01KGLOBALB", Some(&b.this_hash), "[gone]")
+            .unwrap();
+        assert_projection(&store, "retract FF");
+        // reproject valid, then a revise that must NOT clobber it
+        let c = store
+            .append_event("s", "l", "t", EventKind::FactCreated, "ProjC:mem-c", None, "c v1")
+            .unwrap();
+        store
+            .append_event(
+                "s", "l", "t", EventKind::FactReprojected, "ProjC:mem-c", None,
+                &serde_json::json!({ "project": "ProjD" }).to_string(),
+            )
+            .unwrap();
+        store
+            .append_event("s", "l", "t", EventKind::FactRevised, "ProjC:mem-c", Some(&c.this_hash), "c v2")
+            .unwrap();
+        assert_projection(&store, "reproject + revise");
+        assert_eq!(store.projected_project("ProjC:mem-c"), Some(Some("ProjD".to_string())));
+        // malformed reproject = full no-op
+        store
+            .append_event("s", "l", "t", EventKind::FactReprojected, "ProjC:mem-c", None, "not json")
+            .unwrap();
+        assert_projection(&store, "malformed reproject");
+        assert_eq!(store.projected_project("ProjC:mem-c"), Some(Some("ProjD".to_string())));
+        // reproject BEFORE birth, then birth must not clobber the override
+        store
+            .append_event(
+                "s", "l", "t", EventKind::FactReprojected, "ProjE:mem-e", None,
+                &serde_json::json!({ "project": null }).to_string(),
+            )
+            .unwrap();
+        store
+            .append_event("s", "l", "t", EventKind::FactCreated, "ProjE:mem-e", None, "e v1")
+            .unwrap();
+        assert_projection(&store, "reproject before birth");
+        assert_eq!(store.projected_project("ProjE:mem-e"), Some(None), "override to global sticks");
+        // head-neutral echo
+        store
+            .append_event("s", "l", "t", EventKind::FactEchoed, "ProjC:mem-c", None, "{}")
+            .unwrap();
+        assert_projection(&store, "echo (head-neutral)");
+    }
+
+    /// A write that bypasses append (raw insert, the restore/pre-M2 shape)
+    /// leaves the projection STALE - readers must fall back - and the next
+    /// ordinary append rebuilds it in-transaction from the whole log.
+    #[test]
+    fn heads_projection_rebuilds_after_bypass() {
+        let mut store = EventStore::in_memory().unwrap();
+        let a = store
+            .append_event("s", "l", "t", EventKind::FactCreated, "P:mem-a", None, "a v1")
+            .unwrap();
+        assert!(store.heads_projection_current());
+        // bypass: raw event insert without the projection delta
+        store
+            .conn()
+            .execute(
+                "INSERT INTO event (seq, event_uuid, session_id, lineage_id, actor, kind, entity_id,
+                 parent_rev, body, body_ch, prev_hash, this_hash)
+                 VALUES (2, 'bypass-uuid', 's', 'l', 't', 'fact_revised', 'P:mem-a', ?, 'a v2', 'a v2', ?, 'bypass-hash')",
+                params![&a.this_hash, &a.this_hash],
+            )
+            .unwrap();
+        assert!(!store.heads_projection_current(), "bypass leaves the projection stale");
+        // fold fallback still sees the truth
+        let folded = crate::cas::compute_head_sets(&store.get_all_events().unwrap());
+        assert_eq!(folded["P:mem-a"].heads.len(), 1);
+        assert!(folded["P:mem-a"].heads.contains("bypass-hash"));
+        // the next append rebuilds the whole projection
+        store
+            .append_event("s", "l", "t", EventKind::FactCreated, "P:mem-b", None, "b v1")
+            .unwrap();
+        assert!(store.heads_projection_current(), "append after bypass rebuilds");
+        assert!(store.verify_heads_projection().unwrap().is_empty());
+        assert!(store.projected_is_head("P:mem-a", "bypass-hash"));
+    }
+
+    /// projected_head_events serves every current head as its full event row
+    /// with the entity's head count - the anchored-pass workload.
+    #[test]
+    fn projected_head_events_match_fold() {
+        let mut store = EventStore::in_memory().unwrap();
+        let a = store
+            .append_event("s", "l", "t", EventKind::FactCreated, "P:mem-a", None, "a v1")
+            .unwrap();
+        store
+            .append_event("s", "l", "t", EventKind::FactRevised, "P:mem-a", Some("stale"), "a branch")
+            .unwrap();
+        store
+            .append_event("s", "l", "t", EventKind::FactCreated, "Q:doc.md#0", None, "doc chunk")
+            .unwrap();
+        let rows = store.projected_head_events().unwrap();
+        let folded = crate::cas::compute_head_sets(&store.get_all_events().unwrap());
+        let total: usize = folded.values().map(|h| h.heads.len()).sum();
+        assert_eq!(rows.len(), total);
+        for (ev, n, project) in &rows {
+            assert!(folded[&ev.entity_id].heads.contains(&ev.this_hash));
+            assert_eq!(*n as usize, folded[&ev.entity_id].heads.len());
+            assert_eq!(
+                project.as_deref(),
+                crate::repo::owner_project(&ev.entity_id),
+                "birth project served for {}",
+                ev.entity_id
+            );
+        }
+        assert!(rows.iter().any(|(e, n, _)| e.entity_id == "P:mem-a" && *n == 2));
+        let _ = a;
+    }
 
     #[test]
     fn test_canonicalize_body() {

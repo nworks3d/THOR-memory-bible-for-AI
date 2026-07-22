@@ -163,7 +163,7 @@ for b in [
     "A 7000-char judging cap bound BOTH sides: THOR on 47/59 deliberate and 24/59 session items, mimir full-body on most.",
     "Do not compare absolutes across rounds: Test 1 reads 89.2 here vs 73.2 last round - the jury and battery moved, not",
     "the products. Read gaps within a round.",
-    "THOR is compute-bound: 125 -> 146 ms warm as the store grew. Fold materialized 2026-07-22 (cold ~4x); warm figure stands.",
+    "Compute-bound: 125 -> 146 ms warm as the store grew. Fold materialized 2026-07-22, cold ~4x; warm stands.",
     "Newer and far less battle-tested than mimir's daily use; mimir ships at a high cadence (v0.15: inference delegation).",
     "One machine, private corpus, LLM-judged - only drift is repo-reproducible (examples/drift_eval.rs).",
 ]:

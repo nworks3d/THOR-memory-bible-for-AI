@@ -154,7 +154,7 @@
 <text x="20" y="1328" fill="#c9d1d9" font-size="11">THOR's courier answers EVERY prompt - 0 of 20 empty - in 146 ms (p90 167). mimir's hook is faster at 40 ms but</text>
 <text x="20" y="1344" fill="#c9d1d9" font-size="11">returns nothing on 6 of 20: it is fast because it often serves nothing. The mimir channel that competes on drift</text>
 <text x="20" y="1360" fill="#c9d1d9" font-size="11">costs 323 ms and is not a hook. Honestly worse since last round: the courier read 125 ms at 16.1k events and reads</text>
-<text x="20" y="1376" fill="#c9d1d9" font-size="11">146 ms at 19.8k - the compute-bound growth is real, and it is why the materialized-heads work is planned.</text>
+<text x="20" y="1376" fill="#c9d1d9" font-size="11">146 ms at 19.8k - real growth; the per-query fold behind it is materialized since 2026-07-22 (cold paths ~4x).</text>
 <text x="20" y="1406" fill="#c9d1d9" font-size="12.5" font-weight="700" letter-spacing="0.4">HONEST DOWNSIDES</text>
 <text x="20" y="1422" fill="#8b949e" font-size="11">where THOR does not win, and the caveats</text>
 <circle cx="26" cy="1440" r="3" fill="#e3b341"/>
@@ -174,7 +174,7 @@
 <circle cx="26" cy="1587" r="3" fill="#e3b341"/>
 <text x="38" y="1591" fill="#e6edf3" font-size="11.5">the products. Read gaps within a round.</text>
 <circle cx="26" cy="1608" r="3" fill="#e3b341"/>
-<text x="38" y="1612" fill="#e6edf3" font-size="11.5">THOR is compute-bound: 125 ms at 16.1k events -&gt; 146 ms at 19.8k. The daemon hides the cold cost, not the growth.</text>
+<text x="38" y="1612" fill="#e6edf3" font-size="11.5">Compute-bound: 125 -&gt; 146 ms warm as the store grew. Fold materialized 2026-07-22, cold ~4x; warm stands.</text>
 <circle cx="26" cy="1629" r="3" fill="#e3b341"/>
 <text x="38" y="1633" fill="#e6edf3" font-size="11.5">Newer and far less battle-tested than mimir's daily use; mimir ships at a high cadence (v0.15: inference delegation).</text>
 <circle cx="26" cy="1650" r="3" fill="#e3b341"/>

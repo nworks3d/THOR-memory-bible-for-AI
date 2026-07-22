@@ -52,6 +52,9 @@ file or command. What it cannot push is your discipline. Six rules:
    (`verified` only when a test ran, a file was read, or the user confirmed).
 3. **Never store a near-duplicate: `revise` or `retract` the existing
    fact.** THOR refuses obvious duplicates, but the judgement is yours.
+   To fix only metadata (a dead anchor, an expiry, a wrong type), call
+   `revise` with just that parameter and no body - the content and every
+   other field stay untouched, so there is nothing to retype or get wrong.
 4. **Settle `[DIVERGED]` facts** with `resolve` as soon as you know which
    head is right - a contested fact serves both heads until you do.
 5. **`mark` what helped, and what only distracted** (`noise: true`). This

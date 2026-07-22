@@ -2281,13 +2281,22 @@ returned by recall. It is not deleted - the log still holds it, and
   `| expires: <date>` - and keeps showing it after the date passes, while
   `thor recall` no longer returns the fact. That difference is exactly the
   design: the filter is applied at read time, it never evicts anything.
-- **How to turn it off again:** this is the part that trips people up. Revising
-  the fact with a body that simply leaves the footer out does **not** remove the
-  expiry. On every revision, if the new body brings no footer of its own, the
-  previous version's entire footer is re-attached automatically - including
-  `expires`. That default protects your tags and your fact type, so it stays.
+- **How to turn it off again:** on the MCP `revise` tool this is now one call:
+  pass `expires: ""` (an empty string) and nothing else. The fact's content and
+  every other footer field stay exactly as they were; only the date is removed.
+  The same works for setting a new date (`expires: "2028-01-01"`), and the
+  other footer fields have matching parameters (`fact_type`, `tags`,
+  `triggers`, `anchors`, `provenance`) - each one changes only the field you
+  name, so you never retype a footer to fix one value.
 
-  Step by step, the route that works:
+  The background, and the part that used to trip people up: revising the fact
+  with a body that simply leaves the footer out does **not** remove the expiry.
+  On every revision, if the new body brings no footer of its own, the previous
+  version's entire footer is re-attached automatically - including `expires`.
+  That default protects your tags and your fact type, so it stays.
+
+  On the command line (`thor revise`), which has no field parameters, the
+  re-type route still applies, step by step:
 
   1. `thor get <id>` and look at the last line of the body: the bracketed
      footer, something like
@@ -2299,9 +2308,8 @@ returned by recall. It is not deleted - the log still holds it, and
      carried one.
   3. Revise with that body.
 
-  You no longer have to remember this by heart. If you revise without a footer
-  and the fact you are revising has an expiry date, the MCP `revise` tool now
-  says so in its reply:
+  And if you revise over MCP without a footer while the fact has an expiry
+  date, the tool says so in its reply:
 
   ```
   revised acme:mem-1234 -> rev 8f2c...

@@ -1021,13 +1021,17 @@ enum HeadClass {
 
 /// Bundles the per-entity effective-project map with the scope, plus the "a
 /// retracted head is not live" rule, so every candidate path filters identically
-/// with a single `keep(ev)` check.
+/// with a single `keep(ev)` check. Only the fused (semantic) legs still fold
+/// eagerly enough to hold the projects map; the lexical paths went through
+/// keep_event_common directly when the heads projection landed (M2).
+#[cfg(feature = "semantic")]
 struct ScopeFilter<'a> {
     projects: &'a HashMap<String, Option<String>>,
     scope: &'a RecallScope,
     class: HeadClass,
 }
 
+#[cfg(feature = "semantic")]
 impl ScopeFilter<'_> {
     // Expiry note lives on keep_event_common now: expiry is RANK-TIME only -
     // an `| expires: YYYY-MM-DD |` footer field past its date stops surfacing

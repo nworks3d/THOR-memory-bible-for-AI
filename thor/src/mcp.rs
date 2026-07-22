@@ -93,7 +93,8 @@ all_projects:true for everything, project:\"<key>\" for one, kind:\"memory\" to 
 chunks when you want notes/decisions). get shows one entity's full head(s); history its revision \
 log. remember stores a NEW fact (recall first - near-duplicates are refused) and accepts \
 fact_type (gotcha|decision|preference) + tags. When a fact you see is outdated or wrong: revise \
-it (auto-fills parent_rev when single-headed) or retract it - do NOT remember a duplicate. When \
+it (auto-fills parent_rev when single-headed; to fix only metadata - an anchor, an expiry, the \
+type - pass just that parameter and no body) or retract it - do NOT remember a duplicate. When \
 you meet a [DIVERGED] fact: resolve it (keep_rev wins) as soon as you know the right head. When \
 an injected/recalled fact actually helped you: mark it (improves future ranking). pin/unpin \
 manage the standing rules re-injected at every session start; brief shows what THOR knows about \
@@ -102,6 +103,19 @@ another project or global. ROUTING - pick the surface by the question's shape: r
 and prose (\"what did we decide about X\"), where_used when a question names a symbol (\"who \
 calls X\"), impact before changing one (\"what breaks if I touch X\"), outline for a file's \
 shape, get to expand any id the others return.";
+
+/// Appended to INSTRUCTIONS when the server runs in replica divert mode (the
+/// hosted/NAS connector, THOR_CAPTURE_INBOX set). The agent on the other end
+/// cannot see the deployment topology, so the server says it itself: what is
+/// stale, which writes are safe (queued), and which tools to leave alone here.
+const REPLICA_NOTICE: &str = "\n\nTHIS SERVER IS A READ REPLICA of the authoritative store \
+(log-shipped copy, typically up to ~1 hour behind): recent facts may be missing and very recent \
+edits may not show yet. remember/revise/retract are SAFE here - they queue to a capture inbox \
+that the authority replays on its next sync, so expect 'queued to capture inbox', not 'stored'; \
+that is success, do not retry or re-store. Do NOT call mark, resolve, reproject, pin or unpin \
+here: those would change only this replica and the next sync overwrites them - run them on the \
+authority instead. If a local stdio THOR server is also connected in this session, prefer it \
+for everything: it is the authority and it is current.";
 
 /// The current project for a stdio server, from its launch cwd (Claude Code starts
 /// the connector in the project dir). `None` for the HTTP server (no cwd).
@@ -241,17 +255,45 @@ pub struct RememberArgs {
     pub provenance: Option<String>,
 }
 
-#[derive(Deserialize, schemars::JsonSchema)]
+#[derive(Default, Deserialize, schemars::JsonSchema)]
 pub struct ReviseArgs {
     /// The entity id to update.
     pub entity_id: String,
-    /// The corrected, full replacement body.
-    pub body: String,
+    /// The corrected, full replacement body. OMIT it to change only metadata
+    /// fields: the current head's content is kept and the fields below are
+    /// applied to its footer - no retyping, no footer-format risk.
+    #[serde(default)]
+    pub body: Option<String>,
     /// The head rev this update is based on. Omit when the entity has a single
     /// head (auto-filled); required when it is DIVERGED. A stale value is
     /// rejected with the fresh head-set instead of creating a silent branch.
     #[serde(default)]
     pub parent_rev: Option<String>,
+    /// Replace the fact's type: gotcha | decision | preference | note.
+    /// Omit to keep the current type.
+    #[serde(default)]
+    pub fact_type: Option<String>,
+    /// Replace the tag list. Empty list = clear the tags. Omit = keep.
+    #[serde(default)]
+    pub tags: Option<Vec<String>>,
+    /// Replace the fires-when trigger words. Empty list = remove the field.
+    /// Omit = keep.
+    #[serde(default)]
+    pub triggers: Option<Vec<String>>,
+    /// Replace the guard anchors (exact file paths / command strings this
+    /// fact GOVERNS; entries are stored comma-separated - passing them here
+    /// as a list makes the dead space-joined-anchor mistake unrepresentable).
+    /// Empty list = remove the field. Omit = keep.
+    #[serde(default)]
+    pub anchors: Option<Vec<String>>,
+    /// Replace the expiry date (YYYY-MM-DD). Empty string = remove the
+    /// expiry. Omit = keep whatever is there.
+    #[serde(default)]
+    pub expires: Option<String>,
+    /// Replace the provenance label: verified | inferred. Empty string =
+    /// remove it. Omit = keep.
+    #[serde(default)]
+    pub provenance: Option<String>,
 }
 
 #[derive(Deserialize, schemars::JsonSchema)]
@@ -802,14 +844,97 @@ impl ThorServer {
         .await
     }
 
-    #[tool(description = "Update an existing fact with a corrected body (fact_revised). Single-headed facts auto-fill parent_rev; a stale parent_rev is rejected with the fresh head-set (no silent branch). Prefer this over remember for a fact that CHANGED.")]
+    #[tool(description = "Update an existing fact (fact_revised). Two independent modes, combinable: pass 'body' to replace the content, and/or pass metadata fields (fact_type/tags/triggers/anchors/expires/provenance) to edit ONLY those footer fields - the current content and every other field are kept, so fixing an anchor or dropping an expiry never means retyping the fact. Single-headed facts auto-fill parent_rev; a stale parent_rev is rejected with the fresh head-set (no silent branch). Prefer this over remember for a fact that CHANGED.")]
     async fn revise(&self, Parameters(args): Parameters<ReviseArgs>) -> String {
         let inbox = self.inbox.clone();
         self.blocking(move |s| {
-            let body = args.body.trim();
-            if body.is_empty() {
-                return Err("a non-empty 'body' is required".to_string());
+            // Metadata params -> footer field edits, validated like remember.
+            let mut edits = crate::footer::FieldEdits::default();
+            edits.fact_type =
+                args.fact_type.as_deref().map(str::trim).filter(|t| !t.is_empty()).map(str::to_string);
+            edits.tags = args.tags.clone();
+            edits.triggers = args.triggers.clone();
+            edits.anchors = args.anchors.clone();
+            if let Some(exp) = args.expires.as_deref() {
+                let exp = exp.trim();
+                if exp.is_empty() {
+                    edits.expires = Some(None);
+                } else if !crate::footer::valid_expiry(exp) {
+                    return Err(format!(
+                        "expires must be a YYYY-MM-DD date (got '{exp}'); pass an empty string \
+                         to remove the expiry instead"
+                    ));
+                } else {
+                    edits.expires = Some(Some(exp.to_string()));
+                }
             }
+            if let Some(p) = args.provenance.as_deref() {
+                let p = p.trim();
+                if p.is_empty() {
+                    edits.provenance = Some(None);
+                } else if matches!(p, "verified" | "inferred") {
+                    edits.provenance = Some(Some(p.to_string()));
+                } else {
+                    return Err(format!(
+                        "provenance must be 'verified' or 'inferred' (got '{p}'); pass an empty \
+                         string to remove it"
+                    ));
+                }
+            }
+            let body_arg = args.body.as_deref().map(str::trim).filter(|b| !b.is_empty());
+            if body_arg.is_none() && edits.is_empty() {
+                return Err(
+                    "provide a corrected 'body', one or more metadata fields (fact_type, tags, \
+                     triggers, anchors, expires, provenance), or both"
+                        .to_string(),
+                );
+            }
+            // Resolve the final body + parent. With metadata edits the head is
+            // read HERE and the footer surgery baked in BEFORE the replica
+            // divert below, so the inbox queues exactly the body the authority
+            // will replay - a divert of raw params would re-run the surgery
+            // against a head that may have moved by then.
+            let (body, parent_rev) = if edits.is_empty() {
+                (body_arg.unwrap_or_default().to_string(), args.parent_rev.clone())
+            } else {
+                let (rev, head_body, project) =
+                    head_for_field_edit(s, &args.entity_id, args.parent_rev.as_deref())?;
+                let base = match body_arg {
+                    Some(b) => {
+                        crate::footer::carry_over(b, &head_body).unwrap_or_else(|| b.to_string())
+                    }
+                    None => head_body,
+                };
+                let new_body = match crate::footer::extract(&base) {
+                    Some(f) => {
+                        let edited = crate::footer::edit_footer(f, &edits).ok_or_else(|| {
+                            format!(
+                                "the footer of {} is not in the [memory/...] form ({f}); \
+                                 revise with a full corrected body instead",
+                                args.entity_id
+                            )
+                        })?;
+                        format!("{}\n\n{}", crate::footer::strip(&base).trim_end(), edited)
+                    }
+                    // Footerless fact: mint a canonical footer from the edits
+                    // (same shape remember stamps), project label included.
+                    None => {
+                        let label = project.unwrap_or_else(|| "global".into());
+                        let footer = crate::footer::compose_full(
+                            edits.fact_type.as_deref().unwrap_or("note"),
+                            &edits.tags.clone().unwrap_or_default(),
+                            &label,
+                            &edits.triggers.clone().unwrap_or_default(),
+                            &edits.anchors.clone().unwrap_or_default(),
+                            edits.expires.clone().flatten().as_deref(),
+                            edits.provenance.clone().flatten().as_deref(),
+                        );
+                        format!("{}\n\n{}", base.trim_end(), footer)
+                    }
+                };
+                (new_body, Some(rev))
+            };
+            let body = body.as_str();
             // Write-time footer integrity: a malformed footer (CLI-dump tail,
             // missing blank-line separator) silently loses the fact's type and
             // leaks bracket syntax into served snippets - measured live as 16
@@ -824,7 +949,7 @@ impl ThorServer {
                     op: "revise".into(),
                     entity_id: args.entity_id.clone(),
                     body: body.to_string(),
-                    parent_rev: args.parent_rev.clone(),
+                    parent_rev: parent_rev.clone(),
                     ts: crate::inbox::now_ts(),
                     capture_id: Uuid::new_v4().to_string(),
                 };
@@ -842,7 +967,7 @@ impl ThorServer {
                 "mcp",
                 EventKind::FactRevised,
                 &args.entity_id,
-                args.parent_rev.as_deref(),
+                parent_rev.as_deref(),
                 body,
             ) {
                 Ok(ev) => {
@@ -862,8 +987,8 @@ impl ThorServer {
                         Some(exp) => Ok(format!(
                             "revised {} -> rev {}\nnote: this fact still expires on {exp}. Your body \
                              carried no footer, so the previous one was kept, expiry included. To \
-                             change or drop the date, send the body with the full footer re-typed \
-                             (leave the expires field out to remove it).",
+                             change or drop the date, revise again with just the expires parameter \
+                             (a new YYYY-MM-DD, or an empty string to remove it).",
                             args.entity_id, ev.this_hash
                         )),
                         None => Ok(format!("revised {} -> rev {}", args.entity_id, ev.this_hash)),
@@ -1114,6 +1239,74 @@ fn render_mutate_err(s: &EventStore, given: &str, e: anyhow::Error) -> String {
     }
 }
 
+/// The head a metadata-only revise edits from: (rev, body, effective project).
+/// Honors parent_rev the same way append_mutate_checked does - an explicit rev
+/// must be a CURRENT head, an omitted one requires a single head - because the
+/// surgery reads the head body BEFORE the append; a laxer rule here would bake
+/// a stale footer into the write that CAS then happily fast-forwards.
+fn head_for_field_edit(
+    s: &EventStore,
+    entity_id: &str,
+    parent_rev: Option<&str>,
+) -> Result<(String, String, Option<String>), String> {
+    // (rev, body) per current head + the entity's effective project.
+    let (heads, project): (Vec<(String, String)>, Option<String>) = if s.heads_projection_current() {
+        let rows = s.projected_heads_of(entity_id).map_err(|e| format!("error: {e}"))?;
+        let mut heads = Vec::with_capacity(rows.len());
+        for (rev, seq) in rows {
+            let ev = s
+                .get_event_by_seq(seq)
+                .map_err(|e| format!("error: {e}"))?
+                .ok_or_else(|| format!("error: head seq {seq} missing from the log"))?;
+            heads.push((rev, ev.body));
+        }
+        (heads, s.projected_project(entity_id).flatten())
+    } else {
+        let events = s.get_all_events().map_err(|e| format!("error: {e}"))?;
+        let head_sets = crate::cas::compute_head_sets(&events);
+        let by_hash: std::collections::HashMap<&str, &crate::event_store::Event> =
+            events.iter().map(|e| (e.this_hash.as_str(), e)).collect();
+        let heads = head_sets
+            .get(entity_id)
+            .map(|hs| {
+                let mut revs: Vec<&String> = hs.heads.iter().collect();
+                revs.sort();
+                revs.iter()
+                    .filter_map(|r| by_hash.get(r.as_str()).map(|e| ((*r).clone(), e.body.clone())))
+                    .collect()
+            })
+            .unwrap_or_default();
+        let project =
+            crate::cas::compute_projects(&events).get(entity_id).cloned().flatten();
+        (heads, project)
+    };
+    if heads.is_empty() {
+        return Err(unknown_entity_msg(s, entity_id));
+    }
+    let revs: Vec<&str> = heads.iter().map(|(r, _)| r.as_str()).collect();
+    let (rev, body) = match parent_rev {
+        Some(p) => heads.iter().find(|(r, _)| r == p).cloned().ok_or_else(|| {
+            format!(
+                "rejected: parent_rev {} is not a current head. Current head-set for {}: {:?}. \
+                 Re-read the fact (get) and retry with the right parent_rev.",
+                p, entity_id, revs
+            )
+        })?,
+        None if heads.len() == 1 => heads[0].clone(),
+        None => {
+            return Err(format!(
+                "rejected: {} is DIVERGED ({} heads) - a metadata edit needs parent_rev to know \
+                 which head's footer to edit. Head-set: {:?}. Read both with get, then retry \
+                 with parent_rev (or resolve the divergence first).",
+                entity_id,
+                heads.len(),
+                revs
+            ))
+        }
+    };
+    Ok((rev, body, project))
+}
+
 /// Effective project filter for the symbol tools: an explicit "all" widens to
 /// every project, an explicit key pins one, omitted falls back to the server's
 /// startup project (None = unscoped, matching the HTTP server's behavior).
@@ -1234,7 +1427,16 @@ fn render_overview(events: &[crate::event_store::Event], db: &Path, project: Opt
 #[tool_handler]
 impl ServerHandler for ThorServer {
     fn get_info(&self) -> ServerInfo {
-        ServerInfo::new(ServerCapabilities::builder().enable_tools().build()).with_instructions(INSTRUCTIONS)
+        // Replica-ness is a runtime fact (inbox divert active), not a
+        // transport fact: an HTTP daemon on the authority machine is NOT a
+        // replica, so the notice keys on the divert, never on --http itself.
+        let instructions = if self.inbox.is_some() {
+            format!("{INSTRUCTIONS}{REPLICA_NOTICE}")
+        } else {
+            INSTRUCTIONS.to_string()
+        };
+        ServerInfo::new(ServerCapabilities::builder().enable_tools().build())
+            .with_instructions(instructions)
     }
 }
 
@@ -1462,8 +1664,8 @@ mod tests {
         let out = server
             .revise(Parameters(ReviseArgs {
                 entity_id: "e-exp".into(),
-                body: "pin to the 1.9 line - upstream fix has landed, unpin at will".into(),
-                parent_rev: None,
+                body: Some("pin to the 1.9 line - upstream fix has landed, unpin at will".into()),
+                ..Default::default()
             }))
             .await;
         assert!(out.starts_with("revised e-exp"), "{out}");
@@ -1476,10 +1678,175 @@ mod tests {
             crate::footer::compose("gotcha", &["deploy".into()], "global", &[], &[], None)
         );
         let out2 = server
-            .revise(Parameters(ReviseArgs { entity_id: "e-exp".into(), body: cleared, parent_rev: None }))
+            .revise(Parameters(ReviseArgs {
+                entity_id: "e-exp".into(),
+                body: Some(cleared),
+                ..Default::default()
+            }))
             .await;
         assert!(out2.starts_with("revised e-exp"), "{out2}");
         assert!(!out2.contains("still expires"), "a re-typed footer clears it silently: {out2}");
+    }
+
+    /// The error class the metadata params kill: repairing one anchor used to
+    /// mean retyping the whole footer, and a typo there silently wiped fields.
+    #[tokio::test]
+    async fn revise_metadata_only_edits_the_footer_and_keeps_the_body() {
+        let mut store = EventStore::in_memory().unwrap();
+        // Imported-shaped fact with the measured dead-anchor form (one
+        // space-joined anchor) and a mimir marker (the import idempotence key).
+        let body = "never deploy on friday\n\n[memory/gotcha | tags: deploy | anchors: a b c | \
+                    project: P | mimir:01KIMPORT]";
+        store.append_event("s", "l", "a", EventKind::FactCreated, "P:mem-1", None, body).unwrap();
+        let shared = Arc::new(Mutex::new(store));
+        let dir = tempfile::tempdir().unwrap();
+        let server = ThorServer::from_shared(shared.clone(), None, dir.path().join("thor.db"), None);
+
+        let out = server
+            .revise(Parameters(ReviseArgs {
+                entity_id: "P:mem-1".into(),
+                anchors: Some(vec!["deploy/watcher.sh".into(), "docker compose up".into()]),
+                ..Default::default()
+            }))
+            .await;
+        assert!(out.starts_with("revised P:mem-1"), "{out}");
+
+        let s = shared.lock().unwrap();
+        let head = s.get_all_events().unwrap().into_iter().last().unwrap();
+        assert!(matches!(head.kind, EventKind::FactRevised), "a real revision was appended");
+        assert_eq!(
+            head.body,
+            "never deploy on friday\n\n[memory/gotcha | tags: deploy | anchors: \
+             deploy/watcher.sh, docker compose up | project: P | mimir:01KIMPORT]",
+            "content, type, tags, project and the mimir marker survive byte-for-byte"
+        );
+    }
+
+    #[tokio::test]
+    async fn revise_metadata_on_a_footerless_fact_mints_a_canonical_footer() {
+        let mut store = EventStore::in_memory().unwrap();
+        store
+            .append_event("s", "l", "a", EventKind::FactCreated, "P:mem-2", None, "a plain untyped note")
+            .unwrap();
+        let shared = Arc::new(Mutex::new(store));
+        let dir = tempfile::tempdir().unwrap();
+        let server = ThorServer::from_shared(shared.clone(), None, dir.path().join("thor.db"), None);
+
+        let out = server
+            .revise(Parameters(ReviseArgs {
+                entity_id: "P:mem-2".into(),
+                fact_type: Some("gotcha".into()),
+                anchors: Some(vec!["watch.rs".into()]),
+                ..Default::default()
+            }))
+            .await;
+        assert!(out.starts_with("revised P:mem-2"), "{out}");
+
+        let s = shared.lock().unwrap();
+        let head = s.get_all_events().unwrap().into_iter().last().unwrap();
+        assert_eq!(
+            head.body,
+            "a plain untyped note\n\n[memory/gotcha | tags:  | anchors: watch.rs | project: P]",
+            "the minted footer carries the entity's effective project"
+        );
+    }
+
+    #[tokio::test]
+    async fn revise_metadata_clears_an_expiry_without_retyping() {
+        let mut store = EventStore::in_memory().unwrap();
+        let dated = format!(
+            "pin serde until the fix\n\n{}",
+            crate::footer::compose("gotcha", &["pin".into()], "global", &[], &[], Some("2027-01-15"))
+        );
+        store.append_event("s", "l", "a", EventKind::FactCreated, "e-clr", None, &dated).unwrap();
+        let shared = Arc::new(Mutex::new(store));
+        let dir = tempfile::tempdir().unwrap();
+        let server = ThorServer::from_shared(shared.clone(), None, dir.path().join("thor.db"), None);
+
+        let out = server
+            .revise(Parameters(ReviseArgs {
+                entity_id: "e-clr".into(),
+                expires: Some(String::new()),
+                ..Default::default()
+            }))
+            .await;
+        assert!(out.starts_with("revised e-clr"), "{out}");
+        assert!(!out.contains("still expires"), "no carried-expiry nag on an explicit clear: {out}");
+
+        let s = shared.lock().unwrap();
+        let head = s.get_all_events().unwrap().into_iter().last().unwrap();
+        assert!(!head.body.contains("expires:"), "the date is gone: {}", head.body);
+        assert!(head.body.contains("tags: pin"), "every other field survives: {}", head.body);
+    }
+
+    #[tokio::test]
+    async fn revise_refuses_a_no_op_and_bad_metadata() {
+        let (server, _dir) = server_with(EventStore::in_memory().unwrap());
+        let err = server
+            .revise(Parameters(ReviseArgs { entity_id: "e1".into(), ..Default::default() }))
+            .await;
+        assert!(err.contains("provide a corrected 'body'"), "{err}");
+        let err = server
+            .revise(Parameters(ReviseArgs {
+                entity_id: "e1".into(),
+                provenance: Some("guessed".into()),
+                ..Default::default()
+            }))
+            .await;
+        assert!(err.contains("provenance must be"), "{err}");
+        let err = server
+            .revise(Parameters(ReviseArgs {
+                entity_id: "e1".into(),
+                expires: Some("morgen".into()),
+                ..Default::default()
+            }))
+            .await;
+        assert!(err.contains("expires must be"), "{err}");
+    }
+
+    /// The replica ordering rule: field surgery runs BEFORE the inbox divert,
+    /// so the queue carries the final body - the authority replays bytes, it
+    /// never re-runs the surgery against a head that may have moved since.
+    #[tokio::test]
+    async fn revise_metadata_divert_queues_the_final_baked_body() {
+        let mut store = EventStore::in_memory().unwrap();
+        let body = "the rule\n\n[memory/gotcha | tags: x | anchors: dead one | project: P]";
+        store.append_event("s", "l", "a", EventKind::FactCreated, "P:mem-d", None, body).unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let inbox = dir.path().join("inbox.jsonl");
+        let (server, _d) = server_with_inbox(store, inbox.clone());
+
+        let out = server
+            .revise(Parameters(ReviseArgs {
+                entity_id: "P:mem-d".into(),
+                anchors: Some(vec!["real.rs".into()]),
+                ..Default::default()
+            }))
+            .await;
+        assert!(out.contains("queued to capture inbox"), "{out}");
+        let line = std::fs::read_to_string(&inbox).unwrap();
+        assert!(line.contains("anchors: real.rs"), "the queued body is the edited one: {line}");
+        assert!(!line.contains("dead one"), "the dead anchor is already gone in the queue: {line}");
+        assert!(line.contains("\"parent_rev\":\""), "parent resolved before the divert: {line}");
+    }
+
+    /// Screw 2 of the agent-ergonomics pass: the hosted connector says WHAT it
+    /// is. An agent talking to the NAS replica cannot see the topology, so the
+    /// server instructions must carry it - and only in divert mode, because an
+    /// HTTP daemon on the authority machine is not a replica.
+    #[test]
+    fn server_instructions_self_identify_as_replica_only_in_divert_mode() {
+        let (authority, _d1) = server_with(EventStore::in_memory().unwrap());
+        let instructions = authority.get_info().instructions.unwrap();
+        assert!(!instructions.contains("READ REPLICA"), "authority must not claim replica");
+
+        let dir = tempfile::tempdir().unwrap();
+        let (replica, _d2) =
+            server_with_inbox(EventStore::in_memory().unwrap(), dir.path().join("inbox.jsonl"));
+        let instructions = replica.get_info().instructions.unwrap();
+        assert!(instructions.contains("READ REPLICA"), "divert mode must self-identify");
+        assert!(instructions.contains("queued to capture inbox"), "teaches the queue semantics");
+        assert!(instructions.contains("Do NOT call mark"), "warns off the non-diverted writes");
     }
 
     fn server_with(store: EventStore) -> (ThorServer, tempfile::TempDir) {
@@ -1863,8 +2230,8 @@ mod tests {
         let out = server
             .revise(Parameters(ReviseArgs {
                 entity_id: "e1".into(),
-                body: "the deploy watcher gotcha, updated".into(),
-                parent_rev: None,
+                body: Some("the deploy watcher gotcha, updated".into()),
+                ..Default::default()
             }))
             .await;
         assert!(out.starts_with("revised e1"), "{out}");
@@ -1875,8 +2242,9 @@ mod tests {
         let stale = server
             .revise(Parameters(ReviseArgs {
                 entity_id: "e1".into(),
-                body: "racing write".into(),
+                body: Some("racing write".into()),
                 parent_rev: Some("0000000000000000000000000000000000000000000000000000000000000000".into()),
+                ..Default::default()
             }))
             .await;
         assert!(stale.contains("rejected"), "stale parent must conflict: {stale}");
@@ -1885,7 +2253,11 @@ mod tests {
         assert!(!get.contains("DIVERGED"), "a rejected revise must not mint a branch: {get}");
         // revising an unknown entity errors (never creates a stray head)
         let err = server
-            .revise(Parameters(ReviseArgs { entity_id: "nope".into(), body: "x".into(), parent_rev: None }))
+            .revise(Parameters(ReviseArgs {
+                entity_id: "nope".into(),
+                body: Some("x".into()),
+                ..Default::default()
+            }))
             .await;
         assert!(err.contains("unknown entity"), "got: {err}");
     }
@@ -1902,7 +2274,11 @@ mod tests {
         let (server, _d) = server_with(store);
 
         let err = server
-            .revise(Parameters(ReviseArgs { entity_id: "mem-abc".into(), body: "fix".into(), parent_rev: None }))
+            .revise(Parameters(ReviseArgs {
+                entity_id: "mem-abc".into(),
+                body: Some("fix".into()),
+                ..Default::default()
+            }))
             .await;
         assert!(err.contains("unknown entity"), "still names the failure: {err}");
         assert!(err.contains("acme-shop:mem-abc"), "echoes the full id to retry with: {err}");
@@ -1915,7 +2291,11 @@ mod tests {
 
         // A genuinely-unknown bare id has no match: no misleading suggestion.
         let err = server
-            .revise(Parameters(ReviseArgs { entity_id: "mem-zzz".into(), body: "x".into(), parent_rev: None }))
+            .revise(Parameters(ReviseArgs {
+                entity_id: "mem-zzz".into(),
+                body: Some("x".into()),
+                ..Default::default()
+            }))
             .await;
         assert!(err.contains("unknown entity"), "{err}");
         assert!(!err.contains("did you mean"), "no guess when nothing matches: {err}");

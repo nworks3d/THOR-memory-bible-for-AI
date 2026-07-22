@@ -787,6 +787,18 @@ impl EventStore {
         rows.collect()
     }
 
+    /// The current heads of ONE entity as (rev_hash, head_seq) rows. Only
+    /// meaningful when the projection is current.
+    pub fn projected_heads_of(&self, entity_id: &str) -> SqlResult<Vec<(String, i64)>> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT rev_hash, head_seq FROM head_state WHERE entity_id = ? ORDER BY rev_hash")?;
+        let rows = stmt.query_map(params![entity_id], |r| {
+            Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?))
+        })?;
+        rows.collect()
+    }
+
     /// One event by seq (the projected recall path fetches candidates
     /// point-wise instead of loading the whole log).
     pub fn get_event_by_seq(&self, seq: i64) -> SqlResult<Option<Event>> {

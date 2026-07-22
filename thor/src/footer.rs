@@ -50,19 +50,9 @@ pub fn compose_full(
         let t = field_safe(fact_type).to_lowercase();
         if t.is_empty() { "note".to_string() } else { t }
     };
-    let clean = |xs: &[String]| -> Vec<String> {
-        xs.iter().map(|t| field_safe(t)).filter(|t| !t.is_empty()).collect()
-    };
-    let tags = clean(tags).join(" ");
-    let fires = clean(triggers).join(" ");
-    // an anchor may contain spaces (a command phrase), so entries are
-    // comma-separated; commas inside an anchor would split it - strip them
-    let anchors = clean(anchors)
-        .into_iter()
-        .map(|a| a.replace(',', " ").split_whitespace().collect::<Vec<_>>().join(" "))
-        .filter(|a| !a.is_empty())
-        .collect::<Vec<_>>()
-        .join(", ");
+    let tags = join_words(tags);
+    let fires = join_words(triggers);
+    let anchors = join_anchors(anchors);
     let mut out = format!("[memory/{} | tags: {}", ty, tags);
     if !fires.is_empty() {
         out.push_str(&format!(" | fires-when: {}", fires));
@@ -84,6 +74,150 @@ pub fn compose_full(
     }
     out.push_str(&format!(" | project: {}]", project_label));
     out
+}
+
+/// Space-joined, field-safe word list (the tags / fires-when serialization).
+fn join_words(xs: &[String]) -> String {
+    xs.iter().map(|t| field_safe(t)).filter(|t| !t.is_empty()).collect::<Vec<_>>().join(" ")
+}
+
+/// Comma-joined, field-safe anchor list. An anchor may contain spaces (a
+/// command phrase), so entries are comma-separated; commas INSIDE an anchor
+/// would split it and are folded to spaces. A space-joined anchor list is
+/// the measured dead-anchor class: it parses as ONE never-matching anchor.
+fn join_anchors(xs: &[String]) -> String {
+    xs.iter()
+        .map(|t| field_safe(t))
+        .map(|a| a.replace(',', " ").split_whitespace().collect::<Vec<_>>().join(" "))
+        .filter(|a| !a.is_empty())
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+/// Metadata overrides for `edit_footer`: `None` = leave that field exactly as
+/// it is; `Some(empty)` = remove the field (tags stay present but empty - the
+/// format always writes them). Born from the dead-anchor repair sessions,
+/// where changing ONE field meant hand-retyping the whole footer and three
+/// separate gotchas guarded the ways that goes wrong.
+#[derive(Default)]
+pub struct FieldEdits {
+    pub fact_type: Option<String>,
+    pub tags: Option<Vec<String>>,
+    pub triggers: Option<Vec<String>>,
+    pub anchors: Option<Vec<String>>,
+    /// `Some(None)` clears the date; `Some(Some(d))` sets it.
+    pub expires: Option<Option<String>>,
+    /// `Some(None)` clears; `Some(Some(p))` sets.
+    pub provenance: Option<Option<String>>,
+}
+
+impl FieldEdits {
+    pub fn is_empty(&self) -> bool {
+        self.fact_type.is_none()
+            && self.tags.is_none()
+            && self.triggers.is_none()
+            && self.anchors.is_none()
+            && self.expires.is_none()
+            && self.provenance.is_none()
+    }
+}
+
+/// Field surgery on a footer LINE: apply `edits` and leave every other field
+/// byte-for-byte as it was - including the `project:` field (reproject owns
+/// that) and a trailing `mimir:<id>` import marker (the has_source_ref
+/// idempotence key). Fields are (re)written at their canonical position:
+/// tags, fires-when, anchors, expires, provenance, project, mimir.
+/// Returns None when `footer` is not a `[memory/...]` line.
+pub fn edit_footer(footer: &str, edits: &FieldEdits) -> Option<String> {
+    let inner = footer.trim().strip_prefix('[')?.strip_suffix(']')?;
+    let mut segments = inner.split(" | ");
+    let ty_seg = segments.next()?;
+    let old_ty = ty_seg.strip_prefix("memory/")?;
+    // Collect the existing fields verbatim; unknown names ride along behind
+    // provenance so nothing an older or newer binary wrote is dropped.
+    let mut fields: Vec<(String, String)> = Vec::new();
+    let mut mimir_tail: Option<String> = None;
+    for seg in segments {
+        if seg.starts_with("mimir:") {
+            mimir_tail = Some(seg.to_string());
+        } else if let Some((name, value)) = seg.split_once(": ") {
+            fields.push((name.to_string(), value.to_string()));
+        } else if let Some(name) = seg.strip_suffix(':') {
+            fields.push((name.to_string(), String::new()));
+        } else {
+            fields.push((seg.to_string(), String::new()));
+        }
+    }
+    fn set(fields: &mut Vec<(String, String)>, name: &str, value: Option<String>) {
+        match value.filter(|v| !v.is_empty()) {
+            Some(v) => {
+                if let Some(f) = fields.iter_mut().find(|(n, _)| n == name) {
+                    f.1 = v;
+                } else {
+                    fields.push((name.to_string(), v));
+                }
+            }
+            None => fields.retain(|(n, _)| n != name),
+        }
+    }
+    if let Some(tags) = &edits.tags {
+        // tags is always present in the format, possibly empty
+        if let Some(f) = fields.iter_mut().find(|(n, _)| n == "tags") {
+            f.1 = join_words(tags);
+        } else {
+            fields.push(("tags".to_string(), join_words(tags)));
+        }
+    }
+    if let Some(triggers) = &edits.triggers {
+        set(&mut fields, "fires-when", Some(join_words(triggers)));
+    }
+    if let Some(anchors) = &edits.anchors {
+        set(&mut fields, "anchors", Some(join_anchors(anchors)));
+    }
+    if let Some(exp) = &edits.expires {
+        set(&mut fields, "expires", exp.as_ref().map(|d| field_safe(d)));
+    }
+    if let Some(prov) = &edits.provenance {
+        set(&mut fields, "provenance", prov.as_ref().map(|p| field_safe(p)));
+    }
+    let ty = match &edits.fact_type {
+        Some(t) => {
+            let t = field_safe(t).to_lowercase();
+            if t.is_empty() { old_ty.to_string() } else { t }
+        }
+        None => old_ty.to_string(),
+    };
+    // Rebuild in canonical order; anything unknown keeps its relative place
+    // after the known fields (before project).
+    const ORDER: &[&str] = &["tags", "fires-when", "anchors", "expires", "provenance"];
+    let mut out = format!("[memory/{}", ty);
+    let mut emitted: Vec<usize> = Vec::new();
+    for name in ORDER {
+        if let Some(i) = fields.iter().position(|(n, _)| n == name) {
+            out.push_str(&format!(" | {}: {}", name, fields[i].1));
+            emitted.push(i);
+        } else if *name == "tags" {
+            out.push_str(" | tags: ");
+        }
+    }
+    for (i, (n, v)) in fields.iter().enumerate() {
+        if emitted.contains(&i) || n == "project" {
+            continue;
+        }
+        if v.is_empty() {
+            out.push_str(&format!(" | {}", n));
+        } else {
+            out.push_str(&format!(" | {}: {}", n, v));
+        }
+    }
+    if let Some(i) = fields.iter().position(|(n, _)| n == "project") {
+        out.push_str(&format!(" | project: {}", fields[i].1));
+    }
+    if let Some(m) = mimir_tail {
+        out.push_str(&format!(" | {}", m));
+    }
+    out.push(']');
+    Some(out)
 }
 
 /// Parse the footer's `| provenance: <verified|inferred>` field: the fact's
@@ -757,6 +891,91 @@ mod tests {
         assert_eq!(project(&body).as_deref(), Some("ProjA"));
         assert_eq!(strip(&body), "the rule");
         assert!(anchors("no footer here").is_empty());
+    }
+
+    /// The dead-anchor repair case edit_footer exists for: fix ONE field of an
+    /// imported fact without retyping - type, tags, project and the mimir
+    /// marker (the import idempotence key) stay byte-for-byte.
+    #[test]
+    fn edit_footer_changes_one_field_and_leaves_the_rest_byte_for_byte() {
+        let footer = "[memory/gotcha | tags: deploy nas | fires-when: scp | anchors: a b c | \
+                      expires: 2027-01-15 | provenance: verified | project: P | mimir:01KEXAMPLE]";
+        let edits = FieldEdits {
+            anchors: Some(vec!["deploy/watcher.sh".into(), "docker compose up".into()]),
+            ..Default::default()
+        };
+        assert_eq!(
+            edit_footer(footer, &edits).unwrap(),
+            "[memory/gotcha | tags: deploy nas | fires-when: scp | anchors: deploy/watcher.sh, \
+             docker compose up | expires: 2027-01-15 | provenance: verified | project: P | \
+             mimir:01KEXAMPLE]"
+        );
+    }
+
+    #[test]
+    fn edit_footer_inserts_missing_fields_at_their_canonical_position() {
+        let footer = "[memory/note | tags: | project: global]";
+        let edits = FieldEdits {
+            triggers: Some(vec!["git push".into()]),
+            anchors: Some(vec!["deploy.flag".into()]),
+            ..Default::default()
+        };
+        // Empty tags re-emit in compose's shape ("tags: " + separator), which
+        // is why the expectation carries two spaces - same bytes remember writes.
+        assert_eq!(
+            edit_footer(footer, &edits).unwrap(),
+            "[memory/note | tags:  | fires-when: git push | anchors: deploy.flag | project: global]"
+        );
+    }
+
+    #[test]
+    fn edit_footer_clears_fields_and_retypes() {
+        let footer = "[memory/note | tags: a b | fires-when: x | anchors: f.rs | \
+                      expires: 2027-01-01 | provenance: inferred | project: P]";
+        let edits = FieldEdits {
+            fact_type: Some("gotcha".into()),
+            tags: Some(vec![]),
+            triggers: Some(vec![]),
+            anchors: Some(vec![]),
+            expires: Some(None),
+            provenance: Some(None),
+        };
+        // tags stay present-but-empty (the format always writes them, same as
+        // compose); every optional field is gone; project is untouched.
+        assert_eq!(edit_footer(footer, &edits).unwrap(), "[memory/gotcha | tags:  | project: P]");
+    }
+
+    #[test]
+    fn edit_footer_refuses_a_non_memory_line() {
+        let edits = FieldEdits { tags: Some(vec![]), ..Default::default() };
+        assert_eq!(edit_footer("[repo file | P/src/a.rs | chunk 1/1]", &edits), None);
+        assert_eq!(edit_footer("not bracketed at all", &edits), None);
+    }
+
+    #[test]
+    fn edit_footer_output_reads_back_through_every_parser() {
+        let footer = compose_full(
+            "decision",
+            &["k".into()],
+            "ProjA",
+            &["ssh".into()],
+            &["old.rs".into()],
+            Some("2027-05-01"),
+            Some("inferred"),
+        );
+        let edits = FieldEdits {
+            anchors: Some(vec!["new.rs".into(), "cmd one".into()]),
+            provenance: Some(Some("verified".into())),
+            ..Default::default()
+        };
+        let body = format!("content\n\n{}", edit_footer(&footer, &edits).unwrap());
+        assert_eq!(anchors(&body), vec!["new.rs", "cmd one"]);
+        assert_eq!(provenance(&body).as_deref(), Some("verified"));
+        assert_eq!(fires_when(&body).as_deref(), Some("ssh"), "untouched fields survive");
+        assert_eq!(expires(&body).as_deref(), Some("2027-05-01"));
+        assert_eq!(project(&body).as_deref(), Some("ProjA"));
+        assert_eq!(fact_type(&body), Some(FactType::Decision));
+        assert!(write_defect(&body).is_none(), "result must be a valid body");
     }
 
     #[test]

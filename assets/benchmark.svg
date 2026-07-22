@@ -137,7 +137,7 @@
 <text x="20" y="1126" fill="#c9d1d9" font-size="11">Five arms judged blind together; silence scores zero. Session = courier + guard advisories - the as-deployed channel</text>
 <text x="20" y="1142" fill="#c9d1d9" font-size="11">since the action guard landed. Courier alone 75.4, deliberate 70.3, mimir's hook 7.6 (misses 50 of 59, 0 full catches).</text>
 <text x="20" y="1158" fill="#c9d1d9" font-size="11">Sign tests: session beats mimir's best 11 W / 0 L (p 0.001), courier beats it 10 W / 2 L (p 0.039); deliberate vs best</text>
-<text x="20" y="1174" fill="#c9d1d9" font-size="11">is a tie (9 W / 6 L, p 0.61). This REVERSES last round, where mimir's best beat the courier (p 0.043) - the serving-</text>
+<text x="20" y="1174" fill="#c9d1d9" font-size="11">is a tie (9 W / 5 L, p 0.42). This REVERSES last round, where mimir's best beat the courier (p 0.043) - the serving-</text>
 <text x="20" y="1190" fill="#c9d1d9" font-size="11">form work sits in between; the corpus was cleaned (73 -> 59) and the jury changed, so it is two honest rounds, not</text>
 <text x="20" y="1206" fill="#c9d1d9" font-size="11">one number moving. 17 of 59 scenarios carry no expected call - there session equals courier by construction.</text>
 <text x="20" y="1222" fill="#c9d1d9" font-size="11">Separately reproducible in-repo, no judge needed: cargo run --example drift_eval (catches AND false fires).</text>

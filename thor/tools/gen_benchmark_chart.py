@@ -135,7 +135,7 @@ pair("Vs mimir's auto hook", 79.7, 7.6, "+72%", thor_tag="session", mimir_tag="m
 note("Five arms judged blind together; silence scores zero. Session = courier + guard advisories - the as-deployed channel", color=SOFT)
 note("since the action guard landed. Courier alone 75.4, deliberate 70.3, mimir's hook 7.6 (misses 50 of 59, 0 full catches).", color=SOFT)
 note("Sign tests: session beats mimir's best 11 W / 0 L (p 0.001), courier beats it 10 W / 2 L (p 0.039); deliberate vs best", color=SOFT)
-note("is a tie (9 W / 6 L, p 0.61). This REVERSES last round, where mimir's best beat the courier (p 0.043) - the serving-", color=SOFT)
+note("is a tie (9 W / 5 L, p 0.42). This REVERSES last round, where mimir's best beat the courier (p 0.043) - the serving-", color=SOFT)
 note("form work sits in between; the corpus was cleaned (73 -> 59) and the jury changed, so it is two honest rounds, not", color=SOFT)
 note("one number moving. 17 of 59 scenarios carry no expected call - there session equals courier by construction.", color=SOFT)
 note("Separately reproducible in-repo, no judge needed: cargo run --example drift_eval (catches AND false fires).", color=SOFT)

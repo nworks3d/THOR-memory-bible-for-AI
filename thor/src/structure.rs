@@ -1,6 +1,6 @@
 //! Structure Cards: a composed PROSE serving form for structure-shaped queries.
 //!
-//! The measured problem (BENCHMARKS.md, 2026-07-21): on "which functions call X"
+//! The measured problem (docs/BENCHMARKS.md, 2026-07-21): on "which functions call X"
 //! questions THOR retrieves the right file MORE often than the rival (81% vs 69%
 //! where the gold names a file) and still loses the judged category (57.6% vs
 //! 74.2%), because it serves raw code where the rival serves a document that

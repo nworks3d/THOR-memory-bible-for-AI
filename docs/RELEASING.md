@@ -38,7 +38,7 @@ Each ships with a `.sha256`.
 
 2. **Re-measure anything the release claims.** If recall, latency or drift moved,
    the published numbers are now wrong. Re-run the speed set and the evals, then
-   update `BENCHMARKS.md`, `README.md` and regenerate the chart:
+   update `docs/BENCHMARKS.md`, `README.md` and regenerate the chart:
 
    ```
    python thor/tools/gen_benchmark_chart.py
@@ -57,7 +57,7 @@ Each ships with a `.sha256`.
    grows; the rival ships too. Re-measure both sides, at their live size, on the
    same 20-prompt set, and publish the result even when it is worse than last
    time. The honest-numbers line is the point of this repo - see the
-   code-structure entry in BENCHMARKS.md for what it costs to keep.
+   code-structure entry in docs/BENCHMARKS.md for what it costs to keep.
 
 3. **Bump the version** in `thor/Cargo.toml` (and `Cargo.lock` follows via any
    build). Commit it on its own: `release: v0.9.0`.

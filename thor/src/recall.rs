@@ -1698,7 +1698,7 @@ pub fn recall_fused_scoped_cached(
     // (the win is in code-behavior) on the 52-query battery with NO drift-catching
     // regression, precisely because it is gated to the deliberate path: the
     // courier runs with boost_paths=false, so its drift-preventer ranking is
-    // byte-identical to before. See BENCHMARKS.md.
+    // byte-identical to before. See docs/BENCHMARKS.md.
     const RECENCY_WEIGHT: f64 = 0.3;
     const RECENCY_HALFLIFE_EVENTS: f64 = 2000.0;
     let tip_seq = events.iter().map(|e| e.seq).max().unwrap_or(0) as f64;

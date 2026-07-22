@@ -2885,12 +2885,13 @@ into that file instead and answers the client "queued to capture inbox: entity &
   binary size - a diverted write is one appended JSON line. The real cost is the
   delay: a captured write is **not** visible in the replica's own recall until it has
   been drained on the authority and shipped back. The repo is explicit that this is
-  "a capture channel, not a live write". Also note the divert covers only those three
-  tools. Three other MCP tools do append to the replica's own log and can therefore
-  still fork it: `resolve`, `reproject`, and `mark` in its default (useful) form.
-  `pin`, `unpin` and `mark` with `noise: true` are safe here - they write only the
-  local `thor-ledger.db` sidecar next to the store, which is never part of the
-  hash-chained log.
+  "a capture channel, not a live write". The divert covers `remember`, `revise`,
+  `retract` and `mark` in its default (useful) form. Every other write is refused on
+  a replica with a message naming the authority: `resolve` and `reproject` (they
+  would append to the replica's log and fork it) and `pin`, `unpin` and `mark` with
+  `noise: true` (they would land in the replica's local ledger, which your real
+  sessions never read). A refusal is not an error to work around - it is the tool
+  telling you to run that call on the authority instead.
 - **How to turn it on:** set it on the replica only, pointing at a path on the same
   data volume as its store, then restart the replica's MCP process (and its
   `thor recv` process - the drain routes read the same variable):

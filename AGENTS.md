@@ -23,9 +23,9 @@ answer with a wall of options.
    model, sidecars, daemon). A missing model is not an error - THOR runs
    pure bm25 and degrades cleanly.
 3. **Optional: the semantic model.** The user supplies a local ONNX
-   sentence-embedding model (~235 MB, nothing auto-downloads). SETUP.md
-   walks through it; skip this at first setup if in doubt - it can be added
-   any time.
+   sentence-embedding model (~235 MB, nothing auto-downloads).
+   [docs/SETUP.md](docs/SETUP.md) walks through it; skip this at first setup
+   if in doubt - it can be added any time.
 4. **Wire the hooks:** `thor install` (moment-of-action guards) or
    `thor install --with-courier` (plus automatic per-prompt recall - the
    channel that wins drift). It backs up settings and is idempotent.
@@ -66,13 +66,19 @@ Pick the surface by the question's shape: `recall` for facts and prose,
 `where_used` when a question names a symbol, `impact` before changing one,
 `outline` for a file's shape, `get` to expand any id the others return.
 
+One special case: if the server told you at connect time that it is a READ
+REPLICA (a hosted/remote connector), believe it. "queued to capture inbox" is
+success there - do not retry - and a refusal ("run this on the authority") is
+the tool protecting the sync, not an error to work around.
+
 And keep your user in the loop: say in plain language what the memory did
 for them - what was recalled, what you stored and why. A memory that works
 silently is a memory nobody trusts.
 
 ## Depth, when you need it
 
-- [SETUP.md](SETUP.md) - the human-paced setup walkthrough
-- [FEATURES.md](FEATURES.md) - what every part does, in plain words
-- [OPTIONAL-FEATURES.md](OPTIONAL-FEATURES.md) - flags and trade-offs
-- [BENCHMARKS.md](BENCHMARKS.md) - the measured claims, honest caveats included
+- [docs/SETUP.md](docs/SETUP.md) - the human-paced setup walkthrough
+- [docs/FEATURES.md](docs/FEATURES.md) - what every part does, in plain words
+- [docs/OPTIONAL-FEATURES.md](docs/OPTIONAL-FEATURES.md) - flags and trade-offs
+- [docs/REFERENCE.md](docs/REFERENCE.md) - the full command table and architecture depth
+- [docs/BENCHMARKS.md](docs/BENCHMARKS.md) - the measured claims, honest caveats included

@@ -58,7 +58,7 @@ required-features = ["semantic"]
 [[example]]
 name = "drift_eval"
 
-# The benchmark hit-dump harness (BENCHMARKS.md, Method) prefers the fused path
+# The benchmark hit-dump harness (docs/BENCHMARKS.md, Method) prefers the fused path
 # but cfg-degrades to bm25, so it compiles on both feature sets too.
 [[example]]
 name = "hits_dump"

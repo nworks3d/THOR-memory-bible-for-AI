@@ -7,7 +7,7 @@ through the full setup. Every command is idempotent and safe to re-run.
 
 ### Option A: download a release (no toolchain needed)
 
-Grab the asset for your platform from [Releases](../../releases), verify it
+Grab the asset for your platform from [Releases](../../../releases), verify it
 against the `.sha256` next to it, unpack, and put `thor` (or `thor.exe`) where it
 will stay. The hooks do not expect a fixed location: `thor install` (step 2) writes
 the binary's own path into the hook commands as it is at that moment, so give the
@@ -229,7 +229,7 @@ embedder. So if semantic recall "does nothing" while doctor says the model and t
 sidecar are present, the embedder is the piece to look at - check for a file named
 `thor-embedd.json` next to your store, and run `thor warm` if it is missing.
 
-Full command reference is in [README.md](README.md); measured comparison + honest
+Full command reference is in [README.md](../README.md); measured comparison + honest
 weaknesses in [BENCHMARKS.md](BENCHMARKS.md). Everything this guide left out
 because it is optional - the reranker, sync, the guard rulebooks, the kill switch,
 the hygiene commands - is in [OPTIONAL-FEATURES.md](OPTIONAL-FEATURES.md), with

@@ -26,7 +26,7 @@ strictness moves absolute scores. **Do not compare absolute numbers across
 rounds; the within-round gaps are the findings.** That sentence was written
 into the pre-registration before scoring, and it cuts both ways.
 
-![THOR vs mimir - coverage, quality, drift and speed](assets/benchmark.svg?v=20260722)
+![THOR vs mimir - coverage, quality, drift and speed](../assets/benchmark.svg?v=20260722)
 
 ## What changed since the 2026-07-21 round
 

@@ -1,4 +1,4 @@
-# Generates assets/benchmark.svg from the measured aggregates (BENCHMARKS.md).
+# Generates assets/benchmark.svg from the measured aggregates (docs/BENCHMARKS.md).
 # The chart is data: regenerate it here after every fresh benchmark run instead
 # of hand-editing bar widths. Values below are the 2026-07-22 round: THOR
 # v0.9.6 vs mimir v0.15.0, pre-registered, every test re-measured fresh,

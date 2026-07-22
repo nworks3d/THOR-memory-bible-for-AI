@@ -91,4 +91,4 @@ Never paste store contents, secrets, or private paths into an issue.
 
 ## Releases
 
-Maintainer procedure: [RELEASING.md](RELEASING.md).
+Maintainer procedure: [docs/RELEASING.md](docs/RELEASING.md).

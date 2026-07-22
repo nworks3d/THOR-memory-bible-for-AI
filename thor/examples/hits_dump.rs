@@ -1,6 +1,6 @@
 //! Hit-dump harness for the THOR-vs-mimir benchmark: runs a query battery
 //! through a REAL production recall path and writes the returned hits as JSON,
-//! ready for a blind judge pass (see BENCHMARKS.md, Method). Reproducible: the
+//! ready for a blind judge pass (see docs/BENCHMARKS.md, Method). Reproducible: the
 //! published numbers come from exactly these channels, never a re-implementation.
 //!
 //! Input: a JSON array of objects; the query text is taken from the first of

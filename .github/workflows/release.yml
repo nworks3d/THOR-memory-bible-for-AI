@@ -10,7 +10,7 @@
 #   thor-<ver>-linux-x86_64.tar.gz - semantic (dense recall). The client build.
 #   thor-<ver>-linux-x86_64-bm25.tar.gz - default. No ONNX: the server/NAS build.
 #
-# See RELEASING.md for the human procedure around this file.
+# See docs/RELEASING.md for the human procedure around this file.
 name: Release
 
 on:
@@ -168,9 +168,9 @@ jobs:
             install). Run `thor doctor` if anything looks off - it reports the store, model,
             sidecars and daemon, which is what recall behaviour depends on.
 
-            New here? FEATURES.md explains in plain words what each part does and whether it
-            is worth turning on. Full walkthrough: SETUP.md. Exact costs and undo steps for
-            every optional piece: OPTIONAL-FEATURES.md.
+            New here? docs/FEATURES.md explains in plain words what each part does and whether it
+            is worth turning on. Full walkthrough: docs/SETUP.md. Exact costs and undo steps for
+            every optional piece: docs/OPTIONAL-FEATURES.md.
 
             **What has actually been run**
 
@@ -178,4 +178,4 @@ jobs:
             both feature sets, plus the drift corpus). Beyond that, only the platform the
             maintainer uses gets smoke-tested by hand before publishing - the others are
             CI-built but nobody has started them. Reports welcome; that is exactly the gap
-            between this and a 1.0 (see RELEASING.md).
+            between this and a 1.0 (see docs/RELEASING.md).

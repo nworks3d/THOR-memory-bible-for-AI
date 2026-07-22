@@ -223,6 +223,20 @@ cache removes that growth only while a daemon is up. See the weaknesses below.
   been re-tested now: on the older battery mimir answered these questions mostly
   from prose, not code. So the gap is real, significant, and its cause is still
   not established.
+
+  *Addendum (2026-07-21, shipped in v0.9.6):* the diagnosed serving-form half of
+  this gap - THOR found the right file more often (81% vs 69% where the gold
+  names one) yet answered with raw chunks where mimir answered in words - is now
+  addressed by structure cards: "who calls X" / "blast radius of X" questions
+  get a prose card (definition, signature, callers per file, related memories)
+  woven from the one store. Measured mechanically on a 40-question battery
+  generated from the symbol sidecar (gold = the known caller-file list): mean
+  caller-file coverage 58% -> 99%, 26 better / 0 worse. Two honest limits: the
+  sidecar supplies both the gold and the card, so this measures serving form,
+  not sidecar accuracy; and the judged number above is from the pre-card round -
+  the 200-question battery's prose-shaped questions barely trigger cards
+  (27/27 judged ties when they shipped), so the category stands as published
+  until a re-judged round.
 - **mimir's full recall beats THOR's courier on drift** (p = 0.043), the test
   THOR exists to win. THOR's answer is that its channel is a hook and mimir's is
   not; that is a real distinction, but it is not a retrieval-quality win.

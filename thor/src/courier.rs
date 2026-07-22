@@ -108,12 +108,54 @@ pub fn run_pre_compact(db: &Path) {
         return;
     }
     crate::ledger::increment(db, "precompact-seen", &session);
-    println!(
+    println!("{}", pre_compact_message(db, &session));
+}
+
+/// The pre-compact advisory text: the capture nudge, plus - when the courier's
+/// session row carries served memories - the judgment-debt list. The list is
+/// the measured half (A/B 2026-07-22, 12 pairs): presenting the served ids at
+/// the rest point took cold-hit settlement from 0% (ambient nudge alone, all
+/// control runs) to 100% with zero wrong labels. Ambient asking does not work;
+/// a one-time list at a natural pause does.
+fn pre_compact_message(db: &Path, session: &str) -> String {
+    let mut msg = String::from(
         "[THOR pre-compact] Context is about to compact. Durable decisions, gotchas and \
          open-thread state that live ONLY in this conversation will not survive it - persist \
          them NOW via the thor remember tool (fact_type + fires-when). Pins and the brief \
-         re-inject automatically after compaction; unsaved working context does not."
+         re-inject automatically after compaction; unsaved working context does not.",
     );
+    let served: Vec<(String, String)> = crate::ledger::get(db, "courier-seen", session)
+        .and_then(|entry| {
+            entry.get("served").and_then(|v| v.as_object()).map(|m| {
+                let mut pairs: Vec<(String, String)> = m
+                    .iter()
+                    .filter_map(|(k, v)| v.as_str().map(|s| (k.clone(), s.to_string())))
+                    .collect();
+                pairs.sort();
+                pairs
+            })
+        })
+        .unwrap_or_default();
+    if served.is_empty() {
+        return msg;
+    }
+    // Display cap: a compaction-bound context does not want 60 lines; the tail
+    // is named, not hidden.
+    const DEBT_DISPLAY_CAP: usize = 20;
+    msg.push_str(&format!(
+        "\n\n[THOR judgment debt] THOR served you {} memory hit(s) this session. Judge each \
+         one you have not already judged - it trains your future recall: mark(entity_id) if \
+         it answered something or prevented a mistake this session, mark(entity_id, noise: \
+         true) if it was only a distraction here. Served this session:",
+        served.len()
+    ));
+    for (id, snip) in served.iter().take(DEBT_DISPLAY_CAP) {
+        msg.push_str(&format!("\n- {id}: {snip}"));
+    }
+    if served.len() > DEBT_DISPLAY_CAP {
+        msg.push_str(&format!("\n- ... and {} more (thor brief shows them)", served.len() - DEBT_DISPLAY_CAP));
+    }
+    msg
 }
 
 /// The store-independent half of the courier gates: everything that can say
@@ -531,6 +573,31 @@ struct SessionLedger {
     count: u64,
     /// rev|diverged -> the prompt ordinal at which it was last injected.
     seen: HashMap<String, u64>,
+    /// entity_id -> one-line snippet for every MEMORY served this session.
+    /// Unlike `seen` this is NOT window-pruned: it is the judgment-debt list
+    /// the pre-compact surface presents (measured 2026-07-22: a debt list at
+    /// the rest point took cold-hit settlement from 0% to 100%; the ambient
+    /// nudge alone settled nothing). Bounded by SERVED_CAP.
+    served: HashMap<String, String>,
+}
+
+/// Upper bound on the per-session served-memories record. A session that
+/// genuinely serves more distinct memories than this keeps the FIRST arrivals
+/// (insertion refuses past the cap) - a bounded, predictable debt list beats
+/// an unbounded sidecar row.
+const SERVED_CAP: usize = 60;
+
+/// One line of the debt list: the body without its footer, whitespace
+/// collapsed, cut at 70 chars - just enough for the agent to recognize the
+/// fact it saw earlier without re-serving the whole body.
+fn served_snippet(body: &str) -> String {
+    let stripped = crate::footer::strip(body);
+    let one_line = stripped.split_whitespace().collect::<Vec<_>>().join(" ");
+    let mut snip: String = one_line.chars().take(70).collect();
+    if one_line.chars().count() > 70 {
+        snip.push_str("...");
+    }
+    snip
 }
 
 fn ledger_key(rev: &str, diverged: bool) -> String {
@@ -541,7 +608,12 @@ fn ledger_key(rev: &str, diverged: bool) -> String {
 
 impl SessionLedger {
     fn load(db: &Path, session_id: &str) -> Self {
-        let mut this = SessionLedger { session_id: session_id.to_string(), count: 0, seen: HashMap::new() };
+        let mut this = SessionLedger {
+            session_id: session_id.to_string(),
+            count: 0,
+            seen: HashMap::new(),
+            served: HashMap::new(),
+        };
         if session_id.is_empty() {
             return this; // inactive
         }
@@ -551,6 +623,12 @@ impl SessionLedger {
                 this.seen = seen
                     .iter()
                     .filter_map(|(k, v)| v.as_u64().map(|at| (k.clone(), at)))
+                    .collect();
+            }
+            if let Some(served) = entry.get("served").and_then(|v| v.as_object()) {
+                this.served = served
+                    .iter()
+                    .filter_map(|(k, v)| v.as_str().map(|s| (k.clone(), s.to_string())))
                     .collect();
             }
         }
@@ -597,6 +675,13 @@ impl SessionLedger {
         }
         for h in injected {
             self.seen.insert(ledger_key(&h.rev, h.is_diverged), self.count);
+            // The judgment-debt record: memories only (repo chunks are managed
+            // by ingest, marking them is not the learning loop).
+            if !crate::repo::is_chunk_id(&h.entity_id)
+                && (self.served.len() < SERVED_CAP || self.served.contains_key(&h.entity_id))
+            {
+                self.served.entry(h.entity_id.clone()).or_insert_with(|| served_snippet(&h.body));
+            }
         }
         // entries older than the window are dead weight - drop them here so the
         // sidecar stays bounded even in a very long session.
@@ -611,11 +696,13 @@ impl SessionLedger {
         let now = crate::review::now_secs();
         let seen: serde_json::Map<String, serde_json::Value> =
             self.seen.iter().map(|(k, v)| (k.clone(), serde_json::json!(v))).collect();
+        let served: serde_json::Map<String, serde_json::Value> =
+            self.served.iter().map(|(k, v)| (k.clone(), serde_json::json!(v))).collect();
         crate::ledger::upsert(
             db,
             "courier-seen",
             &self.session_id,
-            &serde_json::json!({ "ts": now, "count": self.count, "seen": seen }),
+            &serde_json::json!({ "ts": now, "count": self.count, "seen": seen, "served": served }),
         );
     }
 }
@@ -1559,5 +1646,100 @@ mod tests {
             primary.contains("THOR-PRIMARY"),
             "THOR-PRIMARY.flag must mark the phase in the header"
         );
+    }
+}
+
+#[cfg(test)]
+mod judgment_debt_tests {
+    use super::*;
+    use crate::event_store::EventKind;
+
+    fn hit(id: &str, body: &str) -> RecallHit {
+        RecallHit {
+            entity_id: id.to_string(),
+            rev: format!("rev-{id}"),
+            body: body.to_string(),
+            kind: EventKind::FactCreated,
+            is_diverged: false,
+            rank: -1.0,
+            project: None,
+            fact_type: None,
+            matched_and: true,
+        }
+    }
+
+    #[test]
+    fn served_snippet_strips_the_footer_and_bounds_the_line() {
+        let body = format!("the deploy waits for the lock file\n\n[memory/gotcha | tags: x | project: p]");
+        let snip = served_snippet(&body);
+        assert_eq!(snip, "the deploy waits for the lock file");
+        let long = "word ".repeat(40);
+        assert!(served_snippet(&long).chars().count() <= 73, "70 chars + ellipsis");
+        assert!(served_snippet(&long).ends_with("..."));
+    }
+
+    #[test]
+    fn record_collects_memories_but_never_chunks_and_survives_the_roundtrip() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("thor.db");
+        let mut led = SessionLedger::load(&db, "sess-debt");
+        led.record(&[
+            hit("proj:mem-aaa", "a real memory fact"),
+            hit("proj:src/main.rs#3", "fn main() {}"),
+        ]);
+        led.save(&db);
+        let reloaded = SessionLedger::load(&db, "sess-debt");
+        assert!(reloaded.served.contains_key("proj:mem-aaa"), "memory recorded");
+        assert!(
+            !reloaded.served.keys().any(|k| k.contains("#")),
+            "repo chunks never enter the debt list: {:?}",
+            reloaded.served
+        );
+    }
+
+    #[test]
+    fn served_record_is_not_window_pruned_and_respects_the_cap() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("thor.db");
+        let mut led = SessionLedger::load(&db, "sess-cap");
+        // Far more prompts than SUPPRESS_WINDOW: `seen` prunes, `served` keeps.
+        for i in 0..(SERVED_CAP + 10) {
+            led.count += 1;
+            led.record(&[hit(&format!("p:mem-{i:03}"), "body")]);
+        }
+        assert!(led.served.len() <= SERVED_CAP, "cap enforced: {}", led.served.len());
+        assert!(led.served.contains_key("p:mem-000"), "first arrivals are kept past the window");
+    }
+
+    #[test]
+    fn pre_compact_message_lists_the_debt_only_when_it_exists() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("thor.db");
+        // no session row -> capture nudge only
+        let bare = pre_compact_message(&db, "sess-x");
+        assert!(bare.contains("[THOR pre-compact]"));
+        assert!(!bare.contains("judgment debt"), "no served memories, no debt block");
+        // a session with served memories -> the list rides along
+        let mut led = SessionLedger::load(&db, "sess-x");
+        led.record(&[hit("proj:mem-abc", "the importer takes the same lock"), hit("proj:mem-def", "vans get tires")]);
+        led.save(&db);
+        let msg = pre_compact_message(&db, "sess-x");
+        assert!(msg.contains("[THOR judgment debt]"), "{msg}");
+        assert!(msg.contains("2 memory hit(s)"), "{msg}");
+        assert!(msg.contains("proj:mem-abc: the importer takes the same lock"), "{msg}");
+        assert!(msg.contains("mark(entity_id, noise: true)"), "the repair path is spelled out: {msg}");
+    }
+
+    #[test]
+    fn pre_compact_message_caps_the_display_and_names_the_tail() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("thor.db");
+        let mut led = SessionLedger::load(&db, "sess-many");
+        let hits: Vec<RecallHit> = (0..30).map(|i| hit(&format!("p:mem-{i:03}"), "b")).collect();
+        led.record(&hits);
+        led.save(&db);
+        let msg = pre_compact_message(&db, "sess-many");
+        assert!(msg.contains("30 memory hit(s)"), "{msg}");
+        assert!(msg.contains("and 10 more"), "the tail is named, not hidden: {msg}");
     }
 }

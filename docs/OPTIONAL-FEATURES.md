@@ -1138,17 +1138,25 @@ without a project.
 ### thor pre-compact
 
 When your agent is about to compact its context (summarise the conversation and throw the
-detail away), this hook prints one advisory line asking it to store durable decisions and
-gotchas first. It fires at most once per session.
+detail away), this hook prints one advisory asking it to store durable decisions and
+gotchas first, and - when the courier served memory hits this session - lists those ids so
+the agent judges each one (useful or noise) while it still remembers whether they helped.
+It fires at most once per session.
+
+The judgment-debt list is the measured half (A/B, 24 fresh agents, 2026-07-22): with the
+ambient per-prompt nudge alone, 0 of 12 control agents judged anything at this rest point;
+with the list presented, 12 of 12 settled every served hit, with zero wrong labels against
+planted ground truth. Ambient asking does not work; a one-time list at a natural pause does.
 
 - **Default:** off; installed only by `thor install --with-courier`.
 - **Turn it on if:** you run long sessions that hit compaction and you want one prompt to
   write things down before they are compacted away. This is the only moment memory can act
-  before the context is gone - pins and the brief are recovery afterwards.
+  before the context is gone - pins and the brief are recovery afterwards. It is also the
+  moment the ranking gets its food: the useful/noise judgments feed promotion and decay.
 - **Leave it off if:** you do not use the courier at all, or you keep your agent's context
-  deliberately free of injected text. The advisory is unconditional: it does not check
-  whether anything was actually left unstored, so in a session where you capture
-  diligently it is pure noise.
+  deliberately free of injected text. The capture half of the advisory is unconditional:
+  it does not check whether anything was actually left unstored, so in a session where you
+  capture diligently that line is noise (the debt list only appears when hits were served).
 - **What it costs:** one short-lived process, once per session, and a few lines of context.
   No port, no download, no long-lived process. The repo publishes no measured number for
   what it saves.

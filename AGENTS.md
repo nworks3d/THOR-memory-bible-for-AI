@@ -59,6 +59,8 @@ file or command. What it cannot push is your discipline. Six rules:
    head is right - a contested fact serves both heads until you do.
 5. **`mark` what helped, and what only distracted** (`noise: true`). This
    trains your own future recall; an unfed ranking prior learns nothing.
+   Just before a compaction THOR hands you the list of hits it served this
+   session ("judgment debt") - settle it then: one `mark` per id, honestly.
 6. **`pin` the standing rules your user states** ("never X on prod") -
    pins are re-injected at every session start and survive compaction.
 

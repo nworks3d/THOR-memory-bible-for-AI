@@ -96,7 +96,9 @@ adds THOR entries, never touching existing hooks), wiring:
 - **SessionStart -> `thor session-start`** - refresh a known project's index in the
   background, or emit a `<thor-setup>` cue so the agent offers to set up a new one.
 - **PreCompact -> `thor pre-compact`** - one nudge per session, just before a
-  compaction, to store durable decisions (from `--with-courier`).
+  compaction, to store durable decisions; it also lists the memory hits served
+  this session so the agent judges them (useful/noise) while it still can
+  (from `--with-courier`).
 - **PreToolUse -> `thor guard`** - moment-of-action advisory (from `--with-guard`).
 - **SessionStart -> `thor ensure-daemon`** - start the injection daemon if it is not
   already up (from `--with-daemon`).

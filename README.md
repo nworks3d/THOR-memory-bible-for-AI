@@ -46,7 +46,10 @@ one thing the agent can search automatically. Measured against
   prompt in 146 ms and never stays silent. mimir's hook is faster (40 ms) but
   empty on 6 of 20 prompts; its full recall costs 323 ms and is not a hook.
   Honest note: the courier was 125 ms at 16.1k events and is 146 ms at 19.8k -
-  the growth is real and being worked on. Full picture, including retracted
+  that growth is real. The per-query fold behind it is materialized since
+  2026-07-22 (cold paths measured about 4x faster, guard advisory 499 -> 211 ms,
+  served bytes identical); the warm-courier figure stands until re-measured.
+  Full picture, including retracted
   claims and two discarded scoring passes of our own, in BENCHMARKS.md.
 - **It never loses a write.** Every fact is an event in a hash-chained append-only
   log; a conflicting edit *branches* (both heads kept) instead of overwriting, and

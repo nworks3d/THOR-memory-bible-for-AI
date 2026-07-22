@@ -148,7 +148,7 @@ pair("Cost per prompt", 146.4, 323.4, "2.2x faster",
 note("THOR's courier answers EVERY prompt - 0 of 20 empty - in 146 ms (p90 167). mimir's hook is faster at 40 ms but", color=SOFT)
 note("returns nothing on 6 of 20: it is fast because it often serves nothing. The mimir channel that competes on drift", color=SOFT)
 note("costs 323 ms and is not a hook. Honestly worse since last round: the courier read 125 ms at 16.1k events and reads", color=SOFT)
-note("146 ms at 19.8k - the compute-bound growth is real, and it is why the materialized-heads work is planned.", color=SOFT)
+note("146 ms at 19.8k - real growth; the per-query fold behind it is materialized since 2026-07-22 (cold paths ~4x).", color=SOFT)
 y += 14
 
 # ---- downsides ----
@@ -163,7 +163,7 @@ for b in [
     "A 7000-char judging cap bound BOTH sides: THOR on 47/59 deliberate and 24/59 session items, mimir full-body on most.",
     "Do not compare absolutes across rounds: Test 1 reads 89.2 here vs 73.2 last round - the jury and battery moved, not",
     "the products. Read gaps within a round.",
-    "THOR is compute-bound: 125 ms at 16.1k events -> 146 ms at 19.8k. The daemon hides the cold cost, not the growth.",
+    "THOR is compute-bound: 125 ms at 16.1k -> 146 ms at 19.8k warm. The fold is materialized since 2026-07-22 (guard 499 -> 211 ms, ~4x cold); the warm figure stands until re-measured.",
     "Newer and far less battle-tested than mimir's daily use; mimir ships at a high cadence (v0.15: inference delegation).",
     "One machine, private corpus, LLM-judged - only drift is repo-reproducible (examples/drift_eval.rs).",
 ]:

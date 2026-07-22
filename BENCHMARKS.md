@@ -307,8 +307,18 @@ and it is the motivation for the planned materialized-heads work.
   products. Read gaps within a round.
 - **THOR is compute-bound and its latency grows with store size**: the courier
   read 125 ms at 16.1k events and reads 146 ms at 19.8k. The resident daemon
-  removes the cold-start cost but not the growth; the planned
-  materialized-heads work targets exactly this.
+  removes the cold-start cost but not the growth.
+
+  *Partial resolution (2026-07-22, after this round's speed table was
+  measured):* the O(n) per-query fold over the whole log is now materialized
+  (a heads projection maintained inside the append transaction, with a
+  differential fsck check and byte-identical served output proven three ways
+  against a live-store copy). The COLD paths this fixes are measured: the
+  guard's file advisory went 499 -> 211 ms on the live store, and a synthetic
+  same-store curve reads about 4x at every size (20k events: 17.5 vs 63.7 ms;
+  100k: 95.1 vs 382.5). What it does NOT claim: the 146 ms warm-courier figure
+  above is the semantic path behind the resident cache, whose growth also
+  contains serving volume - that number stands until the next measured round.
 - **Maturity.** THOR is new; mimir is battle-tested in daily use and shipping
   at a high cadence (v0.15 added inference delegation and an FTS consistency
   check).

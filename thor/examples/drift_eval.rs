@@ -619,6 +619,7 @@ fn run_live(
     cwd_override: Option<&Path>,
     json_out: bool,
     symbol_bridge: bool,
+    dump_texts: Option<&Path>,
 ) -> anyhow::Result<()> {
     let db = thor::ledger::data_dir()
         .ok_or_else(|| anyhow::anyhow!("no per-user data dir resolvable"))?
@@ -656,6 +657,11 @@ fn run_live(
     }
     let mut rows: Vec<Row> = Vec::new();
     let mut skipped = 0usize;
+    // --dump-texts: the exact texts each channel served, per scenario, for a
+    // JUDGED evaluation downstream. The mechanical metrics above stay the
+    // instrument's own verdict; the dump exists so a jury scores what the
+    // agent actually SAW, never a re-retrieval.
+    let mut dumped: Vec<serde_json::Value> = Vec::new();
 
     // One disposable store copy for the whole run, only when the corpus
     // carries expected calls at all (older corpora without them run exactly
@@ -714,7 +720,7 @@ fn run_live(
         // twice) keys the session identity, so debounce state never leaks
         // between scenarios.
         let has_calls = !s.expected_files.is_empty() || !s.expected_commands.is_empty();
-        let guard = match (&guard_db, has_calls) {
+        let (guard, guard_text) = match (&guard_db, has_calls) {
             (Some(gdb), true) => {
                 let session = format!("drift-live-{}", idx);
                 let mut advisories: Vec<String> = Vec::new();
@@ -742,14 +748,26 @@ fn run_live(
                 }
                 let text = advisories.join("  ||  ");
                 let lower = text.to_lowercase();
-                Some(Chan {
+                let chan = Chan {
                     surfaced: text.contains(&format!("{}: ", entity)),
                     content_surfaced: content_hit(&lower, "  ||  ", &terms),
                     coverage: coverage_of(&lower, &terms),
-                })
+                };
+                (Some(chan), Some(text))
             }
-            _ => None,
+            _ => (None, None),
         };
+        if dump_texts.is_some() {
+            dumped.push(json!({
+                "seq": s.seq,
+                "category": s.category,
+                "entity": entity,
+                "drift_prompt": s.drift_prompt,
+                "gold": s.gold,
+                "courier_text": block,
+                "guard_text": guard_text,
+            }));
+        }
 
         // What one real session sees: both hooks are installed at once, so
         // the union is the deployed number. Coverage takes the stronger
@@ -806,6 +824,11 @@ fn run_live(
     // scenario is a miss: the deployed channel really catches nothing there)
     // and over only the call-carrying ones (what the channel does when it
     // gets its moment); either over every scenario.
+    if let Some(dump_path) = dump_texts {
+        std::fs::write(dump_path, serde_json::to_string_pretty(&dumped)?)?;
+        eprintln!("dumped {} served-text records to {}", dumped.len(), dump_path.display());
+    }
+
     let n_with_calls = rows.iter().filter(|r| r.guard.is_some()).count();
     let (courier_overall, courier_per) = channel(&|r: &Row| Some(r.courier));
     let (guard_all_overall, guard_all_per) = channel(&|r: &Row| Some(r.guard.unwrap_or(CHAN_MISS)));
@@ -907,6 +930,7 @@ fn main() -> anyhow::Result<()> {
     let mut cwd_override: Option<PathBuf> = None;
     let mut max_noise: Option<usize> = None;
     let mut symbol_bridge = true;
+    let mut dump_texts: Option<PathBuf> = None;
     let mut args = std::env::args().skip(1);
     while let Some(a) = args.next() {
         match a.as_str() {
@@ -929,14 +953,22 @@ fn main() -> anyhow::Result<()> {
             // Ablation arm (live mode): run the guard replay WITHOUT the
             // symbol sidecar, isolating what the symbol bridge itself adds.
             "--no-symbol-bridge" => symbol_bridge = false,
+            // Judged-eval feed (live mode): also write the exact served texts
+            // (courier block + guard advisories) per scenario to this path.
+            "--dump-texts" => {
+                let p = args.next().ok_or_else(|| anyhow::anyhow!("--dump-texts needs a path"))?;
+                dump_texts = Some(PathBuf::from(p));
+            }
             other => anyhow::bail!(
-                "unknown argument '{}' (expected --json, --live <path>, --cwd <dir>, --max-noise <n>, --no-symbol-bridge)",
+                "unknown argument '{}' (expected --json, --live <path>, --cwd <dir>, --max-noise <n>, --no-symbol-bridge, --dump-texts <path>)",
                 other
             ),
         }
     }
     match live {
-        Some(corpus) => run_live(&corpus, cwd_override.as_deref(), json_out, symbol_bridge),
+        Some(corpus) => {
+            run_live(&corpus, cwd_override.as_deref(), json_out, symbol_bridge, dump_texts.as_deref())
+        }
         None => run_committed(json_out, max_noise),
     }
 }

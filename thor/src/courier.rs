@@ -117,13 +117,28 @@ pub fn compact_boundary(db: &Path, session_id: &str) -> Option<String> {
 /// just BEFORE the compaction; that delivery channel turned out not to exist,
 /// so the same list now lands just AFTER, built from the ledger's served map -
 /// which survives the compaction precisely because it never lived in context.)
+///
+/// Two words of caution baked into the wording, both from a fresh-agent A/B on
+/// 2026-07-24 (12 subjects): (1) agents trust the summary's own "memory is up to
+/// date" claim ~1 in 3 - hence the capture nudge now says in as many words that
+/// the document cannot certify itself and to verify with recall. (2) The list is
+/// delivered AFTER the compaction, when the transcript that would prove whether a
+/// hit helped is already gone; pressing for a verdict there just elicits topical
+/// guessing that pollutes the mark signal. So the list now licenses abstention
+/// and points at in-session marking as the honest place. A blocking Stop-gate
+/// that FORCED both duties was built and measured the same day: it cleanly fixed
+/// the trust-the-summary failure but made the debt half worse (forced guesses),
+/// so it was parked, not shipped - see the A/B dossier / THOR mem-1a5b7d09.
 fn compact_recovery_message(db: &Path, session: &str) -> String {
     let mut msg = String::from(
         "[THOR post-compact] The context was just compacted: earlier turns were replaced by \
          a summary. Durable decisions, gotchas and open-thread state that lived only in those \
          turns are gone from this window - if the summary still names any that are not yet in \
-         THOR, persist them NOW via the thor remember tool (fact_type + fires-when). Pins and \
-         the brief re-inject automatically; unsaved working context does not come back.",
+         THOR, persist them NOW via the thor remember tool (fact_type + fires-when). Do not \
+         take the summary's own word that memory is already up to date: the document you are \
+         checking for losses cannot certify itself - verify with a quick recall before you \
+         accept it. Pins and the brief re-inject automatically; unsaved working context does \
+         not come back.",
     );
     let served: Vec<(String, String)> = crate::ledger::get(db, "courier-seen", session)
         .and_then(|entry| {
@@ -144,10 +159,14 @@ fn compact_recovery_message(db: &Path, session: &str) -> String {
     // is named, not hidden.
     const DEBT_DISPLAY_CAP: usize = 20;
     msg.push_str(&format!(
-        "\n\n[THOR judgment debt] THOR served you {} memory hit(s) this session. Judge each \
-         one you have not already judged - it trains your future recall: mark(entity_id) if \
-         it answered something or prevented a mistake this session, mark(entity_id, noise: \
-         true) if it was only a distraction here. Served this session:",
+        "\n\n[THOR judgment debt] THOR served you {} memory hit(s) this session. For each one \
+         you can still tie to what actually happened this session, judge it - it trains your \
+         future recall: mark(entity_id) if it answered something or prevented a mistake, \
+         mark(entity_id, noise: true) if it was only a distraction. But the transcript that \
+         would show whether a hit truly helped went with the compaction, so for any hit you \
+         cannot honestly place, leave it unjudged rather than guess - a guessed mark pollutes \
+         the signal it is meant to train. (Judging hits as you go, mid-session, is where this \
+         is done best.) Served this session:",
         served.len()
     ));
     for (id, snip) in served.iter().take(DEBT_DISPLAY_CAP) {

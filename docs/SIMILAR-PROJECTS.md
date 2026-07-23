@@ -121,7 +121,10 @@ Claude Code has a PreCompact hook; emit "context is about to compact — persist
 durable decisions via remember", cross-checked against the session ledger to
 name what was surfaced-but-never-captured. Zero LLM, effort S, and it patches
 THOR's one *reactive-only* drift gap (pins recover after compaction; nothing
-fires before). (b) **Session summary fact at SessionEnd** injected 1–3 deep at
+fires before). *[Adopted 2026-07-10 as a PreCompact hook; verified 2026-07-23
+that Claude Code never delivers PreCompact stdout to the model, so the advisory
+now rides `session-start` on `source: "compact"` — the boundary's after-edge,
+the only edge that reaches the model.]* (b) **Session summary fact at SessionEnd** injected 1–3 deep at
 next SessionStart under the existing ledger/noise-gate machinery — kills the
 "agent restarts the plan from scratch" cross-session drift claude-mem and
 agentmemory both target. (c) **Optional verbatim episode tier**: Stop-hook

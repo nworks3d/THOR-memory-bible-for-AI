@@ -81,48 +81,49 @@ fn build_injection(db: &Path) -> Option<String> {
     injection_for_hook_json(db, &raw)
 }
 
-/// PreCompact hook: the ONE moment memory can still act BEFORE a compaction
-/// erases working context - everything else THOR does for the post-compaction
-/// window (pins, brief) is recovery-after-the-fact. Prints a single advisory
-/// per session (ledger-deduped) nudging the agent to persist durable
-/// decisions/gotchas via remember NOW; silent on every failure path, like the
-/// courier. Idea credit: Letta's memory-pressure warning (SIMILAR-PROJECTS R7).
-pub fn run_pre_compact(db: &Path) {
-    let mut raw = String::new();
-    if std::io::stdin().read_to_string(&mut raw).is_err() {
-        return;
-    }
-    if flag_present(db, "THOR-SILENT.flag") {
-        return;
-    }
-    let session = serde_json::from_str::<serde_json::Value>(raw.trim_start_matches('\u{feff}'))
-        .ok()
-        .and_then(|v| v.get("session_id").and_then(|s| s.as_str()).map(str::to_string))
-        .unwrap_or_default();
-    if session.is_empty() {
-        return; // no session identity -> no dedup possible; stay silent
-    }
-    // fire-once per session: the second compaction of a session already had
-    // its warning, and a repeated nudge is noise in an already-tight context
-    if crate::ledger::counter(db, "precompact-seen", &session) > 0 {
-        return;
-    }
-    crate::ledger::increment(db, "precompact-seen", &session);
-    println!("{}", pre_compact_message(db, &session));
+/// Everything THOR does at the compaction boundary (`thor session-start` with
+/// source == "compact"): render the recovery message FROM the served map, THEN
+/// clear the courier and guard session state so everything relevant may inject
+/// again into the now-empty window. Order matters: the clear wipes the served
+/// map the message is built from. Returns None when silenced
+/// (THOR-SILENT.flag) - the state clear still happens, it is hygiene tied to
+/// the compaction itself, not a nudge.
+///
+/// WHY here and not a PreCompact hook: Claude Code does not deliver PreCompact
+/// stdout to the model - not into context, not into the transcript, and
+/// additionalContext is unsupported for that event (verified 2026-07-23
+/// against the hooks docs and a live session transcript). The PreCompact
+/// registration THOR shipped 2026-07-10 printed into the void on every real
+/// compaction; SessionStart stdout is context by contract, and source ==
+/// "compact" fires exactly at the boundary. Idea credit for the nudge itself:
+/// Letta's memory-pressure warning (SIMILAR-PROJECTS R7).
+pub fn compact_boundary(db: &Path, session_id: &str) -> Option<String> {
+    let msg = if flag_present(db, "THOR-SILENT.flag") {
+        None
+    } else {
+        Some(compact_recovery_message(db, session_id))
+    };
+    clear_session_ledger(db, session_id);
+    crate::guard::clear_session_guard_seen(db, session_id);
+    msg
 }
 
-/// The pre-compact advisory text: the capture nudge, plus - when the courier's
-/// session row carries served memories - the judgment-debt list. The list is
-/// the measured half (A/B 2026-07-22, 12 pairs): presenting the served ids at
-/// the rest point took cold-hit settlement from 0% (ambient nudge alone, all
-/// control runs) to 100% with zero wrong labels. Ambient asking does not work;
-/// a one-time list at a natural pause does.
-fn pre_compact_message(db: &Path, session: &str) -> String {
+/// The compaction-boundary advisory text: the capture nudge, plus - when the
+/// courier's session row carries served memories - the judgment-debt list. The
+/// list is the measured half (A/B 2026-07-22, 12 pairs): presenting the served
+/// ids at a rest point took cold-hit settlement from 0% (ambient nudge alone,
+/// all control runs) to 100% with zero wrong labels. Ambient asking does not
+/// work; a one-time list at a natural pause does. (The A/B presented the list
+/// just BEFORE the compaction; that delivery channel turned out not to exist,
+/// so the same list now lands just AFTER, built from the ledger's served map -
+/// which survives the compaction precisely because it never lived in context.)
+fn compact_recovery_message(db: &Path, session: &str) -> String {
     let mut msg = String::from(
-        "[THOR pre-compact] Context is about to compact. Durable decisions, gotchas and \
-         open-thread state that live ONLY in this conversation will not survive it - persist \
-         them NOW via the thor remember tool (fact_type + fires-when). Pins and the brief \
-         re-inject automatically after compaction; unsaved working context does not.",
+        "[THOR post-compact] The context was just compacted: earlier turns were replaced by \
+         a summary. Durable decisions, gotchas and open-thread state that lived only in those \
+         turns are gone from this window - if the summary still names any that are not yet in \
+         THOR, persist them NOW via the thor remember tool (fact_type + fires-when). Pins and \
+         the brief re-inject automatically; unsaved working context does not come back.",
     );
     let served: Vec<(String, String)> = crate::ledger::get(db, "courier-seen", session)
         .and_then(|entry| {
@@ -1712,18 +1713,18 @@ mod judgment_debt_tests {
     }
 
     #[test]
-    fn pre_compact_message_lists_the_debt_only_when_it_exists() {
+    fn compact_recovery_message_lists_the_debt_only_when_it_exists() {
         let dir = tempfile::tempdir().unwrap();
         let db = dir.path().join("thor.db");
         // no session row -> capture nudge only
-        let bare = pre_compact_message(&db, "sess-x");
-        assert!(bare.contains("[THOR pre-compact]"));
+        let bare = compact_recovery_message(&db, "sess-x");
+        assert!(bare.contains("[THOR post-compact]"));
         assert!(!bare.contains("judgment debt"), "no served memories, no debt block");
         // a session with served memories -> the list rides along
         let mut led = SessionLedger::load(&db, "sess-x");
         led.record(&[hit("proj:mem-abc", "the importer takes the same lock"), hit("proj:mem-def", "vans get tires")]);
         led.save(&db);
-        let msg = pre_compact_message(&db, "sess-x");
+        let msg = compact_recovery_message(&db, "sess-x");
         assert!(msg.contains("[THOR judgment debt]"), "{msg}");
         assert!(msg.contains("2 memory hit(s)"), "{msg}");
         assert!(msg.contains("proj:mem-abc: the importer takes the same lock"), "{msg}");
@@ -1731,15 +1732,47 @@ mod judgment_debt_tests {
     }
 
     #[test]
-    fn pre_compact_message_caps_the_display_and_names_the_tail() {
+    fn compact_recovery_message_caps_the_display_and_names_the_tail() {
         let dir = tempfile::tempdir().unwrap();
         let db = dir.path().join("thor.db");
         let mut led = SessionLedger::load(&db, "sess-many");
         let hits: Vec<RecallHit> = (0..30).map(|i| hit(&format!("p:mem-{i:03}"), "b")).collect();
         led.record(&hits);
         led.save(&db);
-        let msg = pre_compact_message(&db, "sess-many");
+        let msg = compact_recovery_message(&db, "sess-many");
         assert!(msg.contains("30 memory hit(s)"), "{msg}");
         assert!(msg.contains("and 10 more"), "the tail is named, not hidden: {msg}");
+    }
+
+    #[test]
+    fn compact_boundary_reads_the_debt_before_clearing_the_ledger() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("thor.db");
+        let mut led = SessionLedger::load(&db, "sess-order");
+        led.record(&[hit("proj:mem-abc", "the importer takes the same lock")]);
+        led.save(&db);
+        // The message must be built from the served map even though the same
+        // call clears it: read-before-clear is the invariant under test.
+        let msg = compact_boundary(&db, "sess-order").expect("not silenced");
+        assert!(msg.contains("proj:mem-abc"), "debt rendered from the pre-clear map: {msg}");
+        assert!(
+            crate::ledger::get(&db, "courier-seen", "sess-order").is_none(),
+            "session ledger cleared for the fresh window"
+        );
+    }
+
+    #[test]
+    fn compact_boundary_is_silent_but_still_clears_under_thor_silent() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("thor.db");
+        let mut led = SessionLedger::load(&db, "sess-mute");
+        led.record(&[hit("proj:mem-abc", "body")]);
+        led.save(&db);
+        std::fs::write(dir.path().join("THOR-SILENT.flag"), "").unwrap();
+        assert!(compact_boundary(&db, "sess-mute").is_none(), "silenced -> no message");
+        assert!(
+            crate::ledger::get(&db, "courier-seen", "sess-mute").is_none(),
+            "state hygiene still happens when silenced"
+        );
     }
 }

@@ -356,9 +356,11 @@ enum Commands {
     /// each code chunk defines and calls. Powers where_used/impact and the
     /// deliberate-recall symbol bonus. Safe to delete and rebuild any time.
     Symbols,
-    /// PreCompact hook: one advisory per session, just before a compaction,
-    /// nudging the agent to persist durable decisions via remember. Installed
-    /// by `thor install --with-courier`. Always exits 0.
+    /// Retired no-op, kept only so a stale PreCompact hook registration in an
+    /// existing settings.json keeps exiting 0. Claude Code never delivers
+    /// PreCompact stdout to the model, so the persist+judge advisory moved to
+    /// `session-start` on source=="compact" (whose stdout IS context).
+    /// `thor install` removes the old registration.
     PreCompact,
     /// Prepare a stewardship review: write the consolidate report plus the
     /// proven conservative review rubric to a file an agent session can work
@@ -1156,7 +1158,11 @@ pub fn run() -> Result<()> {
             );
         }
         Commands::PreCompact => {
-            crate::courier::run_pre_compact(&db);
+            // Retired (2026-07-23): PreCompact stdout is not delivered to the
+            // model or the transcript, so printing here reached nobody. The
+            // advisory + judgment-debt list moved to the SessionStart
+            // source=="compact" branch below. This arm stays a silent exit-0
+            // no-op for settings.json files that still carry the hook.
         }
         Commands::Steward => {
             let store = EventStore::new(&db)?;
@@ -1392,13 +1398,18 @@ steward review prepared: {}", path.display());
                 .map(PathBuf::from)
                 .or_else(|| std::env::current_dir().ok());
 
-            // Post-compaction: clear this session's courier ledger AND its
+            // Post-compaction: print the recovery advisory (persist-what-only-
+            // lived-in-context nudge + the judgment-debt list built from the
+            // served map), THEN clear this session's courier ledger AND its
             // guard-seen entries, so everything relevant may (and will) inject
             // again into the now-empty context - including the file-touch
             // advisories, whose text was just destroyed with the context.
+            // SessionStart stdout is added to the model's context by contract;
+            // the PreCompact hook this replaces printed into the void.
             if source == "compact" {
-                crate::courier::clear_session_ledger(&db, &session_id);
-                crate::guard::clear_session_guard_seen(&db, &session_id);
+                if let Some(msg) = crate::courier::compact_boundary(&db, &session_id) {
+                    println!("{msg}");
+                }
             }
 
             if let Some(cwd) = cwd.as_deref() {

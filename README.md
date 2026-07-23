@@ -105,11 +105,11 @@ session often: a long conversation degraded, and every restart lost
 everything anyway. With THOR that advice is obsolete - **one long session is
 the recommended default**:
 
-- **Compaction is covered.** Just before the context gets compressed, THOR
-  nudges the agent to persist any unsaved decisions first, and hands it the
-  list of memory hits it served this session so the agent can judge them
-  (useful/noise) while it still has the context to judge honestly. Pinned
-  rules re-inject automatically afterwards.
+- **Compaction is covered.** The moment the context gets compressed, THOR
+  hands the agent the list of memory hits it served this session so it can
+  judge them (useful/noise) while the work is still fresh, and nudges it to
+  persist any decisions the summary still names that were never stored.
+  Pinned rules re-inject automatically at the same moment.
 - **A restart is covered too.** Pins, the project brief and per-prompt recall
   warm every fresh session from the store, so restarting never loses a
   durable fact.
@@ -119,7 +119,7 @@ session deliberately - because you switch to a different task, or to shed a
 session that talked itself into a dead end - not to manage context length.
 That is what compaction is for.
 
-One honest footnote: the "judge the served hits" moment fires just before a
+One honest footnote: the "judge the served hits" moment fires at a
 compaction, and a short session that ends before any compaction never
 reaches it, so those hits stay unjudged. Nothing breaks and nothing is lost
 - the ranking just learns a little slower than it would in a long session.

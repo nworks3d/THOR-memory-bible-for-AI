@@ -1040,7 +1040,7 @@ looks like it contains a decision or a gotcha that was never stored.
     + Stop (response guard)
     backup: <path to settings.json.thor-bak>
   ```
-  Run it a second time and it prints `(nothing to add - THOR hooks were already present)`.
+  Run it a second time and it prints `(nothing to change - THOR hooks were already current)`.
 - **How to turn it off again:** delete that one entry from the `hooks.Stop` array in the
   settings file (the pre-install copy sits next to it as `settings.json.thor-bak`), then
   restart the agent. There is no `thor uninstall` subcommand - removal is by hand.
@@ -1051,8 +1051,9 @@ looks like it contains a decision or a gotcha that was never stored.
 Adds the per-prompt auto-recall. Every prompt you submit, a `thor courier` process looks
 in the store and prints a `<thor-recall>` block into the prompt, so stored gotchas and
 decisions reach the agent without anyone searching for them. This one flag also wires
-three companion hooks in the same run: `thor warm`, `thor session-start` and
-`thor pre-compact` (each described below).
+two companion hooks in the same run: `thor warm` and `thor session-start` (each
+described below). An older install may also have wired a `PreCompact` hook; that one is
+retired and an install re-run removes it (see `thor pre-compact` below).
 
 - **Default:** off. Without this flag no recall is injected anywhere; you only get memory
   when you or the agent asks for it.
@@ -1084,7 +1085,6 @@ three companion hooks in the same run: `thor warm`, `thor session-start` and
     + Stop (response guard)
     + UserPromptSubmit (recall courier)
     + SessionStart (pre-warm embedder)
-    + PreCompact (persist-before-compaction nudge)
     + SessionStart (project refresh + onboarding cue)
   ```
   In a new session, a `<thor-recall>` block appears with your prompt once the store has
@@ -1092,19 +1092,24 @@ three companion hooks in the same run: `thor warm`, `thor session-start` and
 - **How to turn it off again:** delete THOR's entries from the settings file (the
   `.thor-bak` copy holds the pre-install state), or silence THOR at runtime by creating an
   empty file named `THOR-SILENT.flag` next to the store. Both are lossless: nothing stored
-  is touched. Note that the silence flag does not stop either of the two SessionStart hooks
-  this flag installs: neither `thor session-start` nor `thor warm` checks it. The ones that
-  do check it are the courier, the pre-compact nudge, the Stop guard and the
-  before-the-tool-call guard.
+  is touched. Note that the silence flag does not stop most of what the two SessionStart
+  hooks this flag installs do: `thor warm` never checks it, and `thor session-start`
+  checks it only for its post-compaction advisory - the brief, the background re-index
+  and the setup cue still run. The surfaces that do go quiet are the courier, the
+  post-compaction advisory, the Stop guard and the before-the-tool-call guard.
 
 ### thor session-start
 
 One command your agent runs at the start of every session, and again right after a
-context compaction. It does three useful things: it re-injects your pinned facts as a
+context compaction. It does four useful things: it re-injects your pinned facts as a
 `<thor-brief>` block, it refreshes the index of a project that has a `.thor` marker in
-the background, and for a git project THOR does not know yet it prints a `<thor-setup>`
-cue so the agent offers to set it up instead of indexing anything behind your back. It
-can also nudge, at most once per time window, to review global facts that were stored
+the background, for a git project THOR does not know yet it prints a `<thor-setup>`
+cue so the agent offers to set it up instead of indexing anything behind your back,
+and when the session start IS a compaction (`source: "compact"`) it first prints one
+post-compaction advisory: persist durable decisions that lived only in the compacted
+turns, plus the judgment-debt list of memory hits the courier served this session so
+the agent judges each one (useful or noise) while the work is still fresh. It can
+also nudge, at most once per time window, to review global facts that were stored
 without a project.
 
 - **Default:** off, and it is not separately installable - `thor install --with-courier`
@@ -1118,8 +1123,9 @@ without a project.
   `<thor-setup>` and `<thor-scope-review>` text in your context, and buys nothing.
 - **What it costs:** one short-lived process per session start, plus the detached
   background re-index described above in a marked project. No port, no download. The repo
-  states no measurement of its own run time. One honest caveat: unlike the courier, this
-  hook does not check `THOR-SILENT.flag`, so the kill switch does not silence it.
+  states no measurement of its own run time. One honest caveat: this hook checks
+  `THOR-SILENT.flag` only for the post-compaction advisory; the kill switch does not
+  silence its brief, background re-index or setup cue.
 - **How to turn it on:**
   ```sh
   thor install --with-courier
@@ -1137,40 +1143,33 @@ without a project.
 
 ### thor pre-compact
 
-When your agent is about to compact its context (summarise the conversation and throw the
-detail away), this hook prints one advisory asking it to store durable decisions and
-gotchas first, and - when the courier served memory hits this session - lists those ids so
-the agent judges each one (useful or noise) while it still remembers whether they helped.
-It fires at most once per session.
+Retired, kept only as a silent no-op. This used to be THOR's PreCompact hook: one
+advisory printed just before a compaction, asking the agent to store durable decisions
+first and listing the memory hits served this session so it judges each one (useful or
+noise). On 2026-07-23 it was verified - against the Claude Code hooks documentation and
+a live session transcript - that Claude Code never delivers PreCompact stdout to the
+model: not into the context, not into the transcript, and the `additionalContext` JSON
+field is not supported for that event. Every advisory this hook ever printed reached
+nobody.
 
-The judgment-debt list is the measured half (A/B, 24 fresh agents, 2026-07-22): with the
-ambient per-prompt nudge alone, 0 of 12 control agents judged anything at this rest point;
-with the list presented, 12 of 12 settled every served hit, with zero wrong labels against
-planted ground truth. Ambient asking does not work; a one-time list at a natural pause does.
+The message itself was the measured half (A/B, 24 fresh agents, 2026-07-22: with the
+ambient per-prompt nudge alone, 0 of 12 control agents judged anything at a rest point;
+with the served-hits list presented, 12 of 12 settled every hit, zero wrong labels), so
+the message did not die - it moved to the one compaction-adjacent channel that
+verifiably IS delivered: `thor session-start` prints it when a session starts with
+`source: "compact"`, right after the compaction, built from the ledger's served map -
+which survives the compaction precisely because it never lived in the context. See
+`thor session-start` above.
 
-- **Default:** off; installed only by `thor install --with-courier`.
-- **Turn it on if:** you run long sessions that hit compaction and you want one prompt to
-  write things down before they are compacted away. This is the only moment memory can act
-  before the context is gone - pins and the brief are recovery afterwards. It is also the
-  moment the ranking gets its food: the useful/noise judgments feed promotion and decay.
-- **Leave it off if:** you do not use the courier at all, or you keep your agent's context
-  deliberately free of injected text. The capture half of the advisory is unconditional:
-  it does not check whether anything was actually left unstored, so in a session where you
-  capture diligently that line is noise (the debt list only appears when hits were served).
-- **What it costs:** one short-lived process, once per session, and a few lines of context.
-  No port, no download, no long-lived process. The repo publishes no measured number for
-  what it saves.
-- **How to turn it on:**
-  ```sh
-  thor install --with-courier
-  ```
-  Restart the agent. To scope it to one project instead, add `--settings <path>` (below).
-- **How to check it worked:** the install output lists
-  `+ PreCompact (persist-before-compaction nudge)`, and the settings file then contains a
-  `hooks.PreCompact` array whose command ends in `pre-compact`.
-- **How to turn it off again:** delete the `PreCompact` entry from the settings file and
-  restart. `thor install` only ever adds entries, so a hand-removed entry stays removed.
-  Lossless.
+- **Default:** not installed. `thor install` no longer writes a `PreCompact` entry, and
+  an install re-run REMOVES a THOR `pre-compact` entry it finds - the one self-healing
+  removal the installer performs; other tools' PreCompact hooks are never touched.
+- **Why the subcommand still exists:** a settings file that still carries the old hook
+  keeps working - the command exits 0 and prints nothing, so your agent never sees a
+  hook error. Re-run `thor install` (any flags) to clean the entry away, or delete it
+  by hand. Lossless either way.
+- **What it costs while still registered:** one wasted short-lived process per
+  compaction. Nothing else.
 
 ### thor install --with-daemon
 
@@ -3363,7 +3362,7 @@ Some words used below, in plain terms:
 An empty file next to the store that tells THOR's hooks to say nothing. While it
 exists, the recall block is not injected into your prompts, the guard advisories
 stay quiet, the capture nudge stops holding your agent's final answer, and the
-pre-compaction reminder is skipped. Anything you ask for yourself keeps
+post-compaction advisory is skipped. Anything you ask for yourself keeps
 working: the CLI commands (`thor recall "..."`, `thor get <id>`, and the write
 path `thor create <entity_id> "<body>"`) and every MCP tool, including
 `remember`, are not affected. Note that `remember` exists only as an MCP tool
@@ -3374,7 +3373,7 @@ inside an agent session, not as a `thor remember` shell command.
   hooks you installed: a plain `thor install` wires only the Stop response
   guard, so on a default install this flag mutes that guard and its capture
   nudge. If you installed `--with-courier` it also mutes the injected recall
-  block and the pre-compaction reminder; with `--with-guard` it also mutes the
+  block and the post-compaction advisory; with `--with-guard` it also mutes the
   before-a-tool-runs advisories.
 - **Turn it on if:** you want a stretch of work with no injected memory and no
   held turns - a demo, a screen recording, a clean-room reproduction - or you

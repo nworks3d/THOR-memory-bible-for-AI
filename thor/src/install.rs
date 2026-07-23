@@ -14,9 +14,11 @@ pub fn default_settings_path() -> PathBuf {
 
 /// Wire THOR's hooks into a Claude Code settings.json the same way mimir does:
 /// one command, no hand-editing. Safe by construction - it refuses to touch a
-/// settings.json that is not valid JSON, backs the file up first, only ADDS
-/// THOR's own hook entries (never removes or rewrites mimir's or anyone else's),
-/// is idempotent (re-running adds nothing), and always writes valid JSON.
+/// settings.json that is not valid JSON, backs the file up first, only ever
+/// ADDS or REMOVES THOR's own hook entries (never touches mimir's or anyone
+/// else's), is idempotent (re-running changes nothing), and always writes
+/// valid JSON. Removal exists for one reason: retired THOR hooks (currently
+/// the dead PreCompact nudge) are healed away on upgrade re-runs.
 ///
 /// Default: only the Stop response guard (universally correct - "you have the
 /// tools, do it yourself, don't ask the user"). `with_guard` also installs the
@@ -86,7 +88,48 @@ pub fn run_install(
         true
     }
 
+    // Remove THOR's OWN retired hook commands from an event (self-healing on
+    // upgrade). Matches conservatively - the command must both name thor and
+    // end in the retired subcommand - so other tools' hooks are never touched.
+    // Cleans up emptied groups and the emptied event array. Returns true if it
+    // removed anything.
+    fn remove_own_retired(hooks: &mut serde_json::Map<String, Value>, event: &str, subcommand: &str) -> bool {
+        let Some(arr) = hooks.get_mut(event).and_then(|v| v.as_array_mut()) else {
+            return false;
+        };
+        let is_ours = |h: &Value| {
+            h.get("command")
+                .and_then(|c| c.as_str())
+                .map(|c| c.to_lowercase().contains("thor") && c.ends_with(&format!(" {subcommand}")))
+                .unwrap_or(false)
+        };
+        let mut removed = false;
+        for group in arr.iter_mut() {
+            if let Some(hs) = group.get_mut("hooks").and_then(|h| h.as_array_mut()) {
+                let before = hs.len();
+                hs.retain(|h| !is_ours(h));
+                removed |= hs.len() < before;
+            }
+        }
+        arr.retain(|g| {
+            g.get("hooks").and_then(|h| h.as_array()).map(|hs| !hs.is_empty()).unwrap_or(true)
+        });
+        if arr.is_empty() {
+            hooks.remove(event);
+        }
+        removed
+    }
+
     let mut added: Vec<&str> = Vec::new();
+    let mut removed: Vec<&str> = Vec::new();
+
+    // Retired 2026-07-23: Claude Code never delivers PreCompact stdout to the
+    // model, so the pre-compaction nudge printed into the void. Its message
+    // now rides `session-start` on source=="compact" (SessionStart stdout IS
+    // context); heal any settings.json that still carries the dead hook.
+    if remove_own_retired(hooks, "PreCompact", "pre-compact") {
+        removed.push("PreCompact (retired: stdout never reached the model; moved to session-start on compact)");
+    }
 
     let stop_cmd = cmd("stop-guard");
     if add(
@@ -123,7 +166,9 @@ pub fn run_install(
         // The courier pairs with two SessionStart hooks: `warm` pre-warms the
         // semantic embedder so the first prompt is fast, and `session-start`
         // refreshes a known project's index in the background (or offers to set up
-        // a new one). Both are no-ops when not applicable, so they are safe to add.
+        // a new one), prints the brief, and - on source=="compact" - the
+        // post-compaction advisory with the judgment-debt list. Both are no-ops
+        // when not applicable, so they are safe to add.
         let warm_cmd = cmd("warm");
         if add(
             hooks,
@@ -132,17 +177,6 @@ pub fn run_install(
             &warm_cmd,
         ) {
             added.push("SessionStart (pre-warm embedder)");
-        }
-        // One advisory per session just before a compaction: the only moment
-        // memory can still save working context instead of recovering after.
-        let precompact_cmd = cmd("pre-compact");
-        if add(
-            hooks,
-            "PreCompact",
-            json!({ "hooks": [ { "type": "command", "command": precompact_cmd } ] }),
-            &precompact_cmd,
-        ) {
-            added.push("PreCompact (persist-before-compaction nudge)");
         }
         let session_cmd = cmd("session-start");
         if add(
@@ -186,11 +220,14 @@ pub fn run_install(
     std::fs::write(settings, out)?;
 
     println!("THOR hooks installed into {}", settings.display());
-    if added.is_empty() {
-        println!("  (nothing to add - THOR hooks were already present)");
+    if added.is_empty() && removed.is_empty() {
+        println!("  (nothing to change - THOR hooks were already current)");
     } else {
         for a in &added {
             println!("  + {}", a);
+        }
+        for r in &removed {
+            println!("  - {}", r);
         }
         println!("  backup: {}", settings.with_extension("json.thor-bak").display());
     }
@@ -284,14 +321,40 @@ mod tests {
         assert_eq!(ss.iter().filter(|c| c.ends_with("warm")).count(), 1, "one warm hook");
         assert_eq!(ss.iter().filter(|c| c.contains("session-start")).count(), 1, "one session-start hook");
         assert_eq!(ss.iter().filter(|c| c.contains("ensure-daemon")).count(), 1, "one ensure-daemon hook");
-        let pc: Vec<String> = twice["hooks"]["PreCompact"]
+        // the retired PreCompact nudge is never (re)installed
+        assert!(twice["hooks"].get("PreCompact").is_none(), "no PreCompact hook is registered");
+    }
+
+    #[test]
+    fn test_removes_thors_retired_precompact_but_keeps_foreign_hooks() {
+        // an upgraded settings.json: THOR's dead pre-compact hook next to a
+        // foreign PreCompact hook that must survive
+        let input = r#"{
+            "hooks": {
+                "PreCompact": [
+                    { "hooks": [ { "type": "command", "command": "\"C:\\tools\\thor.exe\" pre-compact" } ] },
+                    { "hooks": [ { "type": "command", "command": "other-tool.ps1 pre-compact-report" } ] }
+                ]
+            }
+        }"#;
+        let out = install_into(input, false, false, false);
+        let pc: Vec<String> = out["hooks"]["PreCompact"]
             .as_array()
             .unwrap()
             .iter()
             .flat_map(|g| g["hooks"].as_array().unwrap().iter())
             .filter_map(|h| h["command"].as_str().map(String::from))
             .collect();
-        assert_eq!(pc.iter().filter(|c| c.contains("pre-compact")).count(), 1, "one pre-compact hook");
+        assert_eq!(pc, vec!["other-tool.ps1 pre-compact-report"], "thor's gone, foreign kept: {pc:?}");
+
+        // only THOR's hook present -> the whole event key is cleaned away
+        let input_only_thor = r#"{
+            "hooks": {
+                "PreCompact": [ { "hooks": [ { "type": "command", "command": "\"C:\\tools\\thor.exe\" pre-compact" } ] } ]
+            }
+        }"#;
+        let out = install_into(input_only_thor, false, false, false);
+        assert!(out["hooks"].get("PreCompact").is_none(), "emptied event key removed");
     }
 
     #[test]

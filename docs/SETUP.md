@@ -87,7 +87,7 @@ as a model and a vector sidecar exist - dropping `--with-daemon` does not avoid 
 avoid that one, do not install a model.
 
 This edits your agent's `settings.json` **idempotently** (it backs up first and only
-adds THOR entries, never touching existing hooks), wiring:
+ever adds or removes THOR's own entries, never touching other tools' hooks), wiring:
 
 - **UserPromptSubmit -> `thor courier`** - auto-recall on every prompt (injects a
   `<thor-recall>` block, scoped to the current project + global).
@@ -95,10 +95,11 @@ adds THOR entries, never touching existing hooks), wiring:
   prompt is fast (no-op on a bm25-only build).
 - **SessionStart -> `thor session-start`** - refresh a known project's index in the
   background, or emit a `<thor-setup>` cue so the agent offers to set up a new one.
-- **PreCompact -> `thor pre-compact`** - one nudge per session, just before a
-  compaction, to store durable decisions; it also lists the memory hits served
-  this session so the agent judges them (useful/noise) while it still can
-  (from `--with-courier`).
+  Right after a context compaction it also prints one advisory: persist durable
+  decisions the summary still names, and judge the memory hits THOR served this
+  session (useful/noise). (An older install may still carry a `PreCompact ->
+  thor pre-compact` entry; that hook's output never reached the model, so it is
+  retired - a re-run of `thor install` removes it.)
 - **PreToolUse -> `thor guard`** - moment-of-action advisory (from `--with-guard`).
 - **SessionStart -> `thor ensure-daemon`** - start the injection daemon if it is not
   already up (from `--with-daemon`).

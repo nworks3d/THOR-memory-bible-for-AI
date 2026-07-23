@@ -98,6 +98,33 @@ New to all this? Read these in order - they hold your hand the whole way:
 3. **[docs/OPTIONAL-FEATURES.md](docs/OPTIONAL-FEATURES.md)** - every optional
    piece: what it costs, how to turn it on, how to undo it.
 
+## Work in one long session - restart on purpose, not out of habit
+
+Before persistent memory, the standard advice was to restart your agent
+session often: a long conversation degraded, and every restart lost
+everything anyway. With THOR that advice is obsolete - **one long session is
+the recommended default**:
+
+- **Compaction is covered.** Just before the context gets compressed, THOR
+  nudges the agent to persist any unsaved decisions first, and hands it the
+  list of memory hits it served this session so the agent can judge them
+  (useful/noise) while it still has the context to judge honestly. Pinned
+  rules re-inject automatically afterwards.
+- **A restart is covered too.** Pins, the project brief and per-prompt recall
+  warm every fresh session from the store, so restarting never loses a
+  durable fact.
+
+So: stay in one session while you are on one thread of work. Start a fresh
+session deliberately - because you switch to a different task, or to shed a
+session that talked itself into a dead end - not to manage context length.
+That is what compaction is for.
+
+One honest footnote: the "judge the served hits" moment fires just before a
+compaction, and a short session that ends before any compaction never
+reaches it, so those hits stay unjudged. Nothing breaks and nothing is lost
+- the ranking just learns a little slower than it would in a long session.
+One more reason the long session is the better habit.
+
 ## Documentation
 
 | page | what it answers |

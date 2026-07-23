@@ -61,6 +61,9 @@ file or command. What it cannot push is your discipline. Six rules:
    trains your own future recall; an unfed ranking prior learns nothing.
    Just before a compaction THOR hands you the list of hits it served this
    session ("judgment debt") - settle it then: one `mark` per id, honestly.
+   That list only appears before a compaction, and a short session may never
+   compact - so do not save your judging for the list: mark a hit in the
+   same turn it proves useful or gets in the way.
 6. **`pin` the standing rules your user states** ("never X on prod") -
    pins are re-injected at every session start and survive compaction.
 

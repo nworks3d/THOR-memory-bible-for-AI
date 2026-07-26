@@ -183,6 +183,10 @@ pub struct Report {
     pub unpointed_scopes: Vec<UnpointedScope>,
     pub ungated_rule_facts: Vec<UngatedRuleFact>,
     pub unanchored: Vec<UnanchoredFact>,
+    /// Typed, unanchored facts that name something concrete but ALREADY carry an
+    /// expiry, so they are left off the proposal list. Counted rather than
+    /// dropped in silence: a hidden cap reads as "nothing to do here".
+    pub unanchored_expiring: usize,
     pub anchor_coverage: AnchorCoverage,
     /// Clusters dropped for being over MAX_CLUSTER_MEMBERS (batch families,
     /// union-find chains) - counted so the cap is never silent.
@@ -304,6 +308,13 @@ struct LiveHead {
     /// feed those surfaces - retro-anchoring above all - must not propose
     /// work on it: an anchor on a silenced fact is dead work.
     expired: bool,
+    /// Footer carries an expiry AT ALL - past or future. A fact with a date on
+    /// it is a REPORT by this store's own doctrine ("reports expire, rules
+    /// never"), and a report scheduled to be silenced does not need a gate.
+    /// Measured 2026-07-26: 23 of the 25 shown retro-anchor candidates already
+    /// carried a future expiry, so the list overstated the real work by more
+    /// than tenfold. Counted, never silently dropped - see `unanchored_expiring`.
+    has_expiry: bool,
     /// Tagged `no-gate`: a steward judged that this fact deliberately carries
     /// no anchor (the named file/command is incidental, not its subject). The
     /// retro-anchor list honors it so the decision persists across rounds.
@@ -396,6 +407,7 @@ fn live_memory_heads(events: &[Event], pins: &[String]) -> Vec<LiveHead> {
             body_chars: head.body.chars().count(),
             report_shaped_no_expiry: crate::footer::report_shaped(&head.body)
                 && crate::footer::expires(&head.body).is_none(),
+            has_expiry: crate::footer::expires(&head.body).is_some(),
             expired: crate::footer::expires(&head.body)
                 .is_some_and(|d| d.as_str() < today.as_str()),
             no_gate: crate::footer::has_tag(&head.body, "no-gate"),
@@ -651,6 +663,12 @@ pub fn build_report(store: &EventStore, db: &Path, events: &[Event], opts: &Opti
     let unpointed_scopes = unpointed_scope_candidates(&heads);
     let ungated_rule_facts = ungated_rule_facts(&heads, &rule_named_ids());
     let unanchored = unanchored_candidates(&heads);
+    let unanchored_expiring = heads
+        .iter()
+        .filter(|h| {
+            h.typed && !h.anchored && !h.no_gate && h.has_expiry && h.anchor_candidate.is_some()
+        })
+        .count();
     let anchor_coverage = AnchorCoverage {
         anchored: heads.iter().filter(|h| h.anchored).count(),
         total: heads.len(),
@@ -674,6 +692,7 @@ pub fn build_report(store: &EventStore, db: &Path, events: &[Event], opts: &Opti
         unpointed_scopes,
         ungated_rule_facts,
         unanchored,
+        unanchored_expiring,
         anchor_coverage,
         broad_clusters_skipped,
         cosine_ran,
@@ -845,7 +864,7 @@ fn unanchored_candidates(heads: &[LiveHead]) -> Vec<UnanchoredFact> {
         // forever and a later steward re-judges it cold (measured 2026-07-26:
         // three facts were re-anchored by a fresh agent after an earlier agent
         // had deliberately skipped them, because the skip lived nowhere).
-        .filter(|h| h.typed && !h.anchored && !h.expired && !h.no_gate)
+        .filter(|h| h.typed && !h.anchored && !h.has_expiry && !h.no_gate)
         .filter_map(|h| {
             h.anchor_candidate.as_ref().map(|c| UnanchoredFact {
                 entity_id: h.entity_id.clone(),
@@ -1003,21 +1022,37 @@ pub fn render_report(report: &Report) -> String {
             line(format!("  {} (named by rule \"{}\")", u.entity_id, u.rule_id));
         }
     }
-    if !report.unanchored.is_empty() {
+    if !report.unanchored.is_empty() || report.unanchored_expiring > 0 {
         line(format!(
             "
-anchor coverage {:.1}% ({} of {} live facts can reach the moment-of-action guard). {} typed \
-fact(s) name a file or command but carry no anchor - proven-useful first, top {} shown:",
+anchor coverage {:.1}% ({} of {} live facts can reach the moment-of-action guard).",
             report.anchor_coverage.pct(),
             report.anchor_coverage.anchored,
             report.anchor_coverage.total,
-            report.unanchored.len(),
-            UNANCHORED_SHOWN.min(report.unanchored.len()),
         ));
-        for u in report.unanchored.iter().take(UNANCHORED_SHOWN) {
+        if report.unanchored.is_empty() {
+            line("No fact is waiting for an anchor.".to_string());
+        } else {
             line(format!(
-                "  {} (strength {:.2}) -> anchors: [\"{}\"] | {}",
-                u.entity_id, u.strength, u.candidate, u.first_line
+                "{} typed fact(s) name a file or command but carry no anchor - proven-useful \
+                 first, top {} shown:",
+                report.unanchored.len(),
+                UNANCHORED_SHOWN.min(report.unanchored.len()),
+            ));
+            for u in report.unanchored.iter().take(UNANCHORED_SHOWN) {
+                line(format!(
+                    "  {} (strength {:.2}) -> anchors: [\"{}\"] | {}",
+                    u.entity_id, u.strength, u.candidate, u.first_line
+                ));
+            }
+        }
+        if report.unanchored_expiring > 0 {
+            line(format!(
+                "{} more name something concrete but carry an expiry (some already past), so \
+                 they are not proposed: a report that is or will be silenced does not need a \
+                 gate. To anchor one anyway, remove its expiry first - that is the decision \
+                 that it is a rule and not a report.",
+                report.unanchored_expiring
             ));
         }
     }
@@ -1402,6 +1437,14 @@ mod tests {
         create(&mut store, "mem-no-gate",
             "the file deploy/deploy-watcher.sh is incidental here\n\n\
              [memory/gotcha | tags: x no-gate]");
+        // Typed, names a path, expiry still in the FUTURE -> not proposed, but
+        // COUNTED. A dated fact is a report by this store's doctrine, and a
+        // report scheduled to be silenced does not need a gate. Measured
+        // 2026-07-26: 23 of 25 shown candidates were exactly this, so listing
+        // them overstated the real work more than tenfold.
+        create(&mut store, "mem-expiring",
+            "round report naming deploy/deploy-watcher.sh\n\n\
+             [memory/decision | tags: x | expires: 2099-01-01]");
 
         let events = store.get_all_events().unwrap();
         let report = build_report(&store, &db, &events, &opts(i64::MAX));
@@ -1412,7 +1455,17 @@ mod tests {
             "only the typed, unanchored fact that names something concrete: {ids:?}"
         );
         assert_eq!(report.unanchored[0].candidate, "deploy/deploy-watcher.sh");
-        assert_eq!(report.anchor_coverage.total, 6);
+        assert_eq!(report.anchor_coverage.total, 7);
+        // The dated one is skipped but never hidden: a silent cap reads as
+        // "nothing to do here", which is how work lists start lying.
+        assert_eq!(
+            report.unanchored_expiring, 2,
+            "both dated candidates are counted, not silently dropped: the future-dated one and              the already-past one. A steward's action is the same for both - nothing, unless              they decide it is a rule and strip the date."
+        );
+        assert!(
+            render_report(&report).contains("carry an expiry (some already past)"),
+            "the skip is stated in the printed report, with its reason"
+        );
         assert_eq!(report.anchor_coverage.anchored, 1, "coverage comes from ONE code path, not an ad hoc count");
         assert!(report.is_clean() || !report.is_clean(), "the list is a backlog, never a gate failure");
         assert!(

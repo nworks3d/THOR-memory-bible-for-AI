@@ -1,0 +1,3440 @@
+//! THOR MCP server: the agent's full stewardship surface - read (recall / get /
+//! history / brief), write (remember with duplicate refusal + typed footers),
+//! repair (revise / retract / resolve, all CAS-checked so a stale write returns
+//! the fresh head-set instead of minting a silent branch), and curate (mark /
+//! pin / unpin / reproject). Served on stdio (`thor mcp`, the local connector)
+//! or Streamable-HTTP (`thor mcp --http <bind>`, the remote connector deployed
+//! on the NAS - THOR's own server, port and DB, fully independent of mimir).
+//! Built on rmcp (mimir's proven recipe).
+//!
+//! The store is sync (rusqlite); every tool hops through spawn_blocking so the
+//! async transport is never blocked. One shared store behind a Mutex serves all
+//! HTTP sessions (WAL + the Mutex handle concurrency).
+
+use crate::cli::{render_get, render_history};
+use crate::event_store::{EventKind, EventStore, MutateConflict, ResolveConflict};
+use crate::recall::{recall_memories_scoped, RecallScope};
+use rmcp::handler::server::router::tool::ToolRouter;
+use rmcp::handler::server::wrapper::Parameters;
+use rmcp::model::{ServerCapabilities, ServerInfo};
+use rmcp::{schemars, tool, tool_handler, tool_router, ServerHandler, ServiceExt};
+use serde::Deserialize;
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
+use uuid::Uuid;
+
+/// Deserialize helpers for the optional list-of-strings tool arguments (`tags`,
+/// `triggers`, `anchors`). serde's stock error for a caller who passes a bare
+/// string is "invalid type: string, expected a sequence" - correct, but it names
+/// neither the field nor "JSON array", so the agent has to guess the fix. These
+/// keep the type exactly as strict (still a JSON array of strings) and only make
+/// the failure self-explanatory: the message names the field and says "JSON array
+/// of strings", so a wrong-shaped call retries right the first time.
+mod string_list {
+    use serde::de::{self, Deserializer, SeqAccess, Visitor};
+    use std::fmt;
+
+    struct SeqV(&'static str);
+    impl<'de> Visitor<'de> for SeqV {
+        type Value = Vec<String>;
+        fn expecting(&self, f: &mut fmt::Formatter) -> fmt::Result {
+            write!(f, "{} to be a JSON array of strings like [\"a\", \"b\"]", self.0)
+        }
+        fn visit_seq<A: SeqAccess<'de>>(self, mut seq: A) -> Result<Self::Value, A::Error> {
+            let mut out = Vec::new();
+            while let Some(s) = seq.next_element::<String>()? {
+                out.push(s);
+            }
+            Ok(out)
+        }
+    }
+
+    struct OptV(&'static str);
+    impl<'de> Visitor<'de> for OptV {
+        type Value = Option<Vec<String>>;
+        fn expecting(&self, f: &mut fmt::Formatter) -> fmt::Result {
+            write!(f, "{} to be a JSON array of strings like [\"a\", \"b\"], or omitted", self.0)
+        }
+        // An explicit JSON null (or an absent field routed here) is "no list".
+        fn visit_none<E: de::Error>(self) -> Result<Self::Value, E> {
+            Ok(None)
+        }
+        fn visit_unit<E: de::Error>(self) -> Result<Self::Value, E> {
+            Ok(None)
+        }
+        // A present value must be a sequence; a bare string lands in serde_json's
+        // deserialize_seq, which reports invalid_type against SeqV's `expecting`.
+        fn visit_some<D: Deserializer<'de>>(self, d: D) -> Result<Self::Value, D::Error> {
+            d.deserialize_seq(SeqV(self.0)).map(Some)
+        }
+    }
+
+    fn de<'de, D: Deserializer<'de>>(
+        d: D,
+        field: &'static str,
+    ) -> Result<Option<Vec<String>>, D::Error> {
+        d.deserialize_option(OptV(field))
+    }
+
+    /// tags accepts a JSON array OR a comma-separated string. Measured field
+    /// friction (three session reports, four failed calls, 2026-07-24/25):
+    /// agents pass "a, b" and the strict array-only shape burned a retry
+    /// every time. Unlike anchors - where joined input silently becomes ONE
+    /// dead anchor that never fires - a split tag list is exactly what the
+    /// caller meant, so coercion is safe here and strictness buys nothing.
+    pub fn tags<'de, D: Deserializer<'de>>(d: D) -> Result<Option<Vec<String>>, D::Error> {
+        struct Outer;
+        impl<'de> Visitor<'de> for Outer {
+            type Value = Option<Vec<String>>;
+            fn expecting(&self, f: &mut fmt::Formatter) -> fmt::Result {
+                write!(f, "tags to be a JSON array of strings, a comma-separated string, or omitted")
+            }
+            fn visit_none<E: de::Error>(self) -> Result<Self::Value, E> {
+                Ok(None)
+            }
+            fn visit_unit<E: de::Error>(self) -> Result<Self::Value, E> {
+                Ok(None)
+            }
+            fn visit_some<D2: Deserializer<'de>>(self, d: D2) -> Result<Self::Value, D2::Error> {
+                d.deserialize_any(Inner)
+            }
+        }
+        struct Inner;
+        impl<'de> Visitor<'de> for Inner {
+            type Value = Option<Vec<String>>;
+            fn expecting(&self, f: &mut fmt::Formatter) -> fmt::Result {
+                write!(f, "tags to be a JSON array of strings or a comma-separated string")
+            }
+            fn visit_str<E: de::Error>(self, s: &str) -> Result<Self::Value, E> {
+                Ok(Some(
+                    s.split(',')
+                        .map(|t| t.trim().to_string())
+                        .filter(|t| !t.is_empty())
+                        .collect(),
+                ))
+            }
+            fn visit_seq<A: SeqAccess<'de>>(self, mut seq: A) -> Result<Self::Value, A::Error> {
+                let mut out = Vec::new();
+                while let Some(s) = seq.next_element::<String>()? {
+                    out.push(s);
+                }
+                Ok(Some(out))
+            }
+        }
+        d.deserialize_option(Outer)
+    }
+    pub fn triggers<'de, D: Deserializer<'de>>(d: D) -> Result<Option<Vec<String>>, D::Error> {
+        de(d, "triggers")
+    }
+    pub fn anchors<'de, D: Deserializer<'de>>(d: D) -> Result<Option<Vec<String>>, D::Error> {
+        de(d, "anchors")
+    }
+}
+
+const INSTRUCTIONS: &str = "THOR is the user's lossless memory - and YOURS to maintain, not just \
+to fill. recall searches the current-head facts (scoped to the current project + the global tier; \
+all_projects:true for everything, project:\"<key>\" for one, kind:\"memory\" to exclude code \
+chunks when you want notes/decisions). get shows one entity's full head(s); history its revision \
+log. remember stores a NEW fact (recall first - near-duplicates are refused) and accepts \
+fact_type (gotcha|decision|preference) + tags. When a fact you see is outdated or wrong: revise \
+it (auto-fills parent_rev when single-headed; to fix only metadata - an anchor, an expiry, the \
+type - pass just that parameter and no body) or retract it - do NOT remember a duplicate. When \
+you meet a [DIVERGED] fact: resolve it (keep_rev wins) as soon as you know the right head. When \
+an injected/recalled fact actually helped you: mark it (improves future ranking). pin/unpin \
+manage the standing rules re-injected at every session start; brief shows what THOR knows about \
+the current project (counts, recent facts, pins, diverged). reproject moves a mis-scoped fact to \
+another project or global. ROUTING - pick the surface by the question's shape: recall for facts \
+and prose (\"what did we decide about X\"), where_used when a question names a symbol (\"who \
+calls X\"), impact before changing one (\"what breaks if I touch X\"), outline for a file's \
+shape, get to expand any id the others return. LIFECYCLE DOCTRINE - reports expire, RULES \
+never: a report/milestone gets an expiry (auto-stamped six weeks when it opens as one) because \
+its operational value is short; a rule that still governs behavior must live in its own \
+never-expiring fact that you revise when it changes. Before you set or accept an expiry on any \
+fact, ask: does this body contain a still-governing rule? If yes, lift the rule into its own \
+fact FIRST (anchors = the exact files/commands it GOVERNS - not just paths it mentions), then \
+let the report expire. An expired fact stays fully readable via get/history; it only stops \
+surfacing.";
+
+/// Appended to INSTRUCTIONS when the server runs in replica divert mode (the
+/// hosted/NAS connector, THOR_CAPTURE_INBOX set). The agent on the other end
+/// cannot see the deployment topology, so the server says it itself: what is
+/// stale, which writes are safe (queued), and which tools to leave alone here.
+/// The authority counterpart of REPLICA_NOTICE. Measured need (2026-07-24): a
+/// session often sees TWO thor connectors at once - this local stdio server
+/// AND a hosted replica connector whose instructions carry the replica
+/// notice. An agent conflated them and believed IT was on a replica ("noise
+/// is refused here"), so the authority now says what it is, and explicitly
+/// releases the agent from the other connector's restrictions on THIS one.
+const AUTHORITY_NOTICE: &str = "\n\nTHIS SERVER IS THE AUTHORITY store (direct writes, nothing \
+queued): remember/revise/retract land immediately, and mark (useful AND noise), resolve, \
+reproject, pin and unpin all run right here. If another THOR connector in this session \
+describes itself as a replica with refused or queued tools, that notice is about that other \
+connector only - it never applies to this one.";
+
+const REPLICA_NOTICE: &str = "\n\nTHIS SERVER IS A READ REPLICA of the authoritative store \
+(log-shipped copy, typically up to ~1 hour behind): recent facts may be missing and very recent \
+edits may not show yet. remember/revise/retract and mark-as-useful are SAFE here - they queue to \
+a capture inbox that the authority replays on its next sync, so expect 'queued to capture \
+inbox', not 'stored'; that is success, do not retry or re-store. resolve, reproject, pin, unpin \
+and mark-as-noise are REFUSED on this replica (they would fork the replica's log or land in a \
+local ledger your real sessions never read) - run those on the authority. If a local stdio THOR \
+server is also connected in this session, prefer it for everything: it is the authority and it \
+is current.";
+
+/// The current project for a stdio server, from its launch cwd (Claude Code starts
+/// the connector in the project dir). `None` for the HTTP server (no cwd).
+fn startup_project() -> Option<String> {
+    std::env::current_dir().ok().and_then(|c| crate::repo::project_key(&c))
+}
+
+#[derive(Clone)]
+pub struct ThorServer {
+    store: Arc<Mutex<EventStore>>,
+    /// Project the server was launched in (`None` = unscoped / HTTP). Recall
+    /// defaults to this; remember tags new facts with it.
+    project: Option<String>,
+    /// Store path, for the sidecars that live NEXT to the db (pins). An empty
+    /// path (in-memory test store) keeps pin/unpin working in a temp cwd.
+    db: PathBuf,
+    #[allow(dead_code)] // read only inside the #[tool_handler] macro expansion
+    tool_router: ToolRouter<Self>,
+    /// When set (env THOR_CAPTURE_INBOX, on a replica), remember/revise/retract
+    /// are diverted to this append-only inbox file instead of appending to the
+    /// local log - so the replica's chain never forks the authority. See inbox.rs.
+    inbox: Option<PathBuf>,
+}
+
+#[derive(Deserialize, schemars::JsonSchema)]
+pub struct RecallArgs {
+    /// What to search for (natural language or keywords).
+    pub query: String,
+    /// Max hits (default 8).
+    #[serde(default)]
+    pub limit: Option<usize>,
+    /// Search every project, not just the current one + the global tier.
+    #[serde(default)]
+    pub all_projects: bool,
+    /// Scope to a specific project key (that project + global). Overrides the
+    /// server's current project.
+    #[serde(default)]
+    pub project: Option<String>,
+    /// "memory" = only hand-written facts (notes/gotchas/decisions), never repo
+    /// code chunks. Omit for everything.
+    #[serde(default)]
+    pub kind: Option<String>,
+    /// true = rescore the top of the result pool with the local cross-encoder
+    /// before returning (slower - one transformer pass per hit - but much
+    /// better paraphrase ordering). Use it as a deliberate second try when the
+    /// normal order looks wrong. Silently keeps the normal order when the
+    /// reranker model is not installed.
+    #[serde(default)]
+    pub rerank: bool,
+    /// "index" = a compact one-line-per-hit listing (id | kind | first line)
+    /// at a fraction of the tokens; follow up with `get` on the ids you need.
+    /// Omit for full served bodies.
+    #[serde(default)]
+    pub detail: Option<String>,
+}
+
+#[derive(Deserialize, schemars::JsonSchema)]
+pub struct WhereUsedArgs {
+    /// Symbol name, exact and case-sensitive ("pack_blocks", "linkJobModal").
+    pub symbol: String,
+    /// Project key to search. Omitted = the server's current project;
+    /// explicitly pass "all" to search every project.
+    #[serde(default)]
+    pub project: Option<String>,
+}
+
+#[derive(Deserialize, schemars::JsonSchema)]
+pub struct ImpactArgs {
+    /// Symbol name whose change blast-radius to walk (exact, case-sensitive).
+    pub symbol: String,
+    /// Project key. Omitted = the server's current project; "all" = every project.
+    #[serde(default)]
+    pub project: Option<String>,
+    /// Reverse-walk depth, 1-3 (default 2): callers, then callers-of-callers.
+    #[serde(default)]
+    pub depth: Option<usize>,
+}
+
+#[derive(Deserialize, schemars::JsonSchema)]
+pub struct OutlineArgs {
+    /// File path (or unambiguous path suffix) to outline, e.g.
+    /// "src/recall.rs" or "web/client/src/pages/Fleet.jsx".
+    pub path: String,
+    /// Project key holding the file. Omitted = the server's current project.
+    #[serde(default)]
+    pub project: Option<String>,
+}
+
+#[derive(Deserialize, schemars::JsonSchema)]
+pub struct GetArgs {
+    /// The entity id to show the current head(s) of.
+    pub entity_id: String,
+}
+
+#[derive(Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+// deny_unknown_fields: an agent passed `content` instead of `body` (measured,
+// session report 2026-07-25) and burned a retry on a generic error; on a write
+// tool a silently-dropped parameter is lost intent, so unknown names error
+// with the real field list instead.
+pub struct RememberArgs {
+    /// The fact to store (concise, self-contained).
+    pub body: String,
+    /// Optional entity id; a new one is minted if omitted.
+    #[serde(default)]
+    pub entity_id: Option<String>,
+    /// Project scope for the new fact: a project key, or "global" for a
+    /// cross-project fact. Omitted = the server's current project.
+    #[serde(default)]
+    pub project: Option<String>,
+    /// Constraint class: "gotcha", "decision", or "preference". Typed facts get
+    /// a footer, a tag in recall/injection, and (guard/brief) priority.
+    #[serde(default)]
+    pub fact_type: Option<String>,
+    /// Free-form tags, stored in the footer for later search.
+    #[serde(default, deserialize_with = "string_list::tags")]
+    pub tags: Option<Vec<String>>,
+    /// WHEN should this fact fire? The exact task words a future prompt would
+    /// contain when this fact matters: commands ("docker compose"), file names
+    /// ("deploy-watcher.sh"), error strings ("subsystem request failed").
+    /// Stored as a fires-when footer field; a query hitting these words gets a
+    /// deliberate ranking boost toward this fact.
+    #[serde(default, deserialize_with = "string_list::triggers")]
+    pub triggers: Option<Vec<String>>,
+    /// Exact file paths or command strings this fact GOVERNS (e.g.
+    /// "deploy/watcher.sh", "docker compose up"). The moment-of-action guard
+    /// surfaces the fact verbatim when a tool call touches one - exact match,
+    /// no ranking involved. Use for hard constraints tied to a specific file
+    /// or command.
+    #[serde(default, deserialize_with = "string_list::anchors")]
+    pub anchors: Option<Vec<String>>,
+    /// Known-temporary fact? YYYY-MM-DD after which it stops surfacing in
+    /// recall ("pin to v1.9 until the upstream fix lands"). History keeps it;
+    /// nothing is deleted. Omit for facts without a natural end date.
+    #[serde(default)]
+    pub expires: Option<String>,
+    /// Epistemic origin at write time: "verified" (a test ran / a file was read /
+    /// output was seen / the user confirmed it) or "inferred" (plausibly reasoned,
+    /// no tool between the claim and storing it). An inferred fact is resurfaced
+    /// with a reconcile hint when it comes back on new activity on its topic.
+    #[serde(default)]
+    pub provenance: Option<String>,
+}
+
+#[derive(Default, Deserialize, schemars::JsonSchema)]
+// deny_unknown_fields: same rationale as RememberArgs/MarkArgs - on a write
+// tool a silently-dropped parameter (a typo'd `trigger:` for `triggers:`) is
+// lost intent; error with the real field list instead.
+#[serde(deny_unknown_fields)]
+pub struct ReviseArgs {
+    /// The entity id to update.
+    pub entity_id: String,
+    /// The corrected, full replacement body. OMIT it to change only metadata
+    /// fields: the current head's content is kept and the fields below are
+    /// applied to its footer - no retyping, no footer-format risk.
+    #[serde(default)]
+    pub body: Option<String>,
+    /// Append this text as a new paragraph under the CURRENT content (footer
+    /// kept) - the light-weight status update ("UPDATE 2026-...: deployed as
+    /// .110") that needs no retyping. Mutually exclusive with body and with
+    /// replace_from.
+    #[serde(default)]
+    pub append: Option<String>,
+    /// Surgical in-place edit: the EXACT text to replace in the current
+    /// content. Must match exactly once - zero or multiple matches are
+    /// rejected so an edit is never ambiguous or silent. Comes together with
+    /// replace_to. Mutually exclusive with body and append; footer fields have
+    /// their own parameters.
+    #[serde(default)]
+    pub replace_from: Option<String>,
+    /// The replacement text for replace_from (may be empty to delete it).
+    #[serde(default)]
+    pub replace_to: Option<String>,
+    /// The head rev this update is based on. Omit when the entity has a single
+    /// head (auto-filled); required when it is DIVERGED. A stale value is
+    /// rejected with the fresh head-set instead of creating a silent branch.
+    #[serde(default)]
+    pub parent_rev: Option<String>,
+    /// Replace the fact's type: gotcha | decision | preference | note.
+    /// Omit to keep the current type.
+    #[serde(default)]
+    pub fact_type: Option<String>,
+    /// Replace the tag list. Empty list = clear the tags. Omit = keep.
+    #[serde(default, deserialize_with = "string_list::tags")]
+    pub tags: Option<Vec<String>>,
+    /// Replace the fires-when trigger words. Empty list = remove the field.
+    /// Omit = keep.
+    #[serde(default)]
+    pub triggers: Option<Vec<String>>,
+    /// Replace the guard anchors (exact file paths / command strings this
+    /// fact GOVERNS; entries are stored comma-separated - passing them here
+    /// as a list makes the dead space-joined-anchor mistake unrepresentable).
+    /// Empty list = remove the field. Omit = keep.
+    #[serde(default)]
+    pub anchors: Option<Vec<String>>,
+    /// Replace the expiry date (YYYY-MM-DD). Empty string = remove the
+    /// expiry. Omit = keep whatever is there.
+    #[serde(default)]
+    pub expires: Option<String>,
+    /// Replace the provenance label: verified | inferred. Empty string =
+    /// remove it. Omit = keep.
+    #[serde(default)]
+    pub provenance: Option<String>,
+}
+
+#[derive(Deserialize, schemars::JsonSchema)]
+pub struct RetractArgs {
+    /// The entity id to retract (recall stops surfacing it; history is kept).
+    pub entity_id: String,
+    /// The head rev being retracted (omit when single-headed).
+    #[serde(default)]
+    pub parent_rev: Option<String>,
+    /// Why it is retracted (kept in the log).
+    #[serde(default)]
+    pub reason: Option<String>,
+}
+
+#[derive(Deserialize, schemars::JsonSchema)]
+pub struct ResolveArgs {
+    /// The DIVERGED entity to settle.
+    pub entity_id: String,
+    /// The head rev that wins; every other contested head is discarded.
+    pub keep_rev: String,
+}
+
+#[derive(Deserialize, schemars::JsonSchema)]
+pub struct EntityArgs {
+    /// The entity id.
+    pub entity_id: String,
+}
+
+#[derive(Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct MarkArgs {
+    /// The entity id.
+    pub entity_id: String,
+    /// true = this fact was NOISE here (injected/recalled but only
+    /// distracting): demotes its promotion and feeds decay, locally.
+    /// Default false = useful.
+    #[serde(default)]
+    pub noise: bool,
+}
+// deny_unknown_fields is load-bearing on MarkArgs and nowhere else: `noise`
+// has a default, so a misspelled parameter (measured 2026-07-24: an agent
+// passed `quality: "noise"`) would silently deserialize as noise=false and
+// INVERT the judgment to useful - the one arg shape where tolerating unknown
+// fields flips the meaning instead of dropping an option.
+
+#[derive(Deserialize, schemars::JsonSchema)]
+pub struct ReprojectArgs {
+    /// The entity id to move (memories only, never repo chunks).
+    pub entity_id: String,
+    /// Target project key, or "global" for the cross-project tier.
+    pub project: String,
+}
+
+#[derive(Deserialize, schemars::JsonSchema)]
+pub struct BriefArgs {
+    /// Project key to brief on. Omitted = the server's current project.
+    #[serde(default)]
+    pub project: Option<String>,
+}
+
+#[tool_router]
+impl ThorServer {
+    pub fn new(store: EventStore, db: PathBuf) -> Self {
+        Self::from_shared(Arc::new(Mutex::new(store)), None, db, None)
+    }
+
+    /// `inbox`: when `Some`, this server is in replica divert mode - remember /
+    /// revise / retract queue to that inbox file instead of appending to the local
+    /// log (see inbox.rs). Only the HTTP server (the remote/NAS connector) ever
+    /// sets it; the stdio server (the local authority) always passes `None`.
+    pub fn from_shared(
+        store: Arc<Mutex<EventStore>>,
+        project: Option<String>,
+        db: PathBuf,
+        inbox: Option<PathBuf>,
+    ) -> Self {
+        ThorServer { store, project, db, tool_router: Self::tool_router(), inbox }
+    }
+
+    /// Run a sync store closure off the async runtime; its Ok/Err String is the
+    /// tool's returned text either way (tool errors are surfaced as content).
+    fn blocking<F>(&self, f: F) -> impl std::future::Future<Output = String>
+    where
+        F: FnOnce(&mut EventStore) -> Result<String, String> + Send + 'static,
+    {
+        let store = self.store.clone();
+        async move {
+            tokio::task::spawn_blocking(move || {
+                let mut s = store.lock().unwrap_or_else(|p| p.into_inner());
+                f(&mut s).unwrap_or_else(|e| e)
+            })
+            .await
+            .unwrap_or_else(|e| format!("error: task panicked: {e}"))
+        }
+    }
+
+    #[tool(description = "Search THOR memory and return the best-matching CURRENT-HEAD facts, ranked. Read-only. kind:\"memory\" excludes repo code chunks. This is the TEXT surface - for \"who calls X\" use where_used, for \"what breaks if I change X\" use impact, for a file's shape use outline (the call graph lives in the symbol sidecar, not in ranking).")]
+    async fn recall(&self, Parameters(args): Parameters<RecallArgs>) -> String {
+        let server_project = self.project.clone();
+        let db = self.db.clone();
+        self.blocking(move |s| {
+            // Scope: all_projects > explicit project > the server's current project.
+            let scope = if args.all_projects {
+                RecallScope::everything()
+            } else if args.project.is_some() {
+                RecallScope::current(args.project.clone())
+            } else {
+                RecallScope::current(server_project.clone())
+            };
+            let limit = args.limit.unwrap_or(8);
+            // A rerank pass rescoring only `limit` hits could never RESCUE a
+            // gold buried just below it - fetch the rescore pool size instead,
+            // reorder, then cut back to the requested limit.
+            #[cfg(feature = "semantic")]
+            let fetch = if args.rerank { limit.max(crate::rerank::RERANK_TOP_N) } else { limit };
+            #[cfg(not(feature = "semantic"))]
+            let fetch = limit;
+            let memories_only = args.kind.as_deref().is_some_and(|k| k.eq_ignore_ascii_case("memory"));
+            #[allow(unused_mut)]
+            let mut hits = if memories_only {
+                recall_memories_scoped(s, &args.query, fetch, &scope).map_err(|e| format!("error: {e}"))?
+            } else {
+                // Fused parity with the courier: a deliberate agent query gets
+                // the same semantic score-fusion path (bm25 on non-semantic
+                // builds or any semantic failure - recall_for degrades itself),
+                // plus the deliberate-only path-affinity boost.
+                crate::courier::recall_for(&db, s, &args.query, &scope, fetch, true)
+            };
+            // Scope pointers, the same registry the courier serves - and this
+            // surface needs it MORE: a chat on the hosted connector has no
+            // courier at all, so without this a fact scoped out of the global
+            // tier is unreachable unless the agent already guesses the scope.
+            // Skipped under all_projects (nothing is out of reach then).
+            let scope_hint_lines: String = if args.all_projects {
+                String::new()
+            } else {
+                let here = args.project.clone().or_else(|| server_project.clone());
+                crate::recall::recall_scoped(
+                    s,
+                    crate::courier::SCOPE_TAG,
+                    crate::courier::REGISTRY_LIMIT,
+                    &scope,
+                )
+                .map(|regs| {
+                    crate::courier::scope_hints(regs.into_iter(), &args.query, here.as_deref())
+                        .iter()
+                        .map(|h| {
+                            format!("Scope hint: {}\n", crate::courier::first_claim(&h.body))
+                        })
+                        .collect::<String>()
+                })
+                .unwrap_or_default()
+            };
+            if hits.is_empty() {
+                // The empty answer is where a pointer earns its keep: "nothing
+                // in this scope" plus "and here is the scope that has it".
+                return Ok(format!("No THOR hits for: {}\n{}", args.query, scope_hint_lines));
+            }
+            // Weak-match note: this channel fills every slot to `limit`, so a
+            // question about a domain that lives elsewhere still gets five
+            // confident-looking lines. Removing them was measured as too
+            // expensive (see recall::is_weak_match), so say it instead - once,
+            // only when EVERY hit is weak, and never removing anything.
+            let weak_note = if crate::ledger::flag_present(&db, "THOR-NO-WEAK-NOTE.flag") {
+                ""
+            } else if hits.iter().all(|h| crate::recall::is_weak_match(&h.body, &args.query, h.matched_and)) {
+                "Weak match: none of these hits covers half your question's terms or declares \
+                 a trigger for it - THOR may hold nothing on this topic in this scope. Prefer \
+                 a scope hint (if any), all_projects:true, or asking the user over answering \
+                 from these hits.\n"
+            } else {
+                ""
+            };
+            let mut rerank_note = "";
+            if args.rerank {
+                #[cfg(feature = "semantic")]
+                {
+                    let (reordered, applied) = crate::rerank::rerank_hits(&args.query, hits);
+                    hits = reordered;
+                    if !applied {
+                        rerank_note = "(rerank skipped: reranker model unavailable or nothing to reorder - fused order)\n";
+                    }
+                }
+                #[cfg(not(feature = "semantic"))]
+                {
+                    rerank_note = "(rerank unavailable: non-semantic build - fused order)\n";
+                }
+            }
+            hits.truncate(limit);
+            // Structure card: a structure-shaped query naming a symbol the
+            // sidecar resolves gets ONE composed prose answer prepended -
+            // definition, signature, callers per file, the related memory.
+            // Additive by construction: the ranked hits follow unchanged, so a
+            // misfire costs a few lines of accurate derived text and nothing
+            // else. This is the serving-form answer to the measured
+            // code-structure loss: THOR found the right file more often than
+            // the rival and lost the category by serving raw code where prose
+            // was needed.
+            let structure_card = if memories_only {
+                None
+            } else {
+                let card_project =
+                    if args.all_projects { None } else { args.project.clone().or_else(|| server_project.clone()) };
+                crate::symbols::SymbolStore::open_default(&db).ok().and_then(|sy| {
+                    crate::structure::detect(&args.query, &sy, card_project.as_deref()).and_then(
+                        |sym| crate::structure::card(s, &sy, &sym, card_project.as_deref()),
+                    )
+                })
+            };
+            // Index mode: one compact line per hit at a fraction of the full
+            // serving cost - the agent gets the map and `get`s what it needs.
+            if args.detail.as_deref().is_some_and(|d| d.eq_ignore_ascii_case("index")) {
+                let mut out = String::from(rerank_note);
+                if let Some(card) = &structure_card {
+                    out.push_str(card);
+                    out.push('\n');
+                }
+                for hit in hits {
+                    crate::ledger::increment(&db, "access", &hit.entity_id);
+                    let ty = hit.fact_type.map(|t| format!(" [{}]", t.as_str())).unwrap_or_default();
+                    let tag = if crate::repo::is_global(hit.project.as_deref()) {
+                        "[global]".to_string()
+                    } else {
+                        format!("[proj:{}]", hit.project.as_deref().unwrap_or("?"))
+                    };
+                    let first = first_line(&hit.body, 100);
+                    out.push_str(&format!("{}{} {} | {}\n", tag, ty, hit.entity_id, first));
+                }
+                out.push_str(weak_note);
+                out.push_str(&scope_hint_lines);
+                out.push_str("(full body: get <entity_id>)\n");
+                return Ok(out);
+            }
+            // Freshness context: the stdio server's launch cwd (the project the
+            // agent is working in). The HTTP server has no meaningful cwd and
+            // freshness passes through - it never re-reads another machine's disk.
+            let cwd = std::env::current_dir().ok().map(|c| c.display().to_string());
+            let fresh_project = cwd.as_deref().and_then(|c| crate::repo::project_key(Path::new(c)));
+            let mut out = String::from(rerank_note);
+            if let Some(card) = &structure_card {
+                out.push_str(card);
+                out.push('\n');
+            }
+            for hit in hits {
+                // A served hit is an access: counted in the LOCAL ledger (decay
+                // signal for consolidate), never in the synced hash-chained log.
+                crate::ledger::increment(&db, "access", &hit.entity_id);
+                let short = &hit.rev[..hit.rev.len().min(8)];
+                let (fresh_tag, snip) = crate::courier::serve_deliberate(
+                    s, &hit.entity_id, &hit.body, &args.query, fresh_project.as_deref(), cwd.as_deref(),
+                );
+                let diverged = if hit.is_diverged { " [DIVERGED]" } else { "" };
+                let ty = hit.fact_type.map(|t| format!(" [{}]", t.as_str())).unwrap_or_default();
+                let tag = if crate::repo::is_global(hit.project.as_deref()) {
+                    "[global]".to_string()
+                } else {
+                    format!("[proj:{}]", hit.project.as_deref().unwrap_or("?"))
+                };
+                out.push_str(&format!(
+                    "{}{} {} ({}{}{}): {}\n",
+                    tag, ty, hit.entity_id, short, diverged, fresh_tag, snip
+                ));
+            }
+            out.push_str(weak_note);
+            out.push_str(&scope_hint_lines);
+            out.push_str("(full body: get <entity_id>; helped you? mark <entity_id>)\n");
+            Ok(out)
+        })
+        .await
+    }
+
+    #[tool(description = "Show the current head(s) of one THOR entity by id (DIVERGED shows every contested head). The follow-up tool: recall/where_used/impact/outline hand out ids, get turns one id into its full body.")]
+    async fn get(&self, Parameters(args): Parameters<GetArgs>) -> String {
+        let db = self.db.clone();
+        self.blocking(move |s| {
+            let events = s.get_all_events().map_err(|e| format!("error: {e}"))?;
+            // Form-tolerant resolution on the miss path only, same discipline
+            // as mark: a uniquely-matching ref is served directly.
+            let target = if events.iter().any(|e| e.entity_id == args.entity_id) {
+                args.entity_id.clone()
+            } else {
+                resolve_entity_ref(s, &args.entity_id).unwrap_or_else(|| args.entity_id.clone())
+            };
+            // Only an EXISTING entity counts as an access - a typo'd id must not
+            // seed a phantom counter in the ledger.
+            if events.iter().any(|e| e.entity_id == target) {
+                crate::ledger::increment(&db, "access", &target);
+            }
+            Ok(render_get(&target, &events))
+        })
+        .await
+    }
+
+    #[tool(description = "Who calls this symbol? Name-based lookup on the derived symbol sidecar: the chunks that DEFINE the symbol and the chunks that CALL it. Reach for this - not recall - the moment a question names a function/symbol (\"who calls X\", \"where is X used\"). Follow with `get <chunk id>` for a caller's full body. Run `thor symbols` once if the sidecar is missing.")]
+    async fn where_used(&self, Parameters(args): Parameters<WhereUsedArgs>) -> String {
+        let server_project = self.project.clone();
+        let db = self.db.clone();
+        self.blocking(move |s| {
+            let sy = crate::symbols::SymbolStore::open_default(&db)
+                .map_err(|e| format!("symbol sidecar unavailable ({e}); run `thor symbols`"))?;
+            let project = resolve_symbol_project(args.project, server_project);
+            let defs = sy.definers_of(&args.symbol, project.as_deref());
+            let callers = sy.callers_of(&args.symbol, project.as_deref());
+            if defs.is_empty() && callers.is_empty() {
+                return Ok(format!(
+                    "No definitions or calls of '{}' in the symbol sidecar{}.",
+                    args.symbol,
+                    project.as_deref().map(|p| format!(" (project {p})")).unwrap_or_default()
+                ));
+            }
+            let mut out = String::new();
+            // The prose answer first - definition, signature, callers per file,
+            // related memory - then the raw id lists for `get`. A tool that
+            // answered with bare chunk ids made the reader do the composing.
+            if let Some(card) = crate::structure::card(s, &sy, &args.symbol, project.as_deref()) {
+                out.push_str(&card);
+                out.push_str("\n\n");
+            }
+            out.push_str(&format!("defined in ({}):\n", defs.len()));
+            for d in &defs {
+                out.push_str(&format!("  {d}\n"));
+            }
+            out.push_str(&format!("called from ({}):\n", callers.len()));
+            for c in callers.iter().take(40) {
+                out.push_str(&format!("  {c}\n"));
+            }
+            if callers.len() > 40 {
+                out.push_str(&format!("  ... {} more\n", callers.len() - 40));
+            }
+            out.push_str("(full body: get <chunk id>; resolution is name-based, not type-resolved)\n");
+            Ok(out)
+        })
+        .await
+    }
+
+    #[tool(description = "Change blast-radius of a symbol: reverse-walks the call edges (who calls it, who calls THOSE definers) up to depth 3. Reach for this - not recall - before touching a widely-used symbol (\"what breaks if I change X\", \"is this safe to rename\"). Name-based and heuristic - a triage map, not a type-checked proof. Needs the symbol sidecar (`thor symbols`).")]
+    async fn impact(&self, Parameters(args): Parameters<ImpactArgs>) -> String {
+        let server_project = self.project.clone();
+        let db = self.db.clone();
+        self.blocking(move |_s| {
+            let sy = crate::symbols::SymbolStore::open_default(&db)
+                .map_err(|e| format!("symbol sidecar unavailable ({e}); run `thor symbols`"))?;
+            let project = resolve_symbol_project(args.project, server_project);
+            let depth = args.depth.unwrap_or(2).clamp(1, 3);
+            let mut out = String::new();
+            let mut frontier: Vec<String> = vec![args.symbol.clone()];
+            let mut seen_chunks: std::collections::HashSet<String> = Default::default();
+            let mut total = 0usize;
+            for level in 1..=depth {
+                let mut next_names: Vec<String> = Vec::new();
+                let mut level_chunks: Vec<String> = Vec::new();
+                for name in &frontier {
+                    for caller in sy.callers_of(name, project.as_deref()) {
+                        if seen_chunks.insert(caller.clone()) {
+                            // the caller's own definitions are the next frontier
+                            next_names.extend(sy.defined_in(&caller));
+                            level_chunks.push(caller);
+                        }
+                    }
+                }
+                if level_chunks.is_empty() {
+                    break;
+                }
+                total += level_chunks.len();
+                out.push_str(&format!("depth {level}: {} caller chunk(s)\n", level_chunks.len()));
+                for c in level_chunks.iter().take(25) {
+                    out.push_str(&format!("  {c}\n"));
+                }
+                if level_chunks.len() > 25 {
+                    out.push_str(&format!("  ... {} more\n", level_chunks.len() - 25));
+                }
+                if total > 150 {
+                    out.push_str("(walk capped at 150 chunks)\n");
+                    break;
+                }
+                frontier = next_names;
+            }
+            if out.is_empty() {
+                return Ok(format!("No callers of '{}' in the symbol sidecar.", args.symbol));
+            }
+            out.push_str("(name-based reverse walk; full body: get <chunk id>)\n");
+            Ok(out)
+        })
+        .await
+    }
+
+    #[tool(description = "Signature map of one indexed file: per chunk its id and first line - a file overview at a fraction of Read's tokens. Reach for this - not recall, not a full Read - when you need a file's shape (\"what is in courier.rs\") rather than a fact or a specific body. Follow with `get <chunk id>` (peek) for one chunk's full body. Idea credit: mimir's outline/peek.")]
+    async fn outline(&self, Parameters(args): Parameters<OutlineArgs>) -> String {
+        let server_project = self.project.clone();
+        self.blocking(move |s| {
+            let events = s.get_all_events().map_err(|e| format!("error: {e}"))?;
+            let heads = crate::cas::compute_head_sets(&events);
+            let by_hash: std::collections::HashMap<&str, &crate::event_store::Event> =
+                events.iter().map(|e| (e.this_hash.as_str(), e)).collect();
+            let want = {
+                let w = args.path.replace('\\', "/").to_lowercase();
+                w.trim_matches('/').to_string()
+            };
+            let proj_filter = args.project.or(server_project);
+            // (file rel, ordinal, entity id, first line, chars)
+            let mut rows: Vec<(String, usize, String, String, usize)> = Vec::new();
+            for (id, hs) in &heads {
+                if !crate::repo::is_chunk_id(id) {
+                    continue;
+                }
+                let Some((proj, rest)) = id.split_once(':') else { continue };
+                if proj_filter.as_deref().is_some_and(|p| p != proj) {
+                    continue;
+                }
+                let Some((rel, ord)) = rest.rsplit_once('#') else { continue };
+                let rl = rel.replace('\\', "/").to_lowercase();
+                // full path or a clean suffix ("pages/Fleet.jsx" matches, "eet.jsx" does not)
+                if !(rl == want || rl.ends_with(&format!("/{want}"))) {
+                    continue;
+                }
+                let Ok(ord) = ord.parse::<usize>() else { continue };
+                let mut live: Option<&crate::event_store::Event> = None;
+                for rev in &hs.heads {
+                    if let Some(ev) = by_hash.get(rev.as_str()) {
+                        if !matches!(ev.kind, EventKind::FactRetracted)
+                            && ev.seq > live.map_or(i64::MIN, |l| l.seq)
+                        {
+                            live = Some(ev);
+                        }
+                    }
+                }
+                let Some(ev) = live else { continue };
+                let body = crate::footer::strip(&ev.body);
+                rows.push((
+                    format!("{proj}:{rel}"),
+                    ord,
+                    id.clone(),
+                    first_line(&body, 110),
+                    body.chars().count(),
+                ));
+            }
+            if rows.is_empty() {
+                return Ok(format!("No indexed chunks match path '{}'.", args.path));
+            }
+            rows.sort();
+            let mut out = String::new();
+            let mut current_file = String::new();
+            // The chunk id is not printed per line (it would dominate a compact
+            // outline); one example id goes in the peek hint below instead.
+            for (file, ord, _id, first, chars) in &rows {
+                if *file != current_file {
+                    let n = rows.iter().filter(|r| &r.0 == file).count();
+                    let total: usize = rows.iter().filter(|r| &r.0 == file).map(|r| r.4).sum();
+                    out.push_str(&format!("{file} ({n} chunks, {total} chars)\n"));
+                    current_file = file.clone();
+                }
+                out.push_str(&format!("  #{ord} ({chars} ch): {first}\n"));
+            }
+            out.push_str(&format!("(peek one chunk: get <id>, e.g. get {})\n", rows[0].2));
+            Ok(out)
+        })
+        .await
+    }
+
+    #[tool(description = "Show one entity's full revision history (seq, kind, rev, parent per event).")]
+    async fn history(&self, Parameters(args): Parameters<EntityArgs>) -> String {
+        self.blocking(move |s| {
+            let events = s.get_events_by_entity(&args.entity_id).map_err(|e| format!("error: {e}"))?;
+            Ok(render_history(&args.entity_id, &events))
+        })
+        .await
+    }
+
+    #[tool(description = "Store a NEW fact (fact_created). Recall first; a near-duplicate of a live fact is refused with a pointer to it. Accepts fact_type (gotcha|decision|preference), tags, and triggers - ask yourself WHEN this fact should fire and pass those exact task words (commands, file names, error strings) so future recall boosts it at the right moment.")]
+    async fn remember(&self, Parameters(args): Parameters<RememberArgs>) -> String {
+        let server_project = self.project.clone();
+        let inbox = self.inbox.clone();
+        self.blocking(move |s| {
+            let body = args.body.trim();
+            if body.is_empty() {
+                return Err("a non-empty 'body' is required".to_string());
+            }
+            // Same write-time integrity check as revise: a caller pasting a
+            // pre-baked (and possibly malformed) [memory/...] footer into the
+            // body would end up with a degraded or doubled footer once
+            // compose() appends its own.
+            if let Some(defect) = crate::footer::write_defect(body) {
+                return Err(format!("body refused: {defect}"));
+            }
+            let mint = match args.project {
+                Some(p) if p.eq_ignore_ascii_case("global") => None,
+                Some(p) => {
+                    // Same validation as init/reproject/ingest: a key with ':' or
+                    // '#' would mis-split the minted id and silently mis-scope
+                    // the fact (owner_project takes the prefix before the FIRST ':').
+                    crate::repo::validate_project_key(&p)?;
+                    Some(p)
+                }
+                None => server_project,
+            };
+            let entity_id = match args.entity_id.filter(|s| !s.is_empty()) {
+                // A caller-supplied id is used verbatim (its prefix defines scope) -
+                // but never a chunk id: repo chunks are managed by ingest alone, and
+                // a fact_created on one would mint a contested head ingest can never
+                // reconcile. (Existing MEMORY ids are refused atomically below.)
+                Some(id) => {
+                    if crate::repo::is_chunk_id(&id) {
+                        return Err(format!(
+                            "{} is a repo chunk id (managed by ingest); omit entity_id to mint a \
+                             memory id",
+                            id
+                        ));
+                    }
+                    id
+                }
+                // A scoped memory is `<key>:mem-<uuid>`, global `mcp-<uuid>`.
+                None => crate::repo::memory_entity_id(mint.as_deref(), &Uuid::new_v4().to_string()),
+            };
+            // Typed footer, stamped at write time via the footer module (the
+            // format's single owner - the same code every parser reads back).
+            // Only when the caller passed a type or tags.
+            let clean_body = body.to_string();
+            let mut body = body.to_string();
+            let triggers = args.triggers.unwrap_or_default();
+            let anchors = args.anchors.unwrap_or_default();
+            if let Some(exp) = args.expires.as_deref() {
+                if !crate::footer::valid_expiry(exp) {
+                    return Err(format!(
+                        "expires must be a YYYY-MM-DD date (got '{exp}'); the fact stops \
+                         surfacing in recall after that day but stays in history"
+                    ));
+                }
+            }
+            if let Some(p) = args.provenance.as_deref() {
+                if !matches!(p, "verified" | "inferred") {
+                    return Err(format!("provenance must be 'verified' or 'inferred' (got '{p}')"));
+                }
+            }
+            if let Some(why) = anchors.iter().find_map(|a| crate::footer::overbroad_anchor(a)) {
+                return Err(format!(
+                    "that anchor is too broad to be a gate: {why}. The guard has no noise \
+                     headroom, and a broad anchor also feeds itself usage credit every time it \
+                     coincidentally fires. Nothing was stored - retry with a specific anchor, or \
+                     drop the anchors and store the fact without one."
+                ));
+            }
+            // A self-declared MILESTONE / MIJLPAAL with no expiry gets one, here
+            // at the write, because the alternative was measured and does not
+            // hold: 61 such facts had accumulated to 11.6% of all stored text
+            // with zero expiries, and hand-cleaning them is neither scalable nor
+            // durable. Nothing is lost (get/history serve an expired fact in
+            // full) and the escape is per-fact, not a global switch: pass an
+            // explicit `expires`, or revise it away afterwards.
+            let auto_expiry: Option<String> = (args.expires.is_none()
+                && crate::footer::report_shaped(&clean_body))
+                .then(|| crate::footer::days_from_today(crate::footer::REPORT_EXPIRY_DAYS));
+            let effective_expiry = args.expires.as_deref().or(auto_expiry.as_deref());
+            if args.fact_type.is_some()
+                || args.tags.as_deref().is_some_and(|t| !t.is_empty())
+                || !triggers.is_empty()
+                || !anchors.is_empty()
+                || effective_expiry.is_some()
+                || args.provenance.is_some()
+            {
+                let scope_label = crate::repo::owner_project(&entity_id)
+                    .map(str::to_string)
+                    .unwrap_or_else(|| "global".into());
+                let footer = crate::footer::compose_full(
+                    args.fact_type.as_deref().unwrap_or("note"),
+                    &args.tags.unwrap_or_default(),
+                    &scope_label,
+                    &triggers,
+                    &anchors,
+                    effective_expiry,
+                    args.provenance.as_deref(),
+                );
+                body.push_str("\n\n");
+                body.push_str(&footer);
+            }
+            // Near-duplicate refusal + entity-exists refusal, ATOMIC with the
+            // append (same immediate write lock), so a concurrent writer process
+            // cannot slip an equal fact between check and append. Same
+            // normalization as recall's near-duplicate collapse (footer-stripped,
+            // so a typed fact's footer cannot defeat it), scoped to where the NEW
+            // fact will live - the same body deliberately stored for a different
+            // project is a legitimate write, not a duplicate.
+            // Replica divert: queue the fully-prepared create (footer already in
+            // `body`, id already minted) to the capture inbox instead of forking
+            // the local log; the authority's drain-inbox re-runs the same dedup.
+            if let Some(path) = &inbox {
+                let op = crate::inbox::InboxOp {
+                    op: "create".into(),
+                    entity_id: entity_id.clone(),
+                    body: body.clone(),
+                    parent_rev: None,
+                    ts: crate::inbox::now_ts(),
+                    capture_id: Uuid::new_v4().to_string(),
+                };
+                return match crate::inbox::append(path, &op) {
+                    Ok(()) => Ok(format!(
+                        "queued to capture inbox: entity {} (pending sync to the authority)",
+                        entity_id
+                    )),
+                    Err(e) => Err(format!("capture inbox write failed: {e}")),
+                };
+            }
+            let scope = RecallScope::current(crate::repo::owner_project(&entity_id).map(str::to_string));
+            let prefix = crate::recall::dedup_prefix(&clean_body);
+            match s.append_created_unique("mcp", "mcp-session", "mcp", &entity_id, &body, |_, project, head_body| {
+                scope.allows(project) && crate::recall::dedup_prefix(head_body) == prefix
+            }) {
+                Ok(ev) => {
+                    let mut out = format!("stored entity {} rev {}", entity_id, ev.this_hash);
+                    if let Some(exp) = &auto_expiry {
+                        out.push_str(&format!(
+                            "\nReport-shaped (it opens as a MILESTONE), so it was stored with \
+                             expires: {exp} - six weeks. A report's operational value is short and \
+                             its body is long, so it would otherwise outrank real answers about its \
+                             own subject by sheer mass. It stays in full in get/history; recall \
+                             stops serving it after that date. What LASTS (which version is live, \
+                             where it runs, the current contract) does not belong here at all: put \
+                             it in ONE rolling fact and revise that, so the next report never \
+                             becomes the twelfth copy. Pass an explicit expires, or revise this one \
+                             away, if it must keep surfacing.",
+                        ));
+                    }
+                    // The inverse trap, measured live 2026-07-26: a body that
+                    // OPENS as a rule got an expiry and silently stopped
+                    // surfacing on its date. Rules never expire (doctrine);
+                    // warn - never refuse, a genuinely temporary rule ("pin
+                    // until upstream fixes it") legitimately carries a date.
+                    if args.expires.is_some() && crate::footer::rule_shaped(&clean_body) {
+                        out.push_str(
+                            "\nThis body opens as a RULE and you set an expiry. Doctrine: reports \
+                             expire, rules never - after this date the rule silently stops \
+                             surfacing in recall. If it is a genuinely temporary rule, keep the \
+                             date; otherwise revise with expires: \"\" to remove it, or split the \
+                             lasting rule into its own fact.",
+                        );
+                    }
+                    // Scope question at the moment of storing (2026-07-24):
+                    // a GLOBAL fact injects into EVERY project. Right for
+                    // cross-cutting agent rules, wrong for domain knowledge -
+                    // the measured recurring noise class is exactly domain
+                    // facts in the global tier. Ask now, while the author still
+                    // holds the context; the user decides.
+                    if crate::repo::owner_project(&entity_id).is_none() {
+                        out.push_str(
+                            "\nLanded GLOBAL - it will surface in every project. Rule of thumb: \
+                             agent rules that must hold everywhere stay global; DOMAIN knowledge \
+                             (one project, a hobby, finance, one machine) belongs in a scope. If \
+                             this is domain knowledge, propose a concrete scope to the user (an \
+                             existing project key, or a new one like 'Investments') and move it \
+                             with reproject on their yes. Deliberate recall still reaches scoped \
+                             facts from anywhere (project:\"<key>\" or all_projects:true).",
+                        );
+                    }
+                    // Anchor question, under a strict ONE-advisory cap: the reply
+                    // must not grow a third paragraph on every typed write, so
+                    // this fires only when the scope question did not. Measured
+                    // 2026-07-26: 181 of 717 live facts carry anchors, and the
+                    // guard - the one channel measured to change behaviour - can
+                    // reach ONLY anchored facts, so three quarters of the store
+                    // is invisible to it. Proposes; never fills one in itself.
+                    else if anchors.is_empty()
+                        && matches!(args.fact_type.as_deref(), Some("gotcha") | Some("decision"))
+                    {
+                        if let Some(cand) = crate::footer::anchor_candidate(&clean_body) {
+                            out.push_str(&format!(
+                                "\nNo anchors, and this body names '{cand}'. An anchor is the only \
+                                 way a fact reaches the moment-of-action guard - retrieval alone \
+                                 does not change behaviour, a gate does. If this fact GOVERNS that \
+                                 file or command, revise it with anchors: [\"{cand}\"] (a path or a \
+                                 full invocation, never a bare role name or tool name). And when a \
+                                 gate carries it, tag it `guarded` in the same turn, so the \
+                                 per-prompt block stops repeating what the gate already enforces."
+                            ));
+                        }
+                    }
+                    Ok(out)
+                }
+                Err(e) => match e.downcast_ref::<MutateConflict>() {
+                    Some(c) if c.reason.starts_with("near-duplicate") => Err(format!(
+                        "NOT stored: near-duplicate of {} (rev {}). Use revise(entity_id:\"{}\") to \
+                         update it, mark(entity_id:\"{}\") if it just proved useful, or reword if it is \
+                         genuinely a different fact.",
+                        c.entity_id,
+                        c.current_heads.first().map(|r| &r[..r.len().min(8)]).unwrap_or(""),
+                        c.entity_id,
+                        c.entity_id
+                    )),
+                    Some(c) => Err(format!(
+                        "NOT stored: {} - {}. Current head-set: {:?}.",
+                        c.entity_id, c.reason, c.current_heads
+                    )),
+                    None => Err(format!("error: {e}")),
+                },
+            }
+        })
+        .await
+    }
+
+    #[tool(description = "Update an existing fact (fact_revised). Content modes (pick one): 'body' replaces the whole content; 'append' adds a paragraph under the current content (the cheap status update); 'replace_from'+'replace_to' does one exact, unique in-place edit (ambiguous or unmatched text is rejected, never silently applied). Metadata fields (fact_type/tags/triggers/anchors/expires/provenance) edit ONLY the footer and combine with any content mode - fixing an anchor or adding a status line never means retyping the fact. Single-headed facts auto-fill parent_rev; a stale parent_rev is rejected with the fresh head-set (no silent branch). Prefer this over remember for a fact that CHANGED.")]
+    async fn revise(&self, Parameters(args): Parameters<ReviseArgs>) -> String {
+        let inbox = self.inbox.clone();
+        self.blocking(move |s| {
+            // Metadata params -> footer field edits, validated like remember.
+            let mut edits = crate::footer::FieldEdits::default();
+            edits.fact_type =
+                args.fact_type.as_deref().map(str::trim).filter(|t| !t.is_empty()).map(str::to_string);
+            edits.tags = args.tags.clone();
+            edits.triggers = args.triggers.clone();
+            edits.anchors = args.anchors.clone();
+            // Same specificity floor as remember: a broad anchor is worse than
+            // no anchor, and revise is the surface a retro-anchoring sweep uses.
+            if let Some(why) = args
+                .anchors
+                .iter()
+                .flatten()
+                .find_map(|a| crate::footer::overbroad_anchor(a))
+            {
+                return Err(format!(
+                    "rejected: that anchor is too broad to be a gate: {why}. Nothing was changed."
+                ));
+            }
+            if let Some(exp) = args.expires.as_deref() {
+                let exp = exp.trim();
+                if exp.is_empty() {
+                    edits.expires = Some(None);
+                } else if !crate::footer::valid_expiry(exp) {
+                    return Err(format!(
+                        "expires must be a YYYY-MM-DD date (got '{exp}'); pass an empty string \
+                         to remove the expiry instead"
+                    ));
+                } else {
+                    edits.expires = Some(Some(exp.to_string()));
+                }
+            }
+            if let Some(p) = args.provenance.as_deref() {
+                let p = p.trim();
+                if p.is_empty() {
+                    edits.provenance = Some(None);
+                } else if matches!(p, "verified" | "inferred") {
+                    edits.provenance = Some(Some(p.to_string()));
+                } else {
+                    return Err(format!(
+                        "provenance must be 'verified' or 'inferred' (got '{p}'); pass an empty \
+                         string to remove it"
+                    ));
+                }
+            }
+            let mut body_owned: Option<String> =
+                args.body.as_deref().map(str::trim).filter(|b| !b.is_empty()).map(str::to_string);
+            let mut parent_arg: Option<String> = args.parent_rev.clone();
+            // Body surgery (append / replace_from+replace_to): the measured
+            // revise friction was "a one-line status change means retyping the
+            // whole body". Same shape as the metadata field-surgery: read the
+            // head HERE, apply the edit to the CONTENT only, keep the footer,
+            // and bake the final body before the divert below.
+            let append = args.append.as_deref().map(str::trim).filter(|s| !s.is_empty());
+            let (rf, rt) = (args.replace_from.as_deref(), args.replace_to.as_deref());
+            if rf.is_some() != rt.is_some() {
+                return Err("replace_from and replace_to come together (replace_to may be an \
+                            empty string to delete the matched text)"
+                    .to_string());
+            }
+            if append.is_some() || rf.is_some() {
+                if body_owned.is_some() {
+                    return Err("pass either a full 'body' OR append/replace_from - not both \
+                                (a full body already says everything)"
+                        .to_string());
+                }
+                if append.is_some() && rf.is_some() {
+                    return Err(
+                        "pass either 'append' OR 'replace_from'/'replace_to', not both".to_string()
+                    );
+                }
+                let (rev, head_body, _project) =
+                    head_for_field_edit(s, &args.entity_id, args.parent_rev.as_deref())?;
+                let content = crate::footer::strip(&head_body).trim_end().to_string();
+                let new_content = if let Some(add) = append {
+                    format!("{content}\n\n{add}")
+                } else {
+                    let from = rf.unwrap();
+                    if from.trim().is_empty() {
+                        return Err("replace_from must be non-empty".to_string());
+                    }
+                    let n = content.matches(from).count();
+                    if n == 0 {
+                        return Err(format!(
+                            "replace_from not found in the content of {} - nothing changed. \
+                             The text must match exactly (check spacing and quotes); the \
+                             footer has its own parameters (fact_type/tags/...).",
+                            args.entity_id
+                        ));
+                    }
+                    if n > 1 {
+                        return Err(format!(
+                            "replace_from matches {n} times in {} - include surrounding words \
+                             so it matches exactly once (an ambiguous edit is never applied).",
+                            args.entity_id
+                        ));
+                    }
+                    content.replacen(from, rt.unwrap(), 1)
+                };
+                body_owned = Some(match crate::footer::extract(&head_body) {
+                    Some(f) => format!("{new_content}\n\n{f}"),
+                    None => new_content,
+                });
+                parent_arg = parent_arg.or(Some(rev));
+            }
+            let body_arg = body_owned.as_deref();
+            if body_arg.is_none() && edits.is_empty() {
+                return Err(
+                    "provide a corrected 'body', an 'append' or 'replace_from'/'replace_to' \
+                     edit, one or more metadata fields (fact_type, tags, triggers, anchors, \
+                     expires, provenance), or a combination"
+                        .to_string(),
+                );
+            }
+            // Resolve the final body + parent. With metadata edits the head is
+            // read HERE and the footer surgery baked in BEFORE the replica
+            // divert below, so the inbox queues exactly the body the authority
+            // will replay - a divert of raw params would re-run the surgery
+            // against a head that may have moved by then.
+            let (body, parent_rev) = if edits.is_empty() {
+                (body_arg.unwrap_or_default().to_string(), parent_arg.clone())
+            } else {
+                let (rev, head_body, project) =
+                    head_for_field_edit(s, &args.entity_id, parent_arg.as_deref())?;
+                let base = match body_arg {
+                    Some(b) => {
+                        crate::footer::carry_over(b, &head_body).unwrap_or_else(|| b.to_string())
+                    }
+                    None => head_body,
+                };
+                let new_body = match crate::footer::extract(&base) {
+                    Some(f) => {
+                        let edited = crate::footer::edit_footer(f, &edits).ok_or_else(|| {
+                            format!(
+                                "the footer of {} is not in the [memory/...] form ({f}); \
+                                 revise with a full corrected body instead",
+                                args.entity_id
+                            )
+                        })?;
+                        format!("{}\n\n{}", crate::footer::strip(&base).trim_end(), edited)
+                    }
+                    // Footerless fact: mint a canonical footer from the edits
+                    // (same shape remember stamps), project label included.
+                    None => {
+                        let label = project.unwrap_or_else(|| "global".into());
+                        let footer = crate::footer::compose_full(
+                            edits.fact_type.as_deref().unwrap_or("note"),
+                            &edits.tags.clone().unwrap_or_default(),
+                            &label,
+                            &edits.triggers.clone().unwrap_or_default(),
+                            &edits.anchors.clone().unwrap_or_default(),
+                            edits.expires.clone().flatten().as_deref(),
+                            edits.provenance.clone().flatten().as_deref(),
+                        );
+                        format!("{}\n\n{}", base.trim_end(), footer)
+                    }
+                };
+                (new_body, Some(rev))
+            };
+            let body = body.as_str();
+            // Write-time footer integrity: a malformed footer (CLI-dump tail,
+            // missing blank-line separator) silently loses the fact's type and
+            // leaks bracket syntax into served snippets - measured live as 16
+            // broken heads. Refuse with the exact defect so the caller fixes
+            // the body instead of storing a degraded head.
+            if let Some(defect) = crate::footer::write_defect(body) {
+                return Err(format!("body refused: {defect}"));
+            }
+            // Replica divert: queue the revise for the authority to replay.
+            if let Some(path) = &inbox {
+                let op = crate::inbox::InboxOp {
+                    op: "revise".into(),
+                    entity_id: args.entity_id.clone(),
+                    body: body.to_string(),
+                    parent_rev: parent_rev.clone(),
+                    ts: crate::inbox::now_ts(),
+                    capture_id: Uuid::new_v4().to_string(),
+                };
+                return match crate::inbox::append(path, &op) {
+                    Ok(()) => Ok(format!(
+                        "queued to capture inbox: revise {} (pending sync to the authority)",
+                        args.entity_id
+                    )),
+                    Err(e) => Err(format!("capture inbox write failed: {e}")),
+                };
+            }
+            match s.append_mutate_checked(
+                "mcp",
+                "mcp-session",
+                "mcp",
+                EventKind::FactRevised,
+                &args.entity_id,
+                parent_rev.as_deref(),
+                body,
+            ) {
+                Ok(ev) => {
+                    // Doctrine check at the only moment it can act: setting an
+                    // expiry on a body that OPENS as a rule is probably a
+                    // mistake (rules never expire; a HARDE REGEL fact expired
+                    // unnoticed this way, measured 2026-07-26). Warn, never
+                    // refuse - a genuinely temporary rule keeps its date.
+                    let rule_expiry_note = if matches!(edits.expires, Some(Some(_)))
+                        && crate::footer::rule_shaped(crate::footer::strip(&ev.body))
+                    {
+                        "\nThis fact opens as a RULE and now carries an expiry. Doctrine: reports \
+                         expire, rules never - after that date the rule silently stops surfacing \
+                         in recall. If it is not genuinely temporary, revise with expires: \"\" \
+                         to remove the date, or lift the lasting rule into its own fact first."
+                    } else {
+                        ""
+                    };
+                    // A body with no footer of its own inherits the previous
+                    // one (footer::carry_over) - protective for tags and type,
+                    // but it silently carries an `expires` date the caller may
+                    // well have been trying to drop. The write succeeds either
+                    // way, and the difference only shows up weeks later when the
+                    // fact stops surfacing, so say it now, at the only moment
+                    // the caller can act on it.
+                    let carried = if crate::footer::extract(body).is_none() {
+                        crate::footer::extract(&ev.body).and_then(crate::footer::expires)
+                    } else {
+                        None
+                    };
+                    match carried {
+                        Some(exp) => Ok(format!(
+                            "revised {} -> rev {}\nnote: this fact still expires on {exp}. Your body \
+                             carried no footer, so the previous one was kept, expiry included. To \
+                             change or drop the date, revise again with just the expires parameter \
+                             (a new YYYY-MM-DD, or an empty string to remove it).{rule_expiry_note}",
+                            args.entity_id, ev.this_hash
+                        )),
+                        None => Ok(format!(
+                            "revised {} -> rev {}{rule_expiry_note}",
+                            args.entity_id, ev.this_hash
+                        )),
+                    }
+                }
+                Err(e) => Err(render_mutate_err(s, &args.entity_id, e)),
+            }
+        })
+        .await
+    }
+
+    #[tool(description = "Retract a wrong or obsolete fact (fact_retracted): recall stops surfacing it, the log keeps its history. Same CAS rules as revise.")]
+    async fn retract(&self, Parameters(args): Parameters<RetractArgs>) -> String {
+        let inbox = self.inbox.clone();
+        self.blocking(move |s| {
+            // Never store an empty retraction body: a retracted rev STAYS a head,
+            // and when it is one side of a DIVERGED entity the courier renders its
+            // body - a blank, unlabeled line is not something an agent can
+            // reconcile against.
+            let body = args
+                .reason
+                .filter(|r| !r.trim().is_empty())
+                .unwrap_or_else(|| "[retracted via mcp]".to_string());
+            // Replica divert: queue the retract for the authority to replay.
+            if let Some(path) = &inbox {
+                let op = crate::inbox::InboxOp {
+                    op: "retract".into(),
+                    entity_id: args.entity_id.clone(),
+                    body: body.clone(),
+                    parent_rev: args.parent_rev.clone(),
+                    ts: crate::inbox::now_ts(),
+                    capture_id: Uuid::new_v4().to_string(),
+                };
+                return match crate::inbox::append(path, &op) {
+                    Ok(()) => Ok(format!(
+                        "queued to capture inbox: retract {} (pending sync to the authority)",
+                        args.entity_id
+                    )),
+                    Err(e) => Err(format!("capture inbox write failed: {e}")),
+                };
+            }
+            match s.append_mutate_checked(
+                "mcp",
+                "mcp-session",
+                "mcp",
+                EventKind::FactRetracted,
+                &args.entity_id,
+                args.parent_rev.as_deref(),
+                &body,
+            ) {
+                Ok(ev) => Ok(format!("retracted {} (rev {})", args.entity_id, ev.this_hash)),
+                Err(e) => Err(render_mutate_err(s, &args.entity_id, e)),
+            }
+        })
+        .await
+    }
+
+    #[tool(description = "Settle a DIVERGED entity: keep_rev becomes the single head, every other contested head is discarded. Run when get/recall shows [DIVERGED] and you know which head is right.")]
+    async fn resolve(&self, Parameters(args): Parameters<ResolveArgs>) -> String {
+        let inbox = self.inbox.clone();
+        self.blocking(move |s| {
+            // Replica refusal (not a divert): a resolve is a decision against
+            // the CURRENT head-set, and this replica's heads can be an hour
+            // stale - queueing the decision could settle the wrong divergence.
+            // Appending it here would fork the log (the measured 2026-07-22
+            // class). The authority is the only correct place.
+            if inbox.is_some() {
+                return Err(format!(
+                    "not resolved: this is a read replica - a resolve appended here would fork \
+                     the replica's log and block the next sync, and this replica's head-set can \
+                     be stale. Run resolve({}) on the authority (the local stdio THOR).",
+                    args.entity_id
+                ));
+            }
+            // Derive the discard set from the current heads; append_resolve
+            // re-verifies the citation under the write lock, so a concurrent
+            // change comes back as a conflict instead of a wrong resolve.
+            let events = s.get_all_events().map_err(|e| format!("error: {e}"))?;
+            let heads = crate::cas::compute_head_sets(&events);
+            let current = heads
+                .get(&args.entity_id)
+                .map(|h| h.heads.clone())
+                .unwrap_or_default();
+            if current.is_empty() {
+                return Err(unknown_entity_msg(s, &args.entity_id));
+            }
+            let discarded: Vec<String> =
+                current.iter().filter(|r| **r != args.keep_rev).cloned().collect();
+            match s.append_resolve("mcp", "mcp-session", "mcp", &args.entity_id, &args.keep_rev, &discarded) {
+                Ok(_) => Ok(format!("resolved {}: kept rev {}", args.entity_id, args.keep_rev)),
+                Err(e) => match e.downcast_ref::<ResolveConflict>() {
+                    Some(c) => Err(format!(
+                        "resolve rejected: {}. Current head-set: {:?} - re-run citing exactly these.",
+                        c.reason, c.current_heads
+                    )),
+                    None => Err(format!("error: {e}")),
+                },
+            }
+        })
+        .await
+    }
+
+    #[tool(description = "Mark a fact as USEFUL (it actually answered your question / prevented a mistake), or with noise:true as NOISE (it was injected/recalled but only distracted here). Marking honestly improves your own future recall: useful feeds the promotion prior, noise demotes and feeds decay. Useful is a synced head-neutral event; noise stays in the local ledger.")]
+    async fn mark(&self, Parameters(args): Parameters<MarkArgs>) -> String {
+        let db = self.db.clone();
+        let inbox = self.inbox.clone();
+        self.blocking(move |s| {
+            // Form-tolerant id resolution: a uniquely-matching bare/prefixed/
+            // truncated ref is used directly (the reply names the full id)
+            // instead of burning the agent's turn on a retry.
+            let entity_id = if s
+                .get_events_by_entity(&args.entity_id)
+                .map_err(|e| format!("error: {e}"))?
+                .is_empty()
+            {
+                match resolve_entity_ref(s, &args.entity_id) {
+                    Some(full) => full,
+                    None => return Err(unknown_entity_msg(s, &args.entity_id)),
+                }
+            } else {
+                args.entity_id.clone()
+            };
+            let resolved_note = if entity_id != args.entity_id {
+                format!(" (resolved from '{}')", args.entity_id)
+            } else {
+                String::new()
+            };
+            let args = MarkArgs { entity_id, noise: args.noise };
+            if args.noise {
+                if inbox.is_some() {
+                    return Err(format!(
+                        "not marked: this is a read replica, and a noise mark is a LOCAL counter \
+                         by design (never synced) - here it would train a ledger your real \
+                         sessions never read. Run mark({}, noise: true) on the authority (the \
+                         local stdio THOR).",
+                        args.entity_id
+                    ));
+                }
+                // "Noise for me during this task" is a LOCAL judgement, not an
+                // institutional fact: it lives in the ledger, never the synced
+                // log (see crate::strength for how it counts against echoes).
+                crate::ledger::increment(&db, "noise", &args.entity_id);
+                // Moment-of-judgment feedback (2026-07-24): a GLOBAL fact
+                // that keeps collecting noise marks is usually a SCOPE problem,
+                // not a ranking problem - the global tier injects into every
+                // project, so domain facts (finance, hobby) bleed everywhere.
+                // Say so exactly when the judgment lands, with the fix in hand.
+                let count = crate::ledger::counter(&db, "noise", &args.entity_id);
+                let global = crate::courier::live_head_body(s, &args.entity_id)
+                    .map(|b| crate::repo::is_global(crate::footer::project(&b).as_deref()))
+                    .unwrap_or(false);
+                if global && count >= 2 {
+                    return Ok(format!(
+                        "marked {}{} as noise (local; {} noise marks now). This is a GLOBAL \
+                         fact - the global tier injects into every project, so a repeat \
+                         offender here is a SCOPE problem, not a ranking problem. If it \
+                         belongs to one domain (finance, a hobby, one machine), propose \
+                         moving it to a narrower project scope with reproject (ask the \
+                         user first): it then only surfaces there.",
+                        args.entity_id, resolved_note, count
+                    ));
+                }
+                return Ok(format!("marked {}{} as noise (local)", args.entity_id, resolved_note));
+            }
+            // Replica divert: a useful-mark is a SYNCED log event, and appending
+            // it here is exactly the measured fork class (2026-07-22: four
+            // fact_echoed events written straight into the replica log blocked
+            // shipping for half a day). Queue it like every other write.
+            if let Some(path) = &inbox {
+                let op = crate::inbox::InboxOp {
+                    op: "mark".into(),
+                    entity_id: args.entity_id.clone(),
+                    body: String::new(),
+                    parent_rev: None,
+                    ts: crate::inbox::now_ts(),
+                    capture_id: Uuid::new_v4().to_string(),
+                };
+                return match crate::inbox::append(path, &op) {
+                    Ok(()) => Ok(format!(
+                        "queued to capture inbox: mark {}{} (pending sync to the authority)",
+                        args.entity_id, resolved_note
+                    )),
+                    Err(e) => Err(format!("capture inbox write failed: {e}")),
+                };
+            }
+            s.append_event("mcp", "mcp-session", "mcp", EventKind::FactEchoed, &args.entity_id, None, "")
+                .map_err(|e| format!("error: {e}"))?;
+            Ok(format!("marked {}{} as useful", args.entity_id, resolved_note))
+        })
+        .await
+    }
+
+    #[tool(description = "Pin a fact: its full body is then re-injected at EVERY session start and right after a compaction (<thor-brief>). Use for standing rules the user states (\"never X on prod\").")]
+    async fn pin(&self, Parameters(args): Parameters<EntityArgs>) -> String {
+        let db = self.db.clone();
+        let inbox = self.inbox.clone();
+        self.blocking(move |s| {
+            // Replica refusal: pins live in a LOCAL ledger next to the store
+            // (never shipped), so a pin here would silently train a brief your
+            // real sessions never see. Refusing beats a successful no-op.
+            if inbox.is_some() {
+                return Err(format!(
+                    "not pinned: this is a read replica, and pins are local to the machine they \
+                     are set on - a pin here would never appear in your real session briefs. Run \
+                     pin({}) on the authority (the local stdio THOR).",
+                    args.entity_id
+                ));
+            }
+            if s.get_events_by_entity(&args.entity_id).map_err(|e| format!("error: {e}"))?.is_empty() {
+                return Err(unknown_entity_msg(s, &args.entity_id));
+            }
+            // One write transaction: a concurrent pin (CLI, another session)
+            // can no longer be dropped by a last-write-wins overwrite.
+            let mut already = false;
+            let pins = crate::ledger::mutate_pins(&db, |mut pins| {
+                if pins.contains(&args.entity_id) {
+                    already = true;
+                } else {
+                    pins.push(args.entity_id.clone());
+                }
+                pins
+            })
+            .map_err(|e| format!("error: {e}"))?;
+            if already {
+                return Ok(format!("already pinned: {}", args.entity_id));
+            }
+            Ok(format!("pinned {} ({} pin(s) total)", args.entity_id, pins.len()))
+        })
+        .await
+    }
+
+    #[tool(description = "Remove a fact from the pinned session-start brief.")]
+    async fn unpin(&self, Parameters(args): Parameters<EntityArgs>) -> String {
+        let db = self.db.clone();
+        let inbox = self.inbox.clone();
+        self.blocking(move |_s| {
+            if inbox.is_some() {
+                return Err(format!(
+                    "not unpinned: this is a read replica, and pins are local to the machine they \
+                     are set on. Run unpin({}) on the authority (the local stdio THOR).",
+                    args.entity_id
+                ));
+            }
+            let mut found = false;
+            crate::ledger::mutate_pins(&db, |mut pins| {
+                let before = pins.len();
+                pins.retain(|p| p != &args.entity_id);
+                found = pins.len() != before;
+                pins
+            })
+            .map_err(|e| format!("error: {e}"))?;
+            if !found {
+                return Ok(format!("not pinned: {}", args.entity_id));
+            }
+            Ok(format!("unpinned {}", args.entity_id))
+        })
+        .await
+    }
+
+    #[tool(description = "Move a mis-scoped fact to another project or to \"global\" (sync-safe fact_reprojected event). Memories only - repo chunks are managed by ingest.")]
+    async fn reproject(&self, Parameters(args): Parameters<ReprojectArgs>) -> String {
+        let inbox = self.inbox.clone();
+        self.blocking(move |s| {
+            // Replica refusal: a reproject is a synced log event; appending it
+            // here forks the chain (the measured 2026-07-22 class).
+            if inbox.is_some() {
+                return Err(format!(
+                    "not reprojected: this is a read replica - a reproject appended here would \
+                     fork the replica's log and block the next sync. Run reproject({}) on the \
+                     authority (the local stdio THOR).",
+                    args.entity_id
+                ));
+            }
+            if crate::repo::is_chunk_id(&args.entity_id) {
+                return Err(format!(
+                    "{} is a repo chunk (managed by ingest); reproject applies to memories",
+                    args.entity_id
+                ));
+            }
+            if s.get_events_by_entity(&args.entity_id).map_err(|e| format!("error: {e}"))?.is_empty() {
+                return Err(unknown_entity_msg(s, &args.entity_id));
+            }
+            let (body, target) = if args.project.eq_ignore_ascii_case("global") {
+                (r#"{"project":null}"#.to_string(), "global".to_string())
+            } else {
+                crate::repo::validate_project_key(&args.project)?;
+                (serde_json::json!({ "project": args.project }).to_string(), args.project.clone())
+            };
+            s.append_event("mcp", "mcp-session", "mcp", EventKind::FactReprojected, &args.entity_id, None, &body)
+                .map_err(|e| format!("error: {e}"))?;
+            // The scope now lives in two places that must agree: the log (this
+            // event, what recall/courier/guard actually use) and the fact's own
+            // footer (what a READER sees). The event alone leaves the footer
+            // claiming the old scope, and nothing ever notices - measured
+            // 2026-07-25 on the real store: 207 of 675 live facts, 31%, told
+            // their reader a scope the machinery had long stopped using. So the
+            // footer is corrected here, as an ordinary content revision on top;
+            // history keeps the original wording, and a fact with no footer or
+            // an already-correct one is left untouched.
+            let note = match footer_scope_fix(s, &args.entity_id, &target) {
+                Ok(true) => " (footer scope updated)",
+                Ok(false) => "",
+                Err(_) => " (NOTE: the footer still names the old scope - revise it by hand)",
+            };
+            Ok(format!("reprojected {} -> {}{}", args.entity_id, target, note))
+        })
+        .await
+    }
+
+    #[tool(description = "What does THOR know here? Live-fact counts (memories vs code chunks, per type), the most recent memories, the pinned standing rules, and any DIVERGED facts needing a resolve. Start-of-task orientation.")]
+    async fn brief(&self, Parameters(args): Parameters<BriefArgs>) -> String {
+        let server_project = self.project.clone();
+        let db = self.db.clone();
+        self.blocking(move |s| {
+            let project = args.project.or(server_project);
+            let events = s.get_all_events().map_err(|e| format!("error: {e}"))?;
+            Ok(render_overview(&events, &db, project.as_deref()))
+        })
+        .await
+    }
+}
+
+/// When a mutate/curate targets an id that has no live head, look for the one
+/// live entity whose id differs only by its `<project>:` prefix - the caller
+/// pasted the bare local part (`mem-...`) instead of the full id remember/recall
+/// hands back. Return that full id so the retry is copy-paste, not a guess.
+/// `None` when the id is already prefixed, matches nothing, or is ambiguous (we
+/// never guess between two candidates).
+fn suggest_full_id(s: &EventStore, given: &str) -> Option<String> {
+    // Already carries a project prefix: nothing to disambiguate.
+    if given.contains(':') {
+        return None;
+    }
+    let events = s.get_all_events().ok()?;
+    let heads = crate::cas::compute_head_sets(&events);
+    let mut matches: Vec<&String> = heads
+        .keys()
+        .filter(|id| id.split_once(':').is_some_and(|(_, local)| local == given))
+        .collect();
+    matches.sort();
+    matches.dedup();
+    match matches.as_slice() {
+        [only] => Some((*only).clone()),
+        _ => None,
+    }
+}
+
+/// Measured friction (three sessions, 2026-07-24): agents guess the id FORM -
+/// bare vs `<project>:`-prefixed, sometimes truncated from a display line - and
+/// burn retries on "unknown entity". Resolve the ref when EXACTLY ONE live
+/// entity matches: the same local part under any project prefix, or (for a ref
+/// of >= 8 chars) a unique prefix-extension of the given form. Never guesses
+/// between two candidates - ambiguity and zero both stay unresolved, so the
+/// caller gets the honest unknown-entity message instead of a silent pick.
+fn resolve_entity_ref(s: &EventStore, given: &str) -> Option<String> {
+    let events = s.get_all_events().ok()?;
+    let heads = crate::cas::compute_head_sets(&events);
+    let local_of = |id: &str| id.split_once(':').map(|(_, l)| l).unwrap_or(id).to_string();
+    let given_local = local_of(given);
+    if given_local.is_empty() {
+        return None;
+    }
+    let mut matches: Vec<&String> =
+        heads.keys().filter(|id| local_of(id) == given_local).collect();
+    if matches.is_empty() && given_local.chars().count() >= 8 {
+        // Truncated paste: a unique id that EXTENDS the given ref.
+        matches = heads
+            .keys()
+            .filter(|id| id.starts_with(given) || local_of(id).starts_with(&given_local))
+            .collect();
+    }
+    matches.sort();
+    matches.dedup();
+    match matches.as_slice() {
+        [only] => Some((*only).clone()),
+        _ => None,
+    }
+}
+
+/// The "unknown entity" message shared by every mutate/curate tool, with a
+/// "did you mean '<project>:mem-...'?" pointer when the caller passed a bare id.
+/// Keeps the literal "unknown entity" so callers (and tests) can still key on it.
+fn unknown_entity_msg(s: &EventStore, given: &str) -> String {
+    match suggest_full_id(s, given) {
+        Some(full) => format!(
+            "unknown entity '{}': did you mean '{}'? Memory ids include their project prefix \
+             (`<project>:mem-...`) - pass the full id remember/recall gave you. If the fact is \
+             genuinely new, store it with remember.",
+            given, full
+        ),
+        None => format!("unknown entity: {}", given),
+    }
+}
+
+/// Typed-conflict rendering for revise/retract: the agent gets the fresh
+/// head-set to retry with, instead of an opaque error.
+fn render_mutate_err(s: &EventStore, given: &str, e: anyhow::Error) -> String {
+    match e.downcast_ref::<MutateConflict>() {
+        // No live head = unknown entity: the head-set is empty, so the generic
+        // "Current head-set: []" reads as noise. Offer the prefixed id instead.
+        Some(c) if c.current_heads.is_empty() => unknown_entity_msg(s, given),
+        Some(c) => format!(
+            "rejected: {}. Current head-set for {}: {:?}. Re-read the fact (get) and retry with \
+             the right parent_rev, or resolve the divergence first.",
+            c.reason, c.entity_id, c.current_heads
+        ),
+        None => format!("error: {e}"),
+    }
+}
+
+/// The head a metadata-only revise edits from: (rev, body, effective project).
+/// Honors parent_rev the same way append_mutate_checked does - an explicit rev
+/// must be a CURRENT head, an omitted one requires a single head - because the
+/// surgery reads the head body BEFORE the append; a laxer rule here would bake
+/// a stale footer into the write that CAS then happily fast-forwards.
+fn head_for_field_edit(
+    s: &EventStore,
+    entity_id: &str,
+    parent_rev: Option<&str>,
+) -> Result<(String, String, Option<String>), String> {
+    // (rev, body) per current head + the entity's effective project.
+    let (heads, project): (Vec<(String, String)>, Option<String>) = if s.heads_projection_current() {
+        let rows = s.projected_heads_of(entity_id).map_err(|e| format!("error: {e}"))?;
+        let mut heads = Vec::with_capacity(rows.len());
+        for (rev, seq) in rows {
+            let ev = s
+                .get_event_by_seq(seq)
+                .map_err(|e| format!("error: {e}"))?
+                .ok_or_else(|| format!("error: head seq {seq} missing from the log"))?;
+            heads.push((rev, ev.body));
+        }
+        (heads, s.projected_project(entity_id).flatten())
+    } else {
+        let events = s.get_all_events().map_err(|e| format!("error: {e}"))?;
+        let head_sets = crate::cas::compute_head_sets(&events);
+        let by_hash: std::collections::HashMap<&str, &crate::event_store::Event> =
+            events.iter().map(|e| (e.this_hash.as_str(), e)).collect();
+        let heads = head_sets
+            .get(entity_id)
+            .map(|hs| {
+                let mut revs: Vec<&String> = hs.heads.iter().collect();
+                revs.sort();
+                revs.iter()
+                    .filter_map(|r| by_hash.get(r.as_str()).map(|e| ((*r).clone(), e.body.clone())))
+                    .collect()
+            })
+            .unwrap_or_default();
+        let project =
+            crate::cas::compute_projects(&events).get(entity_id).cloned().flatten();
+        (heads, project)
+    };
+    if heads.is_empty() {
+        return Err(unknown_entity_msg(s, entity_id));
+    }
+    let revs: Vec<&str> = heads.iter().map(|(r, _)| r.as_str()).collect();
+    let (rev, body) = match parent_rev {
+        Some(p) => heads.iter().find(|(r, _)| r == p).cloned().ok_or_else(|| {
+            format!(
+                "rejected: parent_rev {} is not a current head. Current head-set for {}: {:?}. \
+                 Re-read the fact (get) and retry with the right parent_rev.",
+                p, entity_id, revs
+            )
+        })?,
+        None if heads.len() == 1 => heads[0].clone(),
+        None => {
+            return Err(format!(
+                "rejected: {} is DIVERGED ({} heads) - a metadata edit needs parent_rev to know \
+                 which head's footer to edit. Head-set: {:?}. Read both with get, then retry \
+                 with parent_rev (or resolve the divergence first).",
+                entity_id,
+                heads.len(),
+                revs
+            ))
+        }
+    };
+    Ok((rev, body, project))
+}
+
+/// Rewrite the head's footer so its `project:` field names `target`, as a normal
+/// revision on top of the head. Returns whether anything was written.
+///
+/// Why the footer is edited rather than left alone: `reproject` is head-neutral
+/// by design (it must not fork or replace the content), so on its own it moves
+/// the scope the CODE uses while the scope the READER sees stays behind. Both
+/// are "the project" to whoever meets them, and a silent disagreement between
+/// them is the kind of stale that never announces itself.
+///
+/// Skipped for a DIVERGED entity (whose head to edit is a judgement call) and
+/// for a body with no footer or an already-correct one - no empty revisions.
+fn footer_scope_fix(s: &mut EventStore, entity_id: &str, target: &str) -> Result<bool, String> {
+    let (rev, body, _) = head_for_field_edit(s, entity_id, None)?;
+    let Some(footer) = crate::footer::extract(&body) else { return Ok(false) };
+    let Some(at) = footer.find("| project: ") else { return Ok(false) };
+    let rest = &footer[at + "| project: ".len()..];
+    let current = rest.split(" |").next().unwrap_or("").trim_end_matches(']').trim();
+    if current == target {
+        return Ok(false);
+    }
+    let fixed_footer = footer.replacen(
+        &format!("| project: {current}"),
+        &format!("| project: {target}"),
+        1,
+    );
+    let new_body = body.replacen(footer, &fixed_footer, 1);
+    s.append_mutate_checked(
+        "mcp",
+        "mcp-session",
+        "mcp",
+        EventKind::FactRevised,
+        entity_id,
+        Some(&rev),
+        &new_body,
+    )
+    .map(|_| true)
+    .map_err(|e| format!("error: {e}"))
+}
+
+/// Effective project filter for the symbol tools: an explicit "all" widens to
+/// every project, an explicit key pins one, omitted falls back to the server's
+/// startup project (None = unscoped, matching the HTTP server's behavior).
+fn resolve_symbol_project(arg: Option<String>, server: Option<String>) -> Option<String> {
+    match arg {
+        Some(p) if p.eq_ignore_ascii_case("all") => None,
+        Some(p) => Some(p),
+        None => server,
+    }
+}
+
+/// First non-empty line of a body, whitespace-collapsed and truncated: the
+/// one-line signature used by recall's index mode and the outline tool.
+fn first_line(body: &str, max: usize) -> String {
+    let line = body.lines().find(|l| !l.trim().is_empty()).unwrap_or("");
+    let collapsed = line.split_whitespace().collect::<Vec<_>>().join(" ");
+    if collapsed.chars().count() > max {
+        let cut: String = collapsed.chars().take(max).collect();
+        format!("{cut}...")
+    } else {
+        collapsed
+    }
+}
+
+/// The brief tool's body: counts, recent memories, pins, diverged - the
+/// orientation an agent needs to decide whether memory is worth interrogating.
+fn render_overview(events: &[crate::event_store::Event], db: &Path, project: Option<&str>) -> String {
+    use std::collections::HashMap;
+    let scope = RecallScope::current(project.map(str::to_string));
+    let heads = crate::cas::compute_head_sets(events);
+    let projects = crate::cas::compute_projects(events);
+    let by_hash: HashMap<&str, &crate::event_store::Event> =
+        events.iter().map(|e| (e.this_hash.as_str(), e)).collect();
+
+    let mut memories = 0usize;
+    let mut chunks = 0usize;
+    let mut typed: HashMap<&'static str, usize> = HashMap::new();
+    let mut diverged: Vec<&str> = Vec::new();
+    // (entity, max head seq, body, type) for the recent-memories list
+    let mut recent: Vec<(&str, i64, &str, Option<crate::repo::FactType>)> = Vec::new();
+
+    for (id, hs) in &heads {
+        let effective = projects.get(id).and_then(|o| o.as_deref());
+        if !scope.allows(effective) {
+            continue;
+        }
+        let mut live_body: Option<(&str, i64)> = None;
+        for rev in &hs.heads {
+            if let Some(ev) = by_hash.get(rev.as_str()) {
+                if !matches!(ev.kind, EventKind::FactRetracted) {
+                    let best = live_body.map(|(_, s)| s).unwrap_or(i64::MIN);
+                    if ev.seq > best {
+                        live_body = Some((ev.body.as_str(), ev.seq));
+                    }
+                }
+            }
+        }
+        let (body, seq) = match live_body {
+            Some(x) => x,
+            None => continue, // fully retracted: not a live fact
+        };
+        if crate::repo::is_chunk_id(id) {
+            chunks += 1;
+            continue;
+        }
+        memories += 1;
+        let ty = crate::repo::fact_type(body);
+        if let Some(t) = ty {
+            *typed.entry(t.as_str()).or_default() += 1;
+        }
+        if hs.is_diverged {
+            diverged.push(id);
+        }
+        recent.push((id, seq, body, ty));
+    }
+
+    recent.sort_by(|a, b| b.1.cmp(&a.1));
+    diverged.sort();
+
+    let mut out = format!(
+        "THOR brief [project: {}]\nlive facts in scope: {} memories + {} code chunks",
+        project.unwrap_or("global"),
+        memories,
+        chunks
+    );
+    if !typed.is_empty() {
+        let mut t: Vec<_> = typed.into_iter().collect();
+        t.sort();
+        out.push_str(&format!(
+            " ({})",
+            t.iter().map(|(k, v)| format!("{}: {}", k, v)).collect::<Vec<_>>().join(", ")
+        ));
+    }
+    out.push('\n');
+    if !recent.is_empty() {
+        out.push_str("recent memories:\n");
+        for (id, _, body, ty) in recent.iter().take(5) {
+            let tag = ty.map(|t| format!("[{}] ", t.as_str())).unwrap_or_default();
+            out.push_str(&format!("  {}{}: {}\n", tag, id, crate::recall::snippet(body, 120, "")));
+        }
+    }
+    let pins = crate::ledger::read_pins(db);
+    if let Some(brief) =
+        crate::cli::render_brief(events, &pins, &scope, "brief", project)
+    {
+        out.push_str(&brief);
+        out.push('\n');
+    }
+    if !diverged.is_empty() {
+        out.push_str(&format!(
+            "DIVERGED (resolve these): {}\n",
+            diverged.iter().take(5).cloned().collect::<Vec<_>>().join(", ")
+        ));
+    }
+    out
+}
+
+#[tool_handler]
+impl ServerHandler for ThorServer {
+    fn get_info(&self) -> ServerInfo {
+        // Replica-ness is a runtime fact (inbox divert active), not a
+        // transport fact: an HTTP daemon on the authority machine is NOT a
+        // replica, so the notice keys on the divert, never on --http itself.
+        let instructions = if self.inbox.is_some() {
+            format!("{INSTRUCTIONS}{REPLICA_NOTICE}")
+        } else {
+            format!("{INSTRUCTIONS}{AUTHORITY_NOTICE}")
+        };
+        ServerInfo::new(ServerCapabilities::builder().enable_tools().build())
+            .with_instructions(instructions)
+    }
+}
+
+/// Entry point for `thor mcp`. `http = Some(bind)` serves Streamable-HTTP for
+/// remote clients (the NAS connector); otherwise stdio (the local connector).
+/// Blocking - owns the tokio runtime.
+pub fn run_mcp(db: &Path, http: Option<String>) {
+    if let Err(e) = run(db, http) {
+        eprintln!("thor mcp: fatal: {e}");
+    }
+}
+
+fn run(db: &Path, http: Option<String>) -> anyhow::Result<()> {
+    let shared = Arc::new(Mutex::new(EventStore::new(db)?));
+    let db = db.to_path_buf();
+    let runtime = tokio::runtime::Runtime::new()?;
+    runtime.block_on(async {
+        match http {
+            Some(bind) => serve_http(shared, db, &bind).await,
+            None => {
+                let service = ThorServer::from_shared(shared, startup_project(), db, None)
+                    .serve(rmcp::transport::stdio())
+                    .await?;
+                service.waiting().await?;
+                Ok(())
+            }
+        }
+    })
+}
+
+/// Default bind for the discoverable `thor daemon` alias - loopback only.
+/// `thor mcp --http <bind>` still accepts any explicit bind (unchanged
+/// contract for the NAS remote-MCP deployment); this constant only supplies
+/// the zero-config default when no bind is given.
+pub const DEFAULT_DAEMON_BIND: &str = "127.0.0.1:8765";
+
+#[derive(Clone)]
+struct InjectState {
+    store: Arc<Mutex<EventStore>>,
+    db: PathBuf,
+    bind: String,
+    /// Recall state held across prompts (the daemon is the only THOR process
+    /// that lives long enough to reuse anything). `None` = never built or the
+    /// sidecar is absent, and every prompt then runs the cold path exactly as
+    /// the per-prompt hook does. Behind the same mutex discipline as the store:
+    /// one prompt at a time, and the fold is re-validated per query.
+    #[cfg(feature = "semantic")]
+    warm: Arc<Mutex<Option<crate::recall::WarmRecall>>>,
+}
+
+/// Warm per-prompt injection: same gates, ledger and freshness as the cold
+/// courier (shared core, courier::injection_for_hook_json_warm). Fail-open:
+/// anything unexpected answers 204 (silence), never a 5xx that could confuse
+/// the hook-side client into odd states.
+async fn inject_handler(
+    axum::extract::State(state): axum::extract::State<InjectState>,
+    body: axum::body::Bytes,
+) -> axum::response::Response {
+    use axum::response::IntoResponse;
+    let Ok(raw) = String::from_utf8(body.to_vec()) else {
+        return axum::http::StatusCode::NO_CONTENT.into_response();
+    };
+    let store = state.store.clone();
+    let db = state.db.clone();
+    #[cfg(feature = "semantic")]
+    let warm = state.warm.clone();
+    let result = tokio::task::spawn_blocking(move || {
+        let s = store.lock().unwrap_or_else(|p| p.into_inner());
+        #[cfg(feature = "semantic")]
+        {
+            // Build the resident state on first use (not at startup: a daemon
+            // that never serves a prompt should not pay the fold, and the
+            // sidecar may not exist yet). Any failure just leaves it None and
+            // this prompt takes the cold path - never an error to the hook.
+            let mut w = warm.lock().unwrap_or_else(|p| p.into_inner());
+            if w.is_none() {
+                let vpath = crate::vectors::default_vectors_path(&db);
+                if vpath.exists() {
+                    if let Ok(v) = crate::vectors::VectorStore::open(&vpath) {
+                        *w = crate::recall::WarmRecall::build(&s, v).ok();
+                    }
+                }
+            }
+            if let Some(w) = w.as_mut() {
+                return crate::courier::injection_for_hook_json_resident(&s, &db, &raw, w);
+            }
+        }
+        crate::courier::injection_for_hook_json_warm(&s, &db, &raw)
+    })
+    .await;
+    match result {
+        Ok(Some(block)) => (axum::http::StatusCode::OK, block).into_response(),
+        _ => axum::http::StatusCode::NO_CONTENT.into_response(),
+    }
+}
+
+async fn health_handler(
+    axum::extract::State(state): axum::extract::State<InjectState>,
+) -> axum::Json<serde_json::Value> {
+    axum::Json(serde_json::json!({
+        "status": "ok",
+        "pid": std::process::id(),
+        "bind": state.bind,
+        "db": state.db.display().to_string(),
+    }))
+}
+
+/// Serve the tools over Streamable-HTTP at /mcp, plus the warm courier at
+/// /inject and a /health probe. The MCP transport carries NO auth - bind to
+/// localhost on the NAS and front it with the Cloudflare Access gate, exactly
+/// like mimir's remote MCP; /inject carries prompt text and must never be
+/// exposed beyond loopback.
+async fn serve_http(store: Arc<Mutex<EventStore>>, db: PathBuf, bind: &str) -> anyhow::Result<()> {
+    // HTTP/remote has no cwd: unscoped by default (a cwd-less remote consumer is
+    // cross-project by nature), honoring an explicit `project` arg per call.
+    // Replica divert: on the NAS the container sets THOR_CAPTURE_INBOX so mobile
+    // writes queue to an inbox instead of forking the log (inbox.rs). Only the
+    // HTTP server reads it - the local stdio authority never diverts.
+    let inbox = std::env::var("THOR_CAPTURE_INBOX")
+        .ok()
+        .filter(|s| !s.is_empty())
+        .map(PathBuf::from);
+    let mcp_router = {
+        let store = store.clone();
+        let db = db.clone();
+        mcp_http_router(move || {
+            Ok(ThorServer::from_shared(store.clone(), None, db.clone(), inbox.clone()))
+        })
+    };
+    let listener = match tokio::net::TcpListener::bind(bind).await {
+        Ok(l) => l,
+        Err(e) => {
+            // Bind already held: if it is a healthy THOR daemon on the SAME
+            // store, adopt it - republish the discovery flag it may have lost
+            // (a client timeout self-heals by deleting the flag, but the
+            // process can still be alive) and exit cleanly instead of failing.
+            if let Some(h) = crate::daemon_client::health_at(bind) {
+                if h.get("db").and_then(|v| v.as_str()) == Some(db.display().to_string().as_str()) {
+                    let pid = h.get("pid").and_then(|v| v.as_u64()).unwrap_or(0);
+                    let _ = crate::daemon_client::publish_daemon_flag_as(&db, bind, pid);
+                    println!(
+                        "thor daemon: already running on {bind} (pid {pid}); flag republished, nothing to do"
+                    );
+                    return Ok(());
+                }
+            }
+            return Err(e.into());
+        }
+    };
+    let actual = listener.local_addr()?.to_string();
+    if !actual.starts_with("127.") && !actual.starts_with("[::1]") {
+        eprintln!(
+            "thor daemon: WARNING - /inject is bound beyond loopback ({actual}); it carries \
+             prompt text with no auth. Front it with an auth gate or bind 127.0.0.1."
+        );
+    }
+    let inject_state = InjectState {
+        store,
+        db: db.clone(),
+        bind: actual.clone(),
+        #[cfg(feature = "semantic")]
+        warm: Arc::new(Mutex::new(None)),
+    };
+    let inject_router = axum::Router::new()
+        .route("/inject", axum::routing::post(inject_handler))
+        .route("/health", axum::routing::get(health_handler))
+        .with_state(inject_state);
+    // Publish the discovery flag AFTER the bind succeeded, so a failed start
+    // never leaves a flag pointing at nothing.
+    if let Err(e) = crate::daemon_client::publish_daemon_flag(&db, &actual) {
+        eprintln!("thor daemon: could not write THOR-DAEMON.flag: {e}");
+    }
+    println!(
+        "thor MCP (streamable-http) listening on http://{actual}/mcp (warm inject at http://{actual}/inject)"
+    );
+    axum::serve(listener, mcp_router.merge(inject_router)).await?;
+    Ok(())
+}
+
+/// Build the axum router that serves the MCP tools over Streamable-HTTP at /mcp.
+fn mcp_http_router<F>(make_server: F) -> axum::Router
+where
+    F: Fn() -> std::result::Result<ThorServer, std::io::Error> + Send + Sync + 'static,
+{
+    use rmcp::transport::streamable_http_server::{
+        session::local::LocalSessionManager, StreamableHttpServerConfig, StreamableHttpService,
+    };
+    let service = StreamableHttpService::new(
+        make_server,
+        LocalSessionManager::default().into(),
+        StreamableHttpServerConfig::default(),
+    );
+    axum::Router::new().nest_service("/mcp", service)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn seed() -> EventStore {
+        let mut store = EventStore::in_memory().unwrap();
+        store
+            .append_event("s", "l", "a", EventKind::FactCreated, "e1", None, "the deploy watcher gotcha")
+            .unwrap();
+        store
+    }
+
+    /// Dropping an expiry date is the one footer edit a plain revise cannot do:
+    /// a body with no footer inherits the previous one, expiry included, and the
+    /// write still reports success. The reply has to say so, or the fact quietly
+    /// stops surfacing weeks later and nobody connects it to this call.
+    #[tokio::test]
+    async fn revise_says_when_it_carried_an_expiry_the_caller_did_not_retype() {
+        let mut store = EventStore::in_memory().unwrap();
+        let dated = format!(
+            "pin to the 1.9 line until upstream lands the fix\n\n{}",
+            crate::footer::compose("gotcha", &["deploy".into()], "global", &[], &[], Some("2027-01-15"))
+        );
+        store
+            .append_event("s", "l", "a", EventKind::FactCreated, "e-exp", None, &dated)
+            .unwrap();
+        let (server, _dir) = server_with(store);
+
+        // No footer in the new body: the old one is carried, expiry and all.
+        let out = server
+            .revise(Parameters(ReviseArgs {
+                entity_id: "e-exp".into(),
+                body: Some("pin to the 1.9 line - upstream fix has landed, unpin at will".into()),
+                ..Default::default()
+            }))
+            .await;
+        assert!(out.starts_with("revised e-exp"), "{out}");
+        assert!(out.contains("still expires on 2027-01-15"), "the carried date must be named: {out}");
+
+        // Re-typing the footer WITHOUT expires is the documented route, and a
+        // caller who did that must not be nagged about a date they just removed.
+        let cleared = format!(
+            "pin to the 1.9 line - upstream fix has landed\n\n{}",
+            crate::footer::compose("gotcha", &["deploy".into()], "global", &[], &[], None)
+        );
+        let out2 = server
+            .revise(Parameters(ReviseArgs {
+                entity_id: "e-exp".into(),
+                body: Some(cleared),
+                ..Default::default()
+            }))
+            .await;
+        assert!(out2.starts_with("revised e-exp"), "{out2}");
+        assert!(!out2.contains("still expires"), "a re-typed footer clears it silently: {out2}");
+    }
+
+    /// The error class the metadata params kill: repairing one anchor used to
+    /// mean retyping the whole footer, and a typo there silently wiped fields.
+    #[tokio::test]
+    async fn revise_metadata_only_edits_the_footer_and_keeps_the_body() {
+        let mut store = EventStore::in_memory().unwrap();
+        // Imported-shaped fact with the measured dead-anchor form (one
+        // space-joined anchor) and a mimir marker (the import idempotence key).
+        let body = "never deploy on friday\n\n[memory/gotcha | tags: deploy | anchors: a b c | \
+                    project: P | mimir:01KIMPORT]";
+        store.append_event("s", "l", "a", EventKind::FactCreated, "P:mem-1", None, body).unwrap();
+        let shared = Arc::new(Mutex::new(store));
+        let dir = tempfile::tempdir().unwrap();
+        let server = ThorServer::from_shared(shared.clone(), None, dir.path().join("thor.db"), None);
+
+        let out = server
+            .revise(Parameters(ReviseArgs {
+                entity_id: "P:mem-1".into(),
+                anchors: Some(vec!["deploy/watcher.sh".into(), "docker compose up".into()]),
+                ..Default::default()
+            }))
+            .await;
+        assert!(out.starts_with("revised P:mem-1"), "{out}");
+
+        let s = shared.lock().unwrap();
+        let head = s.get_all_events().unwrap().into_iter().last().unwrap();
+        assert!(matches!(head.kind, EventKind::FactRevised), "a real revision was appended");
+        assert_eq!(
+            head.body,
+            "never deploy on friday\n\n[memory/gotcha | tags: deploy | anchors: \
+             deploy/watcher.sh, docker compose up | project: P | mimir:01KIMPORT]",
+            "content, type, tags, project and the mimir marker survive byte-for-byte"
+        );
+    }
+
+    #[tokio::test]
+    async fn revise_metadata_on_a_footerless_fact_mints_a_canonical_footer() {
+        let mut store = EventStore::in_memory().unwrap();
+        store
+            .append_event("s", "l", "a", EventKind::FactCreated, "P:mem-2", None, "a plain untyped note")
+            .unwrap();
+        let shared = Arc::new(Mutex::new(store));
+        let dir = tempfile::tempdir().unwrap();
+        let server = ThorServer::from_shared(shared.clone(), None, dir.path().join("thor.db"), None);
+
+        let out = server
+            .revise(Parameters(ReviseArgs {
+                entity_id: "P:mem-2".into(),
+                fact_type: Some("gotcha".into()),
+                anchors: Some(vec!["watch.rs".into()]),
+                ..Default::default()
+            }))
+            .await;
+        assert!(out.starts_with("revised P:mem-2"), "{out}");
+
+        let s = shared.lock().unwrap();
+        let head = s.get_all_events().unwrap().into_iter().last().unwrap();
+        assert_eq!(
+            head.body,
+            "a plain untyped note\n\n[memory/gotcha | tags:  | anchors: watch.rs | project: P]",
+            "the minted footer carries the entity's effective project"
+        );
+    }
+
+    #[tokio::test]
+    async fn revise_metadata_clears_an_expiry_without_retyping() {
+        let mut store = EventStore::in_memory().unwrap();
+        let dated = format!(
+            "pin serde until the fix\n\n{}",
+            crate::footer::compose("gotcha", &["pin".into()], "global", &[], &[], Some("2027-01-15"))
+        );
+        store.append_event("s", "l", "a", EventKind::FactCreated, "e-clr", None, &dated).unwrap();
+        let shared = Arc::new(Mutex::new(store));
+        let dir = tempfile::tempdir().unwrap();
+        let server = ThorServer::from_shared(shared.clone(), None, dir.path().join("thor.db"), None);
+
+        let out = server
+            .revise(Parameters(ReviseArgs {
+                entity_id: "e-clr".into(),
+                expires: Some(String::new()),
+                ..Default::default()
+            }))
+            .await;
+        assert!(out.starts_with("revised e-clr"), "{out}");
+        assert!(!out.contains("still expires"), "no carried-expiry nag on an explicit clear: {out}");
+
+        let s = shared.lock().unwrap();
+        let head = s.get_all_events().unwrap().into_iter().last().unwrap();
+        assert!(!head.body.contains("expires:"), "the date is gone: {}", head.body);
+        assert!(head.body.contains("tags: pin"), "every other field survives: {}", head.body);
+    }
+
+    /// Doctrine gate (2026-07-26): reports expire, rules never. Setting an
+    /// expiry on a body that OPENS as a rule draws a warning - on remember and
+    /// on a metadata-only revise - because a HARDE REGEL fact silently expired
+    /// exactly this way in the 2026-07-24 report cleanup. Never a refusal: a
+    /// genuinely temporary rule keeps its date.
+    #[tokio::test]
+    async fn an_expiry_on_a_rule_shaped_body_draws_the_doctrine_warning() {
+        let mut store = EventStore::in_memory().unwrap();
+        let rule = format!(
+            "HARDE REGEL - nooit direct op prod deployen\n\n{}",
+            crate::footer::compose("preference", &[], "global", &[], &[], None)
+        );
+        store.append_event("s", "l", "a", EventKind::FactCreated, "e-rule", None, &rule).unwrap();
+        let shared = Arc::new(Mutex::new(store));
+        let dir = tempfile::tempdir().unwrap();
+        let server = ThorServer::from_shared(shared, None, dir.path().join("thor.db"), None);
+
+        let out = server
+            .revise(Parameters(ReviseArgs {
+                entity_id: "e-rule".into(),
+                expires: Some("2030-01-01".into()),
+                ..Default::default()
+            }))
+            .await;
+        assert!(out.starts_with("revised e-rule"), "{out}");
+        assert!(out.contains("opens as a RULE"), "the doctrine warning fires: {out}");
+
+        let r = server
+            .remember(Parameters(RememberArgs {
+                body: "GOTCHA: de oven mag nooit boven 250 graden".into(),
+                entity_id: None,
+                project: Some("acme".into()),
+                fact_type: Some("gotcha".into()),
+                tags: None,
+                triggers: None,
+                anchors: None,
+                expires: Some("2030-01-01".into()),
+                provenance: None,
+            }))
+            .await;
+        assert!(r.contains("stored entity"), "{r}");
+        assert!(r.contains("opens as a RULE"), "remember warns too: {r}");
+
+        // Clearing a date is a removal, never rule-warned.
+        let clr = server
+            .revise(Parameters(ReviseArgs {
+                entity_id: "e-rule".into(),
+                expires: Some(String::new()),
+                ..Default::default()
+            }))
+            .await;
+        assert!(!clr.contains("opens as a RULE"), "clearing draws no warning: {clr}");
+    }
+
+    #[tokio::test]
+    async fn revise_refuses_a_no_op_and_bad_metadata() {
+        let (server, _dir) = server_with(EventStore::in_memory().unwrap());
+        let err = server
+            .revise(Parameters(ReviseArgs { entity_id: "e1".into(), ..Default::default() }))
+            .await;
+        assert!(err.contains("provide a corrected 'body'"), "{err}");
+        let err = server
+            .revise(Parameters(ReviseArgs {
+                entity_id: "e1".into(),
+                provenance: Some("guessed".into()),
+                ..Default::default()
+            }))
+            .await;
+        assert!(err.contains("provenance must be"), "{err}");
+        let err = server
+            .revise(Parameters(ReviseArgs {
+                entity_id: "e1".into(),
+                expires: Some("morgen".into()),
+                ..Default::default()
+            }))
+            .await;
+        assert!(err.contains("expires must be"), "{err}");
+    }
+
+    /// The replica ordering rule: field surgery runs BEFORE the inbox divert,
+    /// so the queue carries the final body - the authority replays bytes, it
+    /// never re-runs the surgery against a head that may have moved since.
+    #[tokio::test]
+    async fn revise_metadata_divert_queues_the_final_baked_body() {
+        let mut store = EventStore::in_memory().unwrap();
+        let body = "the rule\n\n[memory/gotcha | tags: x | anchors: dead one | project: P]";
+        store.append_event("s", "l", "a", EventKind::FactCreated, "P:mem-d", None, body).unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let inbox = dir.path().join("inbox.jsonl");
+        let (server, _d) = server_with_inbox(store, inbox.clone());
+
+        let out = server
+            .revise(Parameters(ReviseArgs {
+                entity_id: "P:mem-d".into(),
+                anchors: Some(vec!["real.rs".into()]),
+                ..Default::default()
+            }))
+            .await;
+        assert!(out.contains("queued to capture inbox"), "{out}");
+        let line = std::fs::read_to_string(&inbox).unwrap();
+        assert!(line.contains("anchors: real.rs"), "the queued body is the edited one: {line}");
+        assert!(!line.contains("dead one"), "the dead anchor is already gone in the queue: {line}");
+        assert!(line.contains("\"parent_rev\":\""), "parent resolved before the divert: {line}");
+    }
+
+    /// Screw 3, born from the measured 2026-07-22 fork (four fact_echoed events
+    /// written straight into the replica log blocked shipping for half a day):
+    /// on a replica, mark-as-useful QUEUES to the inbox and every other
+    /// non-divertable write is REFUSED with a pointer to the authority. The
+    /// notice (screw 2) advises; this makes the fork unrepresentable.
+    #[tokio::test]
+    async fn replica_diverts_mark_and_refuses_the_other_curation_writes() {
+        let mut store = EventStore::in_memory().unwrap();
+        store.append_event("s", "l", "a", EventKind::FactCreated, "P:mem-1", None, "a fact").unwrap();
+        let shared = Arc::new(Mutex::new(store));
+        let dir = tempfile::tempdir().unwrap();
+        let inbox = dir.path().join("inbox.jsonl");
+        let server =
+            ThorServer::from_shared(shared.clone(), None, dir.path().join("thor.db"), Some(inbox.clone()));
+
+        // mark-useful queues; the replica log gains nothing.
+        let out = server
+            .mark(Parameters(MarkArgs { entity_id: "P:mem-1".into(), noise: false }))
+            .await;
+        assert!(out.contains("queued to capture inbox: mark P:mem-1"), "{out}");
+        let ops = crate::inbox::read_all(&inbox).unwrap();
+        assert_eq!(ops.len(), 1);
+        assert_eq!(ops[0].op, "mark");
+        assert_eq!(ops[0].entity_id, "P:mem-1");
+
+        // Everything that cannot queue is refused, each naming the authority.
+        let refusals = [
+            server.mark(Parameters(MarkArgs { entity_id: "P:mem-1".into(), noise: true })).await,
+            server
+                .resolve(Parameters(ResolveArgs { entity_id: "P:mem-1".into(), keep_rev: "x".into() }))
+                .await,
+            server
+                .reproject(Parameters(ReprojectArgs {
+                    entity_id: "P:mem-1".into(),
+                    project: "global".into(),
+                }))
+                .await,
+            server.pin(Parameters(EntityArgs { entity_id: "P:mem-1".into() })).await,
+            server.unpin(Parameters(EntityArgs { entity_id: "P:mem-1".into() })).await,
+        ];
+        for out in &refusals {
+            assert!(out.contains("read replica"), "names what this server is: {out}");
+            assert!(out.contains("authority"), "points at the right place: {out}");
+        }
+        assert_eq!(crate::inbox::read_all(&inbox).unwrap().len(), 1, "refusals queued nothing");
+        assert_eq!(
+            shared.lock().unwrap().get_all_events().unwrap().len(),
+            1,
+            "the replica log never grew - the fork class is closed"
+        );
+    }
+
+    /// Screw 2 of the agent-ergonomics pass: the hosted connector says WHAT it
+    /// is. An agent talking to the NAS replica cannot see the topology, so the
+    /// server instructions must carry it - and only in divert mode, because an
+    /// HTTP daemon on the authority machine is not a replica.
+    #[test]
+    fn server_instructions_self_identify_as_replica_only_in_divert_mode() {
+        let (authority, _d1) = server_with(EventStore::in_memory().unwrap());
+        let instructions = authority.get_info().instructions.unwrap();
+        assert!(!instructions.contains("READ REPLICA"), "authority must not claim replica");
+        assert!(
+            instructions.contains("AUTHORITY store"),
+            "authority self-identifies too - an agent seeing two connectors must be able \
+             to tell them apart"
+        );
+
+        let dir = tempfile::tempdir().unwrap();
+        let (replica, _d2) =
+            server_with_inbox(EventStore::in_memory().unwrap(), dir.path().join("inbox.jsonl"));
+        let instructions = replica.get_info().instructions.unwrap();
+        assert!(instructions.contains("READ REPLICA"), "divert mode must self-identify");
+        assert!(instructions.contains("queued to capture inbox"), "teaches the queue semantics");
+        assert!(instructions.contains("REFUSED on this replica"), "names the guarded writes");
+    }
+
+    fn server_with(store: EventStore) -> (ThorServer, tempfile::TempDir) {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("thor.db");
+        (ThorServer::new(store, db), dir)
+    }
+
+    /// A server in replica DIVERT mode: writes queue to `inbox`, never the log.
+    fn server_with_inbox(store: EventStore, inbox: PathBuf) -> (ThorServer, tempfile::TempDir) {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("thor.db");
+        let s = ThorServer::from_shared(Arc::new(Mutex::new(store)), None, db, Some(inbox));
+        (s, dir)
+    }
+
+    #[tokio::test]
+    async fn remember_diverts_to_inbox_and_never_touches_the_replica_log() {
+        let dir = tempfile::tempdir().unwrap();
+        let inbox = dir.path().join("inbox.jsonl");
+        let (server, _d) = server_with_inbox(EventStore::in_memory().unwrap(), inbox.clone());
+
+        let reply = server
+            .remember(Parameters(RememberArgs {
+                body: "the metrics port is 9464".into(),
+                entity_id: None,
+                project: Some("acme".into()),
+                fact_type: Some("gotcha".into()),
+                tags: None,
+                triggers: None,
+                anchors: None,
+                expires: None,
+                provenance: None,
+            }))
+            .await;
+        assert!(reply.contains("queued to capture inbox"), "reply: {reply}");
+
+        // The capture is in the inbox, with its footer already composed...
+        let ops = crate::inbox::read_all(&inbox).unwrap();
+        assert_eq!(ops.len(), 1);
+        assert_eq!(ops[0].op, "create");
+        assert!(ops[0].body.contains("the metrics port is 9464"));
+        assert!(ops[0].body.contains("[memory/gotcha"), "footer composed before the divert");
+
+        // ...and the replica log is untouched (this is what stops the fork).
+        let events = server.store.lock().unwrap().get_all_events().unwrap();
+        assert!(events.is_empty(), "a diverted write must NOT append to the log");
+    }
+
+    fn recall_args(query: &str) -> RecallArgs {
+        RecallArgs {
+            query: query.into(),
+            limit: None,
+            all_projects: false,
+            project: None,
+            kind: None,
+            rerank: false,
+            detail: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn test_recall_detail_index_lists_ids_without_bodies() {
+        let mut store = seed();
+        store
+            .append_event("s", "l", "a", EventKind::FactCreated, "e2", None,
+                &format!("the deploy watcher unpacks the tarball\n{}", "detail line\n".repeat(40)))
+            .unwrap();
+        let (server, _d) = server_with(store);
+        let mut args = recall_args("deploy watcher");
+        args.detail = Some("index".into());
+        let out = server.recall(Parameters(args)).await;
+        assert!(out.contains("e2 |"), "index line per hit: {out}");
+        assert!(!out.contains("detail line"), "index mode serves the first line only: {out}");
+        assert!(out.len() < 600, "index mode stays compact: {} chars", out.len());
+    }
+
+    #[tokio::test]
+    async fn test_where_used_and_impact_walk_the_sidecar() {
+        // The tools open the sidecar NEXT TO the server's db path, so the
+        // fixture store must be file-backed and the sidecar built beside it.
+        let (server, d) = server_with(EventStore::in_memory().unwrap());
+        let db = d.path().join("thor.db");
+        let mut fstore = EventStore::new(&db).unwrap();
+        for (eid, body) in [
+            ("P:src/core.rs#0", "pub fn pack_blocks() {}\n\n[repo file | P/src/core.rs | chunk 1/1]"),
+            ("P:src/caller.rs#0", "pub fn run_ingest() { pack_blocks(); }\n\n[repo file | P/src/caller.rs | chunk 1/1]"),
+            ("P:src/top.rs#0", "pub fn main_flow() { run_ingest(); }\n\n[repo file | P/src/top.rs | chunk 1/1]"),
+        ] {
+            fstore.append_event("s", "l", "a", EventKind::FactCreated, eid, None, body).unwrap();
+        }
+        let mut sy = crate::symbols::SymbolStore::open_default(&db).unwrap();
+        sy.rebuild(&fstore).unwrap();
+        let out = server
+            .where_used(Parameters(WhereUsedArgs { symbol: "pack_blocks".into(), project: None }))
+            .await;
+        assert!(out.contains("P:src/core.rs#0"), "definer listed: {out}");
+        assert!(out.contains("P:src/caller.rs#0"), "caller listed: {out}");
+        let out = server
+            .impact(Parameters(ImpactArgs { symbol: "pack_blocks".into(), project: None, depth: Some(2) }))
+            .await;
+        assert!(out.contains("depth 1") && out.contains("P:src/caller.rs#0"), "level 1: {out}");
+        assert!(out.contains("depth 2") && out.contains("P:src/top.rs#0"),
+            "level 2 walks callers-of-definers: {out}");
+    }
+
+    #[tokio::test]
+    async fn test_outline_maps_a_files_chunks_and_peek_hint() {
+        let mut store = EventStore::in_memory().unwrap();
+        for (i, sig) in ["pub fn alpha() {", "pub fn beta() {"].iter().enumerate() {
+            store
+                .append_event("s", "l", "a", EventKind::FactCreated,
+                    &format!("P:src/lib.rs#{i}"), None,
+                    &format!("{sig}\n    body();\n}}\n\n[repo file | P/src/lib.rs | chunk {}/2]", i + 1))
+                .unwrap();
+        }
+        // an unrelated file must not leak into the outline
+        store
+            .append_event("s", "l", "a", EventKind::FactCreated, "P:src/other.rs#0", None,
+                "pub fn gamma() {}\n\n[repo file | P/src/other.rs | chunk 1/1]")
+            .unwrap();
+        let (server, _d) = server_with(store);
+        let out = server
+            .outline(Parameters(OutlineArgs { path: "src/lib.rs".into(), project: None }))
+            .await;
+        assert!(out.contains("#0") && out.contains("pub fn alpha()"), "chunk 0 signature: {out}");
+        assert!(out.contains("#1") && out.contains("pub fn beta()"), "chunk 1 signature: {out}");
+        assert!(!out.contains("gamma"), "other file stays out: {out}");
+        assert!(out.contains("get P:src/lib.rs#0"), "peek hint present: {out}");
+        // suffix matching is boundary-safe: "ib.rs" must not match lib.rs
+        let miss = server
+            .outline(Parameters(OutlineArgs { path: "ib.rs".into(), project: None }))
+            .await;
+        assert!(miss.contains("No indexed chunks"), "no sloppy suffix match: {miss}");
+    }
+
+    #[tokio::test]
+    async fn test_recall_rerank_without_model_keeps_fused_order_with_note() {
+        // No reranker model in the test environment: the fused hit must still
+        // be served, with an honest note instead of an error.
+        let (server, _d) = server_with(seed());
+        let mut args = recall_args("deploy watcher");
+        args.rerank = true;
+        let out = server.recall(Parameters(args)).await;
+        assert!(out.contains("e1"), "hit still served: {out}");
+        assert!(out.contains("rerank skipped") || out.contains("rerank unavailable"),
+            "honest degradation note: {out}");
+    }
+
+    fn remember_args(body: &str) -> RememberArgs {
+        RememberArgs {
+            body: body.into(),
+            entity_id: None,
+            project: None,
+            fact_type: None,
+            tags: None,
+            triggers: None,
+            anchors: None,
+            expires: None,
+            provenance: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn test_recall_tool_returns_hit() {
+        let (server, _d) = server_with(seed());
+        let out = server.recall(Parameters(recall_args("deploy watcher"))).await;
+        assert!(out.contains("e1"), "recall must surface the seeded fact: {out}");
+    }
+
+    #[tokio::test]
+    async fn test_get_and_recall_serves_count_access_in_ledger() {
+        let (server, d) = server_with(seed());
+        let db = d.path().join("thor.db");
+        // a miss must not seed a phantom counter
+        let _ = server.get(Parameters(GetArgs { entity_id: "nope".into() })).await;
+        assert_eq!(crate::ledger::counter(&db, "access", "nope"), 0);
+        // one get + one recall serve = two accesses
+        let _ = server.get(Parameters(GetArgs { entity_id: "e1".into() })).await;
+        let out = server.recall(Parameters(recall_args("deploy watcher"))).await;
+        assert!(out.contains("e1"), "precondition: recall must serve e1: {out}");
+        assert_eq!(crate::ledger::counter(&db, "access", "e1"), 2);
+    }
+
+    #[tokio::test]
+    async fn weak_match_note_warns_without_removing_a_single_hit() {
+        // The deliberate channel fills every slot to `limit`, so a question
+        // about a domain that is not in this store still gets confident-looking
+        // lines. Measured cost of REMOVING them: 15 of 187 known answers on the
+        // 460-question battery. So the note only warns - and must never fire on
+        // a question the store actually answers.
+        let mut store = seed();
+        store
+            .append_event(
+                "s", "l", "a", EventKind::FactCreated, "Proj:mem-tuning", None,
+                "GOTCHA: the deploy watcher unpacks the newest tarball by mtime, so verify \
+                 the upload landed before you touch the request flag.\n\n\
+                 [memory/gotcha | fires-when: deploy watcher tarball flag]",
+            )
+            .unwrap();
+        // One fact that shares a single word with the off-topic question in a
+        // different meaning - the real shape of filler, and the reason a store
+        // that knows nothing about the topic still answers with something.
+        store
+            .append_event(
+                "s", "l", "a", EventKind::FactCreated, "Proj:mem-volt", None,
+                "NOTE: de spanning van de NAS-voeding is 12 volt gelijkstroom.",
+            )
+            .unwrap();
+        let (server, db_dir) = server_with(store);
+
+        let mut off_topic = recall_args("hoeveel bar spanning zet ik op een fietsband");
+        off_topic.all_projects = true;
+        let out = server.recall(Parameters(off_topic)).await;
+        assert!(out.contains("Proj:mem-volt"), "precondition: a weak hit is served: {out}");
+        assert!(out.contains("Weak match:"), "an all-weak answer says so: {out}");
+
+        let mut on_topic = recall_args("deploy watcher tarball flag");
+        on_topic.all_projects = true;
+        let good = server.recall(Parameters(on_topic)).await;
+        assert!(good.contains("Proj:mem-tuning"), "precondition, the answer surfaces: {good}");
+        assert!(!good.contains("Weak match:"), "a real answer must not be flagged weak: {good}");
+
+        // Off switch is a file op, same as every other serving behaviour.
+        std::fs::write(db_dir.path().join("THOR-NO-WEAK-NOTE.flag"), "").unwrap();
+        let mut again = recall_args("hoeveel bar spanning op een fietsband van 28 millimeter");
+        again.all_projects = true;
+        let silenced = server.recall(Parameters(again)).await;
+        assert!(!silenced.contains("Weak match:"), "THOR-NO-WEAK-NOTE.flag silences it: {silenced}");
+    }
+
+    #[tokio::test]
+    async fn test_recall_kind_memory_excludes_chunks() {
+        let mut store = seed();
+        store
+            .append_event("s", "l", "a", EventKind::FactCreated, "Proj:src/widget.rs#0", None, "widget widget code chunk")
+            .unwrap();
+        store
+            .append_event("s", "l", "a", EventKind::FactCreated, "Proj:mem-1", None, "GOTCHA: widget must stay red")
+            .unwrap();
+        let (server, _d) = server_with(store);
+        let mut args = recall_args("widget");
+        args.all_projects = true;
+        args.kind = Some("memory".into());
+        let out = server.recall(Parameters(args)).await;
+        assert!(out.contains("Proj:mem-1"), "the memory surfaces: {out}");
+        assert!(out.contains("[gotcha]"), "typed tag rendered: {out}");
+        assert!(!out.contains("widget.rs#0"), "kind:memory must exclude chunks: {out}");
+    }
+
+    #[tokio::test]
+    async fn test_remember_then_recall_roundtrip_with_typed_footer() {
+        let (server, _d) = server_with(seed());
+        let stored = server
+            .remember(Parameters(RememberArgs {
+                body: "a brand new zephyr fact".into(),
+                entity_id: None,
+                project: None,
+                fact_type: Some("decision".into()),
+                tags: Some(vec!["zephyr".into(), "test".into()]),
+                triggers: None,
+                anchors: None,
+                expires: None,
+                provenance: None,
+            }))
+            .await;
+        assert!(stored.starts_with("stored entity mcp-"), "got: {stored}");
+        let rc = server.recall(Parameters(recall_args("zephyr"))).await;
+        assert!(rc.contains("zephyr"), "the new fact must be recallable: {rc}");
+        assert!(rc.contains("[decision]"), "the typed footer classifies the fact: {rc}");
+    }
+
+    #[tokio::test]
+    async fn test_remember_refuses_near_duplicate() {
+        let (server, _d) = server_with(seed());
+        let out = server
+            .remember(Parameters(remember_args("The deploy   watcher GOTCHA")))
+            .await;
+        assert!(out.contains("NOT stored"), "a near-duplicate must be refused: {out}");
+        assert!(out.contains("e1"), "the refusal points at the existing fact: {out}");
+        assert!(out.contains("revise"), "the refusal teaches the repair path: {out}");
+        // a genuinely different fact still stores
+        let ok = server.remember(Parameters(remember_args("an entirely different filament note"))).await;
+        assert!(ok.starts_with("stored entity"), "{ok}");
+    }
+
+    #[tokio::test]
+    async fn test_remember_dup_check_survives_typed_footer_and_respects_scope() {
+        let (server, _d) = server_with(seed());
+        // store a SHORT typed fact (footer bleeds into a naive 120-char prefix)
+        let first = server
+            .remember(Parameters(RememberArgs {
+                body: "GOTCHA: never open the db over SMB".into(),
+                entity_id: None,
+                project: None,
+                fact_type: Some("gotcha".into()),
+                tags: Some(vec!["db".into()]),
+                triggers: None,
+                anchors: None,
+                expires: None,
+                provenance: None,
+            }))
+            .await;
+        assert!(first.starts_with("stored entity"), "{first}");
+        // the exact same body again: the footer must NOT defeat the refusal
+        let dup = server
+            .remember(Parameters(RememberArgs {
+                body: "GOTCHA: never open the db over SMB".into(),
+                entity_id: None,
+                project: None,
+                fact_type: Some("gotcha".into()),
+                tags: None,
+                triggers: None,
+                anchors: None,
+                expires: None,
+                provenance: None,
+            }))
+            .await;
+        assert!(dup.contains("NOT stored"), "typed footer must not defeat dup detection: {dup}");
+        // ...but the same body deliberately scoped to a PROJECT is a legitimate
+        // write (the global fact would surface there anyway, so THAT is refused;
+        // a fact living only in ProjA must be storable for ProjB).
+        let a = server
+            .remember(Parameters(RememberArgs {
+                body: "ProjA-only rule: pin the flux version".into(),
+                entity_id: None,
+                project: Some("ProjA".into()),
+                fact_type: None,
+                tags: None,
+                triggers: None,
+                anchors: None,
+                expires: None,
+                provenance: None,
+            }))
+            .await;
+        assert!(a.starts_with("stored entity"), "{a}");
+        let b = server
+            .remember(Parameters(RememberArgs {
+                body: "ProjA-only rule: pin the flux version".into(),
+                entity_id: None,
+                project: Some("ProjB".into()),
+                fact_type: None,
+                tags: None,
+                triggers: None,
+                anchors: None,
+                expires: None,
+                provenance: None,
+            }))
+            .await;
+        assert!(
+            b.starts_with("stored entity"),
+            "the same body for ANOTHER project is not a duplicate (ProjA's fact is out of ProjB's scope): {b}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_remember_validates_project_key() {
+        let (server, _d) = server_with(seed());
+        let out = server
+            .remember(Parameters(RememberArgs {
+                body: "a fact for a malformed key".into(),
+                entity_id: None,
+                project: Some("acme:widgets".into()),
+                fact_type: None,
+                tags: None,
+                triggers: None,
+                anchors: None,
+                expires: None,
+                provenance: None,
+            }))
+            .await;
+        assert!(
+            out.contains("invalid project key"),
+            "a ':' in the key would silently mis-scope the fact (owner = prefix before FIRST ':'): {out}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_remember_refuses_existing_entity_and_chunk_ids() {
+        let (server, _d) = server_with(seed());
+        // Existing entity: create is never an upsert - a second parentless root
+        // would silently ADD a contested head (DIVERGED).
+        let out = server
+            .remember(Parameters(RememberArgs {
+                body: "an entirely different corrected body".into(),
+                entity_id: Some("e1".into()),
+                project: None,
+                fact_type: None,
+                tags: None,
+                triggers: None,
+                anchors: None,
+                expires: None,
+                provenance: None,
+            }))
+            .await;
+        assert!(out.contains("NOT stored"), "{out}");
+        assert!(out.contains("already exists"), "{out}");
+        let get = server.get(Parameters(GetArgs { entity_id: "e1".into() })).await;
+        assert!(!get.contains("DIVERGED"), "a refused remember must not mint a branch: {get}");
+        // Chunk id: managed by ingest alone.
+        let chunk = server
+            .remember(Parameters(RememberArgs {
+                body: "text for a chunk".into(),
+                entity_id: Some("Proj:src/a.rs#0".into()),
+                project: None,
+                fact_type: None,
+                tags: None,
+                triggers: None,
+                anchors: None,
+                expires: None,
+                provenance: None,
+            }))
+            .await;
+        assert!(chunk.contains("chunk"), "{chunk}");
+    }
+
+    #[tokio::test]
+    async fn test_remember_rejects_empty_body() {
+        let (server, _d) = server_with(seed());
+        let out = server.remember(Parameters(remember_args("   "))).await;
+        assert!(out.contains("non-empty"), "empty body must be rejected: {out}");
+    }
+
+    #[tokio::test]
+    async fn test_revise_lifecycle_and_stale_parent_conflict() {
+        let (server, _d) = server_with(seed());
+        // revise with auto-filled parent (single head)
+        let out = server
+            .revise(Parameters(ReviseArgs {
+                entity_id: "e1".into(),
+                body: Some("the deploy watcher gotcha, updated".into()),
+                ..Default::default()
+            }))
+            .await;
+        assert!(out.starts_with("revised e1"), "{out}");
+        // the old text is no longer a head; the new one recalls
+        let rc = server.recall(Parameters(recall_args("deploy watcher"))).await;
+        assert!(rc.contains("updated"), "{rc}");
+        // a stale parent_rev is rejected with the fresh head-set, never a branch
+        let stale = server
+            .revise(Parameters(ReviseArgs {
+                entity_id: "e1".into(),
+                body: Some("racing write".into()),
+                parent_rev: Some("0000000000000000000000000000000000000000000000000000000000000000".into()),
+                ..Default::default()
+            }))
+            .await;
+        assert!(stale.contains("rejected"), "stale parent must conflict: {stale}");
+        assert!(stale.contains("head-set"), "the fresh head-set is returned: {stale}");
+        let get = server.get(Parameters(GetArgs { entity_id: "e1".into() })).await;
+        assert!(!get.contains("DIVERGED"), "a rejected revise must not mint a branch: {get}");
+        // revising an unknown entity errors (never creates a stray head)
+        let err = server
+            .revise(Parameters(ReviseArgs {
+                entity_id: "nope".into(),
+                body: Some("x".into()),
+                ..Default::default()
+            }))
+            .await;
+        assert!(err.contains("unknown entity"), "got: {err}");
+    }
+
+    #[tokio::test]
+    async fn test_revise_bare_id_suggests_full_prefixed_id() {
+        // A memory minted for a project carries a `<project>:mem-...` id. An agent
+        // that revises by the bare local part (`mem-...`) must get the exact full
+        // id echoed back, not a bare "unknown entity" it has to reverse-engineer.
+        let mut store = seed();
+        store
+            .append_event("s", "l", "a", EventKind::FactCreated, "acme-shop:mem-abc", None, "a scoped fact")
+            .unwrap();
+        let (server, _d) = server_with(store);
+
+        let err = server
+            .revise(Parameters(ReviseArgs {
+                entity_id: "mem-abc".into(),
+                body: Some("fix".into()),
+                ..Default::default()
+            }))
+            .await;
+        assert!(err.contains("unknown entity"), "still names the failure: {err}");
+        assert!(err.contains("acme-shop:mem-abc"), "echoes the full id to retry with: {err}");
+
+        // retract shares the same path.
+        let err = server
+            .retract(Parameters(RetractArgs { entity_id: "mem-abc".into(), parent_rev: None, reason: None }))
+            .await;
+        assert!(err.contains("acme-shop:mem-abc"), "retract suggests it too: {err}");
+
+        // A genuinely-unknown bare id has no match: no misleading suggestion.
+        let err = server
+            .revise(Parameters(ReviseArgs {
+                entity_id: "mem-zzz".into(),
+                body: Some("x".into()),
+                ..Default::default()
+            }))
+            .await;
+        assert!(err.contains("unknown entity"), "{err}");
+        assert!(!err.contains("did you mean"), "no guess when nothing matches: {err}");
+    }
+
+    #[test]
+    fn tags_as_string_gives_a_self_explanatory_error() {
+        // Since 2026-07-25 tags COERCES a comma-separated string (measured:
+        // four failed calls across three sessions on the strict shape, and a
+        // split tag list is exactly what the caller meant - no dead-anchor
+        // risk exists for tags).
+        let ok = serde_json::from_value::<RememberArgs>(
+            serde_json::json!({ "body": "x", "tags": "deploy, farm , " }),
+        )
+        .unwrap();
+        assert_eq!(ok.tags.unwrap(), vec!["deploy".to_string(), "farm".to_string()]);
+        // anchors/triggers KEEP the strict contract: a joined string would
+        // become one dead anchor that never fires.
+        let err = serde_json::from_value::<RememberArgs>(
+            serde_json::json!({ "body": "x", "anchors": "deploy.sh" }),
+        )
+        .err()
+        .expect("a string anchors value must be rejected")
+        .to_string();
+        assert!(err.contains("anchors") && err.contains("JSON array"), "{err}");
+    }
+
+    /// The remember twin of the mark inversion fix: `content` instead of
+    /// `body` (measured, session report 2026-07-25) must error naming the
+    /// real fields, never silently drop the unknown parameter.
+    #[test]
+    fn remember_rejects_unknown_parameter_names() {
+        let err = match serde_json::from_value::<RememberArgs>(
+            serde_json::json!({ "content": "een feit", "tags": ["a"] }),
+        ) {
+            Ok(_) => panic!("unknown fields must be rejected"),
+            Err(e) => e,
+        };
+        let msg = err.to_string();
+        assert!(msg.contains("unknown field") || msg.contains("missing field"), "{msg}");
+    }
+
+    #[test]
+    fn tags_accept_array_null_and_absence() {
+        let ok = serde_json::from_value::<RememberArgs>(
+            serde_json::json!({ "body": "x", "tags": ["a", "b"] }),
+        )
+        .unwrap();
+        assert_eq!(ok.tags.unwrap(), vec!["a".to_string(), "b".to_string()]);
+
+        let absent =
+            serde_json::from_value::<RememberArgs>(serde_json::json!({ "body": "x" })).unwrap();
+        assert!(absent.tags.is_none());
+
+        let null = serde_json::from_value::<RememberArgs>(
+            serde_json::json!({ "body": "x", "tags": null }),
+        )
+        .unwrap();
+        assert!(null.tags.is_none(), "explicit null is still 'no tags'");
+    }
+
+    #[tokio::test]
+    async fn test_retract_hides_from_recall_keeps_history() {
+        let (server, _d) = server_with(seed());
+        let out = server
+            .retract(Parameters(RetractArgs { entity_id: "e1".into(), parent_rev: None, reason: Some("obsolete".into()) }))
+            .await;
+        assert!(out.starts_with("retracted e1"), "{out}");
+        let rc = server.recall(Parameters(recall_args("deploy watcher"))).await;
+        assert!(rc.contains("No THOR hits"), "a retracted fact must stop surfacing: {rc}");
+        let hist = server.history(Parameters(EntityArgs { entity_id: "e1".into() })).await;
+        assert!(hist.contains("fact_retracted"), "history keeps the full trail: {hist}");
+        assert!(hist.contains("fact_created"), "{hist}");
+    }
+
+    #[tokio::test]
+    async fn test_resolve_settles_diverged_entity() {
+        let mut store = seed();
+        // force a divergence via the raw primitive
+        store
+            .append_event("s", "l", "a", EventKind::FactRevised, "e1", Some("stale-parent"), "branch B")
+            .unwrap();
+        let heads: Vec<String> = {
+            let events = store.get_all_events().unwrap();
+            let mut h: Vec<String> =
+                crate::cas::compute_head_sets(&events)["e1"].heads.iter().cloned().collect();
+            h.sort();
+            h
+        };
+        assert_eq!(heads.len(), 2, "sanity: diverged");
+        let (server, _d) = server_with(store);
+        let out = server
+            .resolve(Parameters(ResolveArgs { entity_id: "e1".into(), keep_rev: heads[0].clone() }))
+            .await;
+        assert!(out.starts_with("resolved e1"), "{out}");
+        let get = server.get(Parameters(GetArgs { entity_id: "e1".into() })).await;
+        assert!(!get.contains("DIVERGED"), "resolve must settle the entity: {get}");
+    }
+
+    #[tokio::test]
+    async fn test_mark_appends_echo_and_validates_entity() {
+        let (server, d) = server_with(seed());
+        let out = server.mark(Parameters(MarkArgs { entity_id: "e1".into(), noise: false })).await;
+        assert!(out.contains("marked e1"), "{out}");
+        let hist = server.history(Parameters(EntityArgs { entity_id: "e1".into() })).await;
+        assert!(hist.contains("fact_echoed"), "the echo lands in the log: {hist}");
+        let bad = server.mark(Parameters(MarkArgs { entity_id: "nope".into(), noise: false })).await;
+        assert!(bad.contains("unknown entity"), "{bad}");
+
+        // noise: LOCAL ledger counter, never a log event
+        let db = d.path().join("thor.db");
+        let out = server.mark(Parameters(MarkArgs { entity_id: "e1".into(), noise: true })).await;
+        assert!(out.contains("noise"), "{out}");
+        assert_eq!(crate::ledger::counter(&db, "noise", "e1"), 1);
+        let hist = server.history(Parameters(EntityArgs { entity_id: "e1".into() })).await;
+        assert_eq!(hist.matches("fact_echoed").count(), 1, "noise never lands in the synced log");
+        let bad = server.mark(Parameters(MarkArgs { entity_id: "nope".into(), noise: true })).await;
+        assert!(bad.contains("unknown entity"), "noise mark validates existence too: {bad}");
+    }
+
+    /// The measured revise friction (three session reports, 2026-07-24): a
+    /// one-line status change meant retyping the whole body. append and
+    /// replace_from/replace_to are body surgery in the same spirit as the
+    /// footer field-surgery: head read here, content edited, footer kept.
+    #[tokio::test]
+    async fn revise_append_and_replace_edit_content_without_retyping() {
+        let mut store = EventStore::in_memory().unwrap();
+        let body = format!(
+            "de feature is NIET gedeployed\n\n{}",
+            crate::footer::compose_full(
+                "decision", &["deploy".into()], "global", &[], &[], None, None,
+            )
+        );
+        store.append_event("s", "l", "a", EventKind::FactCreated, "e-surg", None, &body).unwrap();
+        let (server, _d) = server_with(store);
+
+        // replace: exact unique match, footer untouched.
+        let out = server
+            .revise(Parameters(ReviseArgs {
+                entity_id: "e-surg".into(),
+                replace_from: Some("NIET gedeployed".into()),
+                replace_to: Some("op dev als .110".into()),
+                ..Default::default()
+            }))
+            .await;
+        assert!(out.starts_with("revised e-surg"), "{out}");
+        let got = server.get(Parameters(GetArgs { entity_id: "e-surg".into() })).await;
+        assert!(got.contains("op dev als .110"), "{got}");
+        assert!(!got.contains("NIET gedeployed"), "the old text is gone: {got}");
+        assert!(got.contains("memory/decision"), "footer survives the surgery: {got}");
+
+        // append: a status paragraph lands under the content, footer intact.
+        let out = server
+            .revise(Parameters(ReviseArgs {
+                entity_id: "e-surg".into(),
+                append: Some("UPDATE 2026-07-24: live op prod.".into()),
+                ..Default::default()
+            }))
+            .await;
+        assert!(out.starts_with("revised e-surg"), "{out}");
+        let got = server.get(Parameters(GetArgs { entity_id: "e-surg".into() })).await;
+        assert!(
+            got.contains("op dev als .110") && got.contains("UPDATE 2026-07-24"),
+            "append keeps the old content: {got}"
+        );
+        assert!(got.contains("memory/decision"), "{got}");
+
+        // Guard-rails: unmatched text is refused, body+append conflicts.
+        let miss = server
+            .revise(Parameters(ReviseArgs {
+                entity_id: "e-surg".into(),
+                replace_from: Some("bestaat niet".into()),
+                replace_to: Some("x".into()),
+                ..Default::default()
+            }))
+            .await;
+        assert!(miss.contains("not found"), "{miss}");
+        let conflict = server
+            .revise(Parameters(ReviseArgs {
+                entity_id: "e-surg".into(),
+                body: Some("volledig nieuw".into()),
+                append: Some("en nog wat".into()),
+                ..Default::default()
+            }))
+            .await;
+        assert!(conflict.contains("not both"), "{conflict}");
+    }
+
+    /// Form-tolerant id resolution (the measured 4-failed-mark-calls friction,
+    /// 2026-07-24): a bare or truncated ref matching exactly ONE live entity
+    /// resolves and says so; an ambiguous ref never does.
+    #[tokio::test]
+    async fn mark_resolves_unique_bare_and_truncated_ids_never_ambiguous() {
+        let mut store = EventStore::in_memory().unwrap();
+        store
+            .append_event(
+                "s", "l", "a", EventKind::FactCreated,
+                "ProjX:mem-aabbccdd-1234", None, "scoped feit een",
+            )
+            .unwrap();
+        store
+            .append_event("s", "l", "a", EventKind::FactCreated, "ProjX:mem-zz99", None, "ander feit")
+            .unwrap();
+        store.append_event("s", "l", "a", EventKind::FactCreated, "A:mem-dupe", None, "dubbel a").unwrap();
+        store.append_event("s", "l", "a", EventKind::FactCreated, "B:mem-dupe", None, "dubbel b").unwrap();
+        let (server, _d) = server_with(store);
+
+        let bare = server
+            .mark(Parameters(MarkArgs { entity_id: "mem-aabbccdd-1234".into(), noise: false }))
+            .await;
+        assert!(
+            bare.contains("ProjX:mem-aabbccdd-1234") && bare.contains("resolved from"),
+            "bare ref resolves to the unique scoped id: {bare}"
+        );
+        let trunc = server
+            .mark(Parameters(MarkArgs { entity_id: "ProjX:mem-aabbccdd".into(), noise: false }))
+            .await;
+        assert!(trunc.contains("ProjX:mem-aabbccdd-1234"), "truncated unique ref resolves: {trunc}");
+        let ambig = server
+            .mark(Parameters(MarkArgs { entity_id: "mem-dupe".into(), noise: false }))
+            .await;
+        assert!(ambig.contains("unknown entity"), "ambiguity never resolves: {ambig}");
+    }
+
+    /// The write-time half of the scope discipline (2026-07-24): a fact
+    /// landing GLOBAL comes back with the scope question; a deliberately
+    /// scoped store does not.
+    /// Structural fix for the measured milestone pile-up (61 facts, 11.6% of all
+    /// stored text, zero expiries): the WRITE sets the expiry, because relying on
+    /// authoring discipline is what produced the pile in the first place.
+    #[tokio::test]
+    async fn a_self_declared_report_is_stored_with_an_expiry_by_default() {
+        let (server, _d) = server_with(seed());
+        let args = |body: &str, expires: Option<&str>| RememberArgs {
+            body: body.into(),
+            entity_id: None,
+            project: Some("acme".into()),
+            fact_type: None,
+            tags: None,
+            triggers: None,
+            anchors: None,
+            expires: expires.map(str::to_string),
+            provenance: None,
+        };
+
+        // Report-shaped, no expiry given: THOR supplies one and says so - even
+        // though no other footer field was passed (the footer appears for it).
+        let r = server
+            .remember(Parameters(args("MIJLPAAL: de tweede oven staat live sinds vandaag", None)))
+            .await;
+        assert!(r.contains("stored entity"), "{r}");
+        assert!(r.contains("Report-shaped"), "the reply explains the expiry: {r}");
+        let id = r.split_whitespace().nth(2).unwrap().to_string();
+        let stored = server.get(Parameters(GetArgs { entity_id: id })).await;
+        let horizon = crate::footer::days_from_today(crate::footer::REPORT_EXPIRY_DAYS);
+        assert!(stored.contains(&format!("expires: {horizon}")), "expiry in the footer: {stored}");
+
+        // An explicit expiry always wins - the default never overrides an author.
+        let e = server
+            .remember(Parameters(args("MILESTONE: the kiln rebuild is done", Some("2026-12-31"))))
+            .await;
+        assert!(!e.contains("Report-shaped"), "explicit expires needs no lecture: {e}");
+        let eid = e.split_whitespace().nth(2).unwrap().to_string();
+        let estored = server.get(Parameters(GetArgs { entity_id: eid })).await;
+        assert!(estored.contains("expires: 2026-12-31"), "author's date kept: {estored}");
+
+        // An ordinary fact is untouched: no expiry, no note, no footer forced.
+        let n = server
+            .remember(Parameters(args("de tweede oven draait op 230 volt", None)))
+            .await;
+        assert!(!n.contains("Report-shaped"), "a normal fact gets no note: {n}");
+        let nid = n.split_whitespace().nth(2).unwrap().to_string();
+        let nstored = server.get(Parameters(GetArgs { entity_id: nid })).await;
+        assert!(!nstored.contains("expires:"), "no expiry on a normal fact: {nstored}");
+    }
+
+    /// Measured on the real store (2026-07-25): 207 of 675 live facts, 31%, had
+    /// a footer naming a scope the machinery had stopped using - every reproject
+    /// since the beginning left the reader's copy behind. The event and the
+    /// footer must not be allowed to disagree.
+    #[tokio::test]
+    async fn reproject_also_corrects_the_footer_the_reader_sees() {
+        let mut store = seed();
+        let body = format!(
+            "de oven draait op 230 volt\n\n{}",
+            crate::footer::compose_full("gotcha", &[], "OldProj", &[], &[], None, None)
+        );
+        store
+            .append_event("s", "l", "a", EventKind::FactCreated, "OldProj:mem-oven", None, &body)
+            .unwrap();
+        // A fact WITHOUT a footer must not gain one, and must not error.
+        store
+            .append_event("s", "l", "a", EventKind::FactCreated, "OldProj:mem-bare", None, "kaal feit")
+            .unwrap();
+        let (server, _d) = server_with(store);
+
+        let out = server
+            .reproject(Parameters(ReprojectArgs {
+                entity_id: "OldProj:mem-oven".into(),
+                project: "NewProj".into(),
+            }))
+            .await;
+        assert!(out.contains("footer scope updated"), "the reply says what it did: {out}");
+        let shown = server
+            .get(Parameters(GetArgs { entity_id: "OldProj:mem-oven".into() }))
+            .await;
+        assert!(shown.contains("project: NewProj"), "reader sees the new scope: {shown}");
+        assert!(!shown.contains("project: OldProj"), "and not the old one: {shown}");
+        assert!(shown.contains("de oven draait op 230 volt"), "content untouched: {shown}");
+
+        let bare = server
+            .reproject(Parameters(ReprojectArgs {
+                entity_id: "OldProj:mem-bare".into(),
+                project: "NewProj".into(),
+            }))
+            .await;
+        assert!(bare.contains("reprojected"), "a footerless fact still reprojects: {bare}");
+        assert!(!bare.contains("footer scope updated"), "and writes no empty revision: {bare}");
+    }
+
+    #[tokio::test]
+    async fn remember_global_asks_the_scope_question_scoped_does_not() {
+        let (server, _d) = server_with(seed());
+        let args = |body: &str, project: Option<&str>| RememberArgs {
+            body: body.into(),
+            entity_id: None,
+            project: project.map(str::to_string),
+            fact_type: None,
+            tags: None,
+            triggers: None,
+            anchors: None,
+            expires: None,
+            provenance: None,
+        };
+        let g = server
+            .remember(Parameters(args("een gloednieuw domein-feit over de rookoven", None)))
+            .await;
+        assert!(g.contains("stored entity"), "{g}");
+        assert!(g.contains("Landed GLOBAL"), "global store carries the scope question: {g}");
+        let s = server
+            .remember(Parameters(args(
+                "een netjes gescoped feit over de frezen-bibliotheek",
+                Some("acme"),
+            )))
+            .await;
+        assert!(s.contains("stored entity"), "{s}");
+        assert!(!s.contains("Landed GLOBAL"), "scoped store gets no scope question: {s}");
+    }
+
+    /// Scope-bleed feedback (2026-07-24): a global fact repeatedly judged
+    /// noise should come back with the structural fix (rescope), not just a
+    /// counter tick - and a project-scoped fact never gets that hint.
+    #[tokio::test]
+    async fn repeated_noise_on_a_global_fact_suggests_rescoping() {
+        let mut store = seed();
+        let scoped = format!(
+            "een netjes gescoped feit\n\n{}",
+            crate::footer::compose_full("gotcha", &[], "ProjX", &[], &[], None, None)
+        );
+        store
+            .append_event(
+                "s", "l", "a", EventKind::FactCreated, "ProjX:mem-p1", None, &scoped,
+            )
+            .unwrap();
+        let (server, _d) = server_with(store);
+
+        // First noise mark on a global fact: plain acknowledgment.
+        let first = server.mark(Parameters(MarkArgs { entity_id: "e1".into(), noise: true })).await;
+        assert!(!first.contains("reproject"), "one judgment is not a pattern: {first}");
+        // Second: the scope hint rides along.
+        let second = server.mark(Parameters(MarkArgs { entity_id: "e1".into(), noise: true })).await;
+        assert!(second.contains("reproject"), "repeat noise on GLOBAL suggests rescoping: {second}");
+
+        // A project-scoped fact never gets the hint, however often it is noise.
+        server.mark(Parameters(MarkArgs { entity_id: "ProjX:mem-p1".into(), noise: true })).await;
+        let p2 =
+            server.mark(Parameters(MarkArgs { entity_id: "ProjX:mem-p1".into(), noise: true })).await;
+        assert!(!p2.contains("reproject"), "already-scoped fact gets no rescope hint: {p2}");
+    }
+
+    /// Measured 2026-07-24: an agent called mark with `quality: "noise"` +
+    /// `note: ...`; unknown fields were silently dropped, `noise` defaulted to
+    /// false, and three distractions were recorded as USEFUL - the judgment
+    /// inverted. The args shape must reject what it does not understand.
+    #[test]
+    fn mark_rejects_unknown_parameters_instead_of_inverting_the_judgment() {
+        let err = match serde_json::from_value::<MarkArgs>(serde_json::json!({
+            "entity_id": "e1", "quality": "noise", "note": "pure afleiding"
+        })) {
+            Ok(_) => panic!("unknown fields must be rejected, not dropped"),
+            Err(e) => e,
+        };
+        let msg = err.to_string();
+        // serde names whichever unknown field it meets first - the guarantees
+        // that matter are the rejection itself and a self-explanatory message
+        // listing the real fields.
+        assert!(msg.contains("unknown field"), "self-explanatory rejection: {msg}");
+        assert!(msg.contains("entity_id") && msg.contains("noise"), "lists the real fields: {msg}");
+        // The legitimate shape still parses.
+        let ok = serde_json::from_value::<MarkArgs>(
+            serde_json::json!({"entity_id": "e1", "noise": true}),
+        )
+        .unwrap();
+        assert!(ok.noise);
+    }
+
+    #[tokio::test]
+    async fn test_pin_unpin_and_brief() {
+        let mut store = seed();
+        store
+            .append_event(
+                "s", "l", "a", EventKind::FactCreated, "rule-1", None,
+                "HARDE REGEL: never force-recreate on prod",
+            )
+            .unwrap();
+        let (server, _d) = server_with(store);
+        let out = server.pin(Parameters(EntityArgs { entity_id: "rule-1".into() })).await;
+        assert!(out.starts_with("pinned rule-1"), "{out}");
+        let brief = server.brief(Parameters(BriefArgs { project: None })).await;
+        assert!(brief.contains("2 memories"), "counts live facts: {brief}");
+        assert!(brief.contains("<thor-brief>"), "pinned block present: {brief}");
+        assert!(brief.contains("never force-recreate on prod"), "full pinned body: {brief}");
+        assert!(brief.contains("[preference]"), "typed count/tag: {brief}");
+        let out = server.unpin(Parameters(EntityArgs { entity_id: "rule-1".into() })).await;
+        assert!(out.starts_with("unpinned"), "{out}");
+        let brief = server.brief(Parameters(BriefArgs { project: None })).await;
+        assert!(!brief.contains("<thor-brief>"), "unpinned -> no pinned block: {brief}");
+    }
+
+    #[tokio::test]
+    async fn test_reproject_moves_scope_and_refuses_chunks() {
+        let (server, _d) = server_with(seed());
+        let out = server
+            .reproject(Parameters(ReprojectArgs { entity_id: "e1".into(), project: "ProjA".into() }))
+            .await;
+        assert!(out.contains("e1 -> ProjA"), "{out}");
+        // now scoped: visible in ProjA, hidden in ProjB
+        let mut in_a = recall_args("deploy watcher");
+        in_a.project = Some("ProjA".into());
+        assert!(server.recall(Parameters(in_a)).await.contains("e1"));
+        let mut in_b = recall_args("deploy watcher");
+        in_b.project = Some("ProjB".into());
+        assert!(server.recall(Parameters(in_b)).await.contains("No THOR hits"));
+        // chunks are refused
+        let chunk = server
+            .reproject(Parameters(ReprojectArgs { entity_id: "P:src/a.rs#0".into(), project: "X".into() }))
+            .await;
+        assert!(chunk.contains("chunk"), "{chunk}");
+    }
+
+    #[tokio::test]
+    async fn test_http_router_builds() {
+        // the Streamable-HTTP transport wires up without a live socket
+        let _app = mcp_http_router(|| {
+            Ok(ThorServer::new(EventStore::in_memory().unwrap(), PathBuf::from("thor-test.db")))
+        });
+    }
+}

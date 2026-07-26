@@ -1207,6 +1207,15 @@ pub fn run() -> Result<()> {
 
                  ## Rubric (per candidate, in order)
 
+                 0. PINS FIRST: read every pinned fact against current reality before any
+                    mechanical list below. Pins are re-injected at every session start, so a
+                    stale sentence in a pin is the loudest lie in the store - and no work
+                    list can catch it (the lists check form: anchors, expiry, tags; only
+                    reading checks truth). Also judge the pin SET itself: is each pinned
+                    fact still the right carrier of its rule (not a superseded half)?
+                    Measured 2026-07-27: two pin defects had survived every sweep because
+                    every sweep was list-driven.
+
                  1. KEEP (default, no action): anything with plausible future reuse value.
                     Reference data, formulas, business facts, hardware knowledge, preferences,
                     gotchas, design rationale: ALWAYS keep. Doubt = keep.

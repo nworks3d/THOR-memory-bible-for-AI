@@ -303,11 +303,6 @@ struct LiveHead {
     /// the dup keep-priority uses to prefer the seeded copy.
     referenced: bool,
     pinned: bool,
-    /// Footer expiry already past: the fact no longer surfaces in recall and
-    /// (since 2026-07-26) the guard skips it too, so work lists that exist to
-    /// feed those surfaces - retro-anchoring above all - must not propose
-    /// work on it: an anchor on a silenced fact is dead work.
-    expired: bool,
     /// Footer carries an expiry AT ALL - past or future. A fact with a date on
     /// it is a REPORT by this store's own doctrine ("reports expire, rules
     /// never"), and a report scheduled to be silenced does not need a gate.
@@ -379,7 +374,6 @@ fn live_memory_heads(events: &[Event], pins: &[String]) -> Vec<LiveHead> {
     // Same strict compare recall and the guard use (expired = expires < today).
     // consolidate is not one of the clock-free fold modules (cas/auditor), so
     // reading the clock here is fine - the report is about TODAY's store.
-    let today = crate::footer::today();
     for (id, hs) in &heads {
         if crate::repo::is_chunk_id(id) || hs.is_diverged || hs.heads.len() != 1 {
             continue;
@@ -408,8 +402,6 @@ fn live_memory_heads(events: &[Event], pins: &[String]) -> Vec<LiveHead> {
             report_shaped_no_expiry: crate::footer::report_shaped(&head.body)
                 && crate::footer::expires(&head.body).is_none(),
             has_expiry: crate::footer::expires(&head.body).is_some(),
-            expired: crate::footer::expires(&head.body)
-                .is_some_and(|d| d.as_str() < today.as_str()),
             no_gate: crate::footer::has_tag(&head.body, "no-gate"),
             pointer_body: crate::courier::is_scope_pointer(&head.body).then(|| head.body.clone()),
             guarded: crate::footer::has_tag(&head.body, crate::courier::GUARDED_TAG),

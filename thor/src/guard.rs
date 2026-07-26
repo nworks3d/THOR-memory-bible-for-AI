@@ -296,6 +296,150 @@ fn names_file(body_lower: &str, name_l: &str, stem_l: &str) -> bool {
         && [" ", "-"].iter().any(|sep| body_lower.contains(&stem_l.replace('_', sep)))
 }
 
+/// Shortest token worth treating as a cited code name.
+const STALE_LITERAL_MIN_CHARS: usize = 5;
+/// How far back to look for a negation cue before a cited literal.
+const NEGATION_WINDOW_CHARS: usize = 60;
+/// Cues that turn "this fact cites X" into "this fact says X is gone". The one
+/// surviving false-positive class in the measurement: the fact DOCUMENTS the
+/// removal it is being warned about.
+const NEGATION_CUES: &[&str] = &[
+    "niet meer", "no longer", "instead of", "i.p.v.", "vervangt", "vervangen", "verwijderd",
+    "removed", "replaced", "voorheen", "formerly", "used to", "dropped", "was ", "niet langer",
+];
+
+/// Code literals a fact CITES: tokens carrying an underscore.
+///
+/// The underscore is the whole trick, and it is measured rather than guessed
+/// (2026-07-25, over the live store). A pattern that accepted any SHOUTED word
+/// also caught Dutch emphasis - GOTCHA, AANLEIDING, DATAVERLIES - and fired on
+/// 42% of (fact, file) pairs. Underscores are produced by code and almost never
+/// by prose, so `MAX_HITS`, `TS_AUTHKEY` and `event_store` survive while the
+/// emphasis words drop out. Returns each literal with its byte offset, because
+/// the negation check needs to look at the text just before it.
+fn cited_code_literals(body: &str) -> Vec<(usize, String)> {
+    fn keep(out: &mut Vec<(usize, String)>, body: &str, s: usize, e: usize) {
+        let tok = &body[s..e];
+        if tok.chars().count() < STALE_LITERAL_MIN_CHARS
+            || !tok.contains('_')
+            || tok.starts_with('_')
+            || tok.ends_with('_')
+            || !tok.chars().any(|c| c.is_ascii_alphabetic())
+        {
+            return;
+        }
+        if !out.iter().any(|(_, t)| t == tok) {
+            out.push((s, tok.to_string()));
+        }
+    }
+    let mut out: Vec<(usize, String)> = Vec::new();
+    let mut start: Option<usize> = None;
+    for (i, c) in body.char_indices() {
+        match (c.is_ascii_alphanumeric() || c == '_', start) {
+            (true, None) => start = Some(i),
+            (false, Some(s)) => {
+                keep(&mut out, body, s, i);
+                start = None;
+            }
+            _ => {}
+        }
+    }
+    if let Some(s) = start {
+        keep(&mut out, body, s, body.len());
+    }
+    out
+}
+
+/// Does the text just before a cited literal say it is GONE? Then the fact is
+/// documenting the removal and warning about it would be backwards.
+fn negated_before(body: &str, at: usize) -> bool {
+    let window_start = body[..at]
+        .char_indices()
+        .rev()
+        .take(NEGATION_WINDOW_CHARS)
+        .last()
+        .map(|(i, _)| i)
+        .unwrap_or(0);
+    let window = body[window_start..at].to_lowercase();
+    NEGATION_CUES.iter().any(|cue| window.contains(cue))
+}
+
+/// TRANSITION EVIDENCE - the measured core of the stale-fact signal.
+///
+/// A literal missing from the file on disk means nothing on its own: most of
+/// them were never in that file. It only counts when the literal ALSO appears in
+/// an OLDER revision of that file's chunks, because then it was really taken
+/// out. Nothing new has to be stored for this - the append-only log already
+/// keeps every revision a chunk ever had.
+///
+/// Measured 2026-07-25 over 85 (fact, file) pairs: the naive "the anchored file
+/// changed since the fact" fired on 75% of pairs (useless - a guard that fires
+/// on three of four gets ignored within a day), the narrowed literal rule still
+/// fired on 66%, and this one fired on 2.4%.
+fn literal_was_removed(events: &[crate::event_store::Event], rel: &str, literal: &str) -> bool {
+    let needle = format!(":{rel}#");
+    events
+        .iter()
+        .any(|e| e.entity_id.contains(&needle) && e.body.contains(literal))
+}
+
+/// Read the touched file as ingest would have seen it. Compares against DISK,
+/// never against the stored chunk: an ingest that has not caught up yet would
+/// otherwise be reported as code drift.
+fn read_touched_file(path: &Path) -> Option<String> {
+    const MAX_BYTES: u64 = (crate::repo::MAX_FILE_CHARS as u64) * 4;
+    match std::fs::metadata(path) {
+        Ok(m) if m.len() > MAX_BYTES => return None,
+        Ok(_) => {}
+        Err(_) => return None,
+    }
+    let mut text = std::fs::read_to_string(path).ok()?;
+    crate::repo::truncate_to_max_file_chars(&mut text);
+    Some(text)
+}
+
+/// For each anchored fact, the code names it cites that this file once had and
+/// no longer does. Advisory only - it never blocks and never removes a hit.
+///
+/// Ordered cheapest-first on purpose: the expensive step (folding the log for
+/// this file's chunk history) only runs when a literal is actually missing from
+/// disk, which the measurement puts at a few percent of touches.
+fn vanished_citations(
+    store: &crate::event_store::EventStore,
+    hits: &[crate::recall::RecallHit],
+    file_path: &str,
+    cwd: Option<&str>,
+) -> Vec<(String, String)> {
+    if hits.is_empty() {
+        return Vec::new();
+    }
+    let abs = Path::new(file_path);
+    let Some(cwd) = cwd else { return Vec::new() };
+    let Some(root) = crate::repo::project_root(Path::new(cwd)) else { return Vec::new() };
+    let Ok(rel_path) = abs.strip_prefix(&root) else { return Vec::new() };
+    let rel = rel_path.to_string_lossy().replace('\\', "/");
+    let Some(current) = read_touched_file(abs) else { return Vec::new() };
+    // Cheap pass: which cited names are absent from the file as it is now?
+    let mut candidates: Vec<(String, String)> = Vec::new();
+    for h in hits {
+        for (at, lit) in cited_code_literals(&h.body) {
+            if !current.contains(&lit) && !negated_before(&h.body, at) {
+                candidates.push((h.entity_id.clone(), lit));
+            }
+        }
+    }
+    if candidates.is_empty() {
+        return Vec::new();
+    }
+    // Only now pay for the history: absence alone is not evidence of removal.
+    let events = match store.get_all_events() {
+        Ok(e) => e,
+        Err(_) => return Vec::new(), // fail-soft: no signal beats a wrong one
+    };
+    candidates.retain(|(_, lit)| literal_was_removed(&events, &rel, lit));
+    candidates
+}
+
 fn file_memory_advisory(db: &Path, hook: &Value) -> Option<String> {
     if crate::ledger::flag_present(db, "THOR-SILENT.flag") {
         return None; // the THOR kill switch silences the file advisory too
@@ -474,10 +618,28 @@ fn file_memory_advisory(db: &Path, hook: &Value) -> Option<String> {
     crate::ledger::upsert(db, "guard-seen", &key, &serde_json::json!(now));
     record_advised(db, session_id, "file", &named, now);
 
-    Some(format!(
+    // Stale-citation note. Only for the ANCHORED facts: their author declared
+    // this file, so a code name they cite that this file once had and no longer
+    // has is worth a word. Advisory, never blocking, and it never removes a hit
+    // - the fact may still be right about everything else it says.
+    let stale = vanished_citations(&store, &named, file_path, hook.get("cwd").and_then(|v| v.as_str()));
+    let mut out = format!(
         "stored memory about this file (verify before relying): {}",
         lines.join("  ||  ")
-    ))
+    );
+    if !stale.is_empty() {
+        let notes: Vec<String> = stale
+            .iter()
+            .map(|(id, lit)| format!("{id} cites `{lit}`"))
+            .collect();
+        out.push_str(&format!(
+            "  ||  HEADS UP - this file no longer contains what these facts name, and it did \
+             once: {}. Check them against the file before you build on them; they may simply \
+             be out of date.",
+            notes.join("; ")
+        ));
+    }
+    Some(out)
 }
 
 /// One serving per (session, entity, surface) ACROSS advisory keys. The
@@ -1248,6 +1410,119 @@ pub fn echo_evidence(body: &str, touched: &[String]) -> Option<String> {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    /// The underscore rule is the whole reason this signal is usable. An earlier
+    /// pattern accepted any shouted word and swallowed Dutch emphasis, which put
+    /// the fire rate at 42% of pairs and made it noise.
+    #[test]
+    fn cited_literals_take_code_names_and_leave_shouted_prose_alone() {
+        let body = "GOTCHA: DATAVERLIES dreigt - MAX_HITS staat op 3 en event_store.rs leest \
+                    TS_AUTHKEY, maar AANLEIDING was iets anders";
+        let got: Vec<String> = cited_code_literals(body).into_iter().map(|(_, l)| l).collect();
+        assert!(got.contains(&"MAX_HITS".to_string()), "a constant is a code name: {got:?}");
+        assert!(got.contains(&"TS_AUTHKEY".to_string()), "{got:?}");
+        assert!(got.contains(&"event_store".to_string()), "snake_case counts too: {got:?}");
+        for shouted in ["GOTCHA", "DATAVERLIES", "AANLEIDING"] {
+            assert!(
+                !got.iter().any(|l| l == shouted),
+                "{shouted} is emphasis, not code - it has no underscore: {got:?}"
+            );
+        }
+    }
+
+    /// The one surviving false positive in the measurement: a fact that
+    /// documents the removal it would be warned about.
+    #[test]
+    fn a_fact_that_says_the_name_is_gone_is_not_warned_about() {
+        let live = "server.js reads MAINSAIL_PUBLIC_ORIGIN at boot";
+        let removed = "server.js no longer uses MAINSAIL_PUBLIC_ORIGIN, the value moved to env";
+        let at = |b: &str| cited_code_literals(b).into_iter().next().unwrap().0;
+        assert!(!negated_before(live, at(live)), "a plain citation is not a removal note");
+        assert!(negated_before(removed, at(removed)), "'no longer' means the fact knows");
+    }
+
+    /// End to end: an anchored fact citing a name the file once had and no
+    /// longer has comes back as a warning - and the same fact stops warning the
+    /// moment the name is back in the file. The positive control for a signal
+    /// whose whole point is to stay quiet: silence has to mean "nothing wrong",
+    /// not "wired up wrong".
+    #[test]
+    fn a_vanished_citation_is_reported_and_a_present_one_is_not() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("thor.db");
+        let root = dir.path().join("proj");
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::write(root.join(".thor"), "proj\n").unwrap();
+        let file = root.join("src").join("server.js");
+
+        let mut store = crate::event_store::EventStore::new(&db).unwrap();
+        // The file DID carry the constant once - that is the transition evidence.
+        store
+            .append_event(
+                "s", "l", "a", crate::event_store::EventKind::FactCreated,
+                "proj:src/server.js#0", None, "const MAINSAIL_PUBLIC_ORIGIN = 'x';",
+            )
+            .unwrap();
+        let hit = crate::recall::RecallHit {
+            entity_id: "proj:mem-cites".into(),
+            rev: "r1".into(),
+            body: "the origin comes from MAINSAIL_PUBLIC_ORIGIN in src/server.js".into(),
+            kind: crate::event_store::EventKind::FactCreated,
+            is_diverged: false,
+            rank: 0.0,
+            project: Some("proj".into()),
+            fact_type: None,
+            matched_and: true,
+        };
+        let cwd = root.to_string_lossy().to_string();
+        let path = file.to_string_lossy().to_string();
+
+        // Code changed: the constant is gone from disk -> warn.
+        std::fs::write(&file, "const origin = process.env.ORIGIN;\n").unwrap();
+        let gone = vanished_citations(&store, std::slice::from_ref(&hit), &path, Some(&cwd));
+        assert_eq!(
+            gone,
+            vec![("proj:mem-cites".to_string(), "MAINSAIL_PUBLIC_ORIGIN".to_string())],
+            "the fact names something this file demonstrably used to have"
+        );
+
+        // Same fact, constant still there -> silence.
+        std::fs::write(&file, "const MAINSAIL_PUBLIC_ORIGIN = 'x';\n").unwrap();
+        assert!(
+            vanished_citations(&store, std::slice::from_ref(&hit), &path, Some(&cwd)).is_empty(),
+            "nothing vanished, so there is nothing to say"
+        );
+    }
+
+    /// Transition evidence: absence from the file today proves nothing on its
+    /// own. Measured 2026-07-25 - requiring that an OLDER chunk revision had the
+    /// literal took the fire rate from 75% to 2.4% with no new storage, because
+    /// the append-only log already keeps every revision.
+    #[test]
+    fn a_literal_counts_as_removed_only_if_this_file_once_had_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("thor.db");
+        let mut store = crate::event_store::EventStore::new(&db).unwrap();
+        store
+            .append_event(
+                "s", "l", "a", crate::event_store::EventKind::FactCreated,
+                "P:src/server.js#0", None, "const MAINSAIL_PUBLIC_ORIGIN = 1;",
+            )
+            .unwrap();
+        let events = store.get_all_events().unwrap();
+        assert!(
+            literal_was_removed(&events, "src/server.js", "MAINSAIL_PUBLIC_ORIGIN"),
+            "this file demonstrably carried it once"
+        );
+        assert!(
+            !literal_was_removed(&events, "src/server.js", "NEVER_WAS_HERE"),
+            "a name this file never had cannot have been taken out of it"
+        );
+        assert!(
+            !literal_was_removed(&events, "src/other.js", "MAINSAIL_PUBLIC_ORIGIN"),
+            "history is per file - another file's chunks are not evidence"
+        );
+    }
 
     #[test]
     fn auto_echo_fires_on_anchor_overlap_once_and_only_with_the_flag() {

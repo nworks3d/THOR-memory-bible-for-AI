@@ -1057,6 +1057,9 @@ impl ThorServer {
                             ));
                         }
                     }
+                    if let Some(warning) = crowded_anchor_warning(s, &entity_id, &ev.body) {
+                        out.push_str(&warning);
+                    }
                     Ok(out)
                 }
                 Err(e) => match e.downcast_ref::<MutateConflict>() {
@@ -1307,16 +1310,22 @@ impl ThorServer {
                     } else {
                         None
                     };
+                    // Same write-time crowding check remember does, checked
+                    // against the FINAL body: a metadata-only revise that never
+                    // touched anchors still carries whatever it inherited, and
+                    // that target may have become crowded since.
+                    let crowd_hint =
+                        crowded_anchor_warning(s, &args.entity_id, &ev.body).unwrap_or_default();
                     match carried {
                         Some(exp) => Ok(format!(
                             "revised {} -> rev {}\nnote: this fact still expires on {exp}. Your body \
                              carried no footer, so the previous one was kept, expiry included. To \
                              change or drop the date, revise again with just the expires parameter \
-                             (a new YYYY-MM-DD, or an empty string to remove it).{rule_expiry_note}",
+                             (a new YYYY-MM-DD, or an empty string to remove it).{rule_expiry_note}{crowd_hint}",
                             args.entity_id, ev.this_hash
                         )),
                         None => Ok(format!(
-                            "revised {} -> rev {}{rule_expiry_note}",
+                            "revised {} -> rev {}{rule_expiry_note}{crowd_hint}",
                             args.entity_id, ev.this_hash
                         )),
                     }
@@ -1792,6 +1801,39 @@ fn head_for_field_edit(
         }
     };
     Ok((rev, body, project))
+}
+
+/// Write-time mirror of consolidate's crowded-anchor report (2026-07-29): after
+/// a remember/revise succeeds, warn - never refuse, the write already happened -
+/// when the fact's OWN footer now carries an anchor that already crowds a
+/// target past what the guard can ever serve for it (crate::guard::
+/// FILE_MEMORY_HITS). Anchors otherwise pile up unnoticed: every one past the
+/// cap is dead weight the guard silently drops, and `thor consolidate` only
+/// said so after the fact.
+///
+/// Reuses consolidate's own grouping (crowded_anchors_now) instead of counting
+/// a second, independent way. Membership in a crowded group is decided solely
+/// by a head's OWN anchors (each head's anchors come straight from its own
+/// footer), so a hit whose entity_ids names `entity_id` IS this fact citing a
+/// crowded anchor - no re-parsing or re-normalizing an anchor string here.
+/// Fails silent throughout: a hint must never cost a write, so any read error
+/// just means no warning, never an error surfaced to the caller.
+fn crowded_anchor_warning(store: &EventStore, entity_id: &str, body: &str) -> Option<String> {
+    if crate::footer::anchors(body).is_empty() {
+        return None; // cheap skip: most writes carry no anchor at all
+    }
+    let events = store.get_all_events().ok()?;
+    let hit = crate::consolidate::crowded_anchors_now(&events)
+        .into_iter()
+        .find(|c| c.entity_ids.iter().any(|id| id == entity_id))?;
+    let others = hit.fact_count.saturating_sub(1); // this fact is one of fact_count
+    Some(format!(
+        "\nAnchor '{}' is already crowded: {} other live fact(s) carry it, and the guard only \
+         ever serves {} per target - the rest, including this one, drop silently at the moment \
+         of action. Either drop this anchor, or fold the constraint into one of the facts \
+         already on '{}' and leave this one unanchored.",
+        hit.anchor, others, hit.served, hit.anchor
+    ))
 }
 
 /// Rewrite the head's footer so its `project:` field names `target`, as a normal
@@ -3436,5 +3478,222 @@ mod tests {
         let _app = mcp_http_router(|| {
             Ok(ThorServer::new(EventStore::in_memory().unwrap(), PathBuf::from("thor-test.db")))
         });
+    }
+
+    /// The write-time half of the crowding report (2026-07-29): the guard only
+    /// ever serves crate::guard::FILE_MEMORY_HITS facts per anchored target and
+    /// silently drops the rest, so `thor consolidate` measured 47 targets on a
+    /// real store already past that cap - dead weight nobody was told about.
+    /// Two prior facts already anchored to the target is exactly the guard's
+    /// cap: a third one lands the target one fact past it.
+    #[tokio::test]
+    async fn remember_warns_when_its_anchor_already_crowds_a_target() {
+        let mut store = EventStore::in_memory().unwrap();
+        for id in ["mem-a", "mem-b"] {
+            store
+                .append_event(
+                    "s", "l", "a", EventKind::FactCreated, id, None,
+                    "an existing note about the payment flow\n\n\
+                     [memory/gotcha | tags: x | anchors: server/lib/payment.js]",
+                )
+                .unwrap();
+        }
+        let (server, _d) = server_with(store);
+
+        let out = server
+            .remember(Parameters(RememberArgs {
+                body: "a third note about the same payment flow".into(),
+                entity_id: None,
+                project: Some("acme".into()),
+                fact_type: Some("gotcha".into()),
+                tags: None,
+                triggers: None,
+                anchors: Some(vec!["server/lib/payment.js".into()]),
+                expires: None,
+                provenance: None,
+            }))
+            .await;
+        assert!(out.contains("stored entity"), "{out}");
+        assert!(out.contains("already crowded"), "the write-time warning fires: {out}");
+        assert!(out.contains("server/lib/payment.js"), "names the crowded target: {out}");
+        assert!(
+            out.contains(&format!("{} other live fact(s)", crate::guard::FILE_MEMORY_HITS)),
+            "names the count against the guard's real cap, never a hardcoded copy: {out}"
+        );
+    }
+
+    /// One prior fact on the target is one short of the guard's cap
+    /// (crate::guard::FILE_MEMORY_HITS = 2 OTHER facts needed to warn): the
+    /// guard can still serve both, so there is nothing to report.
+    #[tokio::test]
+    async fn remember_on_a_target_under_the_cap_draws_no_crowding_warning() {
+        let mut store = EventStore::in_memory().unwrap();
+        store
+            .append_event(
+                "s", "l", "a", EventKind::FactCreated, "mem-quiet", None,
+                "an existing note about the export job\n\n\
+                 [memory/gotcha | tags: x | anchors: src/export.rs]",
+            )
+            .unwrap();
+        let (server, _d) = server_with(store);
+
+        let out = server
+            .remember(Parameters(RememberArgs {
+                body: "a second note about the same export job".into(),
+                entity_id: None,
+                project: Some("acme".into()),
+                fact_type: Some("gotcha".into()),
+                tags: None,
+                triggers: None,
+                anchors: Some(vec!["src/export.rs".into()]),
+                expires: None,
+                provenance: None,
+            }))
+            .await;
+        assert!(out.contains("stored entity"), "{out}");
+        assert!(!out.contains("already crowded"), "under the cap, no warning: {out}");
+    }
+
+    /// A note with no anchors at all can never be part of any anchor's crowd -
+    /// the check must not fire regardless of how crowded OTHER targets are.
+    #[tokio::test]
+    async fn remember_with_no_anchors_draws_no_crowding_warning() {
+        let mut store = EventStore::in_memory().unwrap();
+        for id in ["mem-c", "mem-d", "mem-e"] {
+            store
+                .append_event(
+                    "s", "l", "a", EventKind::FactCreated, id, None,
+                    "an existing note about the render pipeline\n\n\
+                     [memory/gotcha | tags: x | anchors: src/render.rs]",
+                )
+                .unwrap();
+        }
+        let (server, _d) = server_with(store);
+
+        let out = server
+            .remember(Parameters(RememberArgs {
+                body: "an unrelated note that carries no anchor at all".into(),
+                entity_id: None,
+                project: Some("acme".into()),
+                fact_type: None,
+                tags: None,
+                triggers: None,
+                anchors: None,
+                expires: None,
+                provenance: None,
+            }))
+            .await;
+        assert!(out.contains("stored entity"), "{out}");
+        assert!(
+            !out.contains("already crowded"),
+            "no anchor at all -> no warning, however crowded an unrelated target is: {out}"
+        );
+    }
+
+    /// A fact must never count itself as one of its own anchor's crowd: the
+    /// FIRST fact ever anchored to a brand-new target is quiet even though it
+    /// carries that anchor, because zero OTHER facts share it yet.
+    #[tokio::test]
+    async fn remember_never_counts_itself_toward_its_own_anchors_crowd() {
+        let (server, _d) = server_with(EventStore::in_memory().unwrap());
+        let out = server
+            .remember(Parameters(RememberArgs {
+                body: "the first note ever anchored to this file".into(),
+                entity_id: None,
+                project: Some("acme".into()),
+                fact_type: Some("gotcha".into()),
+                tags: None,
+                triggers: None,
+                anchors: Some(vec!["src/brand_new.rs".into()]),
+                expires: None,
+                provenance: None,
+            }))
+            .await;
+        assert!(out.contains("stored entity"), "{out}");
+        assert!(
+            !out.contains("already crowded"),
+            "the only fact on its own anchor is never crowded by itself: {out}"
+        );
+    }
+
+    /// Crowding is answered from the LIVE heads only - a retracted fact's
+    /// (dead) anchor must not count toward the crowd, mirroring
+    /// consolidate's own `a_retracted_fact_does_not_count_toward_crowding`.
+    #[tokio::test]
+    async fn remember_does_not_count_a_retracted_fact_toward_the_crowd() {
+        let mut store = EventStore::in_memory().unwrap();
+        let mut revs = Vec::new();
+        for id in ["mem-f", "mem-g"] {
+            let ev = store
+                .append_event(
+                    "s", "l", "a", EventKind::FactCreated, id, None,
+                    "an existing note about the backup job\n\n\
+                     [memory/gotcha | tags: x | anchors: src/backup.rs]",
+                )
+                .unwrap();
+            revs.push(ev.this_hash);
+        }
+        // only ONE live prior fact remains on the target, under the cap
+        store
+            .append_mutate_checked(
+                "s", "l", "a", EventKind::FactRetracted, "mem-g", Some(&revs[1]), "[retracted]",
+            )
+            .unwrap();
+        let (server, _d) = server_with(store);
+
+        let out = server
+            .remember(Parameters(RememberArgs {
+                body: "a third note about the same backup job".into(),
+                entity_id: None,
+                project: Some("acme".into()),
+                fact_type: Some("gotcha".into()),
+                tags: None,
+                triggers: None,
+                anchors: Some(vec!["src/backup.rs".into()]),
+                expires: None,
+                provenance: None,
+            }))
+            .await;
+        assert!(out.contains("stored entity"), "{out}");
+        assert!(
+            !out.contains("already crowded"),
+            "a retracted fact must not count toward the crowd: {out}"
+        );
+    }
+
+    /// The same write-time warning must fire on revise, not just remember: a
+    /// metadata-only anchors edit that lands the target past the cap is
+    /// exactly the moment consolidate's report would otherwise catch cold,
+    /// after the fact.
+    #[tokio::test]
+    async fn revise_warns_when_the_final_body_carries_a_crowded_anchor() {
+        let mut store = EventStore::in_memory().unwrap();
+        for id in ["mem-h", "mem-i"] {
+            store
+                .append_event(
+                    "s", "l", "a", EventKind::FactCreated, id, None,
+                    "an existing note about the invoice job\n\n\
+                     [memory/gotcha | tags: x | anchors: src/invoice.rs]",
+                )
+                .unwrap();
+        }
+        store
+            .append_event(
+                "s", "l", "a", EventKind::FactCreated, "mem-j", None,
+                "a plain note about the invoice job, not yet anchored to anything",
+            )
+            .unwrap();
+        let (server, _d) = server_with(store);
+
+        let out = server
+            .revise(Parameters(ReviseArgs {
+                entity_id: "mem-j".into(),
+                anchors: Some(vec!["src/invoice.rs".into()]),
+                ..Default::default()
+            }))
+            .await;
+        assert!(out.starts_with("revised mem-j"), "{out}");
+        assert!(out.contains("already crowded"), "revise draws the same write-time warning: {out}");
+        assert!(out.contains("src/invoice.rs"), "names the crowded target: {out}");
     }
 }

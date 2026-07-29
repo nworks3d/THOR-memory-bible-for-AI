@@ -994,6 +994,18 @@ fn anchor_crowding(heads: &[LiveHead], cap: usize) -> (Vec<CrowdedAnchor>, Vec<P
     (crowded, promiscuous)
 }
 
+/// The crowded half of `anchor_crowding`, answered for the store as it
+/// stands RIGHT NOW - no strength, no clustering, no embeddings, none of
+/// which the question "is any anchor on this fact crowded" needs. Exposed
+/// standalone so a caller (the MCP remember/revise write path) can ask it
+/// right after a single write without building a whole report, and so the
+/// grouping is never counted a second, independent way. Pins never affect
+/// anchor crowding (see anchor_crowding), so none are read here.
+pub fn crowded_anchors_now(events: &[Event]) -> Vec<CrowdedAnchor> {
+    let heads = live_memory_heads(events, &[]);
+    anchor_crowding(&heads, crate::guard::FILE_MEMORY_HITS).0
+}
+
 #[derive(Default)]
 pub struct ApplyStats {
     pub retracted: usize,

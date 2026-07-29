@@ -122,6 +122,12 @@ explains the same parts in plain words and tells you which are worth your time.
   truncation, a `<ref>:` prefix, or two file names glued by a slash - because
   the guard compares an anchor verbatim against touched paths, and a dead
   anchor still counts toward anchor coverage without ever gating anything.
+  And a ceiling to match that floor: when a write leaves the fact carrying an
+  anchor whose target already holds more live facts than the guard can serve
+  for it, the reply says so and names the target. It warns, never refuses -
+  the write already happened, and which anchor to drop is a judgement call.
+  Without it the surplus piles up unseen, since the guard drops it silently
+  and `thor consolidate` only reports it after the fact.
   MCP `recall` runs the same semantic score-fusion path the courier uses
   (fused parity), and every read surface (MCP/CLI recall and `get`) carries
   the `[refreshed]`/`[stale?]` freshness tags.

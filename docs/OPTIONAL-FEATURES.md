@@ -1973,6 +1973,12 @@ of that name anywhere in your tree. Read it as a floor rather than the whole
 truth: the guard also matches an anchor against a path ending, so two anchors
 that look different can still collide on the same real file.
 
+You should rarely need to act on that section, because the same check now runs
+at the moment of writing: store or edit a note whose anchor lands on a target
+that is already full, and the reply tells you right then, while you still have
+the note in your hands. The report is the sweep for what accumulated before
+that; the warning is what stops it accumulating again.
+
 It also lists three specific backlogs that are cheap and unambiguous to fix, so
 none of them depends on someone remembering: report-shaped facts with no expiry
 date, project scopes that no signpost fact points at, and facts that a response

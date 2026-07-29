@@ -1836,7 +1836,7 @@ const WORKING_CONTRACT_BODY: &str = r#"THOR working contract - how to keep this 
 
 2. SAVE DECISIONS AND GOTCHAS AS THEY HAPPEN, without being asked. Give each one a type (gotcha, decision or preference) and triggers: the words a future question about it would contain. Then scope it - rules about how you work are global, knowledge about one project belongs to that project.
 
-3. ANCHOR IT. An anchor is the exact file or command a note is about, and it puts the note in front of you the moment you touch that thing. Searching is a guess; an anchor is not. Be specific: a bare name like mod.rs or git fires on everything and is worse than nothing.
+3. ANCHOR IT, BUT KNOW THE CHANNEL IS NARROW. An anchor is the exact file or command a note is about, and it puts the note in front of you the moment you touch that thing. Searching is a guess; an anchor is not. Be specific: a bare name like mod.rs or git fires on everything and is worse than nothing. Two limits decide whether an anchor is worth anything. Only a couple of anchored notes are served per touched target, and the rest are dropped, so a third anchor on a busy file is a lottery ticket rather than extra cover - `thor consolidate` lists the targets that are already over. And each served note gets only a few hundred characters, so an anchored note has to be SHORT: one line per constraint, no preamble, no history. Put the story in an ordinary unanchored note and keep the anchored one down to what someone about to edit that file must not get wrong.
 
 4. NEVER SAVE A SECOND COPY. If something is wrong or out of date, revise or retract it. For a small change use append, or an exact replace - never retype a long note to change one line.
 

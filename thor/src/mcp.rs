@@ -1046,15 +1046,31 @@ impl ThorServer {
                         && matches!(args.fact_type.as_deref(), Some("gotcha") | Some("decision"))
                     {
                         if let Some(cand) = crate::footer::anchor_candidate(&clean_body) {
-                            out.push_str(&format!(
-                                "\nNo anchors, and this body names '{cand}'. An anchor is the only \
-                                 way a fact reaches the moment-of-action guard - retrieval alone \
-                                 does not change behaviour, a gate does. If this fact GOVERNS that \
-                                 file or command, revise it with anchors: [\"{cand}\"] (a path or a \
-                                 full invocation, never a bare role name or tool name). And when a \
-                                 gate carries it, tag it `guarded` in the same turn, so the \
-                                 per-prompt block stops repeating what the gate already enforces."
-                            ));
+                            // A candidate whose target is already crowded must not be pushed the
+                            // same way: telling the author to anchor here would be undone by the
+                            // write-time warning below the moment they actually did it (the two
+                            // hints pulled in opposite directions until 2026-07-29). Point at the
+                            // crowding instead of proposing the anchor.
+                            match crowded_anchor_for_candidate(s, &cand) {
+                                Some(hit) => out.push_str(&format!(
+                                    "\nNo anchors, and this body names '{cand}' - but that target \
+                                     already carries {} live fact(s), more than the guard ever \
+                                     serves per target ({}), so a new anchor there would drop \
+                                     silently rather than add cover. Fold this constraint into the \
+                                     fact that already holds that target's invariants instead, or \
+                                     make room there first by retiring one of its existing anchors.",
+                                    hit.fact_count, hit.served
+                                )),
+                                None => out.push_str(&format!(
+                                    "\nNo anchors, and this body names '{cand}'. An anchor is the only \
+                                     way a fact reaches the moment-of-action guard - retrieval alone \
+                                     does not change behaviour, a gate does. If this fact GOVERNS that \
+                                     file or command, revise it with anchors: [\"{cand}\"] (a path or a \
+                                     full invocation, never a bare role name or tool name). And when a \
+                                     gate carries it, tag it `guarded` in the same turn, so the \
+                                     per-prompt block stops repeating what the gate already enforces."
+                                )),
+                            }
                         }
                     }
                     if let Some(warning) = crowded_anchor_warning(s, &entity_id, &ev.body) {
@@ -1834,6 +1850,25 @@ fn crowded_anchor_warning(store: &EventStore, entity_id: &str, body: &str) -> Op
          already on '{}' and leave this one unanchored.",
         hit.anchor, others, hit.served, hit.anchor
     ))
+}
+
+/// Crowding check for the no-anchor nudge (remember, above): that nudge fires
+/// precisely when THIS fact has no anchor yet, so unlike `crowded_anchor_warning`
+/// there is no entity_id to look up by membership - `cand` is only the candidate
+/// string `anchor_candidate` read out of the body, never something stored. Same
+/// grouping as the write-time warning (crate::consolidate::crowded_anchors_now),
+/// and consolidate's own `normalize_anchor_for_grouping` - CALLED, never copied,
+/// because a normalization that drifts would call the same target "crowded" in
+/// one hint and not in the other. Fails silent: any read error reads as "not
+/// crowded", so the ordinary nudge still fires rather than costing the write a
+/// hint.
+fn crowded_anchor_for_candidate(
+    store: &EventStore,
+    cand: &str,
+) -> Option<crate::consolidate::CrowdedAnchor> {
+    let events = store.get_all_events().ok()?;
+    let norm = crate::consolidate::normalize_anchor_for_grouping(cand);
+    crate::consolidate::crowded_anchors_now(&events).into_iter().find(|c| c.anchor == norm)
 }
 
 /// Rewrite the head's footer so its `project:` field names `target`, as a normal
@@ -3658,6 +3693,168 @@ mod tests {
         assert!(
             !out.contains("already crowded"),
             "a retracted fact must not count toward the crowd: {out}"
+        );
+    }
+
+    /// The common case, unchanged (2026-07-29): a candidate whose target
+    /// nobody has anchored yet can never be crowded, so the reply must keep
+    /// proposing it word for word, exactly as before the crowding check
+    /// existed.
+    #[tokio::test]
+    async fn remember_nudge_still_proposes_the_anchor_when_its_target_is_not_crowded() {
+        let (server, _d) = server_with(EventStore::in_memory().unwrap());
+        let out = server
+            .remember(Parameters(RememberArgs {
+                body: "never touch src/example.rs during a deploy window, it corrupts the queue"
+                    .into(),
+                entity_id: None,
+                project: Some("acme".into()),
+                fact_type: Some("gotcha".into()),
+                tags: None,
+                triggers: None,
+                anchors: None,
+                expires: None,
+                provenance: None,
+            }))
+            .await;
+        assert!(out.contains("stored entity"), "{out}");
+        assert!(
+            out.contains("No anchors, and this body names 'src/example.rs'. An anchor is the only"),
+            "the ordinary nudge fires word for word when the candidate is not crowded: {out}"
+        );
+        assert!(
+            out.contains("revise it with anchors: [\"src/example.rs\"]"),
+            "still proposes adding the anchor when nothing crowds it: {out}"
+        );
+    }
+
+    /// The contradiction this fixes (2026-07-29): before this, an author told
+    /// to anchor a crowded target would meet the write-time warning below
+    /// saying the same target drops anchors, on the very next write. Once
+    /// three other live facts already crowd the target, the nudge must stop
+    /// proposing it and name the crowding instead.
+    #[tokio::test]
+    async fn remember_nudge_names_the_crowding_instead_of_proposing_a_crowded_anchor() {
+        let mut store = EventStore::in_memory().unwrap();
+        for id in ["mem-j", "mem-k", "mem-l"] {
+            store
+                .append_event(
+                    "s", "l", "a", EventKind::FactCreated, id, None,
+                    "an existing note about the same crowded target\n\n\
+                     [memory/gotcha | tags: x | anchors: src/example.rs]",
+                )
+                .unwrap();
+        }
+        let (server, _d) = server_with(store);
+
+        let out = server
+            .remember(Parameters(RememberArgs {
+                body: "never touch src/example.rs during a deploy window, it corrupts the queue"
+                    .into(),
+                entity_id: None,
+                project: Some("acme".into()),
+                fact_type: Some("gotcha".into()),
+                tags: None,
+                triggers: None,
+                anchors: None,
+                expires: None,
+                provenance: None,
+            }))
+            .await;
+        assert!(out.contains("stored entity"), "{out}");
+        assert!(
+            !out.contains("revise it with anchors: [\"src/example.rs\"]"),
+            "must not tell the author to add an anchor that would drop silently: {out}"
+        );
+        assert!(
+            out.contains(
+                "No anchors, and this body names 'src/example.rs' - but that target already \
+                 carries 3 live fact(s)"
+            ),
+            "names the crowded target and its count instead of proposing it: {out}"
+        );
+        assert!(
+            out.contains(&format!(
+                "more than the guard ever serves per target ({})",
+                crate::guard::FILE_MEMORY_HITS
+            )),
+            "names the count against the guard's real cap, never a hardcoded copy: {out}"
+        );
+    }
+
+    /// The other trigger conditions are untouched by the crowding check: a
+    /// fact that already carries an anchor never enters this branch at all,
+    /// so it draws neither wording, crowded target or not.
+    #[tokio::test]
+    async fn remember_nudge_does_not_fire_when_the_fact_already_has_an_anchor() {
+        let mut store = EventStore::in_memory().unwrap();
+        for id in ["mem-m", "mem-n", "mem-o"] {
+            store
+                .append_event(
+                    "s", "l", "a", EventKind::FactCreated, id, None,
+                    "an existing note about the same crowded target\n\n\
+                     [memory/gotcha | tags: x | anchors: src/example.rs]",
+                )
+                .unwrap();
+        }
+        let (server, _d) = server_with(store);
+
+        let out = server
+            .remember(Parameters(RememberArgs {
+                body: "never touch src/example.rs during a deploy window, it corrupts the queue"
+                    .into(),
+                entity_id: None,
+                project: Some("acme".into()),
+                fact_type: Some("gotcha".into()),
+                tags: None,
+                triggers: None,
+                anchors: Some(vec!["some/other/place.rs".into()]),
+                expires: None,
+                provenance: None,
+            }))
+            .await;
+        assert!(out.contains("stored entity"), "{out}");
+        assert!(
+            !out.contains("No anchors, and this body names"),
+            "an anchor is already given, so neither nudge wording may fire: {out}"
+        );
+    }
+
+    /// The fact-type gate also survives untouched: a type outside
+    /// gotcha/decision draws no nudge at all, even naming a badly crowded
+    /// target.
+    #[tokio::test]
+    async fn remember_nudge_does_not_fire_for_a_fact_type_that_does_not_qualify() {
+        let mut store = EventStore::in_memory().unwrap();
+        for id in ["mem-p", "mem-q", "mem-r"] {
+            store
+                .append_event(
+                    "s", "l", "a", EventKind::FactCreated, id, None,
+                    "an existing note about the same crowded target\n\n\
+                     [memory/gotcha | tags: x | anchors: src/example.rs]",
+                )
+                .unwrap();
+        }
+        let (server, _d) = server_with(store);
+
+        let out = server
+            .remember(Parameters(RememberArgs {
+                body: "never touch src/example.rs during a deploy window, it corrupts the queue"
+                    .into(),
+                entity_id: None,
+                project: Some("acme".into()),
+                fact_type: None,
+                tags: None,
+                triggers: None,
+                anchors: None,
+                expires: None,
+                provenance: None,
+            }))
+            .await;
+        assert!(out.contains("stored entity"), "{out}");
+        assert!(
+            !out.contains("No anchors, and this body names"),
+            "fact_type does not qualify, so neither nudge wording may fire: {out}"
         );
     }
 

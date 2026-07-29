@@ -931,7 +931,7 @@ fn unanchored_candidates(heads: &[LiveHead]) -> Vec<UnanchoredFact> {
 /// lowercase, backslash to slash. Grouping by this exact string answers "will
 /// the guard treat these as the same anchor", not just "are these bytes
 /// identical".
-fn normalize_anchor_for_grouping(anchor: &str) -> String {
+pub(crate) fn normalize_anchor_for_grouping(anchor: &str) -> String {
     anchor.trim().to_lowercase().replace('\\', "/")
 }
 

@@ -498,12 +498,115 @@ pub fn days_from_today(days: i64) -> String {
 /// subject: expiring nine superseded release reports took one real question from
 /// 3 noise hits out of 5 to 1. Cleaning that up by hand does not scale and does
 /// not last, which is why the tool now defaults it - see REPORT_EXPIRY_DAYS.
+/// Deliberately NARROW, and it stays narrow: this is the predicate behind the
+/// SILENT half of the lifecycle (mcp.rs auto_expiry dates the fact without
+/// asking). Measured 2026-07-29 on the real store: every wider opener rule that
+/// finds the reports this one misses also mislabels about one in four - and a
+/// mislabel here silently dates a RULE, the failure the doctrine exists to
+/// prevent. The wider net lives in `reads_as_report`, on the reviewed surface.
 pub fn report_shaped(body: &str) -> bool {
-    const OPENERS: [&str; 2] = ["MILESTONE", "MIJLPAAL"];
+    opens_with(body, &SHIPPED_OPENERS)
+}
+
+/// The two openers this store has shipped with since the auto-expiry landed.
+const SHIPPED_OPENERS: [&str; 2] = ["MILESTONE", "MIJLPAAL"];
+
+/// Reads as a progress report to a human, on the wider vocabulary - for the
+/// REVIEWED surface only (`thor consolidate`, which proposes and never applies).
+///
+/// Why this is a second predicate and not a widening of `report_shaped`.
+/// Measured 2026-07-29, real store, 816 live facts, three blind classifiers on
+/// the catch (two agreed exactly, the third returned one label for everything
+/// and carried no signal):
+///   - shipped openers:            0 caught. The live "FASE 2 KLAAR" and
+///     "... STEP 4 DONE" reports were invisible to BOTH mechanisms.
+///   - this rule:                 36 caught, 31 real reports, 5 mislabels (86%).
+///   - marker anywhere in line 1: 42 caught, and it degenerates - THOR facts are
+///     one long paragraph, so `lines()` returns the whole body. It matched FASE
+///     inside "GEFASEERDE" and STEP inside "STEP file standard" (a CAD format).
+/// A fourth idea died on the same data: the footer's fact_type does not separate
+/// them. The mislabels are typed `decision` and `note`, exactly like the reports.
+///
+/// So 86% is good enough to hand an agent a worklist, and not good enough to
+/// date a fact behind their back. That split is the whole design.
+///
+/// What acting on the list actually bought, measured end to end on the same day
+/// over the 504-question corpus, through POST /inject (the block a session is
+/// really served - NOT the CLI's `thor recall`, which is bm25 only, and would
+/// have compared bm25 to bm25): expiring 16 confirmed reports took the served
+/// facts drawn from them from 21 to 0, and from 8 first-slot hits to 0, with the
+/// total served count unchanged and no question left empty. A blind three-judge
+/// panel over the 20 attributable changes: 7 better, 1 worse, 12 indifferent.
+/// The one loss is honest and expected - a question that asks about a historical
+/// plan is best answered by that plan.
+pub fn reads_as_report(body: &str) -> bool {
+    report_shaped(body)
+        || (!rule_shaped(body)
+            && (opens_with(body, &WIDE_OPENERS) || head_names(body, &WIDE_OPENERS)))
+}
+
+/// Openers a body ALSO uses to declare itself a report, measured on the real
+/// store 2026-07-29: live progress reports ("FASE 2 KLAAR", "acme-shop deploy
+/// FASE 2 - STEP 4 DONE", "FASE 3 DEPLOY - HISTORISCHE CONFIG-NOTITIE") were
+/// invisible to SHIPPED_OPENERS, so they never got an expiry at the write AND
+/// never reached the consolidate worklist - the two mechanisms that exist to
+/// catch exactly them.
+///
+/// Every term below earned its place, and the ones that did not are gone.
+/// Leave-one-out on the real store: AFGEROND carries 10 catches, FASE, HISTORI
+/// and KLAAR 2 each, VOORTGANG and ACHTERHAALD 1. Candidates were then measured
+/// the same way and kept only at or above the list's own precision (blind
+/// panel, three judges): GEBOUWD 6/6, GESHIPT 5/5, SHIPPED 1/1, VOLTOOID 1/1.
+/// REJECTED with their numbers, so nobody re-proposes them: LIVE catches 10 but
+/// only 6 are reports (60% - it fires on "draait LIVE op ...", which is standing
+/// config), OPGELOST 7 of 9 (78% - no gain over the list, and one miss is a
+/// pointer registry). DONE, COMPLETE and WORKING caught nothing at all.
+/// STEP was DROPPED: zero unique catches (a "STEP 4" title always carries FASE
+/// too) against a real collision - "STEP file" is a CAD format, ordinary
+/// vocabulary in this store.
+///
+/// PHASE and PROGRESS also earn zero HERE and are kept on purpose: they are the
+/// English mirrors of FASE and VOORTGANG, which do earn, and this store is one
+/// Dutch author. A report detector that only works in Dutch is a defect for
+/// every other user of the tool.
+const WIDE_OPENERS: [&str; 12] = [
+    "FASE", "PHASE", "HISTORI", "PROGRESS", "VOORTGANG", "ACHTERHAALD", "KLAAR", "AFGEROND",
+    "GEBOUWD", "GESHIPT", "SHIPPED", "VOLTOOID",
+];
+
+/// Body STARTS with one of these openers (the shipped match: prefix of the
+/// trimmed body, case-insensitive).
+fn opens_with(body: &str, openers: &[&str]) -> bool {
     let head = body.trim_start();
-    OPENERS.iter().any(|o| {
-        head.len() >= o.len() && head[..o.len()].eq_ignore_ascii_case(o)
-    })
+    openers
+        .iter()
+        .any(|o| head.len() >= o.len() && head[..o.len()].eq_ignore_ascii_case(o))
+}
+
+/// How far into the body a self-declaration still counts as an opener. A report
+/// names itself in its title ("acme-shop deploy FASE 2 - STEP 4 DONE"), which
+/// is why a strict prefix match misses it, but THOR facts are written as
+/// ONE long paragraph - so `lines()` gives the whole body back and a first-line
+/// match degenerates into "anywhere". Measured 2026-07-29: that degeneration is
+/// what caught FASE inside "GEFASEERDE" and STEP inside "STEP file standard"
+/// (a CAD format, ordinary vocabulary in this store).
+///
+/// 120 is not a round number, it is the top of a plateau. Swept on the real
+/// store: 40 -> 20 caught, 80 -> 23, 120 -> 23, 200 -> 26, 400 -> 29. Then the
+/// positions say why: past 120 the next markers sit at 215, 270, 384, 397, 566,
+/// 867, 1255, 2438 chars in - that is mid-paragraph, which is not a title and
+/// therefore not a self-declaration at all. Three of those deep matches are
+/// confirmed mislabels. Widen this and you are no longer reading how the author
+/// named the fact, you are keyword-searching its contents.
+const HEAD_WINDOW_CHARS: usize = 120;
+
+/// The marker appears in the opening window, case-SENSITIVE - a lowercase
+/// "fase" mid-prose is not a self-declaration. At position 0 `opens_with` is
+/// case-insensitive instead: a body that STARTS with the word is declaring
+/// itself whatever its capitalisation ("Fase 1 webhook GEBOUWD").
+fn head_names(body: &str, markers: &[&str]) -> bool {
+    let head: String = body.trim_start().chars().take(HEAD_WINDOW_CHARS).collect();
+    markers.iter().any(|m| head.contains(m))
 }
 
 /// Does this body declare ITSELF a rule in its opening line? Keyed on the
@@ -1132,6 +1235,55 @@ mod tests {
         ] {
             assert!(!rule_shaped(not_rule), "{not_rule:?}");
         }
+    }
+
+    /// Every case below is a REAL body from the 2026-07-29 measurement, kept
+    /// verbatim in shape. The split it pins: the wide reading may propose
+    /// (`reads_as_report`), only the narrow one may date a fact silently
+    /// (`report_shaped`), and the two false friends are why.
+    #[test]
+    fn reads_as_report_widens_the_proposal_without_widening_the_silent_expiry() {
+        for report in [
+            "FASE 2 KLAAR + BEWEZEN (2026-06-29): de centrale hub draait LIVE",
+            "acme-shop deploy FASE 2 - STEP 4 DONE (2026-06-26). (4a) ...",
+            "BOUW-VOORTGANG (2026-07-07, v2-workstreams gestart)",
+            "THOR drift/stewardship-ronde AFGEROND (2026-07-09; destijds 3 commits)",
+            "HISTORIE - NOOIT GEBOUWD, GEEN OPENSTAANDE ACTIE. PLAN-LOCK",
+            "SPEED-FIX GESHIPT NAAR MAIN (2026-07-15, commit a6b2d35)",
+            "NAS-DEPLOY v3 VOLTOOID (2026-07-10, sluit het open punt)",
+            // Position 0 is a declaration whatever its capitalisation.
+            "Fase 1 webhook GEBOUWD + live-bewezen op dev (2026-07-04)",
+        ] {
+            assert!(reads_as_report(report), "{report}");
+            assert!(!report_shaped(report), "the silent half stays narrow: {report}");
+        }
+
+        // The false friends, measured: each was caught when the match was allowed
+        // to scan the whole body, because THOR facts are one paragraph. The window
+        // is what keeps a status word deep in prose from renaming the fact.
+        let gefaseerde = "ONDERHOUDSKADER voor de oven: dagelijkse filtercontrole, wekelijkse \
+             kalibratie, en verder een lange uitleg over het kader die pas veel \
+             later spreekt over een geplande GEFASEERDE overgang naar het \
+             nieuwe profiel.";
+        let built_long_ago = "WERKWIJZE voor een nieuwe klantaanvraag: eerst de maatvoering \
+             bevestigen, dan pas offerte, en houd er rekening mee dat de \
+             rekenmodule zelf ooit GEBOUWD is op de oude tarieven.";
+        for false_friend in [gefaseerde, built_long_ago] {
+            assert!(!reads_as_report(false_friend), "{false_friend}");
+        }
+
+        // Terms measured to earn nothing are gone, and STEP is the one that also
+        // collided: "STEP file" is a CAD format, not a status.
+        assert!(!reads_as_report("Deliverables: STEP file standard, scan-data (STL/OBJ)"));
+
+        // A body that declares itself a RULE keeps the wide net off it entirely -
+        // the direction that would silently retire something still governing.
+        assert!(!reads_as_report("HARDE REGEL - FASE 2 blijft de enige geldende procedure"));
+
+        // The shipped openers are untouched on both predicates.
+        assert!(report_shaped("MIJLPAAL: v9 gepubliceerd"));
+        assert!(reads_as_report("MIJLPAAL: v9 gepubliceerd"));
+        assert!(!reads_as_report("de tweede oven draait op 230 volt"));
     }
 
     /// The bug this guards: a revise that rewrites the body drops the footer,

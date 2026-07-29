@@ -17,15 +17,18 @@
 //!      input for agent judgement: contradiction or distillation via
 //!      revise/supersede/resolve. This is clustering, NOT a contradiction
 //!      detector - a cluster is a lead, not a verdict.
-//!   4. report-shaped facts without an expiry - a live fact whose body opens
-//!      with MILESTONE/MIJLPAAL (`crate::footer::report_shaped`) but whose
-//!      footer carries no `expires` field. Measured on this store 2026-07-25:
-//!      61 such facts, 11.6% of all stored text, averaging 2484 chars vs 1865
-//!      for other facts, zero expiries - their length alone is what lets them
-//!      outrank the real answer on their own subject. The MCP `remember` tool
-//!      now defaults an expiry for new ones (mcp.rs auto_expiry), so this is
-//!      the pre-existing backlog plus anything written through another path
-//!      (`thor create`, import).
+//!   4. report-shaped facts without an expiry - a live fact that reads as a
+//!      progress report (`crate::footer::reads_as_report`) but whose footer
+//!      carries no `expires` field. Measured on this store 2026-07-25: 61 such
+//!      facts, 11.6% of all stored text, averaging 2484 chars vs 1865 for other
+//!      facts, zero expiries - their length alone is what lets them outrank the
+//!      real answer on their own subject. The MCP `remember` tool defaults an
+//!      expiry for new ones (mcp.rs auto_expiry) but only on the two openers it
+//!      can date SILENTLY without risk, so this pass runs the wider vocabulary:
+//!      it proposes, a human or agent decides, and 2026-07-29 it was measured
+//!      right 6 times in 7. That leaves the pre-existing backlog, anything
+//!      written through another path (`thor create`, import), and every report
+//!      that names itself in words the silent half deliberately will not act on.
 //!   5. project scopes without a scope pointer - a project holding at least
 //!      MIN_FACTS_FOR_SCOPE_POINTER live memory facts, for which no live
 //!      "wegwijzer" fact (`crate::courier::SCOPE_TAG`) anywhere in the store
@@ -105,12 +108,14 @@ pub struct RetroTagCandidate {
     pub strength: f64,
 }
 
-/// A live fact that reads as a milestone/progress report (its body opens with
-/// MILESTONE/MIJLPAAL, see `crate::footer::report_shaped`) but carries no
-/// `expires` field: the pollution class documented on `report_shaped` itself -
-/// long by nature, and that length is what lets it outrank the real answer on
-/// its own subject. Unlike needs_retro_tag this DOES count as hygiene dirt
-/// (`Report::is_clean`): an expiry is one `revise` away and costs nothing to add.
+/// A live fact that reads as a milestone/progress report (`reads_as_report`,
+/// the wide vocabulary) but carries no `expires` field: the pollution class
+/// documented on `report_shaped` itself - long by nature, and that length is
+/// what lets it outrank the real answer on its own subject. Unlike
+/// needs_retro_tag this DOES count as hygiene dirt (`Report::is_clean`): an
+/// expiry is one `revise` away and costs nothing to add. A CANDIDATE, not a
+/// verdict - about one in seven is a standing rule that opens like a report,
+/// which is why nothing here is ever applied mechanically.
 pub struct ReportShapedCandidate {
     pub entity_id: String,
     /// "global" for the always-in-scope tier, else the project key.
@@ -364,8 +369,9 @@ struct LiveHead {
     /// Full body length in chars: the measured reason report-shaped facts
     /// without an expiry win by sheer mass (2484 vs 1865 avg, 2026-07-25).
     body_chars: usize,
-    /// Body opens with MILESTONE/MIJLPAAL (`crate::footer::report_shaped`) AND
-    /// carries no `expires` field (`crate::footer::expires`).
+    /// Body reads as a progress report (`crate::footer::reads_as_report` - the
+    /// wide vocabulary, which is allowed HERE because this report only proposes)
+    /// AND carries no `expires` field (`crate::footer::expires`).
     report_shaped_no_expiry: bool,
     /// The body, kept ONLY when this fact IS a scope pointer
     /// (`crate::courier::is_scope_pointer`: tagged AND short enough to be a
@@ -446,7 +452,7 @@ fn live_memory_heads(events: &[Event], pins: &[String]) -> Vec<LiveHead> {
             pinned: pins.iter().any(|p| p == id),
             project: projects.get(id.as_str()).cloned().flatten(),
             body_chars: head.body.chars().count(),
-            report_shaped_no_expiry: crate::footer::report_shaped(&head.body)
+            report_shaped_no_expiry: crate::footer::reads_as_report(&head.body)
                 && crate::footer::expires(&head.body).is_none(),
             has_expiry: crate::footer::expires(&head.body).is_some(),
             no_gate: crate::footer::has_tag(&head.body, "no-gate"),
@@ -1117,7 +1123,7 @@ pub fn render_report(report: &Report) -> String {
     if !report.needs_expiry.is_empty() {
         line(format!(
             "
-{} report-shaped fact(s) without an expiry (opens with MILESTONE/MIJLPAAL; body length is why they outrank the real answer) - set one via revise:",
+{} fact(s) that read as a progress report and carry no expiry (body length is why they outrank the real answer) - set one via revise, but READ each first: measured 2026-07-29 this list is right about 6 times in 7, and the seventh is a standing rule wearing a report's opening words:",
             report.needs_expiry.len()
         ));
         for c in &report.needs_expiry {

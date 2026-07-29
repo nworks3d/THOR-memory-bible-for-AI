@@ -1004,6 +1004,28 @@ impl ThorServer {
                              away, if it must keep surfacing.",
                         ));
                     }
+                    // Measured 2026-07-29 on the real store: the two openers
+                    // auto_expiry can act on found NONE of this store's live
+                    // progress reports - they name themselves "FASE 2 KLAAR",
+                    // "... STEP 4 DONE", "HISTORISCH ...". The wider vocabulary
+                    // that does find them is right about 4 times in 5, and the
+                    // fifth is a standing rule wearing a report's opening words.
+                    // Four in five may propose; only certainty may act silently.
+                    // So this asks, here, while the author still holds the why.
+                    else if args.expires.is_none()
+                        && crate::footer::reads_as_report(&clean_body)
+                    {
+                        out.push_str(
+                            "\nThis opens like a progress report (what was built, deployed or \
+                             finished on a date). Stored WITHOUT an expiry, because that reading \
+                             is a guess and a wrong guess would silently date a rule. If it is a \
+                             report, revise it with expires: six weeks out - a report's \
+                             operational value is short and its body is long, so it competes with \
+                             real answers about its own subject for as long as it lives. If part \
+                             of it must keep holding, lift THAT part into its own fact first and \
+                             let this one expire.",
+                        );
+                    }
                     // The inverse trap, measured live 2026-07-26: a body that
                     // OPENS as a rule got an expiry and silently stopped
                     // surfacing on its date. Rules never expire (doctrine);

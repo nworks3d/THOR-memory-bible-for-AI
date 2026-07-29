@@ -350,9 +350,10 @@ it. That is not enthusiasm, it is what the person who wrote THOR runs every day.
 - **Keeping projects apart** - one command per project, then never again. Skip it
   and THOR gets *worse* the more you use it, because every search starts
   competing with projects you were not asking about.
-- **Pinning your hard rules** - a handful, not a list. Every pinned line joins
-  every conversation, and past the limit the extras are dropped without telling
-  you.
+- **Pinning your hard rules** - a handful, not a list, and keep each one short.
+  Every pinned rule joins every conversation in full, so a long one is a long
+  tax. Pin more than fit and the block says so on its last line rather than
+  quietly leaving them out.
 - **Meaning-based search.** You fetch the model file yourself, which is the only
   reason it is not already on. Do it.
 - **The reranker model.** Installing it and *using* it are two different things -

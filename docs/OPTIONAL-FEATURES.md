@@ -3622,8 +3622,9 @@ python thor/tools/export_mimir.py --db <path/to/mimir.db> --out snapshot.jsonl
 thor import snapshot.jsonl
 ```
 
-- **How to check it worked:** `thor brief` shows the fact counts per project,
-  and `thor recall "<something you know mimir held>"` should return it.
+- **How to check it worked:** `thor recall "<something you know mimir held>"`
+  should return it. For counts per project, ask your assistant for the brief -
+  that one is a tool it calls, not a command you type.
 - **How to turn it off again:** not applicable to the export. An import is an
   ordinary set of events in the log, so nothing is destroyed; facts you do not
   want can be retracted individually.

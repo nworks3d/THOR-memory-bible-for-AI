@@ -72,13 +72,21 @@ to a simpler way of working instead of breaking.
 ## Getting started
 
 **Step 1 - get the program.** Download it from
-[Releases](../../releases). Pick `windows-x86_64` or `linux-x86_64` for your own
-computer (on Windows you also need Microsoft's Visual C++ Redistributable, a
-free one-time install from Microsoft). Pick `linux-x86_64-bm25` if you are
-putting it on a small server or a NAS. Each download has a matching `.sha256`
-file so you can check it arrived intact.
+[Releases](../../releases). Pick `thor-windows-x86_64.zip` or
+`thor-linux-x86_64.tar.gz` for your own computer (on Windows you also need
+Microsoft's Visual C++ Redistributable, a free one-time install from Microsoft).
+Pick `thor-linux-x86_64-bm25.tar.gz` if you are putting it on a small server or
+a NAS. Each download has a matching `.sha256` file so you can check it arrived
+intact.
 
 Rather build it yourself? `cd thor && cargo build --release`.
+
+Unpack it somewhere permanent, and know this before the next command: unless
+that folder is one your shell already searches, typing `thor` will come back as
+"command not found". That is normal and nothing is broken - write the path out
+instead, or put the folder on your PATH once and every example below works as
+printed. [docs/SETUP.md](docs/SETUP.md#1-get-the-program) has both, with the
+exact form for PowerShell.
 
 **Step 2 - connect it to your assistant.** One command:
 

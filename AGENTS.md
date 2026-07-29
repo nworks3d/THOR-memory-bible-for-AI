@@ -31,6 +31,13 @@ left off, and the smarter half of the search is silently missing.
 missing language model is not a problem - THOR works without it, just with
 simpler matching.
 
+If that comes back "command not found", the program is simply not in a folder the
+shell searches - which is normal, since the usual home for it on Windows is not on
+PATH. Do not go hunting or reinstall: run it by its full path
+(`& "$env:LOCALAPPDATA\thor\thor.exe" doctor` in PowerShell, the `&` included) and
+keep doing that for every command on this page. Mention to them once that adding
+the folder to PATH makes the short form work, and leave that choice to them.
+
 **3. The language model, if they want it.** It makes THOR find things by meaning
 rather than only by matching words. They supply the file themselves (about
 235 MB); nothing downloads on its own. [docs/SETUP.md](docs/SETUP.md) walks

@@ -41,6 +41,23 @@ the old entries behind - pointing at a file that is no longer there - and adds a
 second set beside them. Open your assistant's `settings.json`, delete the THOR
 lines with the old path, then run step 2 again.
 
+**Read this before the first command fails on you.** Every example in these pages
+is written as `thor something`, which is short and readable but only works as
+typed if the program sits in a folder your shell already searches. That tidy
+Windows home above is *not* one of those folders. So either write the path out
+each time, in PowerShell:
+
+```powershell
+& "$env:LOCALAPPDATA\thor\thor.exe" doctor
+```
+
+(the leading `&` is what tells PowerShell that a quoted string is a program to
+run, not text to print), or spend a minute now and never think about it again:
+put that folder on your PATH, and every example works exactly as printed. On
+Windows: Settings, then "Edit environment variables for your account", then Path,
+then New. Open a fresh terminal afterwards - an already-open one keeps the old
+PATH. Check it took with `thor doctor`.
+
 **Two things the download does not include:**
 
 - **The language model** for meaning search. You supply that yourself in step 3.

@@ -227,8 +227,10 @@ fn try_guard(db: &Path, rulebook: &Path) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// How many file-naming memories to surface per (session, file).
-const FILE_MEMORY_HITS: usize = 2;
+/// How many file-naming memories to surface per (session, file). Read by
+/// `consolidate`'s anchor-crowding report, so the report can never drift from
+/// the cap the guard actually applies.
+pub(crate) const FILE_MEMORY_HITS: usize = 2;
 
 /// Up to this many PROSE chunks ride along after the memories in the file
 /// advisory. Bounded separately so ingested docs can never crowd a typed

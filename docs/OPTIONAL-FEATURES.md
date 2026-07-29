@@ -1963,6 +1963,16 @@ proven-useful first, each with the concrete anchor to consider. That list is a
 backlog, not a fault: it never fails the exit code, because on a real store it
 is far too long to clear in one sitting.
 
+Then the mirror of that list, and it is the one people never think to look for:
+**anchor crowding**. The guard serves a limited number of anchored facts per
+touched file or command, and it drops the surplus without saying so - so an
+anchor you carefully added can sit there doing nothing, forever, and look fine.
+This section names every target carrying more live facts than the guard can
+serve, worst first, and separately lists bare file names, which match every file
+of that name anywhere in your tree. Read it as a floor rather than the whole
+truth: the guard also matches an anchor against a path ending, so two anchors
+that look different can still collide on the same real file.
+
 It also lists three specific backlogs that are cheap and unambiguous to fix, so
 none of them depends on someone remembering: report-shaped facts with no expiry
 date, project scopes that no signpost fact points at, and facts that a response

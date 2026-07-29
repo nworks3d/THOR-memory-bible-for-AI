@@ -173,6 +173,37 @@ impl AnchorCoverage {
     }
 }
 
+/// One normalized anchor string carrying more live facts than the guard can
+/// ever serve for one target in a single advisory (`crate::guard::
+/// FILE_MEMORY_HITS`, enforced by `merge_anchored`'s silent
+/// `out.truncate(cap)`) - worst overflow first. `unanchored`'s mirror image:
+/// that list is facts with too FEW anchors to ever fire, this one is an
+/// anchor with too MANY facts to all fire.
+pub struct CrowdedAnchor {
+    pub anchor: String,
+    /// Live facts declaring this anchor (a fact citing the same anchor twice
+    /// in its own footer counts once).
+    pub fact_count: usize,
+    /// What the guard actually serves per target - always
+    /// `crate::guard::FILE_MEMORY_HITS`, carried per-entry so the printed
+    /// line never needs a second lookup to explain the gap.
+    pub served: usize,
+    pub entity_ids: Vec<String>,
+}
+
+/// A bare-filename anchor (no directory component, e.g. "payment.js") at or
+/// under the crowding cap. The guard matches a bare name against every file
+/// with that name anywhere in the tree (the `a == name_l` leg of
+/// `file_memory_advisory`'s predicate), so it is promiscuous by construction
+/// regardless of how few facts share the exact string - worth seeing even
+/// when `fact_count` alone would never trip `CrowdedAnchor`. A bare name that
+/// DOES exceed the cap is reported as a `CrowdedAnchor` instead, never both.
+pub struct PromiscuousAnchor {
+    pub anchor: String,
+    pub fact_count: usize,
+    pub entity_ids: Vec<String>,
+}
+
 #[derive(Default)]
 pub struct Report {
     pub dups: Vec<DupGroup>,
@@ -188,6 +219,17 @@ pub struct Report {
     /// dropped in silence: a hidden cap reads as "nothing to do here".
     pub unanchored_expiring: usize,
     pub anchor_coverage: AnchorCoverage,
+    /// Anchors shared by more live facts than the guard's cap can ever serve
+    /// for one target (`crate::guard::FILE_MEMORY_HITS`, read from guard.rs
+    /// so this can never drift from the real cap) - worst overflow first. A
+    /// WORK LIST, NOT DIRT, same as `unanchored`: crowding is a backlog to
+    /// trim, not a hygiene failure the CI gate should fail on.
+    pub crowded_anchors: Vec<CrowdedAnchor>,
+    /// Bare-filename anchors at or under the cap that are still promiscuous
+    /// by construction (the guard matches a bare name against every file of
+    /// that name anywhere in the tree). Never overlaps `crowded_anchors`: a
+    /// bare name already over the cap is listed there instead.
+    pub promiscuous_anchors: Vec<PromiscuousAnchor>,
     /// Clusters dropped for being over MAX_CLUSTER_MEMBERS (batch families,
     /// union-find chains) - counted so the cap is never silent.
     pub broad_clusters_skipped: usize,
@@ -339,6 +381,10 @@ struct LiveHead {
     /// Footer carries at least one guard anchor: this fact can reach the
     /// moment-of-action channel at all.
     anchored: bool,
+    /// The exact anchor strings the footer declares, raw (not yet normalized
+    /// for grouping) - read once here so the crowding pass can group anchors
+    /// without re-parsing every body or re-folding the log.
+    anchors: Vec<String>,
     /// The most specific path/command the body names, when the fact carries no
     /// anchor yet - the concrete proposal for the retro-anchoring work list.
     anchor_candidate: Option<String>,
@@ -383,6 +429,7 @@ fn live_memory_heads(events: &[Event], pins: &[String]) -> Vec<LiveHead> {
         if matches!(head.kind, EventKind::FactRetracted) {
             continue;
         }
+        let anchors = crate::footer::anchors(&head.body);
         out.push(LiveHead {
             entity_id: id.clone(),
             head_rev: head.this_hash.clone(),
@@ -405,11 +452,12 @@ fn live_memory_heads(events: &[Event], pins: &[String]) -> Vec<LiveHead> {
             no_gate: crate::footer::has_tag(&head.body, "no-gate"),
             pointer_body: crate::courier::is_scope_pointer(&head.body).then(|| head.body.clone()),
             guarded: crate::footer::has_tag(&head.body, crate::courier::GUARDED_TAG),
-            anchored: !crate::footer::anchors(&head.body).is_empty(),
-            anchor_candidate: crate::footer::anchors(&head.body)
+            anchored: !anchors.is_empty(),
+            anchor_candidate: anchors
                 .is_empty()
                 .then(|| crate::footer::anchor_candidate(&head.body))
                 .flatten(),
+            anchors,
         });
         bodies.push(head.body.clone());
     }
@@ -665,6 +713,7 @@ pub fn build_report(store: &EventStore, db: &Path, events: &[Event], opts: &Opti
         anchored: heads.iter().filter(|h| h.anchored).count(),
         total: heads.len(),
     };
+    let (crowded_anchors, promiscuous_anchors) = anchor_crowding(&heads, crate::guard::FILE_MEMORY_HITS);
     #[allow(unused_mut)]
     let (mut clusters, mut broad_clusters_skipped) = prefix_band_clusters(&heads);
     #[allow(unused_mut)]
@@ -686,6 +735,8 @@ pub fn build_report(store: &EventStore, db: &Path, events: &[Event], opts: &Opti
         unanchored,
         unanchored_expiring,
         anchor_coverage,
+        crowded_anchors,
+        promiscuous_anchors,
         broad_clusters_skipped,
         cosine_ran,
     }
@@ -875,6 +926,74 @@ fn unanchored_candidates(heads: &[LiveHead]) -> Vec<UnanchoredFact> {
     out
 }
 
+/// Same normalization the guard applies to an anchor before matching it
+/// against a touched file (see `file_memory_advisory` in guard.rs): trim,
+/// lowercase, backslash to slash. Grouping by this exact string answers "will
+/// the guard treat these as the same anchor", not just "are these bytes
+/// identical".
+fn normalize_anchor_for_grouping(anchor: &str) -> String {
+    anchor.trim().to_lowercase().replace('\\', "/")
+}
+
+/// Group live facts by the exact string the guard would normalize their
+/// anchors to, then split the result into the two work lists `render_report`
+/// prints: groups that overflow `cap` (`crate::guard::FILE_MEMORY_HITS`), and
+/// bare-filename anchors that are promiscuous by construction even at or
+/// under it. Reads ONLY the live heads `build_report` already folded - no
+/// second pass over the log.
+///
+/// NOT A COMPLETE PICTURE, and deliberately so (see the printed disclaimer):
+/// the guard also matches an anchor against a bare file name and against a
+/// path TAIL (`lib/payment.js` matches `server/lib/payment.js`), so two
+/// anchors that normalize to DIFFERENT strings can still collide on the same
+/// real file at guard time. Grouping by exact normalized string is a floor on
+/// the real crowding, not the whole of it.
+fn anchor_crowding(heads: &[LiveHead], cap: usize) -> (Vec<CrowdedAnchor>, Vec<PromiscuousAnchor>) {
+    let mut by_anchor: HashMap<String, Vec<&LiveHead>> = HashMap::new();
+    for h in heads {
+        for a in &h.anchors {
+            let norm = normalize_anchor_for_grouping(a);
+            if norm.is_empty() {
+                continue;
+            }
+            by_anchor.entry(norm).or_default().push(h);
+        }
+    }
+
+    let mut crowded = Vec::new();
+    let mut promiscuous = Vec::new();
+    for (anchor, group) in &by_anchor {
+        let mut entity_ids: Vec<String> = group.iter().map(|h| h.entity_id.clone()).collect();
+        entity_ids.sort();
+        entity_ids.dedup(); // one fact citing the same anchor twice counts once
+        let fact_count = entity_ids.len();
+        if fact_count > cap {
+            crowded.push(CrowdedAnchor { anchor: anchor.clone(), fact_count, served: cap, entity_ids });
+        } else if !anchor.contains('/') && anchor.contains('.') && !anchor.contains(char::is_whitespace) {
+            // bare file name (no directory) - the guard's bare-name leg makes
+            // it promiscuous even under the cap (see PromiscuousAnchor).
+            //
+            // The whitespace check excludes COMMAND anchors: the guard's
+            // bare-name leg only ever compares against touched FILE names, so
+            // a command line can never actually trigger it, dot or no dot.
+            // Measured on a real store 2026-07-29: without this check, an
+            // ssh invocation carrying an IP address ("ssh admin@192.0.2.1"),
+            // `bws run -- 'node server.js'`, and `thor.exe guard` all showed up
+            // here (dot present, no slash) even though none of them is a bare
+            // file name. A report whose job is to find noise must not itself
+            // produce noise - do not drop this check to "simplify" the test.
+            promiscuous.push(PromiscuousAnchor { anchor: anchor.clone(), fact_count, entity_ids });
+        }
+    }
+    crowded.sort_by(|a, b| {
+        (b.fact_count - b.served)
+            .cmp(&(a.fact_count - a.served))
+            .then_with(|| a.anchor.cmp(&b.anchor))
+    });
+    promiscuous.sort_by(|a, b| b.fact_count.cmp(&a.fact_count).then_with(|| a.anchor.cmp(&b.anchor)));
+    (crowded, promiscuous)
+}
+
 #[derive(Default)]
 pub struct ApplyStats {
     pub retracted: usize,
@@ -1048,6 +1167,45 @@ anchor coverage {:.1}% ({} of {} live facts can reach the moment-of-action guard
             ));
         }
     }
+    if report.crowded_anchors.is_empty() && report.promiscuous_anchors.is_empty() {
+        line("
+no anchor is crowded past what the guard can serve.".to_string());
+    } else {
+        if !report.crowded_anchors.is_empty() {
+            line(format!(
+                "
+{} anchor(s) crowded past what the guard can serve (cap {} live fact(s) per target; \
+                 thor/src/guard.rs merge_anchored truncates the rest silently) - worst overflow first:",
+                report.crowded_anchors.len(),
+                crate::guard::FILE_MEMORY_HITS,
+            ));
+            for c in &report.crowded_anchors {
+                line(format!(
+                    "  anchor \"{}\": {} live fact(s) share it, guard serves only {} -> {}",
+                    c.anchor, c.fact_count, c.served, c.entity_ids.join(" ")
+                ));
+            }
+        }
+        if !report.promiscuous_anchors.is_empty() {
+            line(format!(
+                "
+{} bare-filename anchor(s) at or under the cap but still promiscuous by construction (the \
+                 guard matches a bare name against every file with that name anywhere in the tree):",
+                report.promiscuous_anchors.len(),
+            ));
+            for p in &report.promiscuous_anchors {
+                line(format!(
+                    "  anchor \"{}\": {} live fact(s) -> {}",
+                    p.anchor, p.fact_count, p.entity_ids.join(" ")
+                ));
+            }
+        }
+    }
+    line("
+(anchor crowding is a floor, not the full picture: the guard also matches an anchor against a \
+      bare file name and against a path tail, so two anchors that normalize to different strings \
+      can still collide on the same real file - this groups by exact normalized string plus the \
+      bare-name list only.)".to_string());
     if !report.needs_retro_tag.is_empty() {
         line(format!(
             "
@@ -1463,6 +1621,134 @@ mod tests {
         assert!(
             !report.unanchored.is_empty() && report.needs_expiry.is_empty(),
             "sanity: this fixture has work but no expiry dirt"
+        );
+    }
+
+    /// Three live facts anchored to the same file exceed the guard's real cap
+    /// (`crate::guard::FILE_MEMORY_HITS` = 2): `merge_anchored` would silently
+    /// truncate to two and drop the third, and this is the report that says so.
+    #[test]
+    fn three_facts_sharing_one_anchor_are_reported_as_crowded() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut store, db) = store_at(dir.path());
+        create(&mut store, "mem-a", "first note about the payment flow\n\n[memory/gotcha | tags: x | anchors: server/lib/payment.js]");
+        create(&mut store, "mem-b", "second note about the payment flow\n\n[memory/gotcha | tags: x | anchors: server/lib/payment.js]");
+        create(&mut store, "mem-c", "third note about the payment flow\n\n[memory/gotcha | tags: x | anchors: server/lib/payment.js]");
+
+        let events = store.get_all_events().unwrap();
+        let report = build_report(&store, &db, &events, &opts(i64::MAX));
+        assert_eq!(report.crowded_anchors.len(), 1, "one crowded anchor group");
+        let c = &report.crowded_anchors[0];
+        assert_eq!(c.anchor, "server/lib/payment.js");
+        assert_eq!(c.fact_count, 3, "all three live facts count");
+        assert_eq!(c.served, crate::guard::FILE_MEMORY_HITS, "served mirrors the guard's real cap, never a hardcoded copy");
+        assert_eq!(c.entity_ids, vec!["mem-a".to_string(), "mem-b".to_string(), "mem-c".to_string()]);
+        assert!(
+            render_report(&report).contains("server/lib/payment.js"),
+            "the printed report names the crowded target"
+        );
+    }
+
+    /// Two facts sharing an anchor fit inside the guard's cap: the guard can
+    /// serve both, so there is nothing to report.
+    #[test]
+    fn two_facts_sharing_an_anchor_fit_the_cap_and_are_not_reported() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut store, db) = store_at(dir.path());
+        create(&mut store, "mem-a", "first note about the payment flow\n\n[memory/gotcha | tags: x | anchors: server/lib/payment.js]");
+        create(&mut store, "mem-b", "second note about the payment flow\n\n[memory/gotcha | tags: x | anchors: server/lib/payment.js]");
+
+        let events = store.get_all_events().unwrap();
+        let report = build_report(&store, &db, &events, &opts(i64::MAX));
+        assert!(
+            report.crowded_anchors.is_empty(),
+            "two facts fit the guard's cap of {}: {:?}",
+            crate::guard::FILE_MEMORY_HITS,
+            report.crowded_anchors.iter().map(|c| &c.anchor).collect::<Vec<_>>()
+        );
+        assert!(report.promiscuous_anchors.is_empty(), "the anchor has a directory, so it is not a bare name either");
+    }
+
+    /// A bare file name (no directory) matches every file of that name
+    /// anywhere in the tree at guard time, so it is worth flagging even when
+    /// only one fact carries it - well under the crowding cap.
+    #[test]
+    fn bare_filename_anchor_is_reported_as_promiscuous_even_under_the_cap() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut store, db) = store_at(dir.path());
+        create(&mut store, "mem-a", "a note about the watcher\n\n[memory/gotcha | tags: x | anchors: watcher.rs]");
+
+        let events = store.get_all_events().unwrap();
+        let report = build_report(&store, &db, &events, &opts(i64::MAX));
+        assert!(report.crowded_anchors.is_empty(), "one fact never exceeds the cap");
+        assert_eq!(report.promiscuous_anchors.len(), 1, "a bare file name is promiscuous regardless of count");
+        let p = &report.promiscuous_anchors[0];
+        assert_eq!(p.anchor, "watcher.rs");
+        assert_eq!(p.fact_count, 1);
+        assert_eq!(p.entity_ids, vec!["mem-a".to_string()]);
+        assert!(
+            render_report(&report).contains("watcher.rs"),
+            "the printed report names the promiscuous bare name"
+        );
+    }
+
+    /// A command line can contain a dot (an IP address, a `.exe`/`.js` token)
+    /// and no directory separator, which "no slash, has a dot" alone cannot
+    /// tell apart from a real bare file name - but the guard's bare-name leg
+    /// only ever compares a touched FILE's name against the anchor, so a
+    /// command can never trigger it. Measured on the real store 2026-07-29:
+    /// before the whitespace check existed, an ssh invocation carrying an IP
+    /// address, `bws run -- 'node server.js'`, and `thor.exe guard` were all
+    /// reported here as promiscuous even though none of them is a file name.
+    #[test]
+    fn promiscuous_anchor_excludes_command_lines_with_whitespace() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut store, db) = store_at(dir.path());
+        // a genuine bare file name - still promiscuous
+        create(&mut store, "mem-settings", "a note about the settings file\n\n[memory/gotcha | tags: x | anchors: settings.json]");
+        // command anchors: a dot and no slash, but whitespace marks them as a
+        // command line rather than a file name - must NOT be reported
+        create(&mut store, "mem-ssh", "a note about the deploy host\n\n[memory/gotcha | tags: x | anchors: ssh admin@192.0.2.1]");
+        create(&mut store, "mem-bws", "a note about running the server\n\n[memory/gotcha | tags: x | anchors: bws run -- 'node server.js']");
+        create(&mut store, "mem-thorexe", "a note about the guard command\n\n[memory/gotcha | tags: x | anchors: thor.exe guard]");
+        // a full path - never promiscuous, dot or no dot
+        create(&mut store, "mem-path", "a note about the cli\n\n[memory/gotcha | tags: x | anchors: thor/src/cli.rs]");
+
+        let events = store.get_all_events().unwrap();
+        let report = build_report(&store, &db, &events, &opts(i64::MAX));
+        let anchors: Vec<&str> = report.promiscuous_anchors.iter().map(|p| p.anchor.as_str()).collect();
+        assert_eq!(
+            anchors,
+            vec!["settings.json"],
+            "commands (whitespace) and full paths (a slash) must not be reported as promiscuous: {anchors:?}"
+        );
+    }
+
+    /// A retracted fact must drop out of the crowding count even though its
+    /// (now-dead) anchor string is byte-identical to the live survivors -
+    /// crowding is answered from the LIVE heads, never the raw event log.
+    #[test]
+    fn a_retracted_fact_does_not_count_toward_crowding() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut store, db) = store_at(dir.path());
+        create(&mut store, "mem-a", "first note about the payment flow\n\n[memory/gotcha | tags: x | anchors: server/lib/payment.js]");
+        create(&mut store, "mem-b", "second note about the payment flow\n\n[memory/gotcha | tags: x | anchors: server/lib/payment.js]");
+        let c_created = store
+            .append_event(
+                "s", "l", "a", EventKind::FactCreated, "mem-c", None,
+                "third note about the payment flow\n\n[memory/gotcha | tags: x | anchors: server/lib/payment.js]",
+            )
+            .unwrap();
+        store
+            .append_mutate_checked("s", "l", "a", EventKind::FactRetracted, "mem-c", Some(&c_created.this_hash), "[retracted]")
+            .unwrap();
+
+        let events = store.get_all_events().unwrap();
+        let report = build_report(&store, &db, &events, &opts(i64::MAX));
+        assert!(
+            report.crowded_anchors.is_empty(),
+            "only two LIVE facts remain, which fits the cap: {:?}",
+            report.crowded_anchors.iter().map(|c| (&c.anchor, c.fact_count)).collect::<Vec<_>>()
         );
     }
 

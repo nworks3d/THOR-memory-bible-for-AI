@@ -165,9 +165,11 @@ thor backfill-projects          # attribute legacy memories from their import fo
   hook. No other flag installs that particular entry, so without `--with-courier` you
   add it by hand (other flags do write their own SessionStart entries - `--with-daemon`
   and `--backup-repo` - they just do not write this one). It refreshes a known project
-  in the background, and for a **git** project you have not set up yet it asks the
-  agent to offer setup rather than indexing silently; a plain non-git folder gets no
-  cue and no index. Mis-scoped a fact? `thor reproject` moves it (it travels as an
+  in the background, and for any folder you have not set up yet - a git repo or a
+  plain non-git folder - it asks the agent to offer `thor init` rather than indexing
+  silently (for a plain folder the cue also flags that notes would otherwise land in
+  the global tier, and that Claude Code must restart after `thor init` before the
+  tools see the new project). Nothing is indexed without your OK. Mis-scoped a fact? `thor reproject` moves it (it travels as an
   event, so a replica agrees after sync).
 
 ## Semantic recall (recommended on a client)

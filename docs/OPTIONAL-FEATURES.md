@@ -1117,8 +1117,11 @@ retired and an install re-run removes it (see `thor pre-compact` below).
 One command your agent runs at the start of every session, and again right after a
 context compaction. It does four useful things: it re-injects your pinned facts as a
 `<thor-brief>` block, it refreshes the index of a project that has a `.thor` marker in
-the background, for a git project THOR does not know yet it prints a `<thor-setup>`
-cue so the agent offers to set it up instead of indexing anything behind your back,
+the background, and for any folder THOR does not know yet - a git repo or a plain
+folder with no git - it prints a `<thor-setup>` cue so the agent offers to set it up
+with `thor init` instead of indexing anything behind your back (for a plain folder the
+cue also warns that notes would otherwise land in the shared global tier, and that
+Claude Code must restart after `thor init` before the tools pick up the new project),
 and when the session start IS a compaction (`source: "compact"`) it first prints one
 post-compaction advisory: persist durable decisions that lived only in the compacted
 turns, plus the judgment-debt list of memory hits the courier served this session so

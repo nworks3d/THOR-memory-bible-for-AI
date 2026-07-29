@@ -98,6 +98,12 @@ thor init
 That is it. From here on, your memory gets checked on every message, and your
 assistant can save new things as you work.
 
+Forget this step and just start working in a fresh folder? Your assistant now
+notices that the folder is not a project yet and offers to set it up first, so
+your notes get their own scope instead of piling up in the shared memory every
+project sees. A brand-new folder with no git repository used to get no such
+hint - a poor first impression that is now fixed.
+
 **Step 4 - and this is the one people skip.** Ask your assistant to read
 **[AGENTS.md](AGENTS.md)**. It is one page, written for it rather than for you.
 

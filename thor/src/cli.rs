@@ -1456,22 +1456,20 @@ steward review prepared: {}", path.display());
             }
 
             if let Some(cwd) = cwd.as_deref() {
-                if crate::repo::thor_marker_key(cwd).is_some() {
+                let has_marker = crate::repo::thor_marker_key(cwd).is_some();
+                if has_marker {
                     // known project: refresh its ingest in the background (non-blocking)
                     let _ = spawn_detached_ingest(&db, &[cwd.to_path_buf()], None);
-                } else if let Some(key) = crate::repo::project_key(cwd) {
-                    // a git project with no marker: ask before indexing anything
-                    println!(
-                        "<thor-setup>\nYou are in project '{}', not set up in THOR yet (no .thor \
-                         marker). Ask the user whether to set it up now with `thor init` (index its \
-                         tracked files), and decide which docs are GLOBAL (cross-cutting, available \
-                         in every project) versus project-specific. Do NOT index without the user's \
-                         OK. Propose as global by default: CLAUDE.md, dev-loop.md, START-HERE.md and \
-                         any conventions docs; keep source code project-scoped.\n</thor-setup>",
-                        key
-                    );
                 }
-                // scratch dir (project_key is None): print nothing.
+                // Not onboarded (no marker): a git repo names its project by its
+                // basename; a plain folder (no git either) used to print nothing and
+                // silently write every note to the global tier - now both earn a
+                // <thor-setup> cue. Never index without the user's OK.
+                let git_key = if has_marker { None } else { crate::repo::project_key(cwd) };
+                let dir_name = cwd.file_name().and_then(|n| n.to_str()).unwrap_or("this folder");
+                if let Some(cue) = onboarding_cue(has_marker, git_key.as_deref(), dir_name) {
+                    println!("{cue}");
+                }
             }
             if let Ok(store) = EventStore::new(&db) {
                 if let Ok(events) = store.get_all_events() {
@@ -1716,6 +1714,50 @@ fn run_ingest(db: &Path, paths: &[PathBuf], project_override: Option<&str>) -> R
         }
     }
     result
+}
+
+/// The SessionStart onboarding cue a working directory earns, returned as the cue
+/// TEXT so the exact wording is unit-tested directly (no stdout capture, no store).
+/// `None` only when a `.thor` marker is present: that is a known project the caller
+/// refreshes instead, and it needs no cue.
+///
+/// Two un-onboarded shapes:
+///  - `git_key = Some(key)`: a git repo with no marker. Name the project (its git
+///    basename) and offer `thor init`. Unchanged from before this fix.
+///  - `git_key = None`: a plain folder, no git and no marker. This case used to
+///    print nothing, so a brand-new project started before `git init` got zero
+///    guidance while every note silently landed in the shared GLOBAL tier. It now
+///    earns a soft cue that names the folder, warns about the global fall-through,
+///    offers `thor init`, tells the user to restart Claude Code afterwards (the
+///    stdio MCP server reads its project once at launch, so the tools keep saying
+///    'global' until then), and leaves a scratch-folder escape hatch.
+fn onboarding_cue(has_marker: bool, git_key: Option<&str>, dir_name: &str) -> Option<String> {
+    if has_marker {
+        return None;
+    }
+    Some(match git_key {
+        Some(key) => format!(
+            "<thor-setup>\nYou are in project '{}', not set up in THOR yet (no .thor \
+             marker). Ask the user whether to set it up now with `thor init` (index its \
+             tracked files), and decide which docs are GLOBAL (cross-cutting, available \
+             in every project) versus project-specific. Do NOT index without the user's \
+             OK. Propose as global by default: CLAUDE.md, dev-loop.md, START-HERE.md and \
+             any conventions docs; keep source code project-scoped.\n</thor-setup>",
+            key
+        ),
+        None => format!(
+            "<thor-setup>\nYou are in folder '{}', which is NOT a THOR project yet: no \
+             .thor marker and not a git repo, so every note saved here lands in the shared \
+             GLOBAL tier instead of getting its own project scope. If this IS a real \
+             project, ask the user whether to run `thor init` here (it writes a .thor \
+             marker and indexes the folder), then have them restart Claude Code so the MCP \
+             tools pick up the new scope - the server reads the project once at launch, so \
+             `recall`/`remember`/`brief` keep saying 'global' until that restart. If this \
+             is just a scratch or throwaway folder, ignore this and carry on. Do NOT index \
+             without the user's OK.\n</thor-setup>",
+            dir_name
+        ),
+    })
 }
 
 /// Spawn `thor ingest <paths>` detached with null std handles so it outlives the
@@ -1998,6 +2040,37 @@ fn run_vectors(db: &Path, action: &str, model_dir: Option<PathBuf>, force: bool)
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn onboarding_cue_covers_marker_git_and_plain_folder() {
+        // A known project (a .thor marker) earns NO cue: the caller refreshes its
+        // ingest instead. The marker wins even if a git key is also present.
+        assert_eq!(onboarding_cue(true, None, "Whatever"), None);
+        assert_eq!(onboarding_cue(true, Some("Repo"), "Repo"), None);
+
+        // A git repo with no marker: name the project and offer `thor init`.
+        let git = onboarding_cue(false, Some("CoolRepo"), "CoolRepo")
+            .expect("a git project with no marker earns a cue");
+        assert!(git.starts_with("<thor-setup>") && git.trim_end().ends_with("</thor-setup>"));
+        assert!(git.contains("CoolRepo"), "names the git project");
+        assert!(git.contains("thor init"));
+
+        // A plain folder (no git, no marker) USED TO PRINT NOTHING - the bug. It now
+        // earns a soft cue that names the folder, warns about the global fall-through,
+        // offers the fix, tells the user to restart, and leaves a scratch escape hatch.
+        let plain = onboarding_cue(false, None, "Acetone smoother")
+            .expect("a plain folder earns a cue now (it printed nothing before the fix)");
+        assert!(plain.starts_with("<thor-setup>") && plain.trim_end().ends_with("</thor-setup>"));
+        assert!(plain.contains("Acetone smoother"), "names the folder as the suggested key");
+        assert!(plain.contains("thor init"), "offers the fix");
+        let low = plain.to_lowercase();
+        assert!(low.contains("global"), "warns notes fall through to the global tier");
+        assert!(low.contains("restart"), "tells the user to restart Claude Code (MCP binds project at launch)");
+        assert!(
+            low.contains("scratch") || low.contains("throwaway"),
+            "leaves a scratch-folder escape hatch so it is not pushy in a temp dir"
+        );
+    }
 
     #[test]
     fn footer_parse() {

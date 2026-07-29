@@ -182,6 +182,11 @@ conversation in the right folder.
 only the files git tracks, so anything in your `.gitignore` - your secrets, your
 keys - is never read.
 
+If you forget and just start working in a fresh folder - one with no git
+repository and no `.thor` marker yet - your assistant notices at the start of the
+session and offers to run this for you, instead of quietly saving everything to
+the shared global memory. You can decline if it is only a scratch folder.
+
 **Searches stay inside the current project**, plus anything filed as applying
 everywhere. To reach further:
 

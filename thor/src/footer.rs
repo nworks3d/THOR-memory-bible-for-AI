@@ -565,13 +565,23 @@ pub fn reads_as_report(body: &str) -> bool {
 /// too) against a real collision - "STEP file" is a CAD format, ordinary
 /// vocabulary in this store.
 ///
-/// PHASE and PROGRESS also earn zero HERE and are kept on purpose: they are the
-/// English mirrors of FASE and VOORTGANG, which do earn, and this store is one
-/// Dutch author. A report detector that only works in Dutch is a defect for
-/// every other user of the tool.
-const WIDE_OPENERS: [&str; 12] = [
+/// THE ENGLISH HALF IS REASONED, NOT MEASURED, and that has to be said out
+/// loud. The store this was measured on has ONE Dutch author, so a term like
+/// DONE catching nothing here is evidence about how HE writes, not about
+/// whether it opens a report. Judging English terms by that measurement would
+/// ship a detector that only works in Dutch - a defect for every other user,
+/// and the same trap the tool's own worklist exists to prevent. So each English
+/// entry is the mirror of a Dutch term that DID earn its place: DONE, COMPLETE
+/// and FINISHED for AFGEROND (10 catches), BUILT for GEBOUWD (6), SHIPPED for
+/// GESHIPT (5), PHASE for FASE (2), PROGRESS for VOORTGANG, OUTDATED and
+/// SUPERSEDED for ACHTERHAALD. Verified inert on the measured store: adding
+/// them catches nothing new there, so they cost that store no false positives.
+/// What is NOT known is their precision on an English store. Measure before
+/// trusting the 86% figure for one.
+const WIDE_OPENERS: [&str; 18] = [
     "FASE", "PHASE", "HISTORI", "PROGRESS", "VOORTGANG", "ACHTERHAALD", "KLAAR", "AFGEROND",
-    "GEBOUWD", "GESHIPT", "SHIPPED", "VOLTOOID",
+    "GEBOUWD", "GESHIPT", "SHIPPED", "VOLTOOID", "DONE", "COMPLETE", "FINISHED", "BUILT",
+    "OUTDATED", "SUPERSEDED",
 ];
 
 /// Body STARTS with one of these openers (the shipped match: prefix of the
@@ -1275,6 +1285,27 @@ mod tests {
         // Terms measured to earn nothing are gone, and STEP is the one that also
         // collided: "STEP file" is a CAD format, not a status.
         assert!(!reads_as_report("Deliverables: STEP file standard, scan-data (STL/OBJ)"));
+
+        // The English half. Nothing in the measured store opens like this, which
+        // is exactly why it has to be pinned by a test instead: a store with one
+        // Dutch author cannot tell us whether these fire.
+        for english in [
+            "Sprint 3 DONE (2026-07-04) - the importer now handles partial rows",
+            "Migration FINISHED, old tables dropped, rollback note below",
+            "v2 rollout COMPLETE - both regions serving, dashboards green",
+            "Parser BUILT and benchmarked, numbers at the bottom",
+            "OUTDATED - the queue moved to the new broker, kept for the why",
+            "SUPERSEDED by the v3 plan, keeping this for the rejected options",
+        ] {
+            assert!(reads_as_report(english), "{english}");
+            assert!(!report_shaped(english), "the silent half stays narrow: {english}");
+        }
+        // Same window rule for English: a status word deep in prose is not a title.
+        assert!(!reads_as_report(
+            "RUNBOOK for the nightly job: check the lock file, then the queue depth, \
+             and only page someone when both look wrong - the import is usually just \
+             not DONE yet at that hour."
+        ));
 
         // A body that declares itself a RULE keeps the wide net off it entirely -
         // the direction that would silently retire something still governing.

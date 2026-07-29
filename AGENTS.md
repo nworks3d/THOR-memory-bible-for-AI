@@ -161,7 +161,15 @@ help or annoy you.
 ## 6. Standing rules deserve better than being remembered
 
 When they state a standing rule - "never do that on the live server" - `pin` it.
-Pinned rules come back at the start of every conversation and survive the squeeze.
+Pinned rules come back in full at the start of every conversation and survive the
+squeeze.
+
+**Because it comes back in full, keep a pinned rule short.** Write what to do or
+not do, and one line of why. Leave out the dates, the evidence and the story of
+which older rule it replaced - that belongs in an ordinary note, not in the text
+you re-read at the start of every conversation. When two pinned rules overlap,
+merge them into one and retract the other. A pin that has grown into an essay is
+one nobody finishes reading, including you.
 
 **Better still, give the rule a gate.** A gate is an anchor naming the command or
 the file the rule is about. It fires at the moment you reach for that thing,

@@ -75,9 +75,12 @@ mention them.
 "never run that command against production" needs to be present *before* anyone
 thinks to mention production.
 
-**Worth it?** Yes, for a handful of rules. Keep the list short: every pinned
-line is added to every session, so a long list is a permanent tax and the extras
-get silently dropped past the cap.
+**Worth it?** Yes, for a handful of rules. Two things follow from "in full":
+keep the *list* short, because every pinned rule is added to every session, and
+keep each *rule* short. Write the instruction, not the history behind it - your
+assistant has to act on this at the start of every conversation. If more rules
+are pinned than fit, the block says so on its last line instead of quietly
+leaving them out.
 
 ---
 

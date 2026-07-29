@@ -314,7 +314,7 @@ which is the only store whose behaviour you care about.
 | `thor recall` / `get` / `history` | search / read facts from the shell |
 | `thor create <id> "<body>"` / `revise` | write from the shell - you choose the id yourself. The `remember` tool your assistant uses mints one for you; there is no `thor remember` command |
 | `thor ingest [<path>] [--global] [--project <key>] [--detach]` | index a folder's text files (incremental; git repo = tracked-only, plain folder = walked; `--global` = the `@global` tier; `--project` pins a key) |
-| `thor init [<path>]` | set up a project: write a `.thor` marker + first ingest |
+| `thor init [<path>]` | set up a project: write a `.thor` marker + first ingest; also seeds the working contract (see `thor install`) if it is not there yet |
 | `thor reproject <id> --project <key> \| --global` | reassign a fact's project scope (sync-safe) |
 | `thor backfill-projects [--apply]` | attribute legacy memories from their import footer |
 | `thor review-scope [--mark]` | list no-signal global memories to review (SessionStart nudges once/day) |
@@ -323,7 +323,7 @@ which is the only store whose behaviour you care about.
 | `thor mark <id> [--noise]` | record that a fact actually helped - or was noise here (local; one unified usage strength feeds the courier's promotion and consolidate's decay) |
 | `thor warm` | pre-warm the semantic embedder (idempotent; for SessionStart) |
 | `thor guard` / `thor stop-guard` | moment-of-action advisories (risk rulebook + first-touch file memories) / response advisories + a once-per-session capture nudge for unstored decisions/gotchas |
-| `thor install` | write the hooks into settings.json |
+| `thor install` | write the hooks into settings.json; also seeds THOR's working contract once, as a pinned global note with the fixed id `thor-working-contract`, so an assistant is handed the rules for using the memory at every session start instead of being asked to read a file. Seeded only when that id has no events yet, so re-running never overwrites your edits and never re-pins it after you unpin it |
 | `thor vectors build \| sync \| status` | semantic sidecar (feature `semantic`) |
 | `thor embed-daemon` | warm embedder for the courier (feature `semantic`) |
 | `thor export` / `restore` / `backup` | JSONL backup + verified restore |

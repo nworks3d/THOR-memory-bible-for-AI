@@ -1282,6 +1282,10 @@ steward review prepared: {}", path.display());
         Commands::Install { settings, with_guard, with_courier, with_daemon, backup_repo } => {
             let path = settings.unwrap_or_else(crate::install::default_settings_path);
             crate::install::run_install(&path, with_guard, with_courier, with_daemon, backup_repo.as_deref())?;
+            // "Connect it to your assistant" is exactly the moment the working
+            // contract should start riding the brief; a seeding hiccup must not
+            // undo the hook install that just succeeded, so it is reported, not `?`-ed.
+            report_contract_seed(ensure_working_contract(&db));
         }
         Commands::Export { out } => {
             let store = EventStore::new(&db)?;
@@ -1814,6 +1818,98 @@ fn resolve_repo_root(path: &Path) -> PathBuf {
     crate::repo::find_repo_root(&abs).unwrap_or(abs)
 }
 
+/// The fixed, unprefixed entity id for THOR's own working contract (see
+/// repo::owner_project: no `<project>:` prefix means GLOBAL, so every project's
+/// session-start brief carries the same one fact). This replaces AGENTS.md,
+/// which an assistant could always just not read; a pinned fact instead rides
+/// the guaranteed `<thor-brief>` block that already prints at every session
+/// start regardless of what any file on disk says.
+const WORKING_CONTRACT_ID: &str = "thor-working-contract";
+
+/// The contract body, seeded verbatim by `ensure_working_contract`. Deliberately
+/// left-column (no source indentation): this text becomes the stored fact byte
+/// for byte, so indenting it to match the surrounding Rust would bake literal
+/// leading spaces into everyone's session-start brief.
+const WORKING_CONTRACT_BODY: &str = r#"THOR working contract - how to keep this memory worth having.
+
+1. LOOK IT UP FIRST. The memory is the source of truth: over your assumptions, over an old file on disk, and over any document, including a README or a CLAUDE.md. Documents are copies; the memory is the original. When they disagree the memory wins. Code is the one exception - for what the code does, the code is authoritative. "It is already written in a doc" is never a reason not to store a rule.
+
+2. SAVE DECISIONS AND GOTCHAS AS THEY HAPPEN, without being asked. Give each one a type (gotcha, decision or preference) and triggers: the words a future question about it would contain. Then scope it - rules about how you work are global, knowledge about one project belongs to that project.
+
+3. ANCHOR IT. An anchor is the exact file or command a note is about, and it puts the note in front of you the moment you touch that thing. Searching is a guess; an anchor is not. Be specific: a bare name like mod.rs or git fires on everything and is worse than nothing.
+
+4. NEVER SAVE A SECOND COPY. If something is wrong or out of date, revise or retract it. For a small change use append, or an exact replace - never retype a long note to change one line.
+
+5. WRITE-UPS EXPIRE, RULES NEVER. Give "what happened today" an expiry; keep "what is true now" as one note you correct instead of writing the twelfth report. If a write-up contains a rule that still applies, lift that rule into its own note with no expiry first.
+
+6. SETTLE AND JUDGE. Resolve a note marked DIVERGED as soon as you know which side is right, and mark what actually helped or only distracted - the memory learns nothing if nobody says.
+
+7. PINNED RULES STAY SHORT. A pinned rule comes back in full at the start of every conversation, so write the instruction and one line of why, not the history behind it. Merge pins that overlap.
+
+Which tool for which question: recall for facts and prose, where_used when a question names a symbol, impact before you change one, outline for the shape of a file, get to open any id the others hand back.
+
+Tell them in ordinary words what the memory did: what came back, what you saved, and why. A memory that works silently is a memory nobody trusts.
+
+[memory/preference | tags: thor working-contract | project: global]"#;
+
+/// Seed THOR's own working contract once. Idempotent on the entity's OWN
+/// history, not on its current content: the moment `thor-working-contract` has
+/// ANY event at all - the seed itself, a user's revise, or even a user's
+/// retract - every later call is a permanent no-op. That is what lets this run
+/// unconditionally from both `install` and `init` on every invocation without
+/// ever overwriting a hand-edited contract or fighting a deliberate unpin.
+///
+/// A plain `append_event` (not the CAS-checked path) is the right primitive
+/// here: there is no parent to be stale against on a create, and the entity
+/// existence check just above is what makes a second call inert, not a
+/// compare-and-swap on the write itself.
+///
+/// Pinning only happens on the branch that just created the fact, and mirrors
+/// `thor pin`'s own dedup-on-push shape (`ledger::mutate_pins` does not dedup
+/// by itself - see the Pin command). So the gate above is also what protects a
+/// user's unpin: once seeded, this function never touches the pin list again.
+///
+/// Returns `Ok(true)` only for the call that actually seeded it, `Ok(false)`
+/// for every no-op. Never prints - `report_contract_seed` does, so a fresh seed
+/// is announced once, at whichever command caused it, and a repeat run stays quiet.
+pub fn ensure_working_contract(db: &Path) -> anyhow::Result<bool> {
+    let mut store = EventStore::new(db)?;
+    if !store.get_events_by_entity(WORKING_CONTRACT_ID)?.is_empty() {
+        return Ok(false);
+    }
+    store.append_event(
+        "seed-contract",
+        "seed-contract",
+        "cli",
+        EventKind::FactCreated,
+        WORKING_CONTRACT_ID,
+        None,
+        WORKING_CONTRACT_BODY,
+    )?;
+    crate::ledger::mutate_pins(db, |mut pins| {
+        if !pins.iter().any(|p| p == WORKING_CONTRACT_ID) {
+            pins.push(WORKING_CONTRACT_ID.to_string());
+        }
+        pins
+    })?;
+    Ok(true)
+}
+
+/// Report what `ensure_working_contract` did, the same way at both call sites
+/// (`install`, `init`): loud on a fresh seed, silent on the idempotent no-op,
+/// and never fatal - a seeding hiccup must not abort a command that still has
+/// its own, more important work to do.
+fn report_contract_seed(result: anyhow::Result<bool>) {
+    match result {
+        Ok(true) => println!(
+            "seeded THOR's working contract as a pinned rule (thor-working-contract) - your \
+             assistant now gets it at every session start"
+        ),
+        Ok(false) => {}
+        Err(e) => eprintln!("warning: could not seed THOR's working contract: {e}"),
+    }
+}
+
 /// `thor init`: write a `.thor` marker (the stable project key) at the repo root,
 /// then ingest the project so it is immediately "known".
 fn run_init(db: &Path, path: &Path, key: Option<String>) -> Result<()> {
@@ -1825,6 +1921,10 @@ fn run_init(db: &Path, path: &Path, key: Option<String>) -> Result<()> {
     let marker = root.join(".thor");
     std::fs::write(&marker, format!("{}\n", key))?;
     println!("wrote {} (project key '{}')", marker.display(), key);
+    // `init` is the other command docs point a new user to, so the contract must
+    // seed here too - a project set up via `init` alone (no separate `install`
+    // run) must still get it. Never lets a seeding hiccup block ingest below.
+    report_contract_seed(ensure_working_contract(db));
     run_ingest(db, &[root], None)
 }
 
@@ -2497,6 +2597,67 @@ mod tests {
         assert!(
             help.contains("thor-ledger.db"),
             "the help must name the ledger sidecar pins live in: {help}"
+        );
+    }
+
+    #[test]
+    fn ensure_working_contract_seeds_and_pins_on_a_fresh_store() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("thor.db");
+
+        assert!(ensure_working_contract(&db).unwrap(), "a fresh store has no contract yet");
+
+        let store = EventStore::new(&db).unwrap();
+        let events = store.get_events_by_entity(WORKING_CONTRACT_ID).unwrap();
+        assert_eq!(events.len(), 1, "exactly one fact_created, nothing more");
+        assert_eq!(events[0].kind, EventKind::FactCreated);
+        assert_eq!(events[0].body, WORKING_CONTRACT_BODY, "the body is stored verbatim");
+
+        let pins = crate::ledger::read_pins(&db);
+        assert!(pins.iter().any(|p| p == WORKING_CONTRACT_ID), "the fresh seed is pinned: {pins:?}");
+    }
+
+    #[test]
+    fn ensure_working_contract_is_a_no_op_once_already_seeded() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("thor.db");
+
+        assert!(ensure_working_contract(&db).unwrap(), "first call seeds");
+        assert!(!ensure_working_contract(&db).unwrap(), "second call must report no change");
+
+        let store = EventStore::new(&db).unwrap();
+        let events = store.get_events_by_entity(WORKING_CONTRACT_ID).unwrap();
+        assert_eq!(events.len(), 1, "no second event was appended");
+
+        let pins = crate::ledger::read_pins(&db);
+        assert_eq!(
+            pins.iter().filter(|p| *p == WORKING_CONTRACT_ID).count(),
+            1,
+            "no duplicate pin entry: {pins:?}"
+        );
+    }
+
+    /// The case that matters most: seeding must never fight the user. If they
+    /// deliberately unpinned the contract, a later `install`/`init` re-run must
+    /// leave it unpinned - the entity already has an event, so the gate alone
+    /// (not a pin-list check) is what has to stop the re-pin.
+    #[test]
+    fn ensure_working_contract_never_re_pins_after_the_user_unpins_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("thor.db");
+
+        assert!(ensure_working_contract(&db).unwrap(), "first call seeds and pins");
+        crate::ledger::mutate_pins(&db, |mut pins| {
+            pins.retain(|p| p != WORKING_CONTRACT_ID);
+            pins
+        })
+        .unwrap();
+        assert!(crate::ledger::read_pins(&db).is_empty(), "the user deliberately unpinned it");
+
+        assert!(!ensure_working_contract(&db).unwrap(), "the note already has an event, so this stays a no-op");
+        assert!(
+            crate::ledger::read_pins(&db).is_empty(),
+            "seeding must never fight the user's own unpin"
         );
     }
 }

@@ -104,13 +104,19 @@ your notes get their own scope instead of piling up in the shared memory every
 project sees. A brand-new folder with no git repository used to get no such
 hint - a poor first impression that is now fixed.
 
-**Step 4 - and this is the one people skip.** Ask your assistant to read
-**[AGENTS.md](AGENTS.md)**. It is one page, written for it rather than for you.
+**Step 4 - there is no step 4.** Your assistant needs to know how to use a
+memory well, or it will save notes in a shape that never comes back to it later
+- and neither of you would notice for weeks, because a memory that fails does it
+silently.
 
-Skipping this is the difference between a memory that works and a memory that
-quietly does nothing. An assistant that has not read it will save notes in a
-shape that never comes back to it later - and neither of you will notice for
-weeks, because a memory that fails does it silently. Ten minutes here.
+That used to be a page we asked you to make it read. It is now a rule THOR puts
+into the memory itself during step 2, and hands to your assistant at the start
+of every conversation. Nothing to read, nothing to skip. You can see it with
+`thor get thor-working-contract`, edit it like any other note, or unpin it if
+you would rather write your own.
+
+If you are the assistant doing the setup, [AGENTS.md](AGENTS.md) is the
+walkthrough for the steps above.
 
 ### What that command switches on
 
@@ -143,8 +149,10 @@ away.
    words, and whether it is worth your time.
 2. **[docs/SETUP.md](docs/SETUP.md)** - the full walkthrough, one step at a
    time.
-3. **[AGENTS.md](AGENTS.md)** - how to work with it well. For your assistant,
-   and worth ten minutes of your own time too.
+3. **[AGENTS.md](AGENTS.md)** - the setup, written for your assistant to follow.
+   How to *use* the memory well is not a page at all any more: THOR puts that
+   into the memory during setup and hands it over at the start of every
+   conversation.
 4. **[docs/OPTIONAL-FEATURES.md](docs/OPTIONAL-FEATURES.md)** - the extras. What
    each one costs, how to switch it on, how to undo it.
 
@@ -174,7 +182,7 @@ little slower.
 
 | page | what it answers |
 |---|---|
-| [AGENTS.md](AGENTS.md) | for your AI assistant: how to set THOR up and how to use it well |
+| [AGENTS.md](AGENTS.md) | for your AI assistant: how to set THOR up (using it well is seeded into the memory instead) |
 | [docs/FEATURES.md](docs/FEATURES.md) | what does each part do, and should I care? (plain words, no commands) |
 | [docs/SETUP.md](docs/SETUP.md) | the full walkthrough, for someone who has never done this |
 | [docs/OPTIONAL-FEATURES.md](docs/OPTIONAL-FEATURES.md) | the extras: what each costs, switching on, checking, undoing |

@@ -75,6 +75,12 @@ mention them.
 "never run that command against production" needs to be present *before* anyone
 thinks to mention production.
 
+Your first pin arrives without you: during setup THOR seeds its own working
+contract - how your assistant should store things so they come back - as a
+pinned note. That is the same trick applied to THOR itself, instead of asking
+anyone to read a page about it. It is an ordinary note, so edit it or unpin it
+as you like; setup only ever creates it once and never puts it back.
+
 **Worth it?** Yes, for a handful of rules. Two things follow from "in full":
 keep the *list* short, because every pinned rule is added to every session, and
 keep each *rule* short. Write the instruction, not the history behind it - your

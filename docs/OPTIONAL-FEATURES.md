@@ -2155,14 +2155,17 @@ a follow-up like "carry on" shares no words with the rule).
   protects a fact from the hygiene passes: a pinned fact is never a decay
   candidate and never a dedup retract target.
 - **Leave it off if:** the fact is merely useful rather than governing. Every
-  pinned line is injected into every session, so pins are a permanent context
-  tax. The cap is 8 lines total, and pins past the cap are silently skipped, so
-  an over-pinned list quietly drops its own tail without telling you.
+  pinned rule is injected into every session in full, so pins are a permanent
+  context tax, and a long pinned rule is a long tax. Keep the wording short
+  enough to act on.
 - **What it costs:** no extra process, no port, no download, no change in binary
   size. All your pins live in one row of a local SQLite sidecar next to the store
-  (`thor-ledger.db`). The injected text is up to 400 characters per pin, with
-  whitespace collapsed and the metadata footer stripped, cut off with "..."
-  past that; at most 8 lines in total across all pins.
+  (`thor-ledger.db`). Each pin is injected as its **whole** body - never
+  truncated, because half a rule is worse than a long one - with the trailing
+  metadata footer stripped, since that is ranking plumbing rather than an
+  instruction. The cap is 16 lines in total across all pins, and it is never
+  silent: if pins do not fit, a final line in the block says how many were left
+  out and tells you to unpin something.
 - **Two things to know before you rely on it:** the injected block is
   project-scoped, so a fact pinned in another project does not appear in this
   session's block, only this project's pins and the global ones. And pins are

@@ -681,9 +681,14 @@ pub fn render_history(entity_id: &str, events: &[Event]) -> String {
 
 /// Render the pinned-facts brief: the guaranteed re-orientation block for a
 /// session start - especially right after a compaction, when the context is
-/// empty and prompt-recall has nothing to match against ("ga verder"). Full
-/// bodies (not 220-char snippets), scope-filtered to the current project + the
-/// global tier, every contested head shown. None when nothing is pinned/in scope.
+/// empty and prompt-recall has nothing to match against ("ga verder"). Bodies
+/// are served IN FULL, never snippeted: this block is delivered once per
+/// session, not once per prompt, so truncating a rule defeats its only
+/// guaranteed delivery - a half-shown rule is worse than a long one.
+/// Scope-filtered to the current project + the global tier, every live
+/// contested head shown, up to MAX_PINS lines. When the cap drops something
+/// it is never silent: a trailing NOTE line says how many pinned rules did
+/// not fit and how to make room. None when nothing is pinned/in scope.
 pub fn render_brief(
     events: &[Event],
     pins: &[String],
@@ -691,8 +696,7 @@ pub fn render_brief(
     trigger: &str,
     project: Option<&str>,
 ) -> Option<String> {
-    const MAX_PINS: usize = 8;
-    const PIN_BODY_CHARS: usize = 400;
+    const MAX_PINS: usize = 16;
     if pins.is_empty() {
         return None;
     }
@@ -702,13 +706,16 @@ pub fn render_brief(
         events.iter().map(|e| (e.this_hash.as_str(), e)).collect();
     let mut lines: Vec<String> = Vec::new();
     let mut seen: std::collections::HashSet<&str> = std::collections::HashSet::new();
+    // Live, in-scope, non-retracted heads that still did not fit under MAX_PINS -
+    // counted so the cap can say what it dropped instead of dropping it silently.
+    let mut left_out: usize = 0;
     for id in pins {
-        if !seen.insert(id.as_str()) || lines.len() >= MAX_PINS {
-            continue;
+        if !seen.insert(id.as_str()) {
+            continue; // duplicate id: already covered, not missing
         }
         let hs = match heads_map.get(id) {
             Some(h) if !h.heads.is_empty() => h,
-            _ => continue,
+            _ => continue, // no live head: nothing to show, not the cap's doing
         };
         let effective = projects.get(id).and_then(|o| o.as_deref());
         if !scope.allows(effective) {
@@ -717,9 +724,6 @@ pub fn render_brief(
         let mut head_revs: Vec<&String> = hs.heads.iter().collect();
         head_revs.sort();
         for rev in head_revs {
-            if lines.len() >= MAX_PINS {
-                break; // the cap bounds LINES: diverged pins push one per head
-            }
             let ev = match by_hash.get(rev.as_str()) {
                 Some(e) => *e,
                 None => continue,
@@ -727,21 +731,31 @@ pub fn render_brief(
             if matches!(ev.kind, EventKind::FactRetracted) {
                 continue; // a retracted pin is dead: never re-inject it
             }
+            if lines.len() >= MAX_PINS {
+                left_out += 1; // a live pin the cap had no room left for
+                break; // the cap bounds LINES: diverged pins push one per head
+            }
             let ty = crate::repo::fact_type(&ev.body)
                 .map(|t| format!("[{}] ", t.as_str()))
                 .unwrap_or_default();
             let d = if hs.is_diverged { " [DIVERGED]" } else { "" };
-            lines.push(format!(
-                "- {}{}{}: {}",
-                ty,
-                id,
-                d,
-                crate::recall::snippet(&ev.body, PIN_BODY_CHARS, "")
-            ));
+            // Body only: the trailing metadata footer (tags, fires-when, project)
+            // is ranking plumbing, not an instruction, and the type it carries is
+            // already rendered as the [type] prefix above.
+            let body = crate::footer::strip(&ev.body).trim_end();
+            lines.push(format!("- {}{}{}: {}", ty, id, d, body));
         }
     }
     if lines.is_empty() {
         return None;
+    }
+    if left_out > 0 {
+        // Loud, not silent: name the count and the fix instead of just dropping.
+        lines.push(format!(
+            "- NOTE: {} more pinned rule(s) are not shown (cap {}). Unpin something with \
+             `thor unpin <id>` so the rest fit.",
+            left_out, MAX_PINS
+        ));
     }
     Some(format!(
         "<thor-brief>\nPinned THOR rules [project: {} | start: {}] - standing constraints, pinned \
@@ -2214,6 +2228,58 @@ mod tests {
         let none = render_brief(&events, &["ProjB:mem-1".to_string()], &scope_a, "startup", Some("ProjA"));
         assert!(none.is_none(), "nothing in scope -> silence");
         assert!(render_brief(&events, &[], &scope_a, "startup", None).is_none(), "no pins -> silence");
+    }
+
+    #[test]
+    fn render_brief_serves_full_bodies_and_reports_pins_dropped_by_the_cap() {
+        use crate::recall::RecallScope;
+        let mut store = EventStore::in_memory().unwrap();
+        // Comfortably over the old 400-char snippet cap, with a distinctive tail
+        // so a truncated (or otherwise mangled) rendering is easy to catch. The
+        // metadata footer rides along to prove it is stripped from the brief.
+        let long_body = format!(
+            "{}{}\n\n[memory/decision | tags: t | fires-when: never | project: global]",
+            "filler ".repeat(80),
+            "TAIL-MARKER-XYZ"
+        );
+        assert!(long_body.len() > 400, "the test body must exceed the old snippet cap");
+        store
+            .append_event("s", "l", "a", EventKind::FactCreated, "pin-long", None, &long_body)
+            .unwrap();
+        // 19 more live, in-scope pins: 20 total against a cap of 16, so 4 must be
+        // named as left out rather than dropped without a trace.
+        for i in 0..19 {
+            store
+                .append_event(
+                    "s", "l", "a", EventKind::FactCreated, &format!("pin-{i}"), None,
+                    &format!("short rule number {i}"),
+                )
+                .unwrap();
+        }
+        let events = store.get_all_events().unwrap();
+        let mut pins = vec!["pin-long".to_string()];
+        pins.extend((0..19).map(|i| format!("pin-{i}")));
+
+        let brief = render_brief(&events, &pins, &RecallScope::everything(), "startup", None)
+            .expect("brief renders");
+        assert!(
+            brief.contains("TAIL-MARKER-XYZ"),
+            "the full body reaches the brief, not a 400-char snippet: {brief}"
+        );
+        assert!(!brief.contains("..."), "no truncation marker was inserted: {brief}");
+        assert!(
+            brief.contains("[decision] pin-long"),
+            "the footer's type still renders as the line prefix: {brief}"
+        );
+        assert!(
+            !brief.contains("fires-when") && !brief.contains("[memory/decision"),
+            "the metadata footer itself is stripped - it is plumbing, not instruction: {brief}"
+        );
+        assert!(
+            brief.contains("4 more pinned rule(s) are not shown (cap 16)"),
+            "the cap names how many pins it dropped: {brief}"
+        );
+        assert!(brief.contains("thor unpin"), "the note tells the user how to make room: {brief}");
     }
 
     #[cfg(windows)]

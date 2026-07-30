@@ -1024,6 +1024,33 @@ impl EventStore {
             }
         };
 
+        // A TOMBSTONE IS NOT A PARENT TO BUILD ON (2026-07-30, found by an audit
+        // swarm). Liveness is decided everywhere - recall, the guard's anchor
+        // pass, consolidate - by the KIND of the current head, and nothing here
+        // looked at that kind: a revise citing a retracted head fast-forwarded
+        // off the tombstone like any other head, and the fact was live again
+        // with no word about it in the reply. A stale id from an earlier session
+        // or a saved reference was enough. Refusing is the smaller rule and it
+        // matches the store's own doctrine (a retraction is a decision, not a
+        // pause): the way back is to store the corrected fact fresh, which
+        // leaves a create in the log where a resurrection left nothing.
+        // ...but a RETRACT of an already-retracted fact is not a revival, it is
+        // the same decision arriving twice, and the inbox drain is at-least-once
+        // by design (found by two adversarial verifiers, 2026-07-30: refusing it
+        // made one replayed op fail its batch forever, so nothing the replica
+        // captured afterwards ever reached the authority). It appends a second
+        // tombstone, exactly as before, and the batch stays clean.
+        if kind != EventKind::FactRetracted
+            && events.iter().any(|e| e.this_hash == parent && e.kind == EventKind::FactRetracted)
+        {
+            return Err(conflict(
+                "this fact was RETRACTED - a revise may not silently bring it back. Store the \
+                 corrected fact fresh with remember (the retraction stays in history), or check \
+                 with `history` whether you meant a different entity",
+            )
+            .into());
+        }
+
         // Carry the fact's footer across a content-only REVISE. The footer is
         // the body's tail, not a field, so a caller who rewrites the body
         // without re-typing it silently drops the fact's type, tags, fires-when
@@ -1904,6 +1931,57 @@ mod tests {
         let retrieved = store.get_event_by_uuid(&event.event_uuid).unwrap();
         assert!(retrieved.is_some());
         assert_eq!(retrieved.unwrap().seq, 1);
+    }
+
+    /// A retraction is a decision, not a pause (2026-07-30, found by an audit
+    /// swarm). Liveness is read everywhere from the KIND of the current head,
+    /// and nothing checked that kind before accepting a parent - so a revise
+    /// citing a retracted head fast-forwarded off the tombstone like any other
+    /// head and the fact was simply live again, indistinguishable from one that
+    /// had been revised twice, with no word about it in the reply. A stale id
+    /// from an earlier session was enough to bring back something deliberately
+    /// killed.
+    #[test]
+    fn a_retracted_fact_cannot_be_revived_by_revising_its_tombstone() {
+        let mut store = EventStore::in_memory().unwrap();
+        let v1 = store
+            .append_event("s", "l", "a", EventKind::FactCreated, "e1", None, "the wrong fact")
+            .unwrap();
+        let dead = store
+            .append_mutate_checked(
+                "s", "l", "a", EventKind::FactRetracted, "e1", Some(&v1.this_hash), "wrong",
+            )
+            .unwrap();
+
+        let auto = store.append_mutate_checked(
+            "s", "l", "a", EventKind::FactRevised, "e1", None, "back from the dead",
+        );
+        let err = auto.expect_err("a revise off a tombstone must not silently revive the fact");
+        let msg = format!("{err}");
+        assert!(msg.contains("RETRACTED"), "the refusal says WHY: {msg}");
+        assert!(msg.contains("remember"), "and names the way forward: {msg}");
+
+        // Citing the tombstone explicitly is the same act, so it is refused too.
+        let explicit = store.append_mutate_checked(
+            "s", "l", "a", EventKind::FactRevised, "e1", Some(&dead.this_hash), "sneaky",
+        );
+        assert!(explicit.is_err(), "naming the tombstone as parent is not a loophole");
+
+        // But a RETRACT of an already-retracted fact is the same decision
+        // arriving twice, not a revival, and it must stay idempotent: the
+        // replica inbox is at-least-once, and a deterministic refusal there
+        // froze the whole batch (found by two adversarial verifiers).
+        let again = store.append_mutate_checked(
+            "s", "l", "a", EventKind::FactRetracted, "e1", None, "still wrong",
+        );
+        assert!(again.is_ok(), "a repeated retract must not fail: {:?}", again.err().map(|e| e.to_string()));
+
+        // And the fact really did stay dead.
+        let events = store.get_all_events().unwrap();
+        let heads = crate::cas::compute_head_sets(&events);
+        let head = heads.get("e1").unwrap().heads.iter().next().unwrap().clone();
+        let kind = events.iter().find(|e| e.this_hash == head).map(|e| e.kind).unwrap();
+        assert_eq!(kind, EventKind::FactRetracted, "the tombstone is still the head");
     }
 
     /// A revise that rewrites the body must keep the fact's footer: it holds

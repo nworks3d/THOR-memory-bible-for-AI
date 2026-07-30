@@ -127,8 +127,24 @@ pub fn apply_ops(store: &mut EventStore, ops: &[crate::inbox::InboxOp]) -> Drain
                         println!("{} {} rev {}", op.op, op.entity_id, &ev.this_hash[..8.min(ev.this_hash.len())]);
                     }
                     Err(e) => {
-                        s.errors += 1;
-                        eprintln!("ERROR {} {}: {e}", op.op, op.entity_id);
+                        // Same idempotent skip the create arm has, and for the
+                        // same reason (2026-07-30): a MutateConflict here is a
+                        // DETERMINISTIC verdict about this op - the parent is
+                        // not a head any more, or the fact was retracted in the
+                        // meantime - so retrying it can only fail again. Counted
+                        // as an error it never acks, the batch is re-served on
+                        // every pull, and every capture the replica takes after
+                        // it queues behind a batch that can never clear. A
+                        // transient failure (a locked or unreadable store) is a
+                        // different error type and still counts, so the
+                        // at-least-once retry keeps protecting what it was for.
+                        if e.downcast_ref::<crate::event_store::MutateConflict>().is_some() {
+                            s.skipped += 1;
+                            println!("skip ({}): {} - {e}", op.op, op.entity_id);
+                        } else {
+                            s.errors += 1;
+                            eprintln!("ERROR {} {}: {e}", op.op, op.entity_id);
+                        }
                     }
                 }
             }
@@ -2428,6 +2444,67 @@ mod tests {
         let head = events.iter().find(|e| &e.this_hash == head_hash).unwrap();
         assert!(head.body.contains("confirmed"), "revise applied onto the same id");
         assert!(head.body.contains("[memory/gotcha"), "footer preserved through the drain");
+    }
+
+    /// A deterministic refusal must never freeze the batch (2026-07-30, found
+    /// by two adversarial verifiers on the same day the refusal landed). The
+    /// inbox is at-least-once, so a queued revise whose target the authority
+    /// retracted in the meantime WILL arrive - and it can only ever fail. As an
+    /// error it never acks, the batch is re-served on every pull, and every
+    /// capture the replica takes afterwards queues behind it forever. It has to
+    /// count as a skip, exactly like a duplicate create already does.
+    #[test]
+    fn a_refused_revise_is_skipped_so_the_drain_can_still_ack() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("thor.db");
+        let mut store = EventStore::new(&db).unwrap();
+        let v1 = store
+            .append_event("s", "l", "a", EventKind::FactCreated, "P:mem-dead", None, "a fact")
+            .unwrap();
+        store
+            .append_mutate_checked(
+                "s", "l", "a", EventKind::FactRetracted, "P:mem-dead", Some(&v1.this_hash), "gone",
+            )
+            .unwrap();
+        drop(store);
+
+        let inbox = dir.path().join("inbox.jsonl");
+        crate::inbox::append(&inbox, &crate::inbox::InboxOp {
+            op: "revise".into(),
+            entity_id: "P:mem-dead".into(),
+            body: "back from the dead".into(),
+            parent_rev: None,
+            ts: "1".into(),
+            capture_id: "c-dead".into(),
+        })
+        .unwrap();
+        crate::inbox::append(&inbox, &crate::inbox::InboxOp {
+            op: "create".into(),
+            entity_id: "P:mem-fresh".into(),
+            body: "a capture taken after it".into(),
+            parent_rev: None,
+            ts: "2".into(),
+            capture_id: "c-fresh".into(),
+        })
+        .unwrap();
+
+        let summary = run_drain_inbox(&db, &inbox).unwrap();
+        assert_eq!(
+            summary,
+            DrainSummary { total: 2, applied: 1, skipped: 1, errors: 0 },
+            "the refusal is a skip, not an error - errors would strand the whole batch"
+        );
+
+        let store = EventStore::new(&db).unwrap();
+        let events = store.get_all_events().unwrap();
+        assert!(
+            events.iter().any(|e| e.entity_id == "P:mem-fresh"),
+            "the capture queued behind the refused op still reached the authority"
+        );
+        let heads = crate::cas::compute_head_sets(&events);
+        let head = heads.get("P:mem-dead").unwrap().heads.iter().next().unwrap().clone();
+        let kind = events.iter().find(|e| e.this_hash == head).map(|e| e.kind).unwrap();
+        assert_eq!(kind, EventKind::FactRetracted, "and the dead fact stayed dead");
     }
 
     /// Screw 3 drain side: a useful-mark queued on the replica replays as the

@@ -924,6 +924,20 @@ impl ThorServer {
                      drop the anchors and store the fact without one."
                 ));
             }
+            if let Some(why) = anchors.iter().find_map(|a| crate::footer::unstorable_anchor(a)) {
+                return Err(format!(
+                    "NOT stored: {why}. Anchor the part without the comma (a file it touches, or \
+                     the command up to that argument), so the stored text is the text that fires."
+                ));
+            }
+            // Same call one step further: an anchor with no slot left is as dead
+            // as an over-broad one, only quieter. Refuse it here rather than
+            // storing it and warning about it afterwards.
+            if let Some(why) =
+                unservable_anchor(s, None, crate::repo::owner_project(&entity_id), &anchors)
+            {
+                return Err(format!("NOT stored: {why}"));
+            }
             // A self-declared MILESTONE / MIJLPAAL with no expiry gets one, here
             // at the write, because the alternative was measured and does not
             // hold: 61 such facts had accumulated to 11.6% of all stored text
@@ -1068,20 +1082,26 @@ impl ThorServer {
                         && matches!(args.fact_type.as_deref(), Some("gotcha") | Some("decision"))
                     {
                         if let Some(cand) = crate::footer::anchor_candidate(&clean_body) {
-                            // A candidate whose target is already crowded must not be pushed the
+                            // A candidate whose target is already FULL must not be pushed the
                             // same way: telling the author to anchor here would be undone by the
                             // write-time warning below the moment they actually did it (the two
-                            // hints pulled in opposite directions until 2026-07-29). Point at the
-                            // crowding instead of proposing the anchor.
-                            match crowded_anchor_for_candidate(s, &cand) {
-                                Some(hit) => out.push_str(&format!(
+                            // hints pulled in opposite directions until 2026-07-29, and again at
+                            // the exactly-at-the-cap boundary until 2026-07-30). Point at the
+                            // occupants instead of proposing the anchor - naming them is what
+                            // makes the fold-it-in advice something the author can act on now.
+                            match taken_slots(s, &cand, None, crate::repo::owner_project(&entity_id))
+                            {
+                                Some(holders) => out.push_str(&format!(
                                     "\nNo anchors, and this body names '{cand}' - but that target \
-                                     already carries {} live fact(s), more than the guard ever \
-                                     serves per target ({}), so a new anchor there would drop \
-                                     silently rather than add cover. Fold this constraint into the \
-                                     fact that already holds that target's invariants instead, or \
-                                     make room there first by retiring one of its existing anchors.",
-                                    hit.fact_count, hit.served
+                                     already carries {} live fact(s) and the guard serves at most \
+                                     {} per target, so a new anchor there would drop silently \
+                                     rather than add cover. Holding it now: {}. Fold this \
+                                     constraint into whichever of those carries that target's \
+                                     invariants (revise it with append, one short line), or make \
+                                     room first by retiring one of their anchors.",
+                                    holders.len(),
+                                    crate::guard::FILE_MEMORY_HITS,
+                                    holder_ids(&holders, None)
                                 )),
                                 None => out.push_str(&format!(
                                     "\nNo anchors, and this body names '{cand}'. An anchor is the only \
@@ -1143,6 +1163,22 @@ impl ThorServer {
                 return Err(format!(
                     "rejected: that anchor is too broad to be a gate: {why}. Nothing was changed."
                 ));
+            }
+            if let Some(why) =
+                args.anchors.iter().flatten().find_map(|a| crate::footer::unstorable_anchor(a))
+            {
+                return Err(format!("rejected: {why}. Nothing was changed."));
+            }
+            // An anchor with no slot left is refused here too - but never for a
+            // fact that already holds it, so revising the invariants fact that
+            // occupies the slot keeps working.
+            if let Some(why) = unservable_anchor(
+                s,
+                Some(&args.entity_id),
+                crate::repo::owner_project(&args.entity_id),
+                args.anchors.as_deref().unwrap_or(&[]),
+            ) {
+                return Err(format!("rejected: {why} Nothing was changed."));
             }
             if let Some(exp) = args.expires.as_deref() {
                 let exp = exp.trim();
@@ -1866,31 +1902,115 @@ fn crowded_anchor_warning(store: &EventStore, entity_id: &str, body: &str) -> Op
         .find(|c| c.entity_ids.iter().any(|id| id == entity_id))?;
     let others = hit.fact_count.saturating_sub(1); // this fact is one of fact_count
     Some(format!(
-        "\nAnchor '{}' is already crowded: {} other live fact(s) carry it, and the guard only \
-         ever serves {} per target - the rest, including this one, drop silently at the moment \
-         of action. Either drop this anchor, or fold the constraint into one of the facts \
-         already on '{}' and leave this one unanchored.",
-        hit.anchor, others, hit.served, hit.anchor
+        "\nAnchor '{}' is already crowded: {} other live fact(s) carry it ({}), and the guard \
+         only ever serves {} per target - the rest, including this one, drop silently at the \
+         moment of action. Either drop this anchor, or fold the constraint into one of those \
+         facts and leave this one unanchored.",
+        hit.anchor,
+        others,
+        holder_ids(&hit.entity_ids, Some(entity_id)),
+        hit.served
     ))
 }
 
-/// Crowding check for the no-anchor nudge (remember, above): that nudge fires
-/// precisely when THIS fact has no anchor yet, so unlike `crowded_anchor_warning`
-/// there is no entity_id to look up by membership - `cand` is only the candidate
-/// string `anchor_candidate` read out of the body, never something stored. Same
-/// grouping as the write-time warning (crate::consolidate::crowded_anchors_now),
-/// and consolidate's own `normalize_anchor_for_grouping` - CALLED, never copied,
-/// because a normalization that drifts would call the same target "crowded" in
-/// one hint and not in the other. Fails silent: any read error reads as "not
-/// crowded", so the ordinary nudge still fires rather than costing the write a
-/// hint.
-fn crowded_anchor_for_candidate(
+/// The write-time gate that makes a dead anchor unrepresentable (2026-07-30).
+///
+/// A hint was not enough, and the evidence is a real session: THOR advised the
+/// author to fold the constraint into the target's invariants fact, the author
+/// did not, and two money-critical rules ended up with no gate at all. An
+/// anchor past `FILE_MEMORY_HITS` is not weaker cover - `merge_anchored`
+/// truncates it away and nobody is told - so writing one is work that LOOKS
+/// done and never arrives. Refusing it is the same call the over-broad anchor
+/// check already makes one check earlier, for the same reason.
+///
+/// Returns the refusal text for the FIRST anchor that cannot be served, or
+/// None when every requested anchor has a slot. `entity_id` is the fact doing
+/// the writing: an incumbent re-stating an anchor it already holds is never
+/// refused (revising the invariants fact itself must keep working), which is
+/// why membership is read from the group instead of counted separately.
+/// Fails silent on a read error: a gate that cannot read the store must not
+/// cost a write.
+fn unservable_anchor(
     store: &EventStore,
-    cand: &str,
-) -> Option<crate::consolidate::CrowdedAnchor> {
+    entity_id: Option<&str>,
+    scope_hint: Option<&str>,
+    anchors: &[String],
+) -> Option<String> {
+    for a in anchors {
+        let Some(holders) = taken_slots(store, a, entity_id, scope_hint) else { continue };
+        return Some(format!(
+            "anchor '{}' cannot be served: that target already carries {} live fact(s) and the \
+             guard only ever serves {} per target, so this anchor would be truncated away \
+             silently at the moment of action - cover that looks real and never fires. Holding \
+             it now: {}. Fold this constraint into whichever of those carries that target's \
+             invariants (revise it with append, one short line), or free a slot first by taking \
+             the anchor off one of them. If the fact needs no gate, store it without that anchor.",
+            a.trim(),
+            holders.len(),
+            crate::guard::FILE_MEMORY_HITS,
+            holder_ids(&holders, entity_id)
+        ));
+    }
+    None
+}
+
+/// The one place both write-time anchor questions are answered, so they can
+/// never disagree again: who already holds a slot this anchor would need?
+/// Some(holders) means there is none left; None means it fits.
+///
+/// Two deliberate choices live here. Rivalry is decided by the GUARD's match
+/// rule (crate::consolidate::slot_rivals_now), not by string equality, so a
+/// variant spelling of the same file cannot slip past the gate. And a fact that
+/// ALREADY holds a colliding anchor is never counted as claiming a slot: it
+/// keeps its own, which is what makes the invariants fact the refusal points at
+/// editable, on legacy targets too.
+///
+/// Scoped the way the guard scopes, so the question is asked about the facts
+/// that would actually compete: `self_id`'s effective project when it already
+/// exists (a reproject honored), otherwise `scope_hint` - for a brand new fact
+/// that is its own id prefix, which IS its birth project.
+///
+/// Fails silent on a read error: a gate that cannot read the store must not
+/// cost a write.
+fn taken_slots(
+    store: &EventStore,
+    anchor: &str,
+    self_id: Option<&str>,
+    scope_hint: Option<&str>,
+) -> Option<Vec<String>> {
     let events = store.get_all_events().ok()?;
-    let norm = crate::consolidate::normalize_anchor_for_grouping(cand);
-    crate::consolidate::crowded_anchors_now(&events).into_iter().find(|c| c.anchor == norm)
+    let mine = self_id
+        .and_then(|id| crate::consolidate::project_of_now(&events, id))
+        .or_else(|| scope_hint.map(str::to_string));
+    let scope = crate::recall::RecallScope::current(mine);
+    let rivals = crate::consolidate::slot_rivals_now(&events, anchor, &scope);
+    if self_id.is_some_and(|id| rivals.iter().any(|x| x == id)) {
+        return None;
+    }
+    (rivals.len() >= crate::guard::FILE_MEMORY_HITS).then_some(rivals)
+}
+
+/// How many incumbent ids a capacity hint prints before it summarizes the rest.
+/// The hint is only actionable if it says WHICH fact to fold the constraint
+/// into, but a target like `thor/src/courier.rs` carries sixteen and a wall of
+/// ids is its own kind of unusable.
+const HOLDER_IDS_SHOWN: usize = 3;
+
+/// The incumbents of a full anchor, as one printable phrase: the ids that hold
+/// the slots right now, so the author can revise one of them in the same turn
+/// instead of going looking. `skip` drops the writing fact itself from the list
+/// (the post-write warning counts it among the holders; the author does not
+/// need to be told to fold a fact into itself).
+fn holder_ids(ids: &[String], skip: Option<&str>) -> String {
+    let shown: Vec<&str> =
+        ids.iter().map(String::as_str).filter(|id| Some(*id) != skip).collect();
+    let rest = shown.len().saturating_sub(HOLDER_IDS_SHOWN);
+    let head = shown.iter().take(HOLDER_IDS_SHOWN).copied().collect::<Vec<_>>().join(", ");
+    if rest > 0 {
+        format!("{head} +{rest} more")
+    } else {
+        head
+    }
 }
 
 /// Rewrite the head's footer so its `project:` field names `target`, as a normal
@@ -3537,16 +3657,15 @@ mod tests {
         });
     }
 
-    /// The write-time half of the crowding report (2026-07-29): the guard only
-    /// ever serves crate::guard::FILE_MEMORY_HITS facts per anchored target and
-    /// silently drops the rest, so `thor consolidate` measured 47 targets on a
-    /// real store already past that cap - dead weight nobody was told about.
-    /// Two prior facts already anchored to the target is exactly the guard's
-    /// cap: a third one lands the target one fact past it.
+    /// A target ALREADY past the cap (legacy data, or a store cleaned up after
+    /// the anchors were written) refuses a newcomer just as a full one does.
+    /// Until 2026-07-30 this same write was stored WITH the dead anchor and
+    /// only warned about - `thor consolidate` then measured 47 such targets on
+    /// the real store, all of them cover that never fired.
     #[tokio::test]
-    async fn remember_warns_when_its_anchor_already_crowds_a_target() {
+    async fn remember_refuses_an_anchor_on_a_target_already_past_the_cap() {
         let mut store = EventStore::in_memory().unwrap();
-        for id in ["mem-a", "mem-b"] {
+        for id in ["mem-a", "mem-b", "mem-c"] {
             store
                 .append_event(
                     "s", "l", "a", EventKind::FactCreated, id, None,
@@ -3559,7 +3678,7 @@ mod tests {
 
         let out = server
             .remember(Parameters(RememberArgs {
-                body: "a third note about the same payment flow".into(),
+                body: "a fourth note about the same payment flow".into(),
                 entity_id: None,
                 project: Some("acme".into()),
                 fact_type: Some("gotcha".into()),
@@ -3570,11 +3689,13 @@ mod tests {
                 provenance: None,
             }))
             .await;
-        assert!(out.contains("stored entity"), "{out}");
-        assert!(out.contains("already crowded"), "the write-time warning fires: {out}");
-        assert!(out.contains("server/lib/payment.js"), "names the crowded target: {out}");
+        assert!(out.contains("NOT stored"), "{out}");
+        assert!(out.contains("server/lib/payment.js"), "names the target: {out}");
         assert!(
-            out.contains(&format!("{} other live fact(s)", crate::guard::FILE_MEMORY_HITS)),
+            out.contains(&format!(
+                "the guard only ever serves {} per target",
+                crate::guard::FILE_MEMORY_HITS
+            )),
             "names the count against the guard's real cap, never a hardcoded copy: {out}"
         );
     }
@@ -3797,11 +3918,556 @@ mod tests {
         );
         assert!(
             out.contains(&format!(
-                "more than the guard ever serves per target ({})",
+                "the guard serves at most {} per target",
                 crate::guard::FILE_MEMORY_HITS
             )),
             "names the count against the guard's real cap, never a hardcoded copy: {out}"
         );
+        assert!(
+            out.contains("Holding it now: mem-j, mem-k, mem-l"),
+            "names the incumbents, so folding the constraint in is actionable now: {out}"
+        );
+    }
+
+    /// The boundary the 2026-07-29 fix missed and a real session paid for
+    /// (2026-07-30): a target holding EXACTLY the cap is full - no slot left -
+    /// even though it does not yet overflow. The nudge asked consolidate's
+    /// report question (`fact_count > cap`) instead of the write question
+    /// (`fact_count >= cap`), so here it proposed the anchor and the post-write
+    /// warning condemned it on the next turn. Two live facts, not three: this
+    /// is the commonest state of a busy target, which is why it whipsawed so
+    /// reliably.
+    #[tokio::test]
+    async fn remember_nudge_treats_a_target_at_exactly_the_cap_as_full() {
+        assert_eq!(crate::guard::FILE_MEMORY_HITS, 2, "this test seeds exactly the cap");
+        let mut store = EventStore::in_memory().unwrap();
+        for id in ["mem-p", "mem-q"] {
+            store
+                .append_event(
+                    "s", "l", "a", EventKind::FactCreated, id, None,
+                    "an existing note about the same full target\n\n\
+                     [memory/gotcha | tags: x | anchors: src/example.rs]",
+                )
+                .unwrap();
+        }
+        let (server, _d) = server_with(store);
+
+        let out = server
+            .remember(Parameters(RememberArgs {
+                body: "never touch src/example.rs during a deploy window, it corrupts the queue"
+                    .into(),
+                entity_id: None,
+                project: Some("acme".into()),
+                fact_type: Some("gotcha".into()),
+                tags: None,
+                triggers: None,
+                anchors: None,
+                expires: None,
+                provenance: None,
+            }))
+            .await;
+        assert!(out.contains("stored entity"), "{out}");
+        assert!(
+            !out.contains("revise it with anchors: [\"src/example.rs\"]"),
+            "a target at the cap has no free slot - proposing it here is the whipsaw: {out}"
+        );
+        assert!(
+            out.contains("already carries 2 live fact(s)"),
+            "names the full target and its count: {out}"
+        );
+        assert!(
+            out.contains("Holding it now: mem-p, mem-q"),
+            "names both incumbents so the constraint can be folded in now: {out}"
+        );
+    }
+
+    /// A target one fact BELOW the cap still has a slot, so the ordinary
+    /// proposal must survive the boundary change - the fix must not turn every
+    /// anchor proposal off.
+    #[tokio::test]
+    async fn remember_nudge_still_proposes_when_one_slot_is_left() {
+        assert!(crate::guard::FILE_MEMORY_HITS >= 2, "this test seeds cap - 1 = 1 fact");
+        let mut store = EventStore::in_memory().unwrap();
+        store
+            .append_event(
+                "s", "l", "a", EventKind::FactCreated, "mem-r", None,
+                "an existing note about the same target\n\n\
+                 [memory/gotcha | tags: x | anchors: src/example.rs]",
+            )
+            .unwrap();
+        let (server, _d) = server_with(store);
+
+        let out = server
+            .remember(Parameters(RememberArgs {
+                body: "never touch src/example.rs during a deploy window, it corrupts the queue"
+                    .into(),
+                entity_id: None,
+                project: Some("acme".into()),
+                fact_type: Some("gotcha".into()),
+                tags: None,
+                triggers: None,
+                anchors: None,
+                expires: None,
+                provenance: None,
+            }))
+            .await;
+        assert!(out.contains("stored entity"), "{out}");
+        assert!(
+            out.contains("revise it with anchors: [\"src/example.rs\"]"),
+            "one free slot left, so the anchor is still worth proposing: {out}"
+        );
+    }
+
+    /// The two hints must never contradict each other on one target: whatever
+    /// the nudge proposes, the post-write warning has to accept. Walks the
+    /// occupancy from empty to over-full and asserts the pair agrees at every
+    /// step - the whipsaw was invisible precisely because each hint was only
+    /// ever tested alone.
+    #[tokio::test]
+    async fn the_anchor_nudge_and_the_crowding_warning_never_contradict() {
+        for seeded in 0..=3 {
+            let mut store = EventStore::in_memory().unwrap();
+            for i in 0..seeded {
+                store
+                    .append_event(
+                        "s", "l", "a", EventKind::FactCreated, &format!("mem-seed{i}"), None,
+                        "an existing note about the same target\n\n\
+                         [memory/gotcha | tags: x | anchors: src/example.rs]",
+                    )
+                    .unwrap();
+            }
+            let (server, _d) = server_with(store);
+            let args = |body: &str, anchors: Option<Vec<String>>| RememberArgs {
+                body: body.into(),
+                entity_id: None,
+                project: Some("acme".into()),
+                fact_type: Some("gotcha".into()),
+                tags: None,
+                triggers: None,
+                anchors,
+                expires: None,
+                provenance: None,
+            };
+            let proposed = server
+                .remember(Parameters(args(
+                    "never touch src/example.rs during a deploy window, it corrupts the queue",
+                    None,
+                )))
+                .await
+                .contains("revise it with anchors: [\"src/example.rs\"]");
+            // Taking that advice is the second write: a different constraint
+            // (a near-duplicate body would be refused, never anchored) landing
+            // on the same target the nudge just judged.
+            let condemned = server
+                .remember(Parameters(args(
+                    "the release checklist for src/example.rs runs the schema migration first",
+                    Some(vec!["src/example.rs".into()]),
+                )))
+                .await
+                .contains("is already crowded");
+            assert!(
+                !(proposed && condemned),
+                "occupancy {seeded}: the nudge proposed an anchor the warning then condemned"
+            );
+        }
+    }
+
+    /// The gate that ends the class (2026-07-30): an anchor with no slot left
+    /// is refused at the write, exactly like an over-broad one. Warning about
+    /// it afterwards was measurably not enough - a real session took the advice
+    /// as a dead end and left two money-critical rules with no gate at all.
+    #[tokio::test]
+    async fn remember_refuses_an_anchor_that_has_no_slot_left() {
+        let mut store = EventStore::in_memory().unwrap();
+        for id in ["mem-s", "mem-t"] {
+            store
+                .append_event(
+                    "s", "l", "a", EventKind::FactCreated, id, None,
+                    "an existing note about the same full target\n\n\
+                     [memory/gotcha | tags: x | anchors: src/example.rs]",
+                )
+                .unwrap();
+        }
+        let (server, _d) = server_with(store);
+
+        let out = server
+            .remember(Parameters(RememberArgs {
+                body: "never touch src/example.rs during a deploy window, it corrupts the queue"
+                    .into(),
+                entity_id: None,
+                project: Some("acme".into()),
+                fact_type: Some("gotcha".into()),
+                tags: None,
+                triggers: None,
+                anchors: Some(vec!["src/example.rs".into()]),
+                expires: None,
+                provenance: None,
+            }))
+            .await;
+        assert!(out.contains("NOT stored"), "the write is refused, not silently accepted: {out}");
+        assert!(out.contains("Holding it now: mem-s, mem-t"), "names the holders: {out}");
+        assert!(
+            out.contains("Fold this constraint into"),
+            "says what to do instead, in one concrete step: {out}"
+        );
+    }
+
+    /// The bypass the first version of this gate still had (closed 2026-07-30,
+    /// same day): the two holders spell the SAME file differently, so the
+    /// report's literal grouping sees two half-empty targets and the gate would
+    /// wave a third anchor through - which then loses the slot fight in silence
+    /// anyway, because the guard matches on a path tail. Rivalry has to be
+    /// decided by the guard's rule, not by string equality.
+    #[tokio::test]
+    async fn remember_refuses_an_anchor_whose_rivals_spell_the_target_differently() {
+        let mut store = EventStore::in_memory().unwrap();
+        for (id, anchor) in [("mem-aa", "server/lib/payment.js"), ("mem-bb", "lib/payment.js")] {
+            store
+                .append_event(
+                    "s", "l", "a", EventKind::FactCreated, id, None,
+                    &format!(
+                        "an existing note about the payment flow\n\n\
+                         [memory/gotcha | tags: x | anchors: {anchor}]"
+                    ),
+                )
+                .unwrap();
+        }
+        let (server, _d) = server_with(store);
+
+        let out = server
+            .remember(Parameters(RememberArgs {
+                body: "a third note about the same payment flow".into(),
+                entity_id: None,
+                project: Some("acme".into()),
+                fact_type: Some("gotcha".into()),
+                tags: None,
+                triggers: None,
+                anchors: Some(vec!["server/lib/payment.js".into()]),
+                expires: None,
+                provenance: None,
+            }))
+            .await;
+        assert!(
+            out.contains("NOT stored"),
+            "two spellings of one file are two rivals, not two half-empty targets: {out}"
+        );
+        assert!(out.contains("Holding it now: mem-aa, mem-bb"), "names both spellings: {out}");
+    }
+
+    /// The other direction of the same rule, and the one a bare file name takes:
+    /// the newcomer is the SHORT spelling and the holders are full paths.
+    #[tokio::test]
+    async fn remember_refuses_a_bare_name_whose_rivals_are_full_paths() {
+        let mut store = EventStore::in_memory().unwrap();
+        for (id, anchor) in
+            [("mem-cc", "server/lib/payment.js"), ("mem-dd", "billing/lib/payment.js")]
+        {
+            store
+                .append_event(
+                    "s", "l", "a", EventKind::FactCreated, id, None,
+                    &format!(
+                        "an existing note about a payment file\n\n\
+                         [memory/gotcha | tags: x | anchors: {anchor}]"
+                    ),
+                )
+                .unwrap();
+        }
+        let (server, _d) = server_with(store);
+
+        let out = server
+            .remember(Parameters(RememberArgs {
+                body: "a note that wants the bare name instead".into(),
+                entity_id: None,
+                project: Some("acme".into()),
+                fact_type: Some("gotcha".into()),
+                tags: None,
+                triggers: None,
+                anchors: Some(vec!["payment.js".into()]),
+                expires: None,
+                provenance: None,
+            }))
+            .await;
+        assert!(out.contains("NOT stored"), "a bare name fights every path ending in it: {out}");
+    }
+
+    /// An anchor the footer cannot carry back verbatim is refused at the write
+    /// (2026-07-30, found by an audit swarm). The anchors field is
+    /// comma-separated, so a comma inside an anchor was folded to a space at
+    /// storage time - AFTER every write-time check had passed on the unfolded
+    /// text - and the guard then compared the folded text against a command
+    /// that still had its comma. Stored, looked fine, could never fire.
+    #[tokio::test]
+    async fn remember_refuses_an_anchor_the_footer_would_rewrite() {
+        let (server, _d) = server_with(EventStore::in_memory().unwrap());
+        let out = server
+            .remember(Parameters(RememberArgs {
+                body: "the scaffold command must run from the repo root, never from src".into(),
+                entity_id: None,
+                project: Some("acme".into()),
+                fact_type: Some("gotcha".into()),
+                tags: None,
+                triggers: None,
+                anchors: Some(vec!["mkdir -p project/{src,test}".into()]),
+                expires: None,
+                provenance: None,
+            }))
+            .await;
+        assert!(out.contains("NOT stored"), "{out}");
+        assert!(out.contains("comma"), "the refusal names the reason: {out}");
+        assert!(
+            out.contains("mkdir -p project/{src test}"),
+            "and shows what would have been stored, so the damage is obvious: {out}"
+        );
+    }
+
+    /// The revise call site of that same refusal, which had no test at all
+    /// until an adversarial verifier said so - and revise is the surface a
+    /// retro-anchoring sweep uses, so it is the one that would have carried the
+    /// dead anchors in bulk.
+    #[tokio::test]
+    async fn revise_refuses_an_anchor_the_footer_would_rewrite() {
+        let mut store = EventStore::in_memory().unwrap();
+        store
+            .append_event(
+                "s", "l", "a", EventKind::FactCreated, "mem-cm", None,
+                "a rule about the scaffold command",
+            )
+            .unwrap();
+        let (server, _d) = server_with(store);
+
+        let out = server
+            .revise(Parameters(ReviseArgs {
+                entity_id: "mem-cm".into(),
+                anchors: Some(vec!["mkdir -p project/{src,test}".into()]),
+                ..Default::default()
+            }))
+            .await;
+        assert!(out.contains("rejected"), "{out}");
+        assert!(out.contains("comma"), "the refusal names the reason: {out}");
+        assert!(out.contains("Nothing was changed"), "{out}");
+    }
+
+    /// Slots are per PROJECT, because the guard is (found by an audit swarm,
+    /// 2026-07-30, hours after the gate shipped). Two facts anchored to a bare
+    /// file name in one project must not make that name unanchorable in an
+    /// unrelated project: at guard time those facts are not even candidates
+    /// there, so refusing would block work that is perfectly servable.
+    #[tokio::test]
+    async fn a_rival_in_another_project_does_not_take_this_project_s_slot() {
+        let mut store = EventStore::in_memory().unwrap();
+        for id in ["other:mem-1", "other:mem-2"] {
+            store
+                .append_event(
+                    "s", "l", "a", EventKind::FactCreated, id, None,
+                    "an existing note in an unrelated project\n\n\
+                     [memory/gotcha | tags: x | anchors: src/example.rs | project: other]",
+                )
+                .unwrap();
+        }
+        let (server, _d) = server_with(store);
+
+        let out = server
+            .remember(Parameters(RememberArgs {
+                body: "never touch src/example.rs during a deploy window, it corrupts the queue"
+                    .into(),
+                entity_id: None,
+                project: Some("acme".into()),
+                fact_type: Some("gotcha".into()),
+                tags: None,
+                triggers: None,
+                anchors: Some(vec!["src/example.rs".into()]),
+                expires: None,
+                provenance: None,
+            }))
+            .await;
+        assert!(
+            out.contains("stored entity"),
+            "another project's anchors never competed for this slot: {out}"
+        );
+    }
+
+    /// The other half of the same rule: the GLOBAL tier surfaces in every
+    /// project, so a global fact really does hold a slot everywhere and must
+    /// still be counted.
+    #[tokio::test]
+    async fn a_global_rival_does_take_a_project_slot() {
+        let mut store = EventStore::in_memory().unwrap();
+        for id in ["mcp-g1", "mcp-g2"] {
+            store
+                .append_event(
+                    "s", "l", "a", EventKind::FactCreated, id, None,
+                    "a global note that surfaces in every project\n\n\
+                     [memory/gotcha | tags: x | anchors: src/example.rs]",
+                )
+                .unwrap();
+        }
+        let (server, _d) = server_with(store);
+
+        let out = server
+            .remember(Parameters(RememberArgs {
+                body: "never touch src/example.rs during a deploy window, it corrupts the queue"
+                    .into(),
+                entity_id: None,
+                project: Some("acme".into()),
+                fact_type: Some("gotcha".into()),
+                tags: None,
+                triggers: None,
+                anchors: Some(vec!["src/example.rs".into()]),
+                expires: None,
+                provenance: None,
+            }))
+            .await;
+        assert!(out.contains("NOT stored"), "a global rival competes in every project: {out}");
+    }
+
+    /// Rivalry must stay a TAIL rule, not "contains": two genuinely different
+    /// files whose names merely share a suffix are not rivals, and refusing
+    /// them would make the gate the next thing that has to be worked around.
+    #[tokio::test]
+    async fn a_different_file_with_a_similar_name_is_not_a_rival() {
+        let mut store = EventStore::in_memory().unwrap();
+        for (id, anchor) in [("mem-ee", "server/lib/payment.js"), ("mem-ff", "server/lib/pay.js")] {
+            store
+                .append_event(
+                    "s", "l", "a", EventKind::FactCreated, id, None,
+                    &format!(
+                        "an existing note\n\n[memory/gotcha | tags: x | anchors: {anchor}]"
+                    ),
+                )
+                .unwrap();
+        }
+        let (server, _d) = server_with(store);
+
+        let out = server
+            .remember(Parameters(RememberArgs {
+                body: "a note about the repayment helper, a different file".into(),
+                entity_id: None,
+                project: Some("acme".into()),
+                fact_type: Some("gotcha".into()),
+                tags: None,
+                triggers: None,
+                anchors: Some(vec!["server/lib/repayment.js".into()]),
+                expires: None,
+                provenance: None,
+            }))
+            .await;
+        assert!(
+            out.contains("stored entity"),
+            "repayment.js is not payment.js - a suffix match would be a false refusal: {out}"
+        );
+    }
+
+    /// The gate must only bite where a slot is actually gone: one incumbent
+    /// leaves room for one more, and that write goes through untouched.
+    #[tokio::test]
+    async fn remember_accepts_an_anchor_while_a_slot_is_left() {
+        let mut store = EventStore::in_memory().unwrap();
+        store
+            .append_event(
+                "s", "l", "a", EventKind::FactCreated, "mem-u", None,
+                "an existing note about the same target\n\n\
+                 [memory/gotcha | tags: x | anchors: src/example.rs]",
+            )
+            .unwrap();
+        let (server, _d) = server_with(store);
+
+        let out = server
+            .remember(Parameters(RememberArgs {
+                body: "never touch src/example.rs during a deploy window, it corrupts the queue"
+                    .into(),
+                entity_id: None,
+                project: Some("acme".into()),
+                fact_type: Some("gotcha".into()),
+                tags: None,
+                triggers: None,
+                anchors: Some(vec!["src/example.rs".into()]),
+                expires: None,
+                provenance: None,
+            }))
+            .await;
+        assert!(out.contains("stored entity"), "one free slot, so the anchor lands: {out}");
+        assert!(!out.contains("NOT stored"), "{out}");
+    }
+
+    /// The invariants fact holding the slot must stay editable: an incumbent
+    /// re-stating the anchor it ALREADY holds is not a new claim on a slot.
+    /// Without this the gate would lock the very fact the refusal tells you to
+    /// fold your constraint into.
+    #[tokio::test]
+    async fn revise_may_restate_an_anchor_the_fact_already_holds() {
+        let mut store = EventStore::in_memory().unwrap();
+        for id in ["mem-v", "mem-w"] {
+            store
+                .append_event(
+                    "s", "l", "a", EventKind::FactCreated, id, None,
+                    "an existing note about the same full target\n\n\
+                     [memory/gotcha | tags: x | anchors: src/example.rs]",
+                )
+                .unwrap();
+        }
+        let (server, _d) = server_with(store);
+
+        let out = server
+            .revise(Parameters(ReviseArgs {
+                entity_id: "mem-v".into(),
+                body: None,
+                append: Some("one more constraint, folded in".into()),
+                replace_from: None,
+                replace_to: None,
+                parent_rev: None,
+                fact_type: None,
+                tags: None,
+                triggers: None,
+                anchors: Some(vec!["src/example.rs".into()]),
+                expires: None,
+                provenance: None,
+            }))
+            .await;
+        assert!(!out.contains("rejected"), "an incumbent keeps its own anchor: {out}");
+        assert!(out.contains("revised"), "{out}");
+    }
+
+    /// The same gate on the revise surface: a fact that does NOT hold the
+    /// anchor cannot claim a slot that is gone, however it asks.
+    #[tokio::test]
+    async fn revise_refuses_a_new_anchor_on_a_full_target() {
+        let mut store = EventStore::in_memory().unwrap();
+        for id in ["mem-x", "mem-y"] {
+            store
+                .append_event(
+                    "s", "l", "a", EventKind::FactCreated, id, None,
+                    "an existing note about the same full target\n\n\
+                     [memory/gotcha | tags: x | anchors: src/example.rs]",
+                )
+                .unwrap();
+        }
+        store
+            .append_event(
+                "s", "l", "a", EventKind::FactCreated, "mem-z", None,
+                "a rule that wants a gate it cannot have\n\n[memory/gotcha | tags: x]",
+            )
+            .unwrap();
+        let (server, _d) = server_with(store);
+
+        let out = server
+            .revise(Parameters(ReviseArgs {
+                entity_id: "mem-z".into(),
+                body: None,
+                append: None,
+                replace_from: None,
+                replace_to: None,
+                parent_rev: None,
+                fact_type: None,
+                tags: None,
+                triggers: None,
+                anchors: Some(vec!["src/example.rs".into()]),
+                expires: None,
+                provenance: None,
+            }))
+            .await;
+        assert!(out.contains("rejected"), "a newcomer cannot take a slot that is gone: {out}");
+        assert!(out.contains("Nothing was changed"), "{out}");
+        assert!(out.contains("Holding it now: mem-x, mem-y"), "names the holders: {out}");
     }
 
     /// The other trigger conditions are untouched by the crowding check: a
@@ -3880,14 +4546,16 @@ mod tests {
         );
     }
 
-    /// The same write-time warning must fire on revise, not just remember: a
-    /// metadata-only anchors edit that lands the target past the cap is
-    /// exactly the moment consolidate's report would otherwise catch cold,
-    /// after the fact.
+    /// The post-write warning is NOT dead code after the 2026-07-30 gate: the
+    /// gate can only stop a NEW claim on a slot, so a store whose targets were
+    /// already over the cap when the gate landed still carries facts whose
+    /// anchor never fires. An incumbent revising itself is deliberately let
+    /// through (otherwise the fold-it-in advice would be impossible to follow),
+    /// and that is exactly the moment to tell it its own anchor is dead weight.
     #[tokio::test]
-    async fn revise_warns_when_the_final_body_carries_a_crowded_anchor() {
+    async fn revise_warns_an_incumbent_whose_target_is_already_over_the_cap() {
         let mut store = EventStore::in_memory().unwrap();
-        for id in ["mem-h", "mem-i"] {
+        for id in ["mem-h", "mem-i", "mem-j"] {
             store
                 .append_event(
                     "s", "l", "a", EventKind::FactCreated, id, None,
@@ -3896,23 +4564,18 @@ mod tests {
                 )
                 .unwrap();
         }
-        store
-            .append_event(
-                "s", "l", "a", EventKind::FactCreated, "mem-j", None,
-                "a plain note about the invoice job, not yet anchored to anything",
-            )
-            .unwrap();
         let (server, _d) = server_with(store);
 
         let out = server
             .revise(Parameters(ReviseArgs {
                 entity_id: "mem-j".into(),
-                anchors: Some(vec!["src/invoice.rs".into()]),
+                append: Some("a status line on a fact that already holds this anchor".into()),
                 ..Default::default()
             }))
             .await;
-        assert!(out.starts_with("revised mem-j"), "{out}");
-        assert!(out.contains("already crowded"), "revise draws the same write-time warning: {out}");
+        assert!(out.starts_with("revised mem-j"), "an incumbent is never refused: {out}");
+        assert!(out.contains("already crowded"), "but it is told its anchor is dead: {out}");
         assert!(out.contains("src/invoice.rs"), "names the crowded target: {out}");
+        assert!(out.contains("mem-h, mem-i"), "names the other holders, not itself: {out}");
     }
 }

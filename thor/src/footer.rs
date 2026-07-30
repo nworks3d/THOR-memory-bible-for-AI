@@ -94,6 +94,29 @@ fn join_anchors(xs: &[String]) -> String {
         .join(", ")
 }
 
+/// An anchor the footer format cannot carry back verbatim, so it must never be
+/// accepted at the write (2026-07-30, found by an audit swarm).
+///
+/// The anchors field is comma-separated, so `join_anchors` folds any comma
+/// INSIDE an anchor to a space. The write-time checks all run on the string the
+/// caller passed, the guard matches the string that was STORED, and the command
+/// the user actually types still has its comma - so `mkdir -p src/{a,b}` was
+/// accepted, stored as `mkdir -p src/{a b}`, and could never fire. The reply
+/// said "stored" and nothing mentioned that the text had changed: a dead gate
+/// that looks like cover. Refuse it, exactly like an over-broad anchor.
+pub fn unstorable_anchor(anchor: &str) -> Option<String> {
+    if !anchor.contains(',') {
+        return None;
+    }
+    let folded = anchor.replace(',', " ").split_whitespace().collect::<Vec<_>>().join(" ");
+    Some(format!(
+        "'{}' contains a comma. The anchors field is comma-separated, so it would be stored as \
+         '{}' and would never match what you actually run or touch",
+        anchor.trim(),
+        folded
+    ))
+}
+
 /// File stems that name a file's ROLE, not its subject. As a bare anchor (no
 /// directory) each of these fires on EVERY file with that name, in every
 /// project - the guard matches `a == name_l` (guard.rs).
@@ -275,7 +298,12 @@ pub fn anchor_candidate(body: &str) -> Option<String> {
             && alpha_extension(file).is_some()
             && !t.starts_with("http")
             && !t.contains("://");
-        if looks_path && overbroad_anchor(t).is_none() {
+        // Both floors, never one: a candidate the write would refuse must never
+        // be proposed. Adding `unstorable_anchor` at the call sites alone was
+        // exactly that drift (caught 2026-07-30 by an adversarial verifier),
+        // and it is the same shape as the propose/refuse contradiction fixed
+        // earlier the same day - hint says do X, gate says X is forbidden.
+        if looks_path && overbroad_anchor(t).is_none() && unstorable_anchor(t).is_none() {
             // Prefer the first path named: bodies lead with their subject.
             best.get_or_insert_with(|| t.to_string());
         }
@@ -764,11 +792,25 @@ pub fn extract(body: &str) -> Option<&str> {
 ///
 /// Deliberately not "always overwrite": a new body that brings its own footer
 /// wins, so retyping / re-anchoring a fact stays possible in one call.
+/// Does this trailing bracketed line actually LOOK like one of THOR's footers?
+/// `extract` accepts any single bracketed line after a blank line, which is the
+/// right rule for finding a footer that is known to be there and the wrong one
+/// for deciding whether the caller MEANT to supply one (found 2026-07-30 by an
+/// adversarial verifier). A body ending in an ordinary bracketed remark - a
+/// dated status line, a citation, a checkbox - looked like a footer to
+/// `carry_over`, which then handed the fact "theirs wins" and dropped the real
+/// footer: the type, the tags, the fires-when words and the ANCHORS, gone in
+/// silence, on a fact that keeps reading perfectly well in recall. Exactly the
+/// failure this module's own doc calls out, reached through the door next to it.
+fn looks_like_footer(line: &str) -> bool {
+    line.starts_with("[memory/") || line.starts_with("[repo file")
+}
+
 pub fn carry_over(new_body: &str, prev_body: &str) -> Option<String> {
-    if extract(new_body).is_some() {
-        return None; // the caller supplied a footer - theirs wins
+    if extract(new_body).is_some_and(looks_like_footer) {
+        return None; // the caller supplied a real footer - theirs wins
     }
-    let prev_footer = extract(prev_body)?;
+    let prev_footer = extract(prev_body).filter(|f| looks_like_footer(f))?;
     Some(format!("{}\n\n{}", new_body.trim_end(), prev_footer))
 }
 
@@ -1108,6 +1150,51 @@ mod defect_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A bracketed remark at the end of a body is not a footer, and treating it
+    /// as one silently threw the fact's metadata away (2026-07-30, found by an
+    /// adversarial verifier). The habit that triggers it is this project's most
+    /// common edit: append a dated status line and let the tool carry the footer
+    /// across. If that line happens to be bracketed, `carry_over` used to
+    /// conclude "the caller brought their own footer" and drop the real one -
+    /// type, tags, fires-when and ANCHORS gone, on a fact that still reads
+    /// perfectly in recall, so nobody would ever notice.
+    #[test]
+    fn a_bracketed_status_line_is_not_mistaken_for_a_footer() {
+        let prev = "the rule\n\n[memory/gotcha | tags: x | anchors: src/pay.rs]";
+        let appended = "the rule\n\nUPDATE: still true\n\n[checked 2026-07-30]";
+        let carried = carry_over(appended, prev).expect("the real footer must be re-attached");
+        assert!(
+            carried.ends_with("[memory/gotcha | tags: x | anchors: src/pay.rs]"),
+            "the fact keeps its anchors: {carried}"
+        );
+        assert!(carried.contains("[checked 2026-07-30]"), "and the remark stays content");
+        assert_eq!(anchors(&carried), vec!["src/pay.rs"], "the gate survives the edit");
+
+        // A caller who really does supply a footer still wins, unchanged.
+        let retyped = "the rule\n\n[memory/decision | tags: y]";
+        assert!(carry_over(retyped, prev).is_none(), "theirs wins when it IS a footer");
+    }
+
+    /// The proposal and the refusal must share every floor, or the tool tells
+    /// an agent to do what it then forbids - the propose/refuse drift that cost
+    /// a whole round earlier the same day (2026-07-30). A path with an interior
+    /// comma cannot round-trip through the comma-separated anchors field, so it
+    /// must never be offered either.
+    #[test]
+    fn anchor_candidate_never_proposes_what_the_write_would_refuse() {
+        assert!(unstorable_anchor("data/foo,bar.csv").is_some(), "the floor knows it");
+        assert_eq!(
+            anchor_candidate("the importer chokes on data/foo,bar.csv during the nightly run"),
+            None,
+            "so the proposal must not offer it"
+        );
+        // The ordinary case is untouched: a clean path is still proposed.
+        assert_eq!(
+            anchor_candidate("the importer chokes on data/foobar.csv during the nightly run"),
+            Some("data/foobar.csv".to_string())
+        );
+    }
 
     /// A broad anchor is worse than no anchor: the guard matches a bare file
     /// NAME against every file with that name, and a touched anchor also feeds

@@ -82,8 +82,21 @@ pub fn strength_for(store: &EventStore, db: &Path, ids: &[String]) -> HashMap<St
     let noise = crate::ledger::counters_for(db, "noise", &unique);
     for id in &unique {
         let mut s = out.remove(id).unwrap_or(0.0);
-        s += ACCESS_WEIGHT * (access.get(id).copied().unwrap_or(0) as f64).min(ACCESS_CAP);
-        s -= NOISE_WEIGHT * noise.get(id).copied().unwrap_or(0) as f64;
+        let noise_marks = noise.get(id).copied().unwrap_or(0) as f64;
+        // PASSIVE REUSE MAY NOT UNDO A DELIBERATE JUDGMENT (2026-07-30, found by
+        // an audit swarm). The access counter is incremented on EVERY recall/get
+        // serve, with no relevance judgment attached, and it never decays. So a
+        // fact the user had just pushed away climbed back over its noise mark
+        // after two ordinary reads (+0.5 each against -1.0) - and reads are
+        // exactly what a fact that keeps surfacing wrongly collects most of.
+        // Marking noise then felt like shouting into a hole, which is precisely
+        // what it was. A noise-marked fact is now redeemed only by a DELIBERATE
+        // positive judgment (a useful mark, counted above as an echo), never by
+        // being read again.
+        if noise_marks == 0.0 {
+            s += ACCESS_WEIGHT * (access.get(id).copied().unwrap_or(0) as f64).min(ACCESS_CAP);
+        }
+        s -= NOISE_WEIGHT * noise_marks;
         if s != 0.0 {
             out.insert(id.clone(), s);
         }
@@ -169,6 +182,41 @@ mod tests {
             (read_only - ACCESS_WEIGHT * ACCESS_CAP).abs() < 1e-9,
             "50 reads saturate at the cap: {read_only}"
         );
+    }
+
+    /// A mark is a judgment; a read is not (2026-07-30, found by an audit
+    /// swarm). The access counter rises on EVERY serve, with no relevance
+    /// attached, and never decays - so before this, a fact the user had just
+    /// pushed away climbed back over its own noise mark after two ordinary
+    /// reads, and a fact that keeps surfacing wrongly is exactly the one that
+    /// collects reads fastest. Only a deliberate positive judgment (a useful
+    /// mark, stored as an echo) may redeem it.
+    #[test]
+    fn reading_a_noise_marked_fact_never_undoes_the_mark() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut store, db) = setup(dir.path());
+        let ids = vec!["e1".to_string()];
+        crate::ledger::increment(&db, "noise", "e1");
+        assert!(
+            strength_for(&store, &db, &ids).get("e1").copied().unwrap_or(0.0) < 0.0,
+            "one mark puts it under water"
+        );
+
+        for _ in 0..50 {
+            crate::ledger::increment(&db, "access", "e1");
+        }
+        let after_reads = strength_for(&store, &db, &ids).get("e1").copied().unwrap_or(0.0);
+        assert!(
+            (after_reads - -NOISE_WEIGHT).abs() < 1e-9,
+            "the reads contribute exactly NOTHING, not merely less than the mark - \
+             one mark plus fifty reads is still exactly one mark: {after_reads}"
+        );
+
+        // The deliberate way back still works, and it is the ONLY way.
+        store.append_event("s", "l", "a", EventKind::FactEchoed, "e1", None, "echo").unwrap();
+        store.append_event("s", "l", "a", EventKind::FactEchoed, "e1", None, "echo").unwrap();
+        let after_marks = strength_for(&store, &db, &ids).get("e1").copied().unwrap_or(0.0);
+        assert!(after_marks > 0.0, "two useful marks outweigh one noise mark: {after_marks}");
     }
 
     #[test]

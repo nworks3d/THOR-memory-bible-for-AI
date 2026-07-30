@@ -1974,10 +1974,30 @@ truth: the guard also matches an anchor against a path ending, so two anchors
 that look different can still collide on the same real file.
 
 You should rarely need to act on that section, because the same check now runs
-at the moment of writing: store or edit a note whose anchor lands on a target
-that is already full, and the reply tells you right then, while you still have
-the note in your hands. The report is the sweep for what accumulated before
-that; the warning is what stops it accumulating again.
+at the moment of writing, and it does more than warn: an anchor aimed at a
+target with no slot left is **refused**, the same way an over-broad anchor is.
+The reply names the facts holding those slots, so you can fold your constraint
+into the one that carries that file's invariants instead - one short line in an
+existing note - or free a slot by taking the anchor off one of them. The reason
+it refuses rather than warns is that a surplus anchor is not weaker cover: it is
+dropped in silence, so it reads as work done and never arrives. A note whose
+anchor is refused is not lost - store it without the anchor and it stays fully
+searchable; it just does not claim a gate it would never get.
+
+A fact that already holds one of those slots is never refused, so the note you
+are being told to fold your constraint into stays editable. If its target was
+already over the cap before this check existed, editing it says so, because its
+own anchor may be one of the dead ones.
+
+The report is the sweep for what accumulated before that; the refusal is what
+stops it accumulating again.
+
+Then a short list you will usually hope stays empty: **anchored facts whose
+entity is diverged**. When one fact ends up with two current heads - two
+machines edited it between syncs - the guard skips it entirely before it even
+looks at the anchor, and says nothing. Recall keeps serving the fact as normal,
+so the gate is off and nothing anywhere tells you. Each entry is one `resolve`
+away from being fixed, and this list is the only place that failure is visible.
 
 It also lists three specific backlogs, so none of them depends on someone
 remembering: write-ups with no expiry date, project scopes that no signpost fact
@@ -2249,7 +2269,10 @@ the retro-tag work list.
 - **How the number works:** usage strength is the sum of recency-weighted
   "helped" marks, plus half a point per local read of the fact (capped at four
   reads), minus one point per noise mark. A "helped" mark loses half its weight
-  every 2000 events behind the newest log entry.
+  every 2000 events behind the newest log entry. Once a fact carries a noise
+  mark the read term stops counting for it entirely: a mark is a judgment and a
+  read is not, so being served again must never quietly undo what you said. The
+  way back is another `mark` without `--noise`, never passive reuse.
 - **Turn it on if:** you want the difference between "old and genuinely dead"
   and "old but load-bearing" to be visible to the decay pass. One honest
   "helped" mark takes a fact off the decay candidate list regardless of its age,
@@ -2263,10 +2286,18 @@ the retro-tag work list.
   size. A "helped" mark appends one event to the hash-chained log, which means
   it is permanent and it travels with log shipping. A noise mark increments one
   counter in the local ledger sidecar and is not synced anywhere.
-- **Do not expect a ranking boost:** the effect on the automatic injection is at
-  most a single swap into the third slot, only when there were more candidates
-  than slots and only within a small ranking margin. It is a tiebreaker, not a
-  promotion.
+- **Do not expect a ranking boost from a "helped" mark:** its effect on the
+  automatic injection is at most a single swap into the third slot, only when
+  there were more candidates than slots and only within a small ranking margin.
+  It is a tiebreaker, not a promotion.
+- **A repeated noise mark does more than that:** from the SECOND mark on, the
+  fact is demoted behind every unmarked candidate, so it loses its place in the
+  block instead of only losing the tiebreaker. Demoted, never dropped - when
+  little else matched it still serves, and a mark made in error does not erase
+  the fact from the surface you actually read. One mark on its own changes
+  nothing here: measured against a corpus of real prompts, demoting at a single
+  mark cost real recall (the facts it lost had been marked exactly once), while
+  demoting at two cost none.
 - **MCP niceties (the tool, not the CLI):** the MCP `mark` rejects unknown
   parameter names instead of silently defaulting them - a misspelled parameter
   once inverted a noise judgment into "useful". A bare, differently-prefixed or

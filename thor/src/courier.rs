@@ -75,6 +75,24 @@ fn flag_present(db: &Path, name: &str) -> bool {
 /// only one way for another layer to carry a fact - a guard anchor and a
 /// response-rulebook rule deliver at the moment of action too, which is stricter
 /// than hovering in every prompt. Same off switch, same "demoted, never dropped".
+///
+/// TRIED AND REVERTED, 2026-07-30 - do not rebuild it without new evidence.
+/// An audit swarm pointed out that the tag says a gate EXISTS, never that it
+/// FIRED: a `guarded` fact whose anchor no tool call touches is carried by
+/// nobody. So the demotion was made conditional on the guard's own ledger
+/// (gate_served). Three independent verifiers then showed the cure is worse:
+/// (1) the tag also covers facts carried by a RESPONSE-RULEBOOK rule, which
+/// never writes that ledger, so those hover permanently - the full pre-July
+/// noise level for that whole subset; (2) the courier runs at prompt time and
+/// the guard at tool-call time, so on the first prompt of every session, and
+/// after every compaction, NO guarded fact can be seen as served yet - it
+/// hovers, and then the guard serves the same block again minutes later; (3)
+/// the sessionless call shape the courier supports would lose the demotion
+/// entirely. The July 2026 demotion was MEASURED (three of the four biggest
+/// noise sources, duplication down 93%); the replacement was reasoned. A
+/// reasoned improvement does not get to overrule a measured one. The silence it
+/// aimed at is real but bounded - demoted is not dropped, so a guarded fact
+/// still serves whenever fewer than MAX_HITS other things matched.
 fn pin_dedup(survivors: Vec<RecallHit>, db: &Path) -> Vec<RecallHit> {
     if flag_present(db, "THOR-NO-PIN-DEDUP.flag") {
         return survivors;
@@ -780,6 +798,13 @@ const SCOPE_HINT_CHARS: usize = 300;
 /// stronger match, and slots 1-2 are never touched.
 const TYPED_RANK_SLACK: f64 = 1.5;
 
+/// Usage strength at or above which a hit keeps its place in the pool. Below it
+/// the hit is demoted behind the unmarked ones, so repeated noise marks cost a
+/// slot instead of only a promotion. -1.0, so ONE noise mark (worth -1.0 with no
+/// echo to balance it) still keeps its slot and two do not - measured on the
+/// live corpus, see the note in select_hits.
+const DEMOTE_STRENGTH: f64 = -1.0;
+
 /// Apply the THOR-EXP-HIST-DEMOTE reordering: a self-declared historical
 /// memory hit moves to the back of the pool when a LIVE hit matches at least
 /// as strongly - when the query's best evidence is live, the marginal slot is
@@ -823,6 +848,27 @@ fn select_hits(pool: Vec<RecallHit>, strength: &HashMap<String, f64>) -> Vec<Rec
     // (strength <= 0) never earns the promotion, however often it was echoed.
     let echoed = |h: &RecallHit| strength.get(&h.entity_id).copied().unwrap_or(0.0) > 0.0;
     let typed = |h: &RecallHit| h.fact_type.is_some();
+    // A NOISE MARK MUST BE ABLE TO COST A SLOT, not just a promotion (fixed
+    // 2026-07-30, found by an audit swarm). Strength used to be read only for
+    // the slot-3 promotion below, so a fact that ranked into the top MAX_HITS
+    // kept injecting however often the user marked it noise - the one lever the
+    // recall block advertises did nothing for the case that provokes it most.
+    // DEMOTED, never dropped: the map is empty unless the pool is bigger than
+    // MAX_HITS, so with few survivors a marked fact still serves, and a fact
+    // marked in error stays reachable instead of vanishing from the store's
+    // most visible surface.
+    //
+    // MORE THAN ONE MARK, and that threshold is measured, not chosen (live
+    // corpus, 59 real scenarios, three arms on one binary). Demoting at a
+    // SINGLE mark cost 8.7% of the entity hits and 5.6% of either-channel
+    // coverage: the two golds it lost carried exactly one mark each. Demoting
+    // at two left entity, content and either-channel coverage IDENTICAL to not
+    // demoting at all, while still moving the facts marked four, six and nine
+    // times. One mark is a passing irritation; two is a pattern.
+    let (unmarked, marked): (Vec<RecallHit>, Vec<RecallHit>) = pool
+        .into_iter()
+        .partition(|h| strength.get(&h.entity_id).copied().unwrap_or(0.0) >= DEMOTE_STRENGTH);
+    let pool: Vec<RecallHit> = unmarked.into_iter().chain(marked).collect();
     let mut selected: Vec<RecallHit> = Vec::with_capacity(MAX_HITS);
     let mut rest: Vec<RecallHit> = Vec::new();
     for h in pool {
@@ -848,9 +894,20 @@ fn select_hits(pool: Vec<RecallHit>, strength: &HashMap<String, f64>) -> Vec<Rec
                 }
             }
             if !selected.iter().any(&typed) {
-                if let Some(pos) =
-                    rest.iter().position(|h| typed(h) && within(h, TYPED_RANK_SLACK))
-                {
+                // The strength guard belongs here too, and its absence undid the
+                // demotion above (found by an adversarial verifier, 2026-07-30):
+                // a noise-marked fact demoted into `rest` was handed straight
+                // back into slot 3 by this branch, because it only asked whether
+                // the hit was TYPED. And a typed fact is exactly what a user
+                // marks once a standing rule goes stale, so the one case the
+                // demotion exists for was the one it never covered. The echo
+                // branch above was always safe - `echoed` requires strength
+                // above zero - this one had no equivalent.
+                if let Some(pos) = rest.iter().position(|h| {
+                    typed(h)
+                        && strength.get(&h.entity_id).copied().unwrap_or(0.0) >= DEMOTE_STRENGTH
+                        && within(h, TYPED_RANK_SLACK)
+                }) {
                     selected[MAX_HITS - 1] = rest.swap_remove(pos);
                 }
             }
@@ -1982,6 +2039,11 @@ mod tests {
         let order = |hits: Vec<RecallHit>| {
             pin_dedup(hits, &db).iter().map(|h| h.entity_id.clone()).collect::<Vec<_>>()
         };
+
+        // The demotion rests on the TAG, deliberately, and a 2026-07-30 attempt
+        // to make it conditional on the guard actually having fired was reverted
+        // - see the note on pin_dedup for the three ways that cost more noise
+        // than the silence it bought.
         assert_eq!(
             order(vec![guarded.clone(), live.clone()]),
             vec!["e-live", "e-guarded"],
@@ -2093,6 +2155,79 @@ mod tests {
         let pool = vec![mk("e1", -9.0), mk("e2", -8.0), mk("e3", -6.0), mk("e4", -5.9)];
         let sel = select_hits(pool, &noisy);
         assert_eq!(sel[2].entity_id, "e3", "negative strength = no promotion");
+
+        // AND repeated marks cost the SLOT, not just the promotion (2026-07-30,
+        // found by an audit swarm). Before this, strength was read only for the
+        // slot-3 swap above, so the top-ranked hit kept injecting no matter how
+        // often it was marked - the one lever the recall block advertises did
+        // nothing for the case that provokes it most. e1 ranks first and is
+        // marked twice: it must give up its slot to the three unmarked hits.
+        let mut marked_top = std::collections::HashMap::new();
+        marked_top.insert("e1".to_string(), -2.0f64);
+        let pool = vec![mk("e1", -9.0), mk("e2", -8.0), mk("e3", -6.0), mk("e4", -5.9)];
+        let sel = select_hits(pool, &marked_top);
+        assert!(
+            !sel.iter().any(|h| h.entity_id == "e1"),
+            "a repeatedly marked fact must lose its slot when unmarked hits can fill it: {:?}",
+            sel.iter().map(|h| &h.entity_id).collect::<Vec<_>>()
+        );
+        assert_eq!(sel.len(), MAX_HITS, "the block is still filled, just with the others");
+
+        // ONE mark keeps its slot, and that threshold is the measured decision
+        // of this round, not a taste: demoting at a single mark cost 8.7% of
+        // the entity hits on the live corpus (both golds it lost carried
+        // exactly one mark), while demoting at two matched the no-demotion arm
+        // exactly. A single mark is an irritation; two is a pattern.
+        let mut marked_once = std::collections::HashMap::new();
+        marked_once.insert("e1".to_string(), -1.0f64);
+        let pool = vec![mk("e1", -9.0), mk("e2", -8.0), mk("e3", -6.0), mk("e4", -5.9)];
+        let sel = select_hits(pool, &marked_once);
+        assert_eq!(
+            sel[0].entity_id, "e1",
+            "one mark must NOT cost the slot - measured, see DEMOTE_STRENGTH"
+        );
+
+        // ...and the typed-constraint promotion below may not hand the slot
+        // straight back. A TYPED marked fact is the case that matters: a
+        // standing rule the user marked once it went stale is exactly what
+        // that branch reaches for, and for one round it undid the demotion
+        // completely (caught by an adversarial verifier the same day).
+        let typed_hit = |id: &str, rank: f64| RecallHit {
+            entity_id: id.to_string(),
+            rev: format!("rev-{id}"),
+            body: "b".to_string(),
+            kind: EventKind::FactCreated,
+            is_diverged: false,
+            rank,
+            project: None,
+            fact_type: Some(crate::repo::FactType::Gotcha),
+            matched_and: true,
+        };
+        let mut marked_typed = std::collections::HashMap::new();
+        marked_typed.insert("g".to_string(), -2.0f64);
+        let pool = vec![mk("c1", -9.0), mk("c2", -8.0), typed_hit("g", -6.0), mk("c3", -5.9)];
+        let sel = select_hits(pool, &marked_typed);
+        assert!(
+            !sel.iter().any(|h| h.entity_id == "g"),
+            "a marked TYPED fact must not be promoted back into slot 3: {:?}",
+            sel.iter().map(|h| &h.entity_id).collect::<Vec<_>>()
+        );
+
+        // The promotion still works for an UNMARKED typed fact - the guard must
+        // not cost the feature its purpose.
+        let pool = vec![mk("c1", -9.0), mk("c2", -8.0), mk("c3", -6.0), typed_hit("g", -5.9)];
+        let sel = select_hits(pool, &std::collections::HashMap::new());
+        assert_eq!(sel[2].entity_id, "g", "an unmarked typed constraint still takes slot 3");
+
+        // DEMOTED, never dropped: with nothing else to show, a marked fact is
+        // still better than an empty block, and marks made in error must not
+        // erase the fact from the surface the user actually reads.
+        let pool = vec![mk("e1", -9.0), mk("e2", -8.0)];
+        let sel = select_hits(pool, &marked_top);
+        assert!(
+            sel.iter().any(|h| h.entity_id == "e1"),
+            "few survivors: the marked fact still serves rather than leaving a hole"
+        );
     }
 
     #[test]

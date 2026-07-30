@@ -103,7 +103,11 @@ explains the same parts in plain words and tells you which are worth your time.
   fail-open fallback, like the guard rulebooks).
 - **Agent stewardship.** Over MCP the agent can maintain the memory, not just
   fill it: `revise`/`retract` with real CAS (a stale parent returns the fresh
-  head-set instead of minting a silent branch), `resolve` for DIVERGED facts,
+  head-set instead of minting a silent branch, and a revise whose parent is a
+  RETRACTED head is refused - a retraction is a decision, so bringing a fact
+  back is a fresh `remember`, never a quiet fast-forward off the tombstone;
+  repeating a `retract` stays harmless so an at-least-once replica drain can
+  replay it), `resolve` for DIVERGED facts,
   `mark` ("this helped" - feeds the ranking prior), typed `remember` whose
   duplicate/exists refusal is atomic with the write, `reproject`, and a `brief`
   overview of what THOR knows here. `revise` supports body surgery next to the
@@ -122,12 +126,21 @@ explains the same parts in plain words and tells you which are worth your time.
   truncation, a `<ref>:` prefix, or two file names glued by a slash - because
   the guard compares an anchor verbatim against touched paths, and a dead
   anchor still counts toward anchor coverage without ever gating anything.
-  And a ceiling to match that floor: when a write leaves the fact carrying an
-  anchor whose target already holds more live facts than the guard can serve
-  for it, the reply says so and names the target. It warns, never refuses -
-  the write already happened, and which anchor to drop is a judgement call.
-  Without it the surplus piles up unseen, since the guard drops it silently
-  and `thor consolidate` only reports it after the fact.
+  And a ceiling to match that floor: an anchor whose target has no slot left -
+  it already holds as many live facts as the guard serves there - is REFUSED,
+  naming the facts holding those slots so the constraint can be folded into
+  the one carrying that target's invariants instead. A surplus anchor is not
+  weaker cover: `merge_anchored` truncates it away in silence, so it reads as
+  a gate and never fires. A fact that already holds one of those slots is
+  never refused, so the fact you are told to fold into stays editable; when
+  its target was over the cap before this check existed, editing it warns
+  that its own anchor may be one of the dead ones. Rivalry for a slot is
+  decided by the guard's own match rule rather than by an identical string,
+  so `payment.js`, `lib/payment.js` and `server/lib/payment.js` count as one
+  fight over one file - the report groups by literal text and says it is a
+  floor, but a gate built on that floor could be walked around by respelling
+  the anchor. `thor consolidate` remains the sweep for whatever accumulated
+  before the refusal existed.
   MCP `recall` runs the same semantic score-fusion path the courier uses
   (fused parity), and every read surface (MCP/CLI recall and `get`) carries
   the `[refreshed]`/`[stale?]` freshness tags.
@@ -326,7 +339,7 @@ which is the only store whose behaviour you care about.
 | `thor review-scope [--mark]` | list no-signal global memories to review (SessionStart nudges once/day) |
 | `thor courier` / `thor session-start` | per-prompt recall hook (session-dedup, noise gate, live-file freshness) / SessionStart refresh + pinned `<thor-brief>` + setup cue; on `source: "compact"` it first prints the post-compaction advisory (persist-now nudge + the judgment-debt list of memory hits served this session to mark useful/noise) |
 | `thor pin <id> \| --list` / `thor unpin <id>` | pin standing rules: their full body re-injects at every session start and right after a compaction |
-| `thor mark <id> [--noise]` | record that a fact actually helped - or was noise here (local; one unified usage strength feeds the courier's promotion and consolidate's decay) |
+| `thor mark <id> [--noise]` | record that a fact actually helped - or was noise here (local; one unified usage strength feeds the courier's promotion and consolidate's decay). A SECOND noise mark on the same fact costs it a slot in the per-prompt block, not just its promotion - demoted behind the unmarked hits, never dropped, so it still serves when little else matched. One mark alone does not (measured: demoting at one cost real recall, at two it cost none). Reading a fact does not undo a mark; only a `mark` without `--noise` does |
 | `thor warm` | pre-warm the semantic embedder (idempotent; for SessionStart) |
 | `thor guard` / `thor stop-guard` | moment-of-action advisories (risk rulebook + first-touch file memories) / response advisories + a once-per-session capture nudge for unstored decisions/gotchas |
 | `thor install` | write the hooks into settings.json; also seeds THOR's working contract once, as a pinned global note with the fixed id `thor-working-contract`, so an assistant is handed the rules for using the memory at every session start instead of being asked to read a file. Seeded only when that id has no events yet, so re-running never overwrites your edits and never re-pins it after you unpin it |

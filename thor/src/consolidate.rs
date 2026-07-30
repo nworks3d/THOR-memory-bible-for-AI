@@ -210,6 +210,19 @@ pub struct PromiscuousAnchor {
 }
 
 #[derive(Default)]
+/// A fact carrying a guard anchor whose entity is DIVERGED (more than one
+/// current head). The guard's anchor pass skips a multi-headed entity before it
+/// ever evaluates the anchor, and says nothing about it, so the fact keeps its
+/// gate on paper and has none in practice - the silent-failure shape this whole
+/// channel exists to avoid. Every other surface still serves it, which is
+/// exactly why nobody notices. Counts as dirt (`Report::is_clean`): the fix is
+/// one `resolve`, unambiguous and cheap.
+pub struct DivergedAnchor {
+    pub entity_id: String,
+    pub heads: usize,
+    pub anchors: Vec<String>,
+}
+
 pub struct Report {
     pub dups: Vec<DupGroup>,
     pub decay: Vec<DecayCandidate>,
@@ -235,6 +248,8 @@ pub struct Report {
     /// that name anywhere in the tree). Never overlaps `crowded_anchors`: a
     /// bare name already over the cap is listed there instead.
     pub promiscuous_anchors: Vec<PromiscuousAnchor>,
+    /// Anchored facts whose entity is diverged, so their gate is silently off.
+    pub diverged_anchors: Vec<DivergedAnchor>,
     /// Clusters dropped for being over MAX_CLUSTER_MEMBERS (batch families,
     /// union-find chains) - counted so the cap is never silent.
     pub broad_clusters_skipped: usize,
@@ -261,12 +276,16 @@ impl Report {
     /// gate punished the doctrine being followed, and could never go green on a
     /// healthy store that keeps writing about the same few subjects. A gate
     /// that cannot be satisfied teaches people to ignore it.
+    /// `diverged_anchors` DOES count, for the same reason as those three: a
+    /// declared gate that is silently off is the failure this store is least
+    /// able to see for itself, and the fix is one `resolve`.
     pub fn is_clean(&self) -> bool {
         self.dups.is_empty()
             && self.decay.is_empty()
             && self.needs_expiry.is_empty()
             && self.unpointed_scopes.is_empty()
             && self.ungated_rule_facts.is_empty()
+            && self.diverged_anchors.is_empty()
     }
 }
 
@@ -344,6 +363,13 @@ struct LiveHead {
     /// Unified usage strength (crate::strength: recency-weighted echoes +
     /// capped reads - noise marks). <= 0 = never useful on balance.
     strength: f64,
+    /// Times this fact was actually SERVED to someone (the access counter),
+    /// read separately from `strength` since 2026-07-30. Strength stopped
+    /// counting reads for a noise-marked fact - right for the courier, wrong
+    /// for a decay list whose printed claim is "never read": a fact marked once
+    /// and read fifty times would have landed on it, inviting the next agent to
+    /// retract something the store serves daily.
+    reads: i64,
     prefix: String,
     first_line: String,
     typed: bool,
@@ -463,6 +489,7 @@ fn live_memory_heads(events: &[Event], pins: &[String]) -> Vec<LiveHead> {
             create_seq: *create_seq.get(id.as_str()).unwrap_or(&head.seq),
             last_seq: *last_seq.get(id.as_str()).unwrap_or(&head.seq),
             strength: 0.0, // filled by build_report via crate::strength
+            reads: 0,      // filled by build_report from the access counter
             prefix: crate::recall::dedup_prefix(&head.body),
             first_line: first_line(&head.body),
             typed: crate::footer::fact_type(&head.body).is_some(),
@@ -564,6 +591,14 @@ fn decay_candidates(
                 // never useful on balance: no (recency-weighted) echo or read
                 // outweighs its noise marks - the ONE strength concept
                 && h.strength <= 0.0
+                // ...and NEVER READ, asked separately since 2026-07-30. Strength
+                // no longer counts reads once a fact carries a noise mark (right
+                // for the courier: a mark is a judgment, a read is not), so
+                // without this the list would print a fact served fifty times
+                // under the header "never read" and invite an agent to retract
+                // it. The header has to stay true, or the list stops being
+                // safe to work through.
+                && h.reads == 0
                 && tip_seq - h.last_seq >= min_age_events
         })
         .map(|h| DecayCandidate {
@@ -718,8 +753,10 @@ pub fn build_report(store: &EventStore, db: &Path, events: &[Event], opts: &Opti
     // the courier's promotion does.
     let ids: Vec<String> = heads.iter().map(|h| h.entity_id.clone()).collect();
     let strengths = crate::strength::strength_for(store, db, &ids);
+    let reads = crate::ledger::counters_for(db, "access", &ids);
     for h in &mut heads {
         h.strength = strengths.get(&h.entity_id).copied().unwrap_or(0.0);
+        h.reads = reads.get(&h.entity_id).copied().unwrap_or(0) as i64;
     }
     let tip_seq = events.iter().map(|e| e.seq).max().unwrap_or(0);
 
@@ -764,6 +801,7 @@ pub fn build_report(store: &EventStore, db: &Path, events: &[Event], opts: &Opti
         anchor_coverage,
         crowded_anchors,
         promiscuous_anchors,
+        diverged_anchors: diverged_anchors(events),
         broad_clusters_skipped,
         cosine_ran,
     }
@@ -1039,6 +1077,104 @@ pub fn crowded_anchors_now(events: &[Event]) -> Vec<CrowdedAnchor> {
     anchor_crowding(&heads, crate::guard::FILE_MEMORY_HITS).0
 }
 
+/// Do these two normalized anchors compete for the same slot? The guard's own
+/// match rule is `a == path || a == file name || path ends with "/{a}"`, so two
+/// anchors collide whenever one is a path TAIL of the other - which also covers
+/// a bare file name against any full path ending in it. Grouping by the literal
+/// string (what the REPORT does, and says so) misses exactly that: `pricing.js`,
+/// `lib/pricing.js` and `server/lib/pricing.js` are three groups and one real
+/// fight over two slots.
+fn anchors_collide(a: &str, b: &str) -> bool {
+    a == b || a.ends_with(&format!("/{b}")) || b.ends_with(&format!("/{a}"))
+}
+
+/// Every live fact whose anchor would COMPETE with `anchor` for a slot when the
+/// guard fires - the write path's question, answered by the guard's match rule
+/// instead of by string equality.
+///
+/// Why this exists next to the report's grouping (2026-07-30): the report is
+/// honest about being a floor, but a WRITE-time gate built on that floor has a
+/// bypass. Anchor `server/lib/pricing.js` twice and the target is full; anchor
+/// `pricing.js` a third time and the literal grouping calls it a fresh target,
+/// while at guard time all three fight over the same two slots and one loses in
+/// silence. Same failure the gate was built to end, one variant spelling away.
+///
+/// Expired facts are skipped for the same reason the report skips them: the
+/// guard passes over them before they ever reach a slot, so counting them would
+/// refuse an anchor over a rival that does not exist.
+///
+/// SCOPED like the guard, and that is not optional (2026-07-30, found by an
+/// audit swarm hours after the gate shipped). The guard builds
+/// `RecallScope::current(project)` and never lets one project's facts compete
+/// for another's slots. An unscoped rival count sums every project in the
+/// store, so two facts anchored `config.js` in one repo would make `config.js`
+/// unanchorable in an unrelated repo - a refusal of work that is perfectly
+/// servable, which is exactly how a gate teaches people to route around it.
+/// A GLOBAL write counts only global rivals: a global fact competes inside
+/// whichever project someone is working in, and refusing it because one
+/// unrelated project happens to be full would be the same over-refusal one
+/// level up. Under-counting there is the safer side - `thor consolidate` still
+/// reports the crowding it causes.
+pub fn slot_rivals_now(
+    events: &[Event],
+    anchor: &str,
+    scope: &crate::recall::RecallScope,
+) -> Vec<String> {
+    let want = normalize_anchor_for_grouping(anchor);
+    if want.is_empty() {
+        return Vec::new();
+    }
+    let mut ids: Vec<String> = live_memory_heads(events, &[])
+        .into_iter()
+        .filter(|h| {
+            !h.expired
+                && scope.allows(h.project.as_deref())
+                && h.anchors.iter().any(|a| anchors_collide(&want, &normalize_anchor_for_grouping(a)))
+        })
+        .map(|h| h.entity_id)
+        .collect();
+    ids.sort();
+    ids.dedup(); // one fact citing two colliding spellings counts once
+    ids
+}
+
+/// Anchored facts the guard silently skips because their entity is diverged.
+/// Read straight from the head sets rather than from `live_memory_heads`, which
+/// keeps only single-headed entities - that filter is precisely why this class
+/// was invisible to every existing list.
+fn diverged_anchors(events: &[Event]) -> Vec<DivergedAnchor> {
+    let by_hash: HashMap<&str, &Event> =
+        events.iter().map(|e| (e.this_hash.as_str(), e)).collect();
+    let mut out: Vec<DivergedAnchor> = crate::cas::compute_head_sets(events)
+        .into_iter()
+        .filter(|(id, hs)| hs.heads.len() > 1 && !crate::repo::is_chunk_id(id))
+        .filter_map(|(id, hs)| {
+            // Any head still declaring an anchor is enough: whichever side wins
+            // the resolve, the fact was written to gate something.
+            let mut anchors: Vec<String> = hs
+                .heads
+                .iter()
+                .filter_map(|h| by_hash.get(h.as_str()))
+                .filter(|e| e.kind != crate::event_store::EventKind::FactRetracted)
+                .flat_map(|e| crate::footer::anchors(&e.body))
+                .collect();
+            anchors.sort();
+            anchors.dedup();
+            (!anchors.is_empty())
+                .then(|| DivergedAnchor { entity_id: id.clone(), heads: hs.heads.len(), anchors })
+        })
+        .collect();
+    out.sort_by(|a, b| a.entity_id.cmp(&b.entity_id));
+    out
+}
+
+/// One entity's EFFECTIVE project as the store stands now - a reproject
+/// honored, not the id prefix guessed. The write-time gate needs it to ask its
+/// rival question in the scope the fact actually lives in.
+pub fn project_of_now(events: &[Event], entity_id: &str) -> Option<String> {
+    crate::cas::compute_projects(events).get(entity_id).cloned().flatten()
+}
+
 #[derive(Default)]
 pub struct ApplyStats {
     pub retracted: usize,
@@ -1176,6 +1312,23 @@ pub fn render_report(report: &Report) -> String {
         ));
         for u in &report.ungated_rule_facts {
             line(format!("  {} (named by rule \"{}\")", u.entity_id, u.rule_id));
+        }
+    }
+    if !report.diverged_anchors.is_empty() {
+        line(format!(
+            "
+{} anchored fact(s) are DIVERGED, so their gate is silently off - the guard skips a \
+multi-headed entity before it even looks at the anchor, while recall keeps serving the fact as \
+usual. Resolve each one:",
+            report.diverged_anchors.len()
+        ));
+        for d in &report.diverged_anchors {
+            line(format!(
+                "  {} ({} heads) -> anchors: {}",
+                d.entity_id,
+                d.heads,
+                d.anchors.join(", ")
+            ));
         }
     }
     if !report.unanchored.is_empty() || report.unanchored_expiring > 0 {
@@ -1701,6 +1854,67 @@ mod tests {
         // so this is not "the gate got weaker", it is "the gate got honest".
         report.unpointed_scopes.push(UnpointedScope { project: "Acme".to_string(), fact_count: 6 });
         assert!(!report.is_clean(), "a scope nobody can reach is real dirt and still fails");
+    }
+
+    /// A declared gate that is silently off must be VISIBLE (2026-07-30, found
+    /// by an audit swarm). The guard drops a diverged entity before it looks at
+    /// the anchor and reports nothing; every other surface keeps serving the
+    /// fact, so the owner has no way to notice. `live_memory_heads` cannot see
+    /// this class at all - it keeps single-headed entities only - which is
+    /// exactly why no existing list caught it.
+    #[test]
+    fn a_diverged_anchored_fact_is_reported() {
+        let mut store = crate::event_store::EventStore::in_memory().unwrap();
+        let body = |t: &str| {
+            format!(
+                "{t}\n\n{}",
+                crate::footer::compose_full(
+                    "gotcha", &[], "global", &[], &["src/pay.rs".to_string()], None, None,
+                )
+            )
+        };
+        let v1 = store
+            .append_event(
+                "s", "l", "a", crate::event_store::EventKind::FactCreated, "mem-d", None,
+                &body("the rule"),
+            )
+            .unwrap();
+        // Two revises citing the SAME parent: the fork that arrives when two
+        // machines edit the same fact between syncs.
+        for side in ["one side", "other side"] {
+            store
+                .append_event(
+                    "s", "l", "a", crate::event_store::EventKind::FactRevised, "mem-d",
+                    Some(&v1.this_hash), &body(side),
+                )
+                .unwrap();
+        }
+        let found = diverged_anchors(&store.get_all_events().unwrap());
+        assert_eq!(found.len(), 1, "the diverged anchored fact is listed");
+        assert_eq!(found[0].entity_id, "mem-d");
+        assert_eq!(found[0].heads, 2);
+        assert_eq!(found[0].anchors, vec!["src/pay.rs"]);
+
+        // An UNANCHORED diverged fact is a different problem, already visible
+        // elsewhere, and must not land on this list.
+        let mut store2 = crate::event_store::EventStore::in_memory().unwrap();
+        let a = store2
+            .append_event(
+                "s", "l", "a", crate::event_store::EventKind::FactCreated, "mem-p", None, "plain",
+            )
+            .unwrap();
+        for side in ["one", "two"] {
+            store2
+                .append_event(
+                    "s", "l", "a", crate::event_store::EventKind::FactRevised, "mem-p",
+                    Some(&a.this_hash), side,
+                )
+                .unwrap();
+        }
+        assert!(
+            diverged_anchors(&store2.get_all_events().unwrap()).is_empty(),
+            "no anchor, no silent gate - not this list's business"
+        );
     }
 
     /// Three live facts anchored to the same file exceed the guard's real cap

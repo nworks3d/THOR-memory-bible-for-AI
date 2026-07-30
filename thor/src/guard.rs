@@ -442,6 +442,31 @@ fn vanished_citations(
     candidates
 }
 
+/// "Has anything been written to the store since?", answered without opening
+/// it: the newest mtime of the database and its write-ahead log, in
+/// MILLISECONDS - seconds are too coarse, and not only in a fast test. A rule
+/// corrected in the same second as the advisory that showed its old text is
+/// exactly the moment this is for: you read the block, see it is wrong, and fix
+/// it right then.
+/// A syscall or two, against the alternative of a full store open plus recall
+/// on a hot path that runs for every tool call. Fails HIGH (0 means "unknown"
+/// only when both stats fail, and a caller comparing `<= seen` then re-checks) -
+/// erring toward one extra recall rather than toward silence.
+fn store_watermark(db: &Path) -> u64 {
+    let secs = |p: std::path::PathBuf| {
+        std::fs::metadata(p)
+            .and_then(|m| m.modified())
+            .ok()
+            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0)
+    };
+    let wal = db.with_extension(
+        db.extension().and_then(|e| e.to_str()).map(|e| format!("{e}-wal")).unwrap_or_default(),
+    );
+    secs(db.to_path_buf()).max(secs(wal))
+}
+
 fn file_memory_advisory(db: &Path, hook: &Value) -> Option<String> {
     if crate::ledger::flag_present(db, "THOR-SILENT.flag") {
         return None; // the THOR kill switch silences the file advisory too
@@ -459,8 +484,24 @@ fn file_memory_advisory(db: &Path, hook: &Value) -> Option<String> {
     }
     let key = format!("{}|{}", session_id, file_path);
     match crate::ledger::get(db, "guard-seen", &key) {
-        // already advised for this file this session
+        // Legacy shape (a bare number), written by an older binary earlier in
+        // this same session: already advised, stay quiet.
         Some(v) if v.is_u64() => return None,
+        // Already advised for this file this session - UNLESS the store has
+        // been written to since (2026-07-30). Correcting a rule mid-session used
+        // to be pointless on the file it governs: the debounce returned here,
+        // before any recall could notice the text had changed, so the agent kept
+        // working from the version it saw an hour ago. The watermark is the
+        // store's own mtime, so the common case (nothing written since) still
+        // costs one ledger read and no store open at all; only after a write
+        // does the recall run again, and the content-fingerprint dedup then
+        // makes sure only a fact that ACTUALLY changed gets served twice.
+        Some(v) if v.get("wm").is_some() => {
+            let seen = v.get("wm").and_then(|w| w.as_u64()).unwrap_or(0);
+            if store_watermark(db) <= seen {
+                return None;
+            }
+        }
         // fresh negative answer: skip the store open + recall entirely
         Some(v) => {
             let neg_ts = v.get("ts").and_then(|t| t.as_u64()).unwrap_or(0);
@@ -549,7 +590,7 @@ fn file_memory_advisory(db: &Path, hook: &Value) -> Option<String> {
             names_file(&b, &name_l, &stem_l) || symbols_l.iter().any(|s| b.contains(s.as_str()))
         })
         .collect();
-    let named = merge_anchored(anchored, heuristic, FILE_MEMORY_HITS);
+    let named = merge_anchored(anchored, heuristic);
 
     // The ingested prose knows files too: a CHANGELOG paragraph or design doc
     // that NAMES this file documents decisions the agent cannot see in the
@@ -592,17 +633,35 @@ fn file_memory_advisory(db: &Path, hook: &Value) -> Option<String> {
     doc_chunks.sort_by_key(|h| !h.body.to_lowercase().contains(&name_l));
     doc_chunks.truncate(DOC_CHUNK_HITS);
 
-    // Cross-key dedup: a fact that names several files must not re-serve as a
-    // full block on each of them (see drop_already_advised).
-    let named = drop_already_advised(db, session_id, "file", named);
+    // A TRUE MISS AND AN ALREADY-SHOWN SET ARE NOT THE SAME THING, and only the
+    // first may be cached as one (split 2026-07-30, after an adversarial
+    // verifier caught the file lane still conflating them - the command lane
+    // below had the split, this one never got it). "Nothing in the store names
+    // this file" is worth remembering for a quarter of an hour. "I already said
+    // this earlier in the session" is not: cache it and a fact stored a minute
+    // later stays silent for fifteen, on a file the store demonstrably knows.
+    // So the question is asked BEFORE the dedup, on what actually matched.
+    let nothing_matches = named.is_empty() && doc_chunks.is_empty();
+    let named = dedup_then_cap(db, session_id, "file", named, FILE_MEMORY_HITS);
 
-    if named.is_empty() && doc_chunks.is_empty() {
+    if nothing_matches {
         // Cache the miss briefly (NEG_CACHE_SECS) so repeated touches of a
         // memory-less file stop re-paying the recall; a memory stored later
         // still surfaces once the negative entry expires. Per-key upsert: a
         // concurrent guard on ANOTHER file can no longer lose this entry.
         let now = crate::review::now_secs();
         crate::ledger::upsert(db, "guard-seen", &key, &serde_json::json!({ "ts": now, "neg": true }));
+        return None;
+    }
+    if named.is_empty() && doc_chunks.is_empty() {
+        // Everything that matched was already served this session: stay quiet,
+        // and cache NOTHING. Deliberate, and it is the more expensive branch:
+        // the next touch of this file re-pays the recall. The alternative costs
+        // more - a negative entry would silence a fact stored a minute from now
+        // for a quarter of an hour on a file the store demonstrably knows, and
+        // a positive one would silence it for the whole session. This branch
+        // only fires when every match was already shown, so the repeated cost
+        // is bounded by how often that one file is touched.
         return None;
     }
 
@@ -617,7 +676,14 @@ fn file_memory_advisory(db: &Path, hook: &Value) -> Option<String> {
         .collect();
 
     let now = crate::review::now_secs();
-    crate::ledger::upsert(db, "guard-seen", &key, &serde_json::json!(now));
+    // Carries the watermark, so the next touch of this file can tell "nothing
+    // has happened since" from "the store was written to - look again".
+    crate::ledger::upsert(
+        db,
+        "guard-seen",
+        &key,
+        &serde_json::json!({ "ts": now, "wm": store_watermark(db) }),
+    );
     record_advised(db, session_id, "file", &named, now);
 
     // Stale-citation note. Only for the ANCHORED facts: their author declared
@@ -656,6 +722,30 @@ fn file_memory_advisory(db: &Path, hook: &Value) -> Option<String> {
 /// so the post-compaction clear re-arms them exactly when the context that
 /// held the advisory text is gone. Memories only - doc chunks keep their own
 /// per-file behavior.
+/// PER CONTENT, not per entity (2026-07-30). Keying on the id alone meant a
+/// fact REVISED after its first serving stayed silent for the rest of the
+/// session - including on a different file it had never served for. The agent
+/// then kept acting on the version it saw an hour ago, which is the stale-fact
+/// failure this whole channel exists to prevent. The key carries a fingerprint
+/// of the fact's CONTENT (footer stripped), so a corrected body re-arms exactly
+/// once, while an anchor fix, a tag sweep or an expiry change - metadata edits
+/// that leave the text alone - stay deduped and cost nothing.
+///
+/// THE BOUNDARY, narrower than it first reads (spelled out after an adversarial
+/// verifier called the wording bigger than the code): the per-(session, target)
+/// debounce at the top of each advisory returns before any of this runs, so a
+/// correction does NOT re-fire on a target that already had its one advisory
+/// this session. What this reaches is the fact travelling to a target it has
+/// not served for yet - the case where the agent holds the stale text and the
+/// corrected one has no other way in. Widening it further would mean reopening
+/// that debounce, which is a noise decision, not a bug fix.
+fn content_fingerprint(body: &str) -> String {
+    use sha2::{Digest, Sha256};
+    let mut h = Sha256::new();
+    h.update(crate::footer::strip(body).trim().as_bytes());
+    format!("{:x}", h.finalize())[..12].to_string()
+}
+
 fn drop_already_advised(
     db: &Path,
     session_id: &str,
@@ -667,7 +757,11 @@ fn drop_already_advised(
             crate::ledger::get(
                 db,
                 "guard-seen",
-                &format!("{session_id}|ent-{surface}:{}", h.entity_id),
+                &format!(
+                    "{session_id}|ent-{surface}:{}:{}",
+                    h.entity_id,
+                    content_fingerprint(&h.body)
+                ),
             )
             .is_none()
         })
@@ -685,7 +779,11 @@ fn record_advised(
         crate::ledger::upsert(
             db,
             "guard-seen",
-            &format!("{session_id}|ent-{surface}:{}", h.entity_id),
+            &format!(
+                "{session_id}|ent-{surface}:{}:{}",
+                h.entity_id,
+                content_fingerprint(&h.body)
+            ),
             &serde_json::json!(now),
         );
     }
@@ -795,11 +893,13 @@ fn anchored_memories(
 }
 
 /// Anchored hits first, then the heuristic hits that are not already among
-/// them, capped - the shared merge for both advisories.
+/// them - the shared merge for both advisories. UNCAPPED on purpose since
+/// 2026-07-30: the cap has to be applied AFTER `drop_already_advised`, never
+/// before, or facts that were already served this session hold slots they no
+/// longer need and starve one that was never shown (see the call sites).
 fn merge_anchored(
     anchored: Vec<crate::recall::RecallHit>,
     heuristic: Vec<crate::recall::RecallHit>,
-    cap: usize,
 ) -> Vec<crate::recall::RecallHit> {
     let mut out = anchored;
     for h in heuristic {
@@ -807,6 +907,28 @@ fn merge_anchored(
             out.push(h);
         }
     }
+    out
+}
+
+/// Drop what this session already saw, THEN cap - the order the two steps have
+/// to run in, kept in one place so a call site cannot get it wrong again.
+///
+/// The bug this ends (found by an audit swarm 2026-07-30, present since the
+/// dedup landed): capping first meant the slots were handed out by entity id
+/// among ALL matching facts, and only afterwards were the already-served ones
+/// removed. Three facts anchored to one file, two of them served earlier in the
+/// session, left an EMPTY advisory - the third, never shown, had been truncated
+/// away before the filter ever saw it. Worse, the file advisory then wrote a
+/// "no memory names this file" negative cache entry, asserting the opposite of
+/// the truth for the next quarter of an hour.
+fn dedup_then_cap(
+    db: &Path,
+    session_id: &str,
+    surface: &str,
+    hits: Vec<crate::recall::RecallHit>,
+    cap: usize,
+) -> Vec<crate::recall::RecallHit> {
+    let mut out = drop_already_advised(db, session_id, surface, hits);
     out.truncate(cap);
     out
 }
@@ -968,15 +1090,19 @@ fn command_memory_advisory(db: &Path, hook: &Value) -> Option<String> {
             })
             .collect()
     };
-    let named = merge_anchored(anchored, heuristic, FILE_MEMORY_HITS);
+    let named = merge_anchored(anchored, heuristic);
     let now = crate::review::now_secs();
     if named.is_empty() {
+        // Nothing matches this command at all - a true miss, worth caching.
+        // Checked on the UNCAPPED merge, so this can never mean "the cap hid
+        // everything" the way it could if the cap ran first.
         crate::ledger::upsert(db, "guard-seen", &key, &serde_json::json!({ "ts": now, "neg": true }));
         return None;
     }
     // Cross-key dedup: the same fact must not re-serve as a full block on
-    // every slightly-different command (see drop_already_advised).
-    let named = drop_already_advised(db, session_id, "cmd", named);
+    // every slightly-different command (see drop_already_advised). Cap AFTER
+    // that filter - see dedup_then_cap.
+    let named = dedup_then_cap(db, session_id, "cmd", named, FILE_MEMORY_HITS);
     if named.is_empty() {
         // Everything relevant was already advised this session under another
         // key - remember THIS key too so the next identical call exits early.
@@ -1726,6 +1852,320 @@ mod tests {
         assert!(
             second.is_none(),
             "a slightly different command must not re-serve the same fact: {second:?}"
+        );
+    }
+
+    /// The starvation this ends (found by an audit swarm, 2026-07-30): the cap
+    /// used to be applied BEFORE the already-served filter, so facts that had
+    /// nothing left to say held the slots and a fact that had never been shown
+    /// was truncated away before the filter could make room for it. Two facts
+    /// cover both files, a third covers only the second: after the first file
+    /// is advised, touching the second must serve that third fact - not an
+    /// empty advisory, and above all not a "no memory names this file" cache
+    /// entry, which is the opposite of the truth.
+    #[test]
+    fn a_never_served_fact_is_not_starved_by_two_already_served_ones() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("thor.db");
+        {
+            let mut store = crate::event_store::EventStore::new(&db).unwrap();
+            // ids sort a < b < c, so the two broad facts win the anchor pass.
+            for (id, anchors) in [
+                ("mem-a", vec!["src/one.rs".to_string(), "src/two.rs".to_string()]),
+                ("mem-b", vec!["src/one.rs".to_string(), "src/two.rs".to_string()]),
+                ("mem-c", vec!["src/two.rs".to_string()]),
+            ] {
+                let body = format!(
+                    "constraint {id}: read this before editing\n\n{}",
+                    crate::footer::compose_full(
+                        "gotcha", &[], "global", &[], &anchors, None, None,
+                    )
+                );
+                store
+                    .append_event(
+                        "s", "l", "a", crate::event_store::EventKind::FactCreated, id, None, &body,
+                    )
+                    .unwrap();
+            }
+        }
+        let hook = |path: &str| {
+            json!({
+                "tool_name": "Read",
+                "session_id": "sess-starve",
+                "tool_input": { "file_path": path }
+            })
+        };
+        let first = file_memory_advisory(&db, &hook("src/one.rs"));
+        let first = first.expect("the first file serves its two anchored facts");
+        assert!(first.contains("mem-a") && first.contains("mem-b"), "{first}");
+
+        let second = file_memory_advisory(&db, &hook("src/two.rs"))
+            .expect("the second file still has a fact that was never served");
+        assert!(
+            second.contains("mem-c"),
+            "the never-served fact must get the slot the already-served ones freed: {second}"
+        );
+    }
+
+    /// The cap still bites, and it bites AFTER the filter: with more survivors
+    /// than slots, exactly FILE_MEMORY_HITS are served and they are the
+    /// never-served ones. Without this the reorder could have been written as
+    /// "drop the cap entirely" and no test would have noticed.
+    #[test]
+    fn the_cap_still_applies_once_the_already_served_are_filtered_out() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("thor.db");
+        {
+            let mut store = crate::event_store::EventStore::new(&db).unwrap();
+            for (id, anchors) in [
+                ("mem-a", vec!["src/one.rs".to_string(), "src/two.rs".to_string()]),
+                ("mem-b", vec!["src/one.rs".to_string(), "src/two.rs".to_string()]),
+                ("mem-c", vec!["src/two.rs".to_string()]),
+                ("mem-d", vec!["src/two.rs".to_string()]),
+                ("mem-e", vec!["src/two.rs".to_string()]),
+            ] {
+                let body = format!(
+                    "constraint {id}: read this before editing\n\n{}",
+                    crate::footer::compose_full("gotcha", &[], "global", &[], &anchors, None, None)
+                );
+                store
+                    .append_event(
+                        "s", "l", "a", crate::event_store::EventKind::FactCreated, id, None, &body,
+                    )
+                    .unwrap();
+            }
+        }
+        let hook = |path: &str| {
+            json!({
+                "tool_name": "Read",
+                "session_id": "sess-cap",
+                "tool_input": { "file_path": path }
+            })
+        };
+        file_memory_advisory(&db, &hook("src/one.rs")).expect("first file serves a and b");
+        let second =
+            file_memory_advisory(&db, &hook("src/two.rs")).expect("three never-served remain");
+        let served = ["mem-c", "mem-d", "mem-e"]
+            .iter()
+            .filter(|id| second.contains(**id))
+            .count();
+        assert_eq!(served, FILE_MEMORY_HITS, "the cap holds after the filter: {second}");
+        assert!(
+            !second.contains("mem-a") && !second.contains("mem-b"),
+            "the already-served pair stays out: {second}"
+        );
+    }
+
+    /// A REVISED fact must be able to speak again (2026-07-30, found by an
+    /// audit swarm). The dedup keyed on the entity alone, so a fact corrected
+    /// after its first serving stayed silent for the rest of the session - the
+    /// agent kept working from the version it had already seen, which is the
+    /// exact stale-fact failure this channel exists to prevent. A CONTENT change
+    /// re-arms it once; a metadata-only edit does not.
+    ///
+    /// The BOUNDARY, deliberate: the same file still gets at most one advisory
+    /// per session (the outer per-(session, file) debounce, which this does not
+    /// touch). What is fixed is the fact travelling to a DIFFERENT target it
+    /// never served for - the case where the agent has the stale text and the
+    /// corrected one has no way in.
+    #[test]
+    fn a_revised_fact_speaks_again_but_a_metadata_edit_does_not() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("thor.db");
+        let anchors = vec!["src/one.rs".to_string(), "src/two.rs".to_string()];
+        let body = |text: &str, tags: &[String]| {
+            format!(
+                "{text}\n\n{}",
+                crate::footer::compose_full("gotcha", tags, "global", &[], &anchors, None, None)
+            )
+        };
+        let head_of = |db: &std::path::Path| {
+            let store = crate::event_store::EventStore::new(db).unwrap();
+            let events = store.get_all_events().unwrap();
+            crate::cas::compute_head_sets(&events)
+                .get("mem-r")
+                .unwrap()
+                .heads
+                .iter()
+                .next()
+                .unwrap()
+                .clone()
+        };
+        {
+            let mut store = crate::event_store::EventStore::new(&db).unwrap();
+            store
+                .append_event(
+                    "s", "l", "a", crate::event_store::EventKind::FactCreated, "mem-r", None,
+                    &body("the old wording of the constraint", &[]),
+                )
+                .unwrap();
+        }
+        let hook = |path: &str| {
+            json!({
+                "tool_name": "Read",
+                "session_id": "sess-rev",
+                "tool_input": { "file_path": path }
+            })
+        };
+        assert!(file_memory_advisory(&db, &hook("src/one.rs")).is_some(), "first file serves it");
+        assert!(
+            file_memory_advisory(&db, &hook("src/one.rs")).is_none(),
+            "nothing was written since, so the same file stays quiet"
+        );
+
+        // A metadata-only revision (a tag added) leaves the text alone, so it
+        // has nothing new to say and must not re-fire.
+        {
+            let head = head_of(&db);
+            let mut store = crate::event_store::EventStore::new(&db).unwrap();
+            store
+                .append_mutate_checked(
+                    "s", "l", "a", crate::event_store::EventKind::FactRevised, "mem-r",
+                    Some(&head),
+                    &body("the old wording of the constraint", &["swept".to_string()]),
+                )
+                .unwrap();
+        }
+        assert!(
+            file_memory_advisory(&db, &hook("src/two.rs")).is_none(),
+            "a tag sweep is not news - it must not re-fire on the fact's other file"
+        );
+
+        // A real correction does.
+        {
+            let head = head_of(&db);
+            let mut store = crate::event_store::EventStore::new(&db).unwrap();
+            store
+                .append_mutate_checked(
+                    "s", "l", "a", crate::event_store::EventKind::FactRevised, "mem-r",
+                    Some(&head),
+                    &body("CORRECTED: the constraint is the other way round", &[]),
+                )
+                .unwrap();
+        }
+        let after = file_memory_advisory(&db, &hook("src/two.rs"));
+        assert!(
+            after.as_deref().is_some_and(|a| a.contains("CORRECTED")),
+            "the corrected wording must reach the agent that already saw the old one: {after:?}"
+        );
+
+        // ...and only ONCE, on whichever target is touched first: the
+        // cross-key rule from 2026-07-24 (one serving per session and surface,
+        // however many keys reach the fact) is untouched by this.
+        assert!(
+            file_memory_advisory(&db, &hook("src/one.rs")).is_none(),
+            "the correction speaks once per surface, not once per file"
+        );
+    }
+
+    /// The case that actually bites: you correct a rule ABOUT the file you are
+    /// editing, while editing it. Until 2026-07-30 the per-(session, file)
+    /// debounce returned before any recall ran, so the correction could not
+    /// reach that file again for the rest of the session - the agent kept the
+    /// stale text. The debounce now carries a watermark of the store's own
+    /// mtime: nothing written since means the same cheap early return as
+    /// before, a write means look again.
+    #[test]
+    fn a_correction_reaches_the_very_file_it_governs() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("thor.db");
+        let body = |t: &str| {
+            format!(
+                "{t}\n\n{}",
+                crate::footer::compose_full(
+                    "gotcha", &[], "global", &[], &["src/only.rs".to_string()], None, None,
+                )
+            )
+        };
+        {
+            let mut store = crate::event_store::EventStore::new(&db).unwrap();
+            store
+                .append_event(
+                    "s", "l", "a", crate::event_store::EventKind::FactCreated, "mem-o", None,
+                    &body("the old wording"),
+                )
+                .unwrap();
+        }
+        let hook = json!({
+            "tool_name": "Edit",
+            "session_id": "sess-same",
+            "tool_input": { "file_path": "src/only.rs" }
+        });
+        assert!(file_memory_advisory(&db, &hook).is_some(), "served once");
+        assert!(file_memory_advisory(&db, &hook).is_none(), "quiet while nothing changes");
+
+        {
+            let head = {
+                let store = crate::event_store::EventStore::new(&db).unwrap();
+                let events = store.get_all_events().unwrap();
+                crate::cas::compute_head_sets(&events)
+                    .get("mem-o")
+                    .unwrap()
+                    .heads
+                    .iter()
+                    .next()
+                    .unwrap()
+                    .clone()
+            };
+            let mut store = crate::event_store::EventStore::new(&db).unwrap();
+            store
+                .append_mutate_checked(
+                    "s", "l", "a", crate::event_store::EventKind::FactRevised, "mem-o",
+                    Some(&head), &body("CORRECTED: the other way round"),
+                )
+                .unwrap();
+        }
+        let after = file_memory_advisory(&db, &hook);
+        assert!(
+            after.as_deref().is_some_and(|a| a.contains("CORRECTED")),
+            "the correction must reach the file it governs: {after:?}"
+        );
+        assert!(
+            file_memory_advisory(&db, &hook).is_none(),
+            "and then quiet again - once per correction, not on every touch"
+        );
+    }
+
+    /// "Already shown earlier" must never be cached as "nothing names this
+    /// file" (2026-07-30, adversarial verifier). The negative cache is a
+    /// fifteen-minute silence, so writing it here would swallow a fact stored
+    /// seconds later on a file the store demonstrably knows.
+    #[test]
+    fn an_already_served_set_is_not_cached_as_a_miss() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("thor.db");
+        let write = |db: &std::path::Path, id: &str, anchors: Vec<String>| {
+            let mut store = crate::event_store::EventStore::new(db).unwrap();
+            let body = format!(
+                "constraint {id}\n\n{}",
+                crate::footer::compose_full("gotcha", &[], "global", &[], &anchors, None, None)
+            );
+            store
+                .append_event(
+                    "s", "l", "a", crate::event_store::EventKind::FactCreated, id, None, &body,
+                )
+                .unwrap();
+        };
+        write(&db, "mem-a", vec!["src/one.rs".into(), "src/two.rs".into()]);
+        let hook = |path: &str| {
+            json!({
+                "tool_name": "Read",
+                "session_id": "sess-neg",
+                "tool_input": { "file_path": path }
+            })
+        };
+        file_memory_advisory(&db, &hook("src/one.rs")).expect("serves on the first file");
+        assert!(
+            file_memory_advisory(&db, &hook("src/two.rs")).is_none(),
+            "nothing new to say on the second file"
+        );
+
+        // A fact stored right after must still reach the very next touch.
+        write(&db, "mem-z", vec!["src/two.rs".into()]);
+        let after = file_memory_advisory(&db, &hook("src/two.rs"));
+        assert!(
+            after.as_deref().is_some_and(|a| a.contains("mem-z")),
+            "a fresh fact must not be swallowed by a cached miss that was never a miss: {after:?}"
         );
     }
 

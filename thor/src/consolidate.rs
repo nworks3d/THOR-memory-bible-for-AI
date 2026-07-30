@@ -357,6 +357,14 @@ struct LiveHead {
     /// carried a future expiry, so the list overstated the real work by more
     /// than tenfold. Counted, never silently dropped - see `unanchored_expiring`.
     has_expiry: bool,
+    /// The expiry date has PASSED (`expires < today`, the same strict compare
+    /// recall and the guard use). Distinct from `has_expiry` on purpose: a
+    /// future date still competes for everything, a past one competes for
+    /// nothing. The crowding pass needs this - it reports what the guard can
+    /// serve per target, and the guard skips an expired fact, so counting one
+    /// as a rival overstates the crowding and sends a steward after work that
+    /// is already done (found 2026-07-30, while working that very list).
+    expired: bool,
     /// Tagged `no-gate`: a steward judged that this fact deliberately carries
     /// no anchor (the named file/command is incidental, not its subject). The
     /// retro-anchor list honors it so the decision persists across rounds.
@@ -423,9 +431,11 @@ fn live_memory_heads(events: &[Event], pins: &[String]) -> Vec<LiveHead> {
     }
     let mut out = Vec::new();
     let mut bodies: Vec<String> = Vec::new(); // aligned with `out` until the sort
-    // Same strict compare recall and the guard use (expired = expires < today).
-    // consolidate is not one of the clock-free fold modules (cas/auditor), so
-    // reading the clock here is fine - the report is about TODAY's store.
+    // Same strict compare recall and the guard use (expired = expires < today),
+    // read ONCE for the whole fold rather than per head. consolidate is not one
+    // of the clock-free fold modules (cas/auditor), so reading the clock here is
+    // fine - the report is about TODAY's store.
+    let today = crate::footer::today();
     for (id, hs) in &heads {
         if crate::repo::is_chunk_id(id) || hs.is_diverged || hs.heads.len() != 1 {
             continue;
@@ -455,6 +465,7 @@ fn live_memory_heads(events: &[Event], pins: &[String]) -> Vec<LiveHead> {
             report_shaped_no_expiry: crate::footer::reads_as_report(&head.body)
                 && crate::footer::expires(&head.body).is_none(),
             has_expiry: crate::footer::expires(&head.body).is_some(),
+            expired: crate::footer::expires(&head.body).is_some_and(|d| d.as_str() < today.as_str()),
             no_gate: crate::footer::has_tag(&head.body, "no-gate"),
             pointer_body: crate::courier::is_scope_pointer(&head.body).then(|| head.body.clone()),
             guarded: crate::footer::has_tag(&head.body, crate::courier::GUARDED_TAG),
@@ -957,6 +968,12 @@ pub(crate) fn normalize_anchor_for_grouping(anchor: &str) -> String {
 fn anchor_crowding(heads: &[LiveHead], cap: usize) -> (Vec<CrowdedAnchor>, Vec<PromiscuousAnchor>) {
     let mut by_anchor: HashMap<String, Vec<&LiveHead>> = HashMap::new();
     for h in heads {
+        // An expired fact is not a rival: the guard skips it before it ever
+        // reaches a slot, so counting it here would report crowding that does
+        // not exist and send a steward after work already done.
+        if h.expired {
+            continue;
+        }
         for a in &h.anchors {
             let norm = normalize_anchor_for_grouping(a);
             if norm.is_empty() {
@@ -1664,6 +1681,46 @@ mod tests {
         assert!(
             render_report(&report).contains("server/lib/payment.js"),
             "the printed report names the crowded target"
+        );
+    }
+
+    /// A fact whose expiry has PASSED is not a rival for an anchor slot: the
+    /// guard skips it before it reaches one. Counting it reported crowding that
+    /// does not exist - found 2026-07-30 while working the crowding list, when a
+    /// target still showed three carriers although a guard probe served the two
+    /// live ones. A FUTURE date must keep counting, because such a fact still
+    /// competes today; that is the half this test pins hardest.
+    #[test]
+    fn an_expired_carrier_does_not_crowd_an_anchor_but_a_future_dated_one_does() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut store, db) = store_at(dir.path());
+        let past = crate::footer::days_from_today(-1);
+        let future = crate::footer::days_from_today(30);
+        create(&mut store, "mem-a", "first note about the payment flow\n\n[memory/gotcha | tags: x | anchors: server/lib/payment.js]");
+        create(&mut store, "mem-b", "second note about the payment flow\n\n[memory/gotcha | tags: x | anchors: server/lib/payment.js]");
+        create(&mut store, "mem-c", &format!("third note about the payment flow\n\n[memory/gotcha | tags: x | expires: {past} | anchors: server/lib/payment.js]"));
+
+        let events = store.get_all_events().unwrap();
+        let report = build_report(&store, &db, &events, &opts(i64::MAX));
+        assert!(
+            report.crowded_anchors.is_empty(),
+            "the expired third carrier must not crowd the two live ones: {:?}",
+            report.crowded_anchors.iter().map(|c| (&c.anchor, c.fact_count)).collect::<Vec<_>>()
+        );
+
+        // Same shape, date not yet reached: it DOES still compete.
+        create(&mut store, "mem-d", &format!("fourth note about the payment flow\n\n[memory/gotcha | tags: x | expires: {future} | anchors: server/lib/payment.js]"));
+        let events = store.get_all_events().unwrap();
+        let report = build_report(&store, &db, &events, &opts(i64::MAX));
+        assert_eq!(report.crowded_anchors.len(), 1, "a future expiry still crowds");
+        assert_eq!(
+            report.crowded_anchors[0].fact_count, 3,
+            "three rivals: the two dateless ones plus the future-dated one, never the expired one"
+        );
+        assert!(
+            !report.crowded_anchors[0].entity_ids.contains(&"mem-c".to_string()),
+            "the expired carrier is left out by id too: {:?}",
+            report.crowded_anchors[0].entity_ids
         );
     }
 

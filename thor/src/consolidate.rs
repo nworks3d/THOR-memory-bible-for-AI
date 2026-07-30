@@ -250,10 +250,20 @@ impl Report {
     /// unpointed_scopes and ungated_rule_facts DO count: all three are measured
     /// pollution classes with a cheap, unambiguous fix (revise an expiry; write
     /// a pointer; add one tag).
+    /// `clusters` is EXCLUDED for the same reason, and the reason is measured.
+    /// A cluster is text similarity, which the module doc already calls a lead
+    /// and not a verdict - but counting it here turned every lead into a gate
+    /// failure. Reviewed all 16 groups on the real store 2026-07-30, every
+    /// member read: 16 of 16 were legitimately distinct, zero duplicates, zero
+    /// contradictions. Worse, three of them were pairs this store's OWN
+    /// doctrine creates - lift a still-governing rule out of an expiring report
+    /// and you have written two notes about one subject, on purpose. So the
+    /// gate punished the doctrine being followed, and could never go green on a
+    /// healthy store that keeps writing about the same few subjects. A gate
+    /// that cannot be satisfied teaches people to ignore it.
     pub fn is_clean(&self) -> bool {
         self.dups.is_empty()
             && self.decay.is_empty()
-            && self.clusters.is_empty()
             && self.needs_expiry.is_empty()
             && self.unpointed_scopes.is_empty()
             && self.ungated_rule_facts.is_empty()
@@ -1652,11 +1662,45 @@ mod tests {
             "the skip is stated in the printed report, with its reason"
         );
         assert_eq!(report.anchor_coverage.anchored, 1, "coverage comes from ONE code path, not an ad hoc count");
-        assert!(report.is_clean() || !report.is_clean(), "the list is a backlog, never a gate failure");
+        assert!(
+            report.is_clean(),
+            "the unanchored list is a backlog, never a gate failure - this fixture has \
+             work waiting on it and must still pass the gate"
+        );
         assert!(
             !report.unanchored.is_empty() && report.needs_expiry.is_empty(),
             "sanity: this fixture has work but no expiry dirt"
         );
+    }
+
+    /// A same-topic cluster is a LEAD, so it must never fail the gate. Measured
+    /// on the real store 2026-07-30: all 16 groups reviewed member by member,
+    /// 16 of 16 legitimately distinct - and three of them were report-plus-rule
+    /// pairs this store's own doctrine tells you to create. Counting clusters
+    /// meant the gate went red for following the doctrine and could never go
+    /// green again.
+    #[test]
+    fn a_same_topic_cluster_is_a_lead_and_never_fails_the_gate() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut store, db) = store_at(dir.path());
+        create(&mut store, "mem-a", "the deploy watcher truncates its log every run\n\n[memory/gotcha | tags: x]");
+        let events = store.get_all_events().unwrap();
+        let mut report = build_report(&store, &db, &events, &opts(i64::MAX));
+        assert!(report.is_clean(), "sanity: this fixture starts clean");
+
+        report.clusters.push(Cluster {
+            reason: "cosine>=0.86".to_string(),
+            members: vec!["mem-a".to_string(), "mem-b".to_string()],
+        });
+        assert!(
+            report.is_clean(),
+            "a cluster is text similarity, not proven dirt - it must not gate"
+        );
+
+        // A measured pollution class with an unambiguous fix still DOES gate,
+        // so this is not "the gate got weaker", it is "the gate got honest".
+        report.unpointed_scopes.push(UnpointedScope { project: "Acme".to_string(), fact_count: 6 });
+        assert!(!report.is_clean(), "a scope nobody can reach is real dirt and still fails");
     }
 
     /// Three live facts anchored to the same file exceed the guard's real cap

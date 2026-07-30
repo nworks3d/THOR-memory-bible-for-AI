@@ -1979,10 +1979,19 @@ that is already full, and the reply tells you right then, while you still have
 the note in your hands. The report is the sweep for what accumulated before
 that; the warning is what stops it accumulating again.
 
-It also lists three specific backlogs that are cheap and unambiguous to fix, so
-none of them depends on someone remembering: report-shaped facts with no expiry
-date, project scopes that no signpost fact points at, and facts that a response
-rule already enforces but that carry no `guarded` tag. That last one closes the
+It also lists three specific backlogs, so none of them depends on someone
+remembering: write-ups with no expiry date, project scopes that no signpost fact
+points at, and facts that a response rule already enforces but that carry no
+`guarded` tag.
+
+That first list deserves one warning, because it is the only one you should not
+work through mechanically. It uses a wide reading of "this announces finished
+work" - not just notes beginning with `MILESTONE`, but also "Sprint 3 DONE",
+"FASE 2 KLAAR", "SUPERSEDED by ...". Measured on a real store that reading is
+right about six times out of seven. The seventh is a standing rule that happens
+to open like a write-up, so read each entry before you give it a date, and when a
+rule is buried inside one, lift that rule into its own dateless note first. This
+is why the list only ever proposes and nothing here is applied for you. That last one closes the
 loop on the response rulebook: if you write a rule to hold your assistant to a
 standing preference, the per-prompt block no longer needs to repeat that
 preference - but only if the fact is tagged. THOR finds the pairing by reading
@@ -2288,7 +2297,28 @@ An optional field when a fact is written. After that date the fact stops being
 returned by recall. It is not deleted - the log still holds it, and
 `thor get`/`thor history` still show it.
 
-- **Default:** absent. A fact written without the field never expires.
+- **Default:** absent for almost every note - write a fact without the field and
+  it never expires. There is one exception and it is deliberate: if the body
+  begins with the word `MILESTONE` or `MIJLPAAL`, THOR fills in a date six weeks
+  out by itself and says so in the reply. The reason is length. A write-up of
+  "what we did today" is long by nature, and length is exactly what lets it beat
+  the real answer on its own subject for months afterwards. You can pass your own
+  date to override it, or take the date off later if that write-up has to keep
+  showing up.
+- **A nudge when a note only READS like a write-up.** Begin a note with
+  `MILESTONE` and THOR dates it. Begin it with anything else that announces
+  finished work - "Sprint 3 DONE", "Migration FINISHED", "FASE 2 KLAAR",
+  "SUPERSEDED by the v3 plan" - and the note is stored **without** a date, but
+  the reply points out that it reads like a write-up and suggests you give it
+  one. That split is on purpose. The wider reading was measured on a real store
+  and is right about six times out of seven; the seventh is a standing rule
+  wearing a write-up's opening words, and dating one of those by mistake makes it
+  disappear quietly - the one failure this whole field exists to prevent. Six out
+  of seven is good enough to suggest and not good enough to act on its own, so
+  only the two words above ever set a date for you.
+  One honest limit: that six-in-seven was measured on a store with a single Dutch
+  author. The English openers are there because they mirror Dutch ones that
+  earned their place, not because they were measured.
 - **Turn it on if:** the fact has a genuine natural end date - a workaround for
   a known upstream bug, a temporary deploy freeze, a version pin with a planned
   removal.

@@ -239,6 +239,14 @@ set of tools for that, none of which delete anything behind your back:
   a standing rule rather than a temporary note, THOR warns rather than blocks
   when you try to give it a date too: reports are meant to expire, rules are
   not.
+- **A date THOR fills in for write-ups.** Start a note with the word
+  `MILESTONE` and it gets six weeks automatically, because "what we did today"
+  is long, and long notes crowd out the actual answer on their own subject for
+  months. Start it with anything else that announces finished work - "Sprint 3
+  DONE", "Migration FINISHED" - and THOR leaves it dateless but says it looks
+  like a write-up and suggests you add one. It only acts by itself where it is
+  certain; where it is merely probably right, it asks. `thor consolidate` sweeps
+  up the write-ups that slipped through either way.
 - **A how-do-we-know label** on each fact - `verified` or `inferred`. This one
   has its own section below.
 

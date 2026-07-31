@@ -90,6 +90,15 @@ thor unpin thor-working-contract
 It stays gone. Setup checks whether that note exists, not whether it is pinned,
 so running setup again will not quietly put it back.
 
+The same idea, one step lighter: `thor starter-pack` adds three example working
+rules to an empty memory - finish what you start, split work by what it costs to
+be wrong, let nothing leave your machine without being asked. Those arrive
+**unpinned**, so unlike the contract above they are not put in front of your
+assistant every time; they simply sit there and turn up when they answer
+something. They exist to show what a rule worth keeping looks like, and to give
+your first searches something to find. Pin the ones you agree with, reword them,
+or throw them away - a rule you never chose is worse than no rule at all.
+
 **Worth it?** Yes, for a handful of rules. Two things follow from "in full":
 keep the *list* short, because every pinned rule is added to every session, and
 keep each *rule* short. Write the instruction, not the history behind it - your

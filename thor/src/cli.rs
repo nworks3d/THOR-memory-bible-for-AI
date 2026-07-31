@@ -384,6 +384,11 @@ enum Commands {
     /// SessionStart-safe warm start: when the daemon's /health does not
     /// answer, spawn `thor daemon` detached (debounced) and return at once.
     EnsureDaemon,
+    /// Add a few example working rules to your memory, so a fresh store is not
+    /// an empty one. They are stored UNPINNED and change nothing on their own -
+    /// read them, edit them, pin the ones you want, retract the rest. Running
+    /// this twice never duplicates or overwrites anything.
+    StarterPack,
     /// Read-only health check across THOR's surfaces: store, semantic
     /// model/sidecar, injection daemon warm/cold, and any flags present.
     Doctor,
@@ -1192,6 +1197,9 @@ pub fn run() -> Result<()> {
         Commands::EnsureDaemon => {
             crate::daemon_client::ensure_daemon(&db);
         }
+        Commands::StarterPack => {
+            run_starter_pack(&db)?;
+        }
         Commands::Doctor => {
             crate::doctor::print_doctor(&db);
         }
@@ -1926,6 +1934,109 @@ fn report_contract_seed(result: anyhow::Result<bool>) {
     }
 }
 
+/// The example rules `thor starter-pack` seeds. Three, not thirty: they exist to
+/// show what a rule worth keeping looks like - short, about behaviour, and
+/// written so it still reads right in a year - not to hand anyone a philosophy.
+///
+/// Three deliberate choices, and each one is the difference between a helpful
+/// template and an imposition:
+///  - UNPINNED. A pin is re-injected in full at every session start, so seeding
+///    pinned rules would spend a new user's context on opinions they never
+///    chose. Pinning is one command, and it should be their command.
+///  - NO MODEL NAMES. "Use model X for code" is wrong within months; "the
+///    cheaper model executes, the strongest judges" is not.
+///  - NOTHING FROM ONE SETUP. No tool names, no paths, no host, no workflow that
+///    only makes sense in the repo this shipped from.
+const STARTER_PACK: [(&str, &str); 3] = [
+    (
+        "thor-starter-finish-what-you-start",
+        "FINISH WHAT YOU START, and do not stop to ask permission to continue.\n\n\
+         Leave nothing half done: no failing tests, no half-finished migration, no TODO you \
+         intend to explain away. If your change breaks something next to it, fix that in the same \
+         turn rather than offering to fix it later.\n\n\
+         When a step is done, test it and ask yourself what is left. If the next step follows \
+         plainly from the work itself, start it - do not stop to present a menu. Stop only when \
+         the honest answer is \"nothing\", or when the next step is genuinely the other person's \
+         call: new cost, something irreversible, or a change of direction.\n\n\
+         (An example rule from `thor starter-pack`. Edit it, pin it with `thor pin`, or retract \
+         it - it is yours now.)\n\n\
+         [memory/preference | tags: starter-pack | project: global]",
+    ),
+    (
+        "thor-starter-split-work-by-cost-of-being-wrong",
+        "SPLIT THE WORK BY WHAT IT COSTS TO BE WRONG.\n\n\
+         The cheaper, faster model does the execution: writing code to a design that already \
+         exists, refactors, tests, formatting, searching and reading, mechanical sweeps. The \
+         strongest model does the judgment: planning, architecture, root-cause debugging, and \
+         anything sensitive or hard to undo - publishing, releases, security, rewriting history.\n\n\
+         The strong one also decides who does what and writes each worker's brief, because that \
+         split is judgment too. A sub-agent starts BLANK: it does not inherit your memory, your \
+         standing rules or the conversation, so every constraint that matters has to be written \
+         into its prompt in words.\n\n\
+         Nothing a cheap model produced is finished until it has passed the build and test gate, \
+         or a review by the strong one.\n\n\
+         (An example rule from `thor starter-pack`. Edit it, pin it with `thor pin`, or retract \
+         it - it is yours now.)\n\n\
+         [memory/preference | tags: starter-pack | project: global]",
+    ),
+    (
+        "thor-starter-nothing-leaves-without-an-explicit-ask",
+        "NOTHING LEAVES THIS MACHINE WITHOUT AN EXPLICIT ASK.\n\n\
+         No push, no tag, no release, no published page, no message sent on someone's behalf - \
+         not out of habit, not because it was the obvious next step, and not because permission \
+         was given for something similar earlier. Ask, in the conversation, every time.\n\n\
+         Publishing is irreversible in practice: within minutes it is cached and indexed \
+         elsewhere, and taking it down does not take it back. Before anything does go out, read \
+         it for secrets, for internal names and paths, and for personal data - \"there are no \
+         passwords in it\" is not the same as \"this is safe to publish\".\n\n\
+         (An example rule from `thor starter-pack`. Edit it, pin it with `thor pin`, or retract \
+         it - it is yours now.)\n\n\
+         [memory/preference | tags: starter-pack | project: global]",
+    ),
+];
+
+/// `thor starter-pack`: seed the example rules above, idempotently and without
+/// pinning anything.
+///
+/// Idempotent on each fact's OWN history, exactly like the working contract:
+/// the moment an id has ANY event - the seed, a later revise, or the user's own
+/// retract - it is skipped forever. That is what makes a second run safe, and
+/// what stops this from resurrecting something the user deliberately threw away.
+fn run_starter_pack(db: &Path) -> Result<()> {
+    let mut store = EventStore::new(db)?;
+    let (mut added, mut kept) = (0usize, 0usize);
+    for (id, body) in STARTER_PACK {
+        if !store.get_events_by_entity(id)?.is_empty() {
+            kept += 1;
+            println!("already in your memory, left alone: {id}");
+            continue;
+        }
+        store.append_event("starter-pack", "starter-pack", "cli", EventKind::FactCreated, id, None, body)?;
+        added += 1;
+        println!("added: {id}");
+    }
+    println!();
+    if added == 0 {
+        println!(
+            "Nothing to add - all {kept} example rule(s) are already in your memory (or you \
+             retracted them, which is also a decision this respects)."
+        );
+    } else {
+        println!(
+            "Added {added} example rule(s){}. They are NOT pinned, so they change nothing on \
+             their own: your assistant only sees one when it happens to be relevant.",
+            if kept > 0 { format!(", left {kept} alone") } else { String::new() }
+        );
+    }
+    println!(
+        "Read one with `thor get <id>`. Keep what fits by pinning it (`thor pin <id>`), which \
+         puts it in front of your assistant at every session start. Rewrite one with `thor \
+         revise`, and drop the rest with `thor retract <id>` - a rule you did not choose is \
+         worse than no rule at all."
+    );
+    Ok(())
+}
+
 /// `thor init`: write a `.thor` marker (the stable project key) at the repo root,
 /// then ingest the project so it is immediately "known".
 fn run_init(db: &Path, path: &Path, key: Option<String>) -> Result<()> {
@@ -2444,6 +2555,78 @@ mod tests {
         let head = events.iter().find(|e| &e.this_hash == head_hash).unwrap();
         assert!(head.body.contains("confirmed"), "revise applied onto the same id");
         assert!(head.body.contains("[memory/gotcha"), "footer preserved through the drain");
+    }
+
+    /// The starter pack must be a GIFT, not a graft: it may seed once, it may
+    /// never pin anything on the user's behalf (a pin costs context at every
+    /// session start, and that choice is theirs), and a second run may not
+    /// duplicate or overwrite. Every example also has to be a real typed fact -
+    /// an untyped one would not carry the format it is supposed to demonstrate.
+    #[test]
+    fn starter_pack_seeds_once_typed_and_never_pins() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("thor.db");
+        EventStore::new(&db).unwrap();
+
+        run_starter_pack(&db).unwrap();
+        run_starter_pack(&db).unwrap();
+
+        let store = EventStore::new(&db).unwrap();
+        for (id, _) in STARTER_PACK {
+            let events = store.get_events_by_entity(id).unwrap();
+            assert_eq!(events.len(), 1, "{id} was seeded twice by a second run");
+            let body = &events[0].body;
+            assert!(
+                crate::footer::fact_type(body).is_some(),
+                "{id} must be a typed fact - it is a template for how to write one"
+            );
+            assert!(
+                crate::footer::anchors(body).is_empty(),
+                "{id} must not claim an anchor: these are rules about behaviour, not about a file, \
+                 and a seeded anchor would take a scarce slot on someone else's target"
+            );
+        }
+        assert!(
+            crate::ledger::read_pins(&db).is_empty(),
+            "the starter pack must never pin on the user's behalf"
+        );
+    }
+
+    /// Retracting an example is a decision, and a later run must respect it.
+    /// The idempotence key is the entity's OWN history, not its current content,
+    /// precisely so that "I threw this one away" survives the next run.
+    #[test]
+    fn starter_pack_never_resurrects_an_example_the_user_threw_away() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("thor.db");
+        EventStore::new(&db).unwrap();
+        run_starter_pack(&db).unwrap();
+
+        let unwanted = STARTER_PACK[0].0;
+        {
+            let mut store = EventStore::new(&db).unwrap();
+            let head = store.get_events_by_entity(unwanted).unwrap()[0].this_hash.clone();
+            store
+                .append_mutate_checked(
+                    "s", "l", "a", EventKind::FactRetracted, unwanted, Some(&head), "not for me",
+                )
+                .unwrap();
+        }
+
+        run_starter_pack(&db).unwrap();
+
+        let store = EventStore::new(&db).unwrap();
+        let events = store.get_all_events().unwrap();
+        let head = crate::cas::compute_head_sets(&events)
+            .get(unwanted)
+            .unwrap()
+            .heads
+            .iter()
+            .next()
+            .unwrap()
+            .clone();
+        let kind = events.iter().find(|e| e.this_hash == head).map(|e| e.kind).unwrap();
+        assert_eq!(kind, EventKind::FactRetracted, "a retracted example must stay retracted");
     }
 
     /// A deterministic refusal must never freeze the batch (2026-07-30, found

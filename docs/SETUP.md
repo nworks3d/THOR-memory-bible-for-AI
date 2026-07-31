@@ -141,6 +141,34 @@ avoid that second one. The only way to avoid it is to not install a model.
 
 Optional: add `--backup-repo <path to a git clone>` for a daily backup.
 
+### Give the empty memory something to start from
+
+Right after this, your memory contains one note: the rules THOR hands your
+assistant about using a memory well. Nothing else. That makes the next few days
+harder than they need to be, because you cannot see what a rule worth keeping
+looks like until you have written a few bad ones.
+
+```sh
+thor starter-pack
+```
+
+Three short working rules land in your memory: finish what you start, split work
+by what it costs to be wrong, and let nothing leave your machine without being
+asked for it. They are examples, not instructions - deliberately written about
+the way of working rather than about any one tool, so they are still true in a
+year.
+
+They arrive **switched off in the quiet sense**: not pinned, so they are not put
+in front of your assistant at the start of every conversation. Your assistant
+only meets one when it happens to be the answer to something. That is on purpose
+- a pinned rule takes space in every single conversation, and that choice should
+be yours, not a gift you never opened.
+
+So look at them (`thor get thor-starter-finish-what-you-start`), keep what fits
+by pinning it, rewrite one in your own words with `thor revise`, and throw the
+rest away with `thor retract`. Running the command again adds nothing twice, and
+a rule you threw away is never put back.
+
 ---
 
 ## 3. Meaning search (worth it on your own machine)

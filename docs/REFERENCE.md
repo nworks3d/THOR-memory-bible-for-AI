@@ -343,6 +343,7 @@ which is the only store whose behaviour you care about.
 | `thor warm` | pre-warm the semantic embedder (idempotent; for SessionStart) |
 | `thor guard` / `thor stop-guard` | moment-of-action advisories (risk rulebook + first-touch file memories) / response advisories + a once-per-session capture nudge for unstored decisions/gotchas |
 | `thor install` | write the hooks into settings.json; also seeds THOR's working contract once, as a pinned global note with the fixed id `thor-working-contract`, so an assistant is handed the rules for using the memory at every session start instead of being asked to read a file. Seeded only when that id has no events yet, so re-running never overwrites your edits and never re-pins it after you unpin it |
+| `thor starter-pack` | add three example working rules to an empty memory - finish what you start, split work by what it costs to be wrong, nothing leaves without an explicit ask. Stored UNPINNED, so they change nothing until you pin one: they are there to show what a rule worth keeping looks like and to give recall something to find on day one. Idempotent per rule, and a rule you retract is never seeded again |
 | `thor vectors build \| sync \| status` | semantic sidecar (feature `semantic`) |
 | `thor embed-daemon` | warm embedder for the courier (feature `semantic`) |
 | `thor export` / `restore` / `backup` | JSONL backup + verified restore |

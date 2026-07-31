@@ -2169,6 +2169,70 @@ mod tests {
         );
     }
 
+    /// THE SHIPPED EXAMPLES MUST ACTUALLY WORK. `parse_rules` fails open by
+    /// design - malformed JSON yields an empty rule list and the guard simply
+    /// stays quiet - so a broken example would be copied by a new user and do
+    /// NOTHING, with no error anywhere. That is the exact silent-failure shape
+    /// this whole channel exists to prevent, so the templates get a gate of
+    /// their own: they parse, they are not empty, every rule can fire, and no
+    /// rule fires on EVERYTHING.
+    #[test]
+    fn the_shipped_example_rulebooks_parse_and_every_rule_can_fire() {
+        for name in ["guard-rulebook.example.json", "guard-response-rulebook.example.json"] {
+            let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(name);
+            let text = std::fs::read_to_string(&path)
+                .unwrap_or_else(|e| panic!("{name} must be readable: {e}"));
+            let rules = parse_rules(&text);
+            assert!(!rules.is_empty(), "{name} parsed to zero rules - malformed JSON fails OPEN");
+
+            let mut ids = std::collections::HashSet::new();
+            for r in &rules {
+                assert!(!r.id.trim().is_empty(), "{name}: a rule without an id");
+                assert!(ids.insert(r.id.clone()), "{name}: duplicate rule id {}", r.id);
+                assert!(
+                    !r.reminder.trim().is_empty(),
+                    "{name}: rule {} has no reminder - it would block with nothing to say",
+                    r.id
+                );
+                assert!(
+                    !r.all_of.is_empty() || !r.any_of.is_empty(),
+                    "{name}: rule {} has no matcher, so it fires on every message",
+                    r.id
+                );
+
+                // Round-trip: build the smallest haystack this rule claims to
+                // want and check it really fires, then add one of its own
+                // escape hatches and check it stops. A template nobody ever
+                // triggered is worth as little as a broken one.
+                let mut hay = String::new();
+                for s in r.all_of.iter().chain(r.any_of.iter().take(1)) {
+                    hay.push_str(&s.to_lowercase());
+                    hay.push(' ');
+                }
+                while hay.chars().count() < r.min_chars {
+                    hay.push_str("padding ");
+                }
+                // Command rules are tool-scoped (Bash/PowerShell); response
+                // rules are not. Ask each rule under a tool it accepts, or the
+                // check would only ever prove that a scoped rule stays silent
+                // for the wrong tool.
+                let tool = r.tools.first().map(String::as_str).unwrap_or("response");
+                let fired = evaluate(&rules, tool, &hay);
+                assert!(fired.iter().any(|f| f.contains(&r.reminder)), "{name}: rule {} never fires on its own trigger words", r.id);
+
+                if let Some(escape) = r.none_of.first() {
+                    let quiet = format!("{hay} {}", escape.to_lowercase());
+                    let fired = evaluate(&rules, tool, &quiet);
+                    assert!(
+                        !fired.iter().any(|f| f.contains(&r.reminder)),
+                        "{name}: rule {} ignores its own none_of escape hatch",
+                        r.id
+                    );
+                }
+            }
+        }
+    }
+
     #[test]
     fn test_salient_command_tokens_precision() {
         // structured composites and rare words survive; shell verbs and short

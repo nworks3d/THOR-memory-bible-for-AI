@@ -64,7 +64,15 @@ Then have them restart once, so it gets picked up.
 **6. Introduce it to their project.** Run `thor init` in the project folder. It
 marks the folder and reads the project's files into memory.
 
-**7. Prove it works before you say it works.** Run `thor doctor` again, then look
+**7. Offer them a few example rules.** Their memory is empty at this point, so
+there is nothing for you to find and nothing to show them what a rule worth
+keeping looks like. `thor starter-pack` puts three short working rules in it -
+finish what you start, split work by what it costs to be wrong, let nothing leave
+the machine without being asked. They arrive unpinned, so they change nothing on
+their own; say that plainly, and say they can pin the ones they like, rewrite
+them, or throw them out. Do not pin any of them for them.
+
+**8. Prove it works before you say it works.** Run `thor doctor` again, then look
 something up that you know is in there. Only then tell them setup is done.
 
 ---

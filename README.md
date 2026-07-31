@@ -123,6 +123,21 @@ of every conversation. Nothing to read, nothing to skip. You can see it with
 `thor get thor-working-contract`, edit it like any other note, or unpin it if
 you would rather write your own.
 
+**Optional - start with a few example rules.** A brand-new memory is empty, and
+an empty memory makes it hard to see what a rule worth keeping even looks like:
+
+```sh
+thor starter-pack
+```
+
+That puts three short working rules in your memory: finish what you start, split
+work by what it costs to be wrong, and let nothing leave your machine without
+being asked for it. They sit in the background - your assistant only sees one
+when it happens to be relevant - so they change nothing until you decide they
+should. Read one with `thor get`, keep the ones that fit by pinning them, rewrite
+them in your own words, or throw them out. Run the command twice and nothing
+doubles up; throw one away and it stays away.
+
 If you are the assistant doing the setup, [AGENTS.md](AGENTS.md) is the
 walkthrough for the steps above.
 

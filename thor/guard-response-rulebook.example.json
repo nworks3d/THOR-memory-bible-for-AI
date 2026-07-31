@@ -1,19 +1,89 @@
 [
   {
-    "id": "ask-user-to-commit-push",
-    "any_of": ["naar welke branch", "welke branch", "which branch", "zal ik pushen", "kun je pushen", "kun je committen", "committen + "],
-    "none_of": ["pull request", "merge request"],
-    "reminder": "You can commit and push yourself (passwordless git). Pick the branch per the repo's deploy rules and do it - do not ask the user which branch or to push for you."
+    "id": "asks-permission-for-what-was-already-asked",
+    "any_of": [
+      "shall i go ahead",
+      "should i go ahead",
+      "do you want me to",
+      "would you like me to",
+      "should i commit",
+      "shall i commit",
+      "should i push",
+      "want me to push",
+      "let me know if you want me to",
+      "just say the word"
+    ],
+    "none_of": ["false positive", "for example", "rulebook", "any_of", "misfire"],
+    "reminder": "They already asked for this. Do it, and settle the small details yourself from the project's own rules - do not hand their own request back to them as a question. Ask only when the next step is genuinely theirs: new cost, something irreversible, or a change of direction."
   },
   {
-    "id": "claim-no-access-without-checking",
-    "any_of": ["kan ik van hieruit niet", "geen tailnet", "geen nas-toegang", "geen toegang", "ik heb geen toegang", "i can't reach", "i don't have access", "no access to the nas"],
-    "none_of": ["read-only", "alleen-lezen"],
-    "reminder": "Verify before claiming you cannot: you likely have passwordless git + SSH/SMB to the NAS. Check what you actually reach (facts first) and read the repo's deploy/procedure tips instead of assuming."
+    "id": "claims-it-cannot-without-checking",
+    "any_of": [
+      "i don't have access",
+      "i do not have access",
+      "i can't access",
+      "i cannot access",
+      "i'm unable to reach",
+      "i am unable to reach",
+      "i have no way to",
+      "that is outside what i can"
+    ],
+    "none_of": ["false positive", "for example", "rulebook", "read-only", "i tried"],
+    "reminder": "Check before you claim you cannot. Run the command, list the directory, open the file - a refusal you never tested is a guess, and it costs the user a task they could have had. If it really does fail, say what you tried and what came back."
   },
   {
-    "id": "ask-user-to-check-or-fetch",
-    "any_of": ["kun je checken", "kun je kijken", "could you check", "can you check", "can you pull up", "paste me", "would you mind pulling", "let me know what it says"],
-    "reminder": "You likely have the tools/access to check this yourself (SSH/SMB, or by reading the repo) - do it directly rather than asking the user."
+    "id": "asks-the-user-to-fetch",
+    "any_of": [
+      "can you check",
+      "could you check",
+      "can you paste",
+      "could you paste",
+      "can you send me the",
+      "let me know what it says",
+      "can you look up",
+      "could you run that and tell me"
+    ],
+    "none_of": ["false positive", "for example", "rulebook", "does that match what you meant"],
+    "reminder": "Look it up yourself first. You can usually read the file, run the command or search the project - asking the user to fetch something you can reach yourself costs them a round trip for nothing. Ask only for what genuinely lives in their head or on their screen."
+  },
+  {
+    "id": "results-without-a-plain-language-opening",
+    "min_chars": 1200,
+    "any_of": [
+      "tests passed",
+      "test result",
+      "exit code",
+      "all green",
+      "benchmark",
+      "measured",
+      "throughput",
+      "coverage"
+    ],
+    "none_of": [
+      "in short",
+      "short version",
+      "summary:",
+      "tldr",
+      "the short answer",
+      "false positive",
+      "rulebook"
+    ],
+    "reminder": "This reads like results and it opens with detail. Start with two or three sentences in ordinary language: what you did, whether it works, and what it means for the person reading. Keep every number - put it under that opening instead of in front of it."
+  },
+  {
+    "id": "hands-back-a-diff-instead-of-the-artifact",
+    "min_chars": 400,
+    "any_of": [
+      "here's the changed part",
+      "here is the changed part",
+      "the changed lines",
+      "just the diff",
+      "replace that section with",
+      "the rest stays the same",
+      "the rest is unchanged",
+      "leave the rest as is"
+    ],
+    "none_of": ["false positive", "for example", "rulebook", "full file below", "here is the complete"],
+    "reminder": "After changing a document, script or any other artifact, hand back the WHOLE thing, not the lines that moved. The reader has to be able to use it - copy it, send it, publish it - without first reassembling it in their head from your patch."
   }
 ]

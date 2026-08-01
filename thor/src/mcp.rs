@@ -462,20 +462,93 @@ impl ThorServer {
         ThorServer { store, project, db, tool_router: Self::tool_router(), inbox }
     }
 
+    /// The panic's own message, not just "task N panicked".
+    ///
+    /// A caller who is told to report a bug can only do that with the text. The
+    /// case that made this worth extracting was a UTF-8 slice panic whose
+    /// message ("byte index 11 is not a char boundary; it is inside an em
+    /// dash") named the offending character and thereby the offending fact,
+    /// while the JoinError alone named neither.
+    fn panic_message(e: tokio::task::JoinError) -> String {
+        if e.is_cancelled() {
+            return "the task was cancelled".to_string();
+        }
+        match e.try_into_panic() {
+            Ok(payload) => payload
+                .downcast_ref::<&str>()
+                .map(|s| (*s).to_string())
+                .or_else(|| payload.downcast_ref::<String>().cloned())
+                .unwrap_or_else(|| "panic with no message".to_string()),
+            Err(other) => other.to_string(),
+        }
+    }
+
     /// Run a sync store closure off the async runtime; its Ok/Err String is the
     /// tool's returned text either way (tool errors are surfaced as content).
+    ///
+    /// A PANIC IN HERE USED TO LIE ABOUT THE DIRECTION OF THE FAILURE, and that
+    /// was more expensive than the panic itself. The reply was a flat
+    /// "error: task panicked", so a caller read it as "nothing was stored" and
+    /// wrote the fact again. But a tool panics AFTER its append just as easily
+    /// as before it: every write tool does its store call first and then formats
+    /// hints, warnings and pointers to neighbouring facts. Measured on
+    /// 2026-08-01: four writes reported as failures had all landed, and
+    /// re-trying them left four silent duplicates in a store whose first rule is
+    /// never to hold a second copy.
+    ///
+    /// So the reply now states which side of the append the panic fell on. The
+    /// witness is `cache_fingerprint()` - (row count, max seq), index-only,
+    /// ~0.02ms, and exact for the append-only event table.
     fn blocking<F>(&self, f: F) -> impl std::future::Future<Output = String>
     where
         F: FnOnce(&mut EventStore) -> Result<String, String> + Send + 'static,
     {
         let store = self.store.clone();
+        let witness = self.store.clone();
+        // The BEFORE reading is taken inside the blocking task, never on a
+        // runtime thread: the store mutex is a std lock that a long recall can
+        // hold for tens of milliseconds, and grabbing it from the reactor would
+        // trade a rare panic for a routine stall.
+        let before: Arc<Mutex<Option<(i64, i64)>>> = Arc::new(Mutex::new(None));
+        let before_writer = before.clone();
         async move {
-            tokio::task::spawn_blocking(move || {
+            match tokio::task::spawn_blocking(move || {
                 let mut s = store.lock().unwrap_or_else(|p| p.into_inner());
+                if let Ok(mut slot) = before_writer.lock() {
+                    *slot = s.cache_fingerprint().ok();
+                }
                 f(&mut s).unwrap_or_else(|e| e)
             })
             .await
-            .unwrap_or_else(|e| format!("error: task panicked: {e}"))
+            {
+                Ok(text) => text,
+                Err(join_err) => {
+                    let after = {
+                        // The panic poisons the mutex; recovering it is correct
+                        // here because the log is a database, not the guarded
+                        // in-memory state, and it is append-only.
+                        let s = witness.lock().unwrap_or_else(|p| p.into_inner());
+                        s.cache_fingerprint().ok()
+                    };
+                    let cause = Self::panic_message(join_err);
+                    let before = before.lock().ok().and_then(|g| *g);
+                    match (before, after) {
+                        (Some(b), Some(a)) if a != b => format!(
+                            "PARTIAL: the write LANDED, then a later step failed ({cause}). \
+                             DO NOT retry - retrying is what creates a duplicate. Check with \
+                             recall or get, and report this: it is a bug in THOR, not in your call."
+                        ),
+                        (Some(b), Some(a)) if a == b => format!(
+                            "NOT stored - nothing was written ({cause}). The log is unchanged, so \
+                             retrying is safe. Please report this."
+                        ),
+                        _ => format!(
+                            "error: a step failed ({cause}) and THOR could not determine whether \
+                             the write landed. Check with recall or get BEFORE retrying."
+                        ),
+                    }
+                }
+            }
         }
     }
 
@@ -2750,6 +2823,48 @@ mod tests {
         // ...and the replica log is untouched (this is what stops the fork).
         let events = server.store.lock().unwrap().get_all_events().unwrap();
         assert!(events.is_empty(), "a diverted write must NOT append to the log");
+    }
+
+    /// Measured 2026-08-01: a panic AFTER the append was reported as
+    /// "error: task panicked", the caller read that as "nothing was stored",
+    /// wrote the fact again, and the store gained a silent duplicate - four
+    /// times over, in a store whose first rule is never to hold a second copy.
+    /// The reply has to say which side of the append the failure fell on.
+    #[tokio::test]
+    async fn a_panic_after_the_write_says_the_write_landed() {
+        let (server, _d) = server_with(EventStore::in_memory().unwrap());
+        let reply = server
+            .blocking(|s| {
+                s.append_event("s", "l", "a", EventKind::FactCreated, "e-panic", None, "landed")
+                    .unwrap();
+                panic!("byte index 11 is not a char boundary");
+            })
+            .await;
+        assert!(reply.starts_with("PARTIAL:"), "names the direction of the failure: {reply}");
+        assert!(reply.contains("DO NOT retry"), "retrying is what duplicates: {reply}");
+        assert!(reply.contains("char boundary"), "carries the real cause: {reply}");
+        // And the write really is there, which is the whole point of saying so.
+        // The panic poisoned the mutex; recover it exactly as production does,
+        // because the guarded value is an append-only database rather than
+        // in-memory state a panic could have left half-updated.
+        let guard = server.store.lock().unwrap_or_else(|p| p.into_inner());
+        assert_eq!(guard.get_all_events().unwrap().len(), 1, "the append survived the panic");
+    }
+
+    #[tokio::test]
+    async fn a_panic_before_the_write_says_retrying_is_safe() {
+        let (server, _d) = server_with(EventStore::in_memory().unwrap());
+        let reply = server.blocking(|_s| panic!("refused before touching the log")).await;
+        assert!(reply.starts_with("NOT stored"), "no write, so say so plainly: {reply}");
+        assert!(reply.contains("retrying is safe"), "{reply}");
+        assert!(reply.contains("refused before touching the log"), "carries the cause: {reply}");
+    }
+
+    #[tokio::test]
+    async fn an_ordinary_tool_error_is_untouched_by_the_panic_handling() {
+        let (server, _d) = server_with(EventStore::in_memory().unwrap());
+        let reply = server.blocking(|_s| Err("a normal refusal".to_string())).await;
+        assert_eq!(reply, "a normal refusal");
     }
 
     fn recall_args(query: &str) -> RecallArgs {

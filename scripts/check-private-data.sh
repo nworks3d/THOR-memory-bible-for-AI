@@ -17,7 +17,7 @@
 #     ln -sf ../../scripts/check-private-data.sh .git/hooks/pre-commit
 #
 # Adding a token: add it to PATTERN below. Public brand names are deliberately
-# absent - nworks3d, N-Works 3D, NoizieWorks and the PayPal/YouTube links in
+# absent - nworks3d, N-Works 3D, NoizieWorks and the Ko-fi/YouTube links in
 # README.md and .github/FUNDING.yml are meant to be public, so listing them
 # would make this gate cry wolf and get ignored.
 #

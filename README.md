@@ -3,8 +3,8 @@
 # THOR - a memory for your AI coding assistant
 
 THOR is free and GPLv3. If it earns its keep, you can support the work:
-**[donate via PayPal](https://www.paypal.com/paypalme/ognoizieworks)** or
-**[become a YouTube member](https://www.youtube.com/@NoizieWorks/join)** -
+**[buy me a Ko-fi](https://ko-fi.com/noizieworks)** or
+**[become a YouTube member](https://www.youtube.com/channel/UCrEZc_oJR9mywNjqY115mRg/join)** -
 no pressure, no paywall, everything stays open either way.
 
 > **Are you an AI assistant, setting THOR up for the person you work with?** Go
@@ -241,13 +241,13 @@ you. The tool is here. The verdict is yours.
 
 ## Support this project
 
-THOR is built by [N-Works 3D](https://www.youtube.com/@NoizieWorks). If it has
+THOR is built by [N-Works 3D](https://www.youtube.com/channel/UCrEZc_oJR9mywNjqY115mRg). If it has
 earned its keep - saved you an explanation, caught a mistake before it cost you,
 or just meant you did not have to start from scratch - there are two easy ways
 to help keep it going:
 
-- **PayPal**: https://www.paypal.com/paypalme/ognoizieworks
-- **YouTube members**: https://www.youtube.com/@NoizieWorks/join
+- **Ko-fi**: https://ko-fi.com/noizieworks
+- **YouTube members**: https://www.youtube.com/channel/UCrEZc_oJR9mywNjqY115mRg/join
 
 No pressure and no paywall - it all stays open either way. Skål, and thanks for
 reading this far.

@@ -1,0 +1,2888 @@
+use rusqlite::{Connection, OpenFlags, Result as SqlResult, params};
+use sha2::{Sha256, Digest};
+use uuid::Uuid;
+use std::collections::HashSet;
+use std::path::Path;
+use std::time::Duration;
+
+#[derive(Debug, Clone)]
+pub struct Event {
+    pub seq: i64,
+    pub event_uuid: String,
+    pub session_id: String,
+    pub lineage_id: String,
+    pub actor: String,
+    pub kind: EventKind,
+    pub entity_id: String,
+    pub parent_rev: Option<String>,
+    pub body: String,
+    pub body_ch: String,
+    pub prev_hash: String,
+    pub this_hash: String,
+}
+
+/// One event as shipped between machines (log shipping). Exactly the JSONL
+/// backup field set: the fact-content quad + provenance + the authority's seq and
+/// this_hash. `event_uuid` and `prev_hash` are deliberately omitted - event_uuid
+/// is local identity (regenerated on ingest, never hashed) and prev_hash is
+/// implied by the receiver's own chain tail (that IS the continuity check).
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct ShippedEvent {
+    pub seq: i64,
+    pub session_id: String,
+    pub lineage_id: String,
+    pub actor: String,
+    pub kind: String,
+    pub entity_id: String,
+    #[serde(default)]
+    pub parent_rev: Option<String>,
+    pub body: String,
+    pub this_hash: String,
+}
+
+impl Event {
+    /// Wire form for shipping this event to a replica.
+    pub fn to_shipped(&self) -> ShippedEvent {
+        ShippedEvent {
+            seq: self.seq,
+            session_id: self.session_id.clone(),
+            lineage_id: self.lineage_id.clone(),
+            actor: self.actor.clone(),
+            kind: self.kind.as_str().to_string(),
+            entity_id: self.entity_id.clone(),
+            parent_rev: self.parent_rev.clone(),
+            body: self.body.clone(),
+            this_hash: self.this_hash.clone(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EventKind {
+    FactCreated,
+    FactRevised,
+    FactSuperseded,
+    FactRetracted,
+    FactReasserted,
+    FactEchoed,
+    FactResolved,
+    /// Reassigns the fact's PROJECT scope (body = `{"project":"<key>"}` or
+    /// `{"project":null}` for global). Never changes the head-set; folded like a
+    /// no-op for heads, read only by the project fold (see cas::compute_projects).
+    FactReprojected,
+    /// A model-layer item was served at a gate. Head-neutral, like
+    /// FactReasserted/FactEchoed/FactReprojected: it records delivery
+    /// telemetry only, never the fact content. Defined here so a later phase
+    /// can append it without changing this enum again; not yet written by
+    /// any code path in this workspace (see crate `model`'s `served` module).
+    ItemServed,
+    /// A model-layer item was marked useful - the other half of the decay
+    /// doctrine (see crate `serve`'s `decay` module): an item served
+    /// repeatedly and never marked useful eventually stops reaching an
+    /// injection surface, and a single mark here cancels that permanently.
+    /// Head-neutral, exactly like `ItemServed`: telemetry only, never fact
+    /// content (see crate `model`'s `marked` module for the body shape).
+    ItemMarkedUseful,
+    /// A model-layer item was marked NOISE where it fired - the reader saying
+    /// "this did not belong here". Head-neutral, exactly like `ItemServed`
+    /// and `ItemMarkedUseful`: telemetry only, never fact content.
+    ///
+    /// Why this exists (2026-08-03). Decay by silence was falsified on its
+    /// first day of real use: zero usefulness marks occur, so "never marked
+    /// useful" is a constant and the rule degenerated into a timer that
+    /// retired the most-used rules first. What it needed was the OTHER
+    /// signal, and 1.0 already had it - a ledger of 182 explicit noise
+    /// judgements the migration left behind. An explicit negative is a real
+    /// observation; the absence of a positive is not.
+    ItemMarkedNoise,
+}
+
+impl EventKind {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            EventKind::FactCreated => "fact_created",
+            EventKind::FactRevised => "fact_revised",
+            EventKind::FactSuperseded => "fact_superseded",
+            EventKind::FactRetracted => "fact_retracted",
+            EventKind::FactReasserted => "fact_reasserted",
+            EventKind::FactEchoed => "fact_echoed",
+            EventKind::FactResolved => "fact_resolved",
+            EventKind::FactReprojected => "fact_reprojected",
+            EventKind::ItemServed => "item_served",
+            EventKind::ItemMarkedUseful => "item_marked_useful",
+            EventKind::ItemMarkedNoise => "item_marked_noise",
+        }
+    }
+
+    pub fn from_str(s: &str) -> Option<Self> {
+        match s {
+            "fact_created" => Some(EventKind::FactCreated),
+            "fact_revised" => Some(EventKind::FactRevised),
+            "fact_superseded" => Some(EventKind::FactSuperseded),
+            "fact_retracted" => Some(EventKind::FactRetracted),
+            "fact_reasserted" => Some(EventKind::FactReasserted),
+            "fact_echoed" => Some(EventKind::FactEchoed),
+            "fact_resolved" => Some(EventKind::FactResolved),
+            "fact_reprojected" => Some(EventKind::FactReprojected),
+            "item_served" => Some(EventKind::ItemServed),
+            "item_marked_useful" => Some(EventKind::ItemMarkedUseful),
+            "item_marked_noise" => Some(EventKind::ItemMarkedNoise),
+            _ => None,
+        }
+    }
+}
+
+pub fn canonicalize_body(body: &str) -> String {
+    // Normalize CRLF and lone CR to LF so the same logical content always
+    // canonicalizes (and therefore hashes) identically across platforms
+    // and editors, then strip trailing whitespace.
+    body.replace("\r\n", "\n")
+        .replace('\r', "\n")
+        .trim_end()
+        .to_string()
+}
+
+pub fn hash_event(prev_hash: &str, canonical_repr: &str) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(prev_hash.as_bytes());
+    hasher.update(b"\n");
+    hasher.update(canonical_repr.as_bytes());
+    format!("{:x}", hasher.finalize())
+}
+
+/// Frame one field as `<byte-len>:<bytes>`. Concatenating framed fields is an
+/// INJECTIVE encoding: a decoder reads the decimal length, then exactly that
+/// many bytes, so nothing a field contains ('|', ':', digits, newlines) can
+/// shift a field boundary. A bare "a|b|c" join is NOT injective when the fields
+/// are free text: (entity_id="x", body_ch="y||z") and (entity_id="x||y",
+/// body_ch="z") both flatten to "...|x||y||z", so a stored row could be
+/// rewritten to a different (entity_id, body) that hashes identically and slips
+/// past fsck (and even past replica tip-comparison, since this_hash is
+/// unchanged). Length-framing closes that: any change to a HASHED field (the
+/// four below) alters the canonical and therefore the recomputed hash.
+fn frame(field: &str) -> String {
+    format!("{}:{}", field.len(), field)
+}
+
+/// The single canonical representation of an event that is hashed into
+/// this_hash. The writer (append) and the auditor (fsck) MUST both go through
+/// this function so their notions of "the hashed content" can never drift.
+///
+/// This is `canonical(event)` from the spec formula
+/// `this_hash = sha256(prev_hash || canonical(event))` (design section 4):
+/// `canonical(event) = frame(kind) . frame(entity_id) . frame(parent_rev) .
+/// frame(body_ch)`. It covers exactly the FACT-CONTENT QUAD, no more. Two kinds
+/// of fields are deliberately OUTSIDE the hash:
+///
+/// - the storage `seq`: a hub-assigned counter, not part of the event's
+///   meaning; its integrity is enforced structurally by fsck (seq must be
+///   contiguous from 1, and the prev_hash chain binds every event to its exact
+///   position - rewriting a position forces rewriting the whole suffix, true
+///   with or without seq in the hash, since M0 carries no external signature);
+/// - the provenance fields `actor`, `session_id`, `lineage_id`: per the schema
+///   these are display/provenance-only and never decision input, so M0 does
+///   NOT make them tamper-evident. A rewrite of actor/session/lineage on a row
+///   passes fsck; that is an accepted M0 stance, not a covered field. (If
+///   provenance ever needs tamper-evidence, add it to the canonical then.)
+///
+/// An empty-string parent_rev is normalized to "no parent" before hashing (see
+/// insert_event), so `None` and `Some("")` can never denote distinct events.
+pub fn canonical_repr_parts(
+    kind: EventKind,
+    entity_id: &str,
+    parent_rev: Option<&str>,
+    body_ch: &str,
+) -> String {
+    format!(
+        "{}{}{}{}",
+        frame(kind.as_str()),
+        frame(entity_id),
+        frame(parent_rev.unwrap_or("")),
+        frame(body_ch)
+    )
+}
+
+pub fn canonical_repr(event: &Event) -> String {
+    canonical_repr_parts(
+        event.kind,
+        &event.entity_id,
+        event.parent_rev.as_deref(),
+        &event.body_ch,
+    )
+}
+
+/// A resolve was rejected because the head-set it cited does not match the
+/// current head-set (multi-head CAS failure). Carries the fresh head-set so
+/// the caller can retry citing exactly what is current.
+#[derive(Debug, thiserror::Error)]
+#[error("resolve rejected for entity {entity_id}: {reason}; current head-set: {current_heads:?}")]
+pub struct ResolveConflict {
+    pub entity_id: String,
+    pub reason: String,
+    pub current_heads: Vec<String>,
+}
+
+/// A checked revise/retract was rejected: the entity is unknown, diverged with
+/// no parent cited, or the cited parent_rev is not a current head. Carries the
+/// fresh head-set so the caller can retry citing exactly what is current -
+/// the MCP write path returns this instead of ever minting a silent branch.
+#[derive(Debug, thiserror::Error)]
+#[error("mutate rejected for entity {entity_id}: {reason}; current head-set: {current_heads:?}")]
+pub struct MutateConflict {
+    pub entity_id: String,
+    pub reason: String,
+    pub current_heads: Vec<String>,
+}
+
+/// Result of ingesting a shipped batch into a replica (log shipping receiver).
+#[derive(Debug)]
+pub enum IngestOutcome {
+    /// The batch continued our chain. `applied` new events were appended,
+    /// `skipped` were already present (idempotent re-ship). `contiguous_seq` /
+    /// `tip_hash` are the replica's tip AFTER ingest.
+    Applied {
+        applied: usize,
+        skipped: usize,
+        contiguous_seq: i64,
+        tip_hash: String,
+    },
+    /// The batch does NOT continue our chain (a gap, a fork on shared history, or
+    /// a tampered payload). NOTHING was written - the whole batch is atomic.
+    /// `contiguous_seq` / `tip_hash` are our UNCHANGED tip, so the shipper can
+    /// resume from exactly there.
+    Rejected {
+        reason: String,
+        at_seq: i64,
+        contiguous_seq: i64,
+        tip_hash: String,
+    },
+}
+
+const EVENT_COLUMNS: &str = "seq, event_uuid, session_id, lineage_id, actor, kind, entity_id, \
+                             parent_rev, body, body_ch, prev_hash, this_hash";
+
+fn row_to_event(row: &rusqlite::Row) -> rusqlite::Result<Event> {
+    // `kind` is read through `get_ref` (a borrowed `&str` straight off the
+    // column, no allocation) instead of `get::<_, String>` - the column value
+    // exists only to be matched against `EventKind::from_str` and thrown away
+    // immediately after, so the allocation `get::<_, String>` used to do on
+    // EVERY row (this runs once per row of the whole log, not just the head
+    // set) was pure waste. Every other field is returned to the caller, so it
+    // still needs its own owned `String`.
+    let kind_str: &str = row.get_ref(5)?.as_str()?;
+    Ok(Event {
+        seq: row.get(0)?,
+        event_uuid: row.get(1)?,
+        session_id: row.get(2)?,
+        lineage_id: row.get(3)?,
+        actor: row.get(4)?,
+        kind: EventKind::from_str(kind_str).ok_or(rusqlite::Error::InvalidQuery)?,
+        entity_id: row.get(6)?,
+        parent_rev: row.get(7)?,
+        body: row.get(8)?,
+        body_ch: row.get(9)?,
+        prev_hash: row.get(10)?,
+        this_hash: row.get(11)?,
+    })
+}
+
+/// One row the binding projection (`item_binding`) wants out of an item
+/// body: which shape (`moment`/`target`/`always`), the moment's action string
+/// or the target's raw value, and the target's own kind when there is one.
+struct BindingRow {
+    kind: &'static str,
+    value: Option<String>,
+    target_kind: Option<String>,
+}
+
+/// Pull every binding row out of an item body, generically - `core` never
+/// depends on crate `model` (the reverse dependency runs the other way), so
+/// this reads the JSON structurally instead of through `model::item::Binding`.
+/// Mirrors that type's own (default, externally-tagged) wire shape exactly:
+/// `"always"` (a bare string), `{"moment":"<action>"}`, or
+/// `{"target":{"kind":"<kind>","value":"<value>"}}` - pinned against the real
+/// shape by `model`'s own round-trip tests (`model/src/item.rs`) and by this
+/// module's `item_binding_rows_match_the_real_wire_shape` test below. A body
+/// with no `bindings` array, or one that does not parse at all, yields no
+/// rows rather than an error - this is a read path, not a write path, same as
+/// every other reader on this boundary.
+fn extract_binding_rows(body: &str) -> Vec<BindingRow> {
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(body) else { return Vec::new() };
+    let Some(bindings) = value.get("bindings").and_then(|b| b.as_array()) else { return Vec::new() };
+    let mut out = Vec::new();
+    for binding in bindings {
+        if let Some(s) = binding.as_str() {
+            if s == "always" {
+                out.push(BindingRow { kind: "always", value: None, target_kind: None });
+            }
+            continue;
+        }
+        let Some(obj) = binding.as_object() else { continue };
+        if let Some(action) = obj.get("moment").and_then(|m| m.as_str()) {
+            out.push(BindingRow { kind: "moment", value: Some(action.to_string()), target_kind: None });
+            continue;
+        }
+        if let Some(target) = obj.get("target").and_then(|t| t.as_object()) {
+            let tk = target.get("kind").and_then(|k| k.as_str()).map(str::to_string);
+            let val = target.get("value").and_then(|v| v.as_str()).map(str::to_string);
+            if let Some(tk) = tk {
+                out.push(BindingRow { kind: "target", value: val, target_kind: Some(tk) });
+            }
+        }
+    }
+    out
+}
+
+fn next_seq(conn: &Connection) -> SqlResult<i64> {
+    conn.query_row("SELECT COALESCE(MAX(seq), 0) + 1 FROM event", [], |row| row.get(0))
+}
+
+fn last_hash(conn: &Connection) -> SqlResult<String> {
+    // "" is the genesis prev_hash and is returned ONLY for a genuinely empty
+    // log. Every other error (BUSY, IO error, corruption) propagates: mapping
+    // it to "" would durably commit a forged chain break.
+    let result = conn.query_row(
+        "SELECT this_hash FROM event ORDER BY seq DESC LIMIT 1",
+        [],
+        |row| row.get::<_, String>(0),
+    );
+    match result {
+        Ok(hash) => Ok(hash),
+        Err(rusqlite::Error::QueryReturnedNoRows) => Ok(String::new()),
+        Err(e) => Err(e),
+    }
+}
+
+/// The hole-proof "contiguous tip": (contiguous_seq, tip_hash) where
+/// contiguous_seq is the highest N such that EVERY seq 1..=N is present (never
+/// MAX(seq) - a gap above a hole must not be reported as reached), and tip_hash
+/// is the this_hash at that seq. (0, "") for an empty log or a gap from the very
+/// start. The predicate `e.seq == COUNT(x.seq <= e.seq)` holds exactly when the
+/// prefix 1..=e.seq is dense; MAX over those rows is the contiguous frontier.
+fn contiguous_tip_conn(conn: &Connection) -> SqlResult<(i64, String)> {
+    // contiguous_seq = the highest N such that every seq 1..=N is present.
+    // Robust against an externally-injected non-positive seq: a seq <= 0 must
+    // NEITHER mask a real hole above it NOR sink a clean 1..K prefix to 0, so the
+    // whole computation is scoped to seq >= 1. Fast on the healthy path: when the
+    // positive seqs are already dense from 1 (MAX == COUNT over seq >= 1) the
+    // frontier is just MAX (index-only); only a genuine hole falls through to the
+    // first-gap scan, which MIN short-circuits at the lowest gap (so it is cheap
+    // exactly when a low hole would make a COUNT(x.seq <= e.seq) form quadratic).
+    let cseq: i64 = conn.query_row(
+        "SELECT CASE \
+           WHEN NOT EXISTS (SELECT 1 FROM event WHERE seq = 1) THEN 0 \
+           WHEN (SELECT MAX(seq) FROM event WHERE seq >= 1) \
+              = (SELECT COUNT(*) FROM event WHERE seq >= 1) \
+             THEN (SELECT MAX(seq) FROM event WHERE seq >= 1) \
+           ELSE (SELECT MIN(e.seq) FROM event e WHERE e.seq >= 1 \
+                 AND NOT EXISTS (SELECT 1 FROM event n WHERE n.seq = e.seq + 1)) \
+         END",
+        [],
+        |r| r.get(0),
+    )?;
+    if cseq == 0 {
+        return Ok((0, String::new()));
+    }
+    let hash: String =
+        conn.query_row("SELECT this_hash FROM event WHERE seq = ?", [cseq], |r| r.get(0))?;
+    Ok((cseq, hash))
+}
+
+fn this_hash_at(conn: &Connection, seq: i64) -> SqlResult<Option<String>> {
+    match conn.query_row("SELECT this_hash FROM event WHERE seq = ?", [seq], |r| {
+        r.get::<_, String>(0)
+    }) {
+        Ok(h) => Ok(Some(h)),
+        Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+        Err(e) => Err(e),
+    }
+}
+
+fn query_all_events(conn: &Connection) -> SqlResult<Vec<Event>> {
+    let mut stmt = conn.prepare(&format!("SELECT {} FROM event ORDER BY seq", EVENT_COLUMNS))?;
+    let events = stmt.query_map([], row_to_event)?;
+    events.collect()
+}
+
+fn query_events_by_entity(conn: &Connection, entity_id: &str) -> SqlResult<Vec<Event>> {
+    let mut stmt = conn
+        .prepare(&format!("SELECT {} FROM event WHERE entity_id = ? ORDER BY seq", EVENT_COLUMNS))?;
+    let events = stmt.query_map([entity_id], row_to_event)?;
+    events.collect()
+}
+
+/// Insert one event on a handle that ALREADY holds the immediate (RESERVED)
+/// write lock. seq and prev_hash are read on that same handle, inside the
+/// transaction: two writers can therefore never observe the same
+/// MAX(seq)/last hash and race each other. The caller commits.
+fn insert_event(
+    conn: &Connection,
+    session_id: &str,
+    lineage_id: &str,
+    actor: &str,
+    kind: EventKind,
+    entity_id: &str,
+    parent_rev: Option<&str>,
+    body: &str,
+) -> anyhow::Result<Event> {
+    let event_uuid = Uuid::new_v4().to_string();
+    let body_ch = canonicalize_body(body);
+
+    // Normalize an empty parent_rev to "no parent": an empty string is not a
+    // valid rev (revs are 64-hex sha256 hashes), and leaving Some("") around
+    // would alias with None in the canonical (both frame to "0:"). Coercing it
+    // here keeps the empty-parent state unrepresentable end to end (stored NULL,
+    // hashed as no-parent), so None and Some("") can never denote two events.
+    let parent_rev = parent_rev.filter(|p| !p.is_empty());
+
+    let seq = next_seq(conn)?;
+    let prev_hash = last_hash(conn)?;
+
+    let canonical = canonical_repr_parts(kind, entity_id, parent_rev, &body_ch);
+    let this_hash = hash_event(&prev_hash, &canonical);
+
+    conn.execute(
+        "INSERT INTO event (seq, event_uuid, session_id, lineage_id, actor, kind, entity_id,
+         parent_rev, body, body_ch, prev_hash, this_hash) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        params![
+            seq,
+            &event_uuid,
+            session_id,
+            lineage_id,
+            actor,
+            kind.as_str(),
+            entity_id,
+            parent_rev,
+            body,
+            &body_ch,
+            &prev_hash,
+            &this_hash
+        ],
+    )?;
+
+    // Recall projection, SAME transaction as the append: the FTS index can
+    // never be more or less current than the log it indexes.
+    conn.execute(
+        "INSERT INTO event_fts(rowid, body_ch) VALUES (?, ?)",
+        params![seq, &body_ch],
+    )?;
+
+    // Heads projection (M2), SAME transaction. Incremental when the
+    // projection is exactly one event behind; any gap (fresh table, a store
+    // written by a pre-M2 binary, a bulk path that bypassed append) triggers
+    // a full in-transaction rebuild - amortized once, and the projection can
+    // never advance from a wrong base.
+    let tip: i64 = conn
+        .query_row("SELECT v FROM projection_meta WHERE k = 'tip_seq'", [], |r| r.get(0))
+        .unwrap_or(0);
+    if tip == seq - 1 {
+        EventStore::apply_projection_delta(
+            conn, seq, kind, entity_id, parent_rev, body, &this_hash,
+        )?;
+        conn.execute(
+            "INSERT INTO projection_meta (k, v) VALUES ('tip_seq', ?)
+             ON CONFLICT(k) DO UPDATE SET v = excluded.v",
+            params![seq],
+        )?;
+    } else {
+        EventStore::rebuild_projection(conn)?;
+    }
+
+    Ok(Event {
+        seq,
+        event_uuid,
+        session_id: session_id.to_string(),
+        lineage_id: lineage_id.to_string(),
+        actor: actor.to_string(),
+        kind,
+        entity_id: entity_id.to_string(),
+        parent_rev: parent_rev.map(|s| s.to_string()),
+        body: body.to_string(),
+        body_ch,
+        prev_hash,
+        this_hash,
+    })
+}
+
+pub struct EventStore {
+    conn: Connection,
+}
+
+impl EventStore {
+    pub fn new(path: &Path) -> SqlResult<Self> {
+        let conn = Connection::open(path)?;
+        // Serialize competing writers instead of erroring with SQLITE_BUSY.
+        conn.busy_timeout(Duration::from_secs(5))?;
+        conn.execute_batch("PRAGMA journal_mode = WAL")?;
+        conn.execute_batch("PRAGMA synchronous = FULL")?;
+        // A bigger page cache than SQLite's 2MB default (negative = KiB, so
+        // 20000 = ~20MB): this connection reads the SAME event-table pages
+        // more than once in a single hook call (the heads projection join,
+        // then `event_kinds` runs twice for the two decay folds), and the
+        // default cache is smaller than the log on any real store, so the
+        // second and third reads were paying for a disk fetch that the first
+        // read had already done moments earlier. Read-only tuning: changes
+        // nothing about what any query returns.
+        conn.execute_batch("PRAGMA cache_size = -20000")?;
+        Self::init_schema(&conn)?;
+        Self::sync_fts(&conn)?;
+        Self::ensure_item_binding_projection(&conn)?;
+        Ok(EventStore { conn })
+    }
+
+    /// Open an EXISTING store to look at it: no create, no schema work, no FTS
+    /// heal. `new` is the right constructor for anything that writes, but the
+    /// inspection commands (doctor, fsck, status) went through it too, and it
+    /// CREATES the file when it is missing. A typo in `--db` therefore produced a
+    /// brand-new empty store that then looked like a healthy but empty THOR -
+    /// the worst possible answer to "why is my memory not coming back". Skipping
+    /// the FTS heal also lets fsck report a broken projection instead of quietly
+    /// repairing it during its own open and then declaring itself OK; a normal
+    /// command still heals it, because every writer keeps using `new`.
+    /// Not the same as read-only: SQLite touches the -wal and -shm companions on
+    /// any open. What this guarantees is narrower and is what matters - it never
+    /// creates your store and never changes what is in it.
+    pub fn open_existing(path: &Path) -> anyhow::Result<Self> {
+        anyhow::ensure!(
+            path.exists(),
+            "no THOR store at {} - this command never creates one; check the path (--db) \
+             or store your first memory to create it",
+            path.display()
+        );
+        let conn = Connection::open_with_flags(
+            path,
+            OpenFlags::SQLITE_OPEN_READ_WRITE
+                | OpenFlags::SQLITE_OPEN_URI
+                | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        )?;
+        conn.busy_timeout(Duration::from_secs(5))?;
+        Ok(EventStore { conn })
+    }
+
+    pub fn in_memory() -> SqlResult<Self> {
+        let conn = Connection::open_in_memory()?;
+        conn.busy_timeout(Duration::from_secs(5))?;
+        conn.execute_batch("PRAGMA journal_mode = WAL")?;
+        conn.execute_batch("PRAGMA synchronous = FULL")?;
+        Self::init_schema(&conn)?;
+        Self::sync_fts(&conn)?;
+        Self::ensure_item_binding_projection(&conn)?;
+        Ok(EventStore { conn })
+    }
+
+    fn init_schema(conn: &Connection) -> SqlResult<()> {
+        // Projections stance: head-sets WERE a pure fold recomputed from the
+        // event log on every read (M0/M1a, see cas::compute_head_sets). M2
+        // materializes that fold - as the M0 comment here always prescribed:
+        // written in the SAME transaction as the append, and fsck asserts
+        // stored projection == from-scratch fold. The log stays the only
+        // truth; every projection table is derived, rebuildable, and readers
+        // fall back to the fold whenever the projection is not current.
+        conn.execute_batch(
+            "
+            CREATE TABLE IF NOT EXISTS event (
+                seq INTEGER PRIMARY KEY,
+                event_uuid TEXT NOT NULL UNIQUE,
+                session_id TEXT NOT NULL,
+                lineage_id TEXT NOT NULL,
+                actor TEXT NOT NULL,
+                kind TEXT NOT NULL,
+                entity_id TEXT NOT NULL,
+                parent_rev TEXT,
+                body TEXT NOT NULL,
+                body_ch TEXT NOT NULL,
+                prev_hash TEXT NOT NULL,
+                this_hash TEXT NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_event_entity ON event(entity_id);
+            CREATE INDEX IF NOT EXISTS idx_event_hash ON event(this_hash);
+            -- Recall projection (M1): a contentless FTS5 index over body_ch,
+            -- keyed by the event seq (rowid). Written in the SAME transaction as
+            -- the event append (see insert_event), so the index can never lag the
+            -- log. `thor fsck` (verify_fts_projection) asserts the index ROW SET
+            -- equals the log; sync_fts heals a cold-open row-count mismatch (a
+            -- pre-M1 store or aborted backfill). Per-row text is not separately
+            -- audited (contentless index), but it cannot drift from the code path.
+            CREATE VIRTUAL TABLE IF NOT EXISTS event_fts USING fts5(body_ch, content='');
+            -- Heads projection (M2): cas::compute_head_sets and
+            -- compute_projects, materialized. head_state holds every CURRENT
+            -- head (one row per contested head; >1 rows = DIVERGED);
+            -- entity_meta holds the effective project per seen entity (NULL =
+            -- global); projection_meta.tip_seq records the last folded seq.
+            -- Maintained by apply_projection_delta inside the append
+            -- transaction; any writer that bypasses append (restore, a
+            -- pre-M2 binary) leaves tip_seq behind MAX(seq), which makes
+            -- every reader fall back to the full fold and the next append
+            -- rebuild the projection in-transaction. Nothing here is truth.
+            CREATE TABLE IF NOT EXISTS head_state (
+                entity_id TEXT NOT NULL,
+                rev_hash TEXT NOT NULL,
+                head_seq INTEGER NOT NULL,
+                PRIMARY KEY (entity_id, rev_hash)
+            );
+            CREATE INDEX IF NOT EXISTS idx_head_entity ON head_state(entity_id);
+            CREATE TABLE IF NOT EXISTS entity_meta (
+                entity_id TEXT PRIMARY KEY,
+                project TEXT
+            );
+            CREATE TABLE IF NOT EXISTS projection_meta (
+                k TEXT PRIMARY KEY,
+                v INTEGER NOT NULL
+            );
+            -- Binding projection: one row per (Moment/Target/Always) binding
+            -- an item's CURRENT single live head declares, so a caller can
+            -- narrow to candidates by binding shape - kind='always' for
+            -- session start, kind='moment' + value=<action> for the moment
+            -- surface, kind='target' + target_kind=<kind> for a target match
+            -- (narrowed to the right TargetKind only; the exact value/
+            -- normalisation match still runs on the fully parsed item, see
+            -- serve::rank::target_matches) - without parsing every live
+            -- item's body on every call (see live.rs's own doc comment for
+            -- the defect this closes: PARSING, not the head fold, was the
+            -- remaining cost). Kept current per-entity inside
+            -- apply_projection_delta, in the SAME transaction as the append,
+            -- exactly like head_state; a store whose log predates this table
+            -- gets it backfilled once (see ensure_item_binding_projection),
+            -- never re-derives it from anything but the JSON body already on
+            -- disk, and readers fall back to the full scan whenever it is not
+            -- current - correctness never depends on this table, only speed
+            -- does.
+            CREATE TABLE IF NOT EXISTS item_binding (
+                entity_id TEXT NOT NULL,
+                kind TEXT NOT NULL,
+                value TEXT,
+                target_kind TEXT
+            );
+            CREATE INDEX IF NOT EXISTS idx_item_binding_entity ON item_binding(entity_id);
+            CREATE INDEX IF NOT EXISTS idx_item_binding_moment ON item_binding(kind, value);
+            CREATE INDEX IF NOT EXISTS idx_item_binding_target ON item_binding(kind, target_kind);
+            ",
+        )?;
+        Ok(())
+    }
+
+    /// One event's delta on the heads projection - the incremental mirror of
+    /// the cas fold arms, applied inside the SAME transaction as the append.
+    /// cas::compute_head_sets/compute_projects stay the authority; the
+    /// differential fsck check and the equivalence tests pin this mirror to
+    /// them. Any change to the fold MUST change both places.
+    fn apply_projection_delta(
+        conn: &Connection,
+        seq: i64,
+        kind: EventKind,
+        entity_id: &str,
+        parent_rev: Option<&str>,
+        body: &str,
+        this_hash: &str,
+    ) -> SqlResult<()> {
+        // Project fold mirror: birth on first sight for every kind EXCEPT a
+        // reprojected event (whose arm only writes when its body parses -
+        // a malformed reproject is a full no-op, not a birth).
+        match kind {
+            EventKind::FactReprojected => {
+                if let Some(override_project) = crate::cas::parse_reproject_body(body) {
+                    conn.execute(
+                        "INSERT INTO entity_meta (entity_id, project) VALUES (?, ?)
+                         ON CONFLICT(entity_id) DO UPDATE SET project = excluded.project",
+                        params![entity_id, override_project],
+                    )?;
+                }
+            }
+            // Mirrors cas::compute_projects: delivery/usefulness telemetry is
+            // never a birth event, so it must not mint a phantom project
+            // entry for an entity id that was only ever served or marked,
+            // never created.
+            EventKind::ItemServed | EventKind::ItemMarkedUseful | EventKind::ItemMarkedNoise => {}
+            _ => {
+                conn.execute(
+                    "INSERT OR IGNORE INTO entity_meta (entity_id, project) VALUES (?, ?)",
+                    params![entity_id, crate::repo::owner_project(entity_id)],
+                )?;
+            }
+        }
+        // Head-set fold mirror.
+        match kind {
+            EventKind::FactCreated => {
+                conn.execute(
+                    "INSERT OR IGNORE INTO head_state (entity_id, rev_hash, head_seq) VALUES (?, ?, ?)",
+                    params![entity_id, this_hash, seq],
+                )?;
+            }
+            EventKind::FactRevised | EventKind::FactSuperseded | EventKind::FactRetracted => {
+                if let Some(parent) = parent_rev {
+                    // Fast-forward when the cited parent IS a current head;
+                    // the DELETE's row count is the membership test.
+                    conn.execute(
+                        "DELETE FROM head_state WHERE entity_id = ? AND rev_hash = ?",
+                        params![entity_id, parent],
+                    )?;
+                }
+                conn.execute(
+                    "INSERT OR IGNORE INTO head_state (entity_id, rev_hash, head_seq) VALUES (?, ?, ?)",
+                    params![entity_id, this_hash, seq],
+                )?;
+            }
+            EventKind::FactResolved => {
+                if let Some((keep_rev, discarded)) = crate::cas::parse_resolve_body(body) {
+                    let current: std::collections::HashSet<String> = {
+                        let mut stmt = conn.prepare(
+                            "SELECT rev_hash FROM head_state WHERE entity_id = ?",
+                        )?;
+                        let rows = stmt.query_map(params![entity_id], |r| r.get::<_, String>(0))?;
+                        rows.collect::<Result<_, _>>()?
+                    };
+                    let keep_also_discarded = discarded.iter().any(|d| *d == keep_rev);
+                    let mut cited: std::collections::HashSet<String> =
+                        discarded.iter().cloned().collect();
+                    cited.insert(keep_rev.clone());
+                    let valid =
+                        !keep_also_discarded && current.contains(&keep_rev) && cited == current;
+                    if valid {
+                        for rev in &discarded {
+                            conn.execute(
+                                "DELETE FROM head_state WHERE entity_id = ? AND rev_hash = ?",
+                                params![entity_id, rev],
+                            )?;
+                        }
+                    }
+                }
+            }
+            EventKind::FactReasserted
+            | EventKind::FactEchoed
+            | EventKind::FactReprojected
+            | EventKind::ItemServed
+            | EventKind::ItemMarkedUseful
+            | EventKind::ItemMarkedNoise => {}
+        }
+        // Binding projection mirror: only the kinds above that can move a
+        // head need it, so a delivery/usefulness telemetry event (ItemServed
+        // et al, appended on every hook call) never touches this table at
+        // all - head_state did not change for those either.
+        match kind {
+            EventKind::FactCreated
+            | EventKind::FactRevised
+            | EventKind::FactSuperseded
+            | EventKind::FactRetracted
+            | EventKind::FactResolved => {
+                Self::refresh_item_binding(conn, entity_id)?;
+            }
+            EventKind::FactReasserted
+            | EventKind::FactEchoed
+            | EventKind::FactReprojected
+            | EventKind::ItemServed
+            | EventKind::ItemMarkedUseful
+            | EventKind::ItemMarkedNoise => {}
+        }
+        Ok(())
+    }
+
+    /// Recompute `item_binding` for exactly one entity, derived from
+    /// `head_state`'s OWN idea of that entity's current state (just updated
+    /// by the match block above) - never re-decided from the event's own
+    /// kind/body directly, so this stays correct no matter which arm touched
+    /// it (create, revise, retract, resolve all shift a head differently).
+    /// A diverged entity (more than one current head) or one with no live
+    /// head at all contributes no rows, matching `live_items`'s own liveness
+    /// rule exactly (see `serve::live`: `head_set.heads.len() != 1` => skip).
+    /// Called once per touched entity inside the SAME transaction as the
+    /// append (or once per event during a full `rebuild_projection` replay,
+    /// ending on the same correct state), so this table can never be more or
+    /// less current than `head_state` itself.
+    fn refresh_item_binding(conn: &Connection, entity_id: &str) -> SqlResult<()> {
+        conn.execute("DELETE FROM item_binding WHERE entity_id = ?", params![entity_id])?;
+        let head_seqs: Vec<i64> = {
+            let mut stmt = conn.prepare("SELECT head_seq FROM head_state WHERE entity_id = ?")?;
+            let rows = stmt.query_map(params![entity_id], |r| r.get::<_, i64>(0))?;
+            rows.collect::<Result<_, _>>()?
+        };
+        if head_seqs.len() != 1 {
+            return Ok(()); // diverged, or no live head at all: publish nothing
+        }
+        let (event_kind, body): (String, String) = conn.query_row(
+            "SELECT kind, body FROM event WHERE seq = ?",
+            params![head_seqs[0]],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )?;
+        if event_kind == EventKind::FactRetracted.as_str() {
+            return Ok(()); // a tombstone is not a live item
+        }
+        for row in extract_binding_rows(&body) {
+            conn.execute(
+                "INSERT INTO item_binding (entity_id, kind, value, target_kind) VALUES (?, ?, ?, ?)",
+                params![entity_id, row.kind, row.value, row.target_kind],
+            )?;
+        }
+        Ok(())
+    }
+
+    /// Rebuild the heads projection from the whole log, inside the caller's
+    /// transaction. Same delta function per event, so incremental and rebuilt
+    /// state cannot diverge from each other by construction.
+    fn rebuild_projection(conn: &Connection) -> SqlResult<i64> {
+        conn.execute("DELETE FROM head_state", [])?;
+        conn.execute("DELETE FROM entity_meta", [])?;
+        let mut tip = 0i64;
+        let mut stmt = conn.prepare(
+            "SELECT seq, kind, entity_id, parent_rev, body, this_hash FROM event ORDER BY seq",
+        )?;
+        let rows = stmt.query_map([], |r| {
+            Ok((
+                r.get::<_, i64>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, String>(2)?,
+                r.get::<_, Option<String>>(3)?,
+                r.get::<_, String>(4)?,
+                r.get::<_, String>(5)?,
+            ))
+        })?;
+        for row in rows {
+            let (seq, kind_s, entity_id, parent_rev, body, this_hash) = row?;
+            let Some(kind) = EventKind::from_str(&kind_s) else {
+                // An unknown kind cannot be folded; leave the projection
+                // stale (tip stays behind), so readers keep falling back.
+                return Err(rusqlite::Error::InvalidQuery);
+            };
+            Self::apply_projection_delta(
+                conn,
+                seq,
+                kind,
+                &entity_id,
+                parent_rev.as_deref(),
+                &body,
+                &this_hash,
+            )?;
+            tip = seq;
+        }
+        conn.execute(
+            "INSERT INTO projection_meta (k, v) VALUES ('tip_seq', ?)
+             ON CONFLICT(k) DO UPDATE SET v = excluded.v",
+            params![tip],
+        )?;
+        Ok(tip)
+    }
+
+    /// Rebuild the FTS projection from the log if the two ever disagree in row
+    /// count (e.g. a store written by a pre-M1 binary that had no FTS table, or
+    /// an aborted backfill). Cheap no-op when they already match. Append keeps
+    /// them in lockstep in-transaction; this only heals a cold-open mismatch.
+    fn sync_fts(conn: &Connection) -> SqlResult<()> {
+        let events: i64 = conn.query_row("SELECT COUNT(*) FROM event", [], |r| r.get(0))?;
+        let indexed: i64 = conn.query_row("SELECT COUNT(*) FROM event_fts", [], |r| r.get(0))?;
+        if events == indexed {
+            return Ok(());
+        }
+        conn.execute("INSERT INTO event_fts(event_fts) VALUES('delete-all')", [])?;
+        let mut stmt = conn.prepare("SELECT seq, body_ch FROM event ORDER BY seq")?;
+        let rows = stmt.query_map([], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?)))?;
+        for row in rows {
+            let (seq, body_ch) = row?;
+            conn.execute(
+                "INSERT INTO event_fts(rowid, body_ch) VALUES (?, ?)",
+                params![seq, &body_ch],
+            )?;
+        }
+        Ok(())
+    }
+
+    /// One-time backfill for `item_binding` on a store whose log predates
+    /// that table: from this code's own first run onward the table stays
+    /// current incrementally, one entity at a time, inside
+    /// `apply_projection_delta` - but that only ever refreshes the ONE entity
+    /// an append touches, so an entity nobody has revised since would
+    /// otherwise carry zero binding rows forever, and every reader would fall
+    /// back to the full scan for good. Runs at most once per store (gated by
+    /// `projection_meta`'s `item_binding_built` flag, set in the SAME
+    /// transaction as the backfill it guards) and only once `head_state`
+    /// itself is caught up - a bypass writer leaves head_state stale too, and
+    /// this simply waits for the next append's own rebuild to catch both up
+    /// together. Cheap on every call after the first: one indexed point
+    /// lookup, same shape as `heads_projection_current`'s own check.
+    fn ensure_item_binding_projection(conn: &Connection) -> SqlResult<()> {
+        let built: i64 = conn
+            .query_row("SELECT v FROM projection_meta WHERE k = 'item_binding_built'", [], |r| r.get(0))
+            .unwrap_or(0);
+        if built != 0 {
+            return Ok(());
+        }
+        let max_seq: i64 = conn.query_row("SELECT COALESCE(MAX(seq), 0) FROM event", [], |r| r.get(0))?;
+        if max_seq == 0 {
+            // Nothing written yet: mark built so a fresh store never repeats
+            // this check, and stays incrementally correct from its first
+            // append onward (see apply_projection_delta).
+            conn.execute(
+                "INSERT INTO projection_meta (k, v) VALUES ('item_binding_built', 1)
+                 ON CONFLICT(k) DO UPDATE SET v = excluded.v",
+                [],
+            )?;
+            return Ok(());
+        }
+        let tip: i64 = conn
+            .query_row("SELECT v FROM projection_meta WHERE k = 'tip_seq'", [], |r| r.get(0))
+            .unwrap_or(0);
+        if tip != max_seq {
+            // head_state itself is not caught up (a bypass writer); leave
+            // item_binding unbuilt too and try again on the next open. The
+            // read path already falls back to the full scan whenever
+            // heads_projection_current() is false, so nothing here is ever
+            // relied on before it is genuinely ready.
+            return Ok(());
+        }
+        let tx = conn.unchecked_transaction()?;
+        tx.execute("DELETE FROM item_binding", [])?;
+        let rows: Vec<(String, String, String)> = {
+            // Only entities with EXACTLY one current head contribute
+            // bindings - the same `!= 1` liveness rule `live_items` itself
+            // applies (a diverged entity is skipped, never guessed at).
+            let mut stmt = tx.prepare(
+                "SELECT h.entity_id, e.kind, e.body
+                 FROM head_state h
+                 JOIN event e ON e.seq = h.head_seq
+                 WHERE (SELECT COUNT(*) FROM head_state h2 WHERE h2.entity_id = h.entity_id) = 1",
+            )?;
+            let mapped = stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?;
+            mapped.collect::<Result<_, _>>()?
+        };
+        for (entity_id, event_kind, body) in rows {
+            if event_kind == EventKind::FactRetracted.as_str() {
+                continue; // a tombstone is not a live item
+            }
+            for row in extract_binding_rows(&body) {
+                tx.execute(
+                    "INSERT INTO item_binding (entity_id, kind, value, target_kind) VALUES (?, ?, ?, ?)",
+                    params![entity_id, row.kind, row.value, row.target_kind],
+                )?;
+            }
+        }
+        tx.execute(
+            "INSERT INTO projection_meta (k, v) VALUES ('item_binding_built', 1)
+             ON CONFLICT(k) DO UPDATE SET v = excluded.v",
+            [],
+        )?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    pub fn get_next_seq(&self) -> SqlResult<i64> {
+        next_seq(&self.conn)
+    }
+
+    pub fn get_prev_hash(&self) -> SqlResult<String> {
+        last_hash(&self.conn)
+    }
+
+    // ---- Heads projection (M2) readers -------------------------------------
+    //
+    // Only meaningful when `heads_projection_current()` - every caller checks
+    // that first and falls back to the cas fold otherwise. The check is two
+    // index-only lookups (the contiguous-tip gap-scan mistake is deliberately
+    // not repeated here: MAX(seq), never a scan).
+
+    /// True when the heads projection covers the whole log.
+    pub fn heads_projection_current(&self) -> bool {
+        let tip: i64 = match self
+            .conn
+            .query_row("SELECT v FROM projection_meta WHERE k = 'tip_seq'", [], |r| r.get(0))
+        {
+            Ok(v) => v,
+            Err(_) => return false,
+        };
+        let max_seq: i64 = match self
+            .conn
+            .query_row("SELECT COALESCE(MAX(seq), 0) FROM event", [], |r| r.get(0))
+        {
+            Ok(v) => v,
+            Err(_) => return false,
+        };
+        tip == max_seq && max_seq > 0
+    }
+
+    /// Is this rev a CURRENT head of its entity? (Point lookup on the PK.)
+    pub fn projected_is_head(&self, entity_id: &str, rev_hash: &str) -> bool {
+        self.conn
+            .query_row(
+                "SELECT 1 FROM head_state WHERE entity_id = ? AND rev_hash = ?",
+                params![entity_id, rev_hash],
+                |_| Ok(()),
+            )
+            .is_ok()
+    }
+
+    /// Number of current heads (>1 = DIVERGED).
+    pub fn projected_head_count(&self, entity_id: &str) -> i64 {
+        self.conn
+            .query_row(
+                "SELECT COUNT(*) FROM head_state WHERE entity_id = ?",
+                params![entity_id],
+                |r| r.get(0),
+            )
+            .unwrap_or(0)
+    }
+
+    /// The entity's effective project. Outer None = entity never seen;
+    /// inner None = global.
+    pub fn projected_project(&self, entity_id: &str) -> Option<Option<String>> {
+        self.conn
+            .query_row(
+                "SELECT project FROM entity_meta WHERE entity_id = ?",
+                params![entity_id],
+                |r| r.get::<_, Option<String>>(0),
+            )
+            .ok()
+    }
+
+    /// Every current head as its full event row, with the head count and the
+    /// effective project of its entity - the anchored-pass workload (walk all
+    /// heads once) without the O(log) fold. Ordered by entity for determinism.
+    pub fn projected_head_events(&self) -> SqlResult<Vec<(Event, i64, Option<String>)>> {
+        let mut stmt = self.conn.prepare(&format!(
+            "SELECT {}, (SELECT COUNT(*) FROM head_state h2 WHERE h2.entity_id = h.entity_id),
+                    m.project
+             FROM head_state h
+             JOIN event e ON e.seq = h.head_seq
+             LEFT JOIN entity_meta m ON m.entity_id = h.entity_id
+             ORDER BY h.entity_id, h.rev_hash",
+            EVENT_COLUMNS
+                .split(", ")
+                .map(|c| format!("e.{}", c))
+                .collect::<Vec<_>>()
+                .join(", ")
+        ))?;
+        let rows = stmt.query_map([], |row| {
+            let ev = row_to_event(row)?;
+            let n: i64 = row.get(12)?;
+            let project: Option<String> = row.get(13)?;
+            Ok((ev, n, project))
+        })?;
+        rows.collect()
+    }
+
+    /// True when the binding projection (`item_binding`) is safe to read: the
+    /// heads projection it is derived from is itself current, AND the
+    /// one-time backfill for a pre-existing log has run (see
+    /// `ensure_item_binding_projection`, called from `new`/`in_memory` on
+    /// every open - so in practice this is only ever false for a store this
+    /// binary has literally never opened with a write handle, or one whose
+    /// heads projection itself fell behind). The caller (`serve::live`) falls
+    /// back to the full scan whenever this is false, exactly like
+    /// `live_items` already falls back on `heads_projection_current`.
+    pub fn item_binding_projection_current(&self) -> bool {
+        if !self.heads_projection_current() {
+            return false;
+        }
+        let built: i64 = self
+            .conn
+            .query_row("SELECT v FROM projection_meta WHERE k = 'item_binding_built'", [], |r| r.get(0))
+            .unwrap_or(0);
+        built != 0
+    }
+
+    /// Every entity id currently bound `Always` - session start's own
+    /// candidate pool (see `serve::session_start`), read straight out of the
+    /// binding projection instead of parsing every live item. Only meaningful
+    /// when `item_binding_projection_current()`.
+    pub fn projected_always_entities(&self) -> SqlResult<Vec<String>> {
+        let mut stmt = self.conn.prepare("SELECT DISTINCT entity_id FROM item_binding WHERE kind = 'always'")?;
+        let rows = stmt.query_map([], |r| r.get::<_, String>(0))?;
+        rows.collect()
+    }
+
+    /// Every entity id whose binding projection COULD match this input: an
+    /// exact `value` match for `kind = 'moment'` (mirrors
+    /// `serve::rank::binding_matches`'s exact `Action` equality exactly, no
+    /// narrowing loss possible), or a `target_kind`-only match for
+    /// `kind = 'target'` (broader on purpose - the exact value/normalisation
+    /// comparison, `serve::rank::target_matches`, still runs on the fully
+    /// parsed item afterwards, so this can only ever over-include, never
+    /// drop a true match). Deduplicated; order is not meaningful here, the
+    /// caller re-derives real order from the fully parsed candidates same as
+    /// today. Only meaningful when `item_binding_projection_current()`.
+    pub fn projected_binding_candidates(
+        &self,
+        moments: &[String],
+        target_kinds: &[String],
+    ) -> SqlResult<Vec<String>> {
+        let mut ids: HashSet<String> = HashSet::new();
+        if !moments.is_empty() {
+            let placeholders = vec!["?"; moments.len()].join(",");
+            let sql = format!(
+                "SELECT DISTINCT entity_id FROM item_binding WHERE kind = 'moment' AND value IN ({placeholders})"
+            );
+            let mut stmt = self.conn.prepare(&sql)?;
+            let rows = stmt.query_map(rusqlite::params_from_iter(moments.iter()), |r| r.get::<_, String>(0))?;
+            for row in rows {
+                ids.insert(row?);
+            }
+        }
+        if !target_kinds.is_empty() {
+            let placeholders = vec!["?"; target_kinds.len()].join(",");
+            let sql = format!(
+                "SELECT DISTINCT entity_id FROM item_binding WHERE kind = 'target' AND target_kind IN ({placeholders})"
+            );
+            let mut stmt = self.conn.prepare(&sql)?;
+            let rows = stmt.query_map(rusqlite::params_from_iter(target_kinds.iter()), |r| r.get::<_, String>(0))?;
+            for row in rows {
+                ids.insert(row?);
+            }
+        }
+        Ok(ids.into_iter().collect())
+    }
+
+    /// Exactly `projected_head_events`, narrowed to a specific set of entity
+    /// ids - the fetch half of the binding-projection fast path: once
+    /// `projected_binding_candidates`/`projected_always_entities` names WHICH
+    /// entities could match, this loads just their current head rows instead
+    /// of every current head in the store. Empty input yields an empty
+    /// result without ever preparing a statement (an empty SQL `IN ()` is
+    /// invalid, and "nothing named" trivially means "nothing found").
+    pub fn projected_head_events_for(&self, entity_ids: &[String]) -> SqlResult<Vec<(Event, i64, Option<String>)>> {
+        if entity_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let placeholders = vec!["?"; entity_ids.len()].join(",");
+        let sql = format!(
+            "SELECT {}, (SELECT COUNT(*) FROM head_state h2 WHERE h2.entity_id = h.entity_id),
+                    m.project
+             FROM head_state h
+             JOIN event e ON e.seq = h.head_seq
+             LEFT JOIN entity_meta m ON m.entity_id = h.entity_id
+             WHERE h.entity_id IN ({placeholders})
+             ORDER BY h.entity_id, h.rev_hash",
+            EVENT_COLUMNS
+                .split(", ")
+                .map(|c| format!("e.{}", c))
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+        let mut stmt = self.conn.prepare(&sql)?;
+        let rows = stmt.query_map(rusqlite::params_from_iter(entity_ids.iter()), |row| {
+            let ev = row_to_event(row)?;
+            let n: i64 = row.get(12)?;
+            let project: Option<String> = row.get(13)?;
+            Ok((ev, n, project))
+        })?;
+        rows.collect()
+    }
+
+    /// The current heads of ONE entity as (rev_hash, head_seq) rows. Only
+    /// meaningful when the projection is current.
+    pub fn projected_heads_of(&self, entity_id: &str) -> SqlResult<Vec<(String, i64)>> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT rev_hash, head_seq FROM head_state WHERE entity_id = ? ORDER BY rev_hash")?;
+        let rows = stmt.query_map(params![entity_id], |r| {
+            Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?))
+        })?;
+        rows.collect()
+    }
+
+    /// One event by seq (the projected recall path fetches candidates
+    /// point-wise instead of loading the whole log).
+    pub fn get_event_by_seq(&self, seq: i64) -> SqlResult<Option<Event>> {
+        let mut stmt = self
+            .conn
+            .prepare(&format!("SELECT {} FROM event WHERE seq = ?", EVENT_COLUMNS))?;
+        let mut rows = stmt.query_map(params![seq], row_to_event)?;
+        rows.next().transpose()
+    }
+
+    /// Rebuild the heads projection from the log, in one transaction. The
+    /// explicit form of what the next append would do anyway - for a store
+    /// upgraded from a pre-M2 binary that wants the fast path before its
+    /// first write (`thor fsck --rebuild-heads`).
+    pub fn rebuild_heads_projection(&mut self) -> anyhow::Result<i64> {
+        let tx = self
+            .conn
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let tip = Self::rebuild_projection(&tx)?;
+        tx.commit()?;
+        Ok(tip)
+    }
+
+    /// Differential audit: the stored projection must equal the from-scratch
+    /// fold (heads, divergence and projects). Returns a list of human-readable
+    /// mismatches; empty = consistent. `fsck` calls this; the M0 comment on
+    /// init_schema always promised it.
+    pub fn verify_heads_projection(&self) -> anyhow::Result<Vec<String>> {
+        let mut issues = Vec::new();
+        if !self.heads_projection_current() {
+            issues.push("heads projection not current (tip_seq behind the log) - readers are on the fold fallback; the next append rebuilds it".to_string());
+            return Ok(issues);
+        }
+        let events = self.get_all_events()?;
+        let folded = crate::cas::compute_head_sets(&events);
+        let folded_projects = crate::cas::compute_projects(&events);
+        // Stored heads.
+        let mut stored: std::collections::HashMap<String, std::collections::HashSet<String>> =
+            std::collections::HashMap::new();
+        {
+            let mut stmt = self.conn.prepare("SELECT entity_id, rev_hash FROM head_state")?;
+            let rows = stmt.query_map([], |r| {
+                Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
+            })?;
+            for row in rows {
+                let (e, h) = row?;
+                stored.entry(e).or_default().insert(h);
+            }
+        }
+        for (entity, hs) in &folded {
+            match stored.get(entity) {
+                Some(s) if *s == hs.heads => {}
+                Some(_) => issues.push(format!("head-set mismatch for {}", entity)),
+                None => issues.push(format!("entity {} missing from head_state", entity)),
+            }
+        }
+        for entity in stored.keys() {
+            if !folded.contains_key(entity) {
+                issues.push(format!("stale entity {} in head_state", entity));
+            }
+        }
+        // Stored projects.
+        {
+            let mut stmt = self.conn.prepare("SELECT entity_id, project FROM entity_meta")?;
+            let rows = stmt.query_map([], |r| {
+                Ok((r.get::<_, String>(0)?, r.get::<_, Option<String>>(1)?))
+            })?;
+            let mut stored_projects: std::collections::HashMap<String, Option<String>> =
+                std::collections::HashMap::new();
+            for row in rows {
+                let (e, p) = row?;
+                stored_projects.insert(e, p);
+            }
+            for (entity, project) in &folded_projects {
+                if stored_projects.get(entity) != Some(project) {
+                    issues.push(format!("project mismatch for {}", entity));
+                }
+            }
+        }
+        Ok(issues)
+    }
+
+    pub fn append_event(
+        &mut self,
+        session_id: &str,
+        lineage_id: &str,
+        actor: &str,
+        kind: EventKind,
+        entity_id: &str,
+        parent_rev: Option<&str>,
+        body: &str,
+    ) -> anyhow::Result<Event> {
+        // BEGIN IMMEDIATE takes the write lock FIRST; seq and prev_hash are
+        // then read inside the transaction (see insert_event), so the read-
+        // decide-write sequence is atomic against other writers.
+        let tx = self
+            .conn
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let event = insert_event(&tx, session_id, lineage_id, actor, kind, entity_id, parent_rev, body)?;
+        tx.commit()?;
+        Ok(event)
+    }
+
+    /// Append a fact_resolved event as a real multi-head CAS: the caller must
+    /// cite the exact, full current head-set ({keep_rev} union discarded[]).
+    /// The head-set is recomputed under the immediate write lock, so no head
+    /// can appear between the check and the append. On mismatch nothing is
+    /// written and a ResolveConflict carrying the fresh head-set is returned.
+    pub fn append_resolve(
+        &mut self,
+        session_id: &str,
+        lineage_id: &str,
+        actor: &str,
+        entity_id: &str,
+        keep_rev: &str,
+        discarded: &[String],
+    ) -> anyhow::Result<Event> {
+        let tx = self
+            .conn
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+
+        // Per-entity load (idx_event_entity): the head fold only ever needs this
+        // entity's events, so the whole log is never materialized under the lock.
+        let events = query_events_by_entity(&tx, entity_id)?;
+        let current: HashSet<String> = crate::cas::compute_head_sets(&events)
+            .get(entity_id)
+            .map(|head_set| head_set.heads.clone())
+            .unwrap_or_default();
+
+        let mut current_sorted: Vec<String> = current.iter().cloned().collect();
+        current_sorted.sort();
+        let conflict = |reason: &str| ResolveConflict {
+            entity_id: entity_id.to_string(),
+            reason: reason.to_string(),
+            current_heads: current_sorted.clone(),
+        };
+
+        if discarded.iter().any(|d| d == keep_rev) {
+            return Err(conflict("keep_rev is also listed in discarded").into());
+        }
+        if !current.contains(keep_rev) {
+            return Err(conflict("keep_rev is not a current head").into());
+        }
+        let mut cited: HashSet<String> = discarded.iter().cloned().collect();
+        cited.insert(keep_rev.to_string());
+        if cited != current {
+            return Err(conflict("cited head-set does not match the current head-set").into());
+        }
+
+        let body = serde_json::json!({ "keep_rev": keep_rev, "discarded": discarded }).to_string();
+        let event = insert_event(
+            &tx,
+            session_id,
+            lineage_id,
+            actor,
+            EventKind::FactResolved,
+            entity_id,
+            None,
+            &body,
+        )?;
+        tx.commit()?;
+        Ok(event)
+    }
+
+    /// Append a revise/retract as a CHECKED mutation: the head-set is recomputed
+    /// under the immediate write lock, and the event is only written when its
+    /// parent is a current head - so a concurrent writer turns the call into a
+    /// typed MutateConflict (carrying the fresh heads) instead of a silent
+    /// DIVERGED branch. `parent_rev = None` auto-fills the single head; a
+    /// diverged entity then rejects with "resolve first". This is the safe write
+    /// path for agents (MCP): plain `append_event` stays the raw, branch-capable
+    /// primitive.
+    pub fn append_mutate_checked(
+        &mut self,
+        session_id: &str,
+        lineage_id: &str,
+        actor: &str,
+        kind: EventKind,
+        entity_id: &str,
+        parent_rev: Option<&str>,
+        body: &str,
+    ) -> anyhow::Result<Event> {
+        let tx = self
+            .conn
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+
+        // Head-set fold is per-entity, so only this entity's events are loaded
+        // (idx_event_entity) - never the whole log while holding the write lock.
+        let events = query_events_by_entity(&tx, entity_id)?;
+        let current: HashSet<String> = crate::cas::compute_head_sets(&events)
+            .get(entity_id)
+            .map(|head_set| head_set.heads.clone())
+            .unwrap_or_default();
+        let mut current_sorted: Vec<String> = current.iter().cloned().collect();
+        current_sorted.sort();
+        let conflict = |reason: &str| MutateConflict {
+            entity_id: entity_id.to_string(),
+            reason: reason.to_string(),
+            current_heads: current_sorted.clone(),
+        };
+
+        if current.is_empty() {
+            return Err(conflict("unknown entity (no live head); store a new fact instead").into());
+        }
+        let parent = match parent_rev.filter(|p| !p.is_empty()) {
+            Some(p) => {
+                if !current.contains(p) {
+                    return Err(conflict(
+                        "parent_rev is not a current head (the fact changed since you read it)",
+                    )
+                    .into());
+                }
+                p.to_string()
+            }
+            None => {
+                if current.len() > 1 {
+                    return Err(conflict(
+                        "entity is DIVERGED: resolve it first, or cite the exact parent_rev to mutate",
+                    )
+                    .into());
+                }
+                current_sorted[0].clone()
+            }
+        };
+
+        // A TOMBSTONE IS NOT A PARENT TO BUILD ON (2026-07-30, found by an audit
+        // swarm). Liveness is decided everywhere - recall, the guard's anchor
+        // pass, consolidate - by the KIND of the current head, and nothing here
+        // looked at that kind: a revise citing a retracted head fast-forwarded
+        // off the tombstone like any other head, and the fact was live again
+        // with no word about it in the reply. A stale id from an earlier session
+        // or a saved reference was enough. Refusing is the smaller rule and it
+        // matches the store's own doctrine (a retraction is a decision, not a
+        // pause): the way back is to store the corrected fact fresh, which
+        // leaves a create in the log where a resurrection left nothing.
+        // ...but a RETRACT of an already-retracted fact is not a revival, it is
+        // the same decision arriving twice, and the inbox drain is at-least-once
+        // by design (found by two adversarial verifiers, 2026-07-30: refusing it
+        // made one replayed op fail its batch forever, so nothing the replica
+        // captured afterwards ever reached the authority). It appends a second
+        // tombstone, exactly as before, and the batch stays clean.
+        if kind != EventKind::FactRetracted
+            && events.iter().any(|e| e.this_hash == parent && e.kind == EventKind::FactRetracted)
+        {
+            return Err(conflict(
+                "this fact was RETRACTED - a revise may not silently bring it back. Store the \
+                 corrected fact fresh with remember (the retraction stays in history), or check \
+                 with `history` whether you meant a different entity",
+            )
+            .into());
+        }
+
+        // Carry the fact's footer across a content-only REVISE. The footer is
+        // the body's tail, not a field, so a caller who rewrites the body
+        // without re-typing it silently drops the fact's type, tags, fires-when
+        // vocabulary and the guard's anchors. Nothing errors and recall still
+        // finds the fact, so the loss is invisible - it just stops firing at the
+        // moment of action, which was the reason it was written. A new body that
+        // brings its OWN footer wins (retyping stays a one-call operation).
+        //
+        // Revise only: a retract's body is the tombstone and a supersede points
+        // elsewhere - neither should inherit the old metadata.
+        let carried;
+        let body = match kind {
+            EventKind::FactRevised => {
+                let prev = events.iter().find(|e| e.this_hash == parent);
+                match prev.and_then(|p| crate::footer::carry_over(body, &p.body)) {
+                    Some(b) => {
+                        carried = b;
+                        carried.as_str()
+                    }
+                    None => body,
+                }
+            }
+            _ => body,
+        };
+
+        let event = insert_event(&tx, session_id, lineage_id, actor, kind, entity_id, Some(&parent), body)?;
+        tx.commit()?;
+        Ok(event)
+    }
+
+    /// Append a fact_created with its uniqueness checks under the SAME immediate
+    /// write lock, so a concurrent writer process (another MCP server, a running
+    /// `thor import`) cannot slip an equal fact between check and append:
+    /// - the entity must not exist yet: a second parentless root would silently
+    ///   ADD a contested head (create is never an upsert);
+    /// - no live (non-retracted) head accepted by `is_dup` may exist; the caller
+    ///   supplies the near-duplicate predicate over
+    ///   (entity_id, effective_project, head_body).
+    /// On conflict nothing is written and a typed MutateConflict names the
+    /// blocking entity (reason "already exists" or "near-duplicate").
+    pub fn append_created_unique<F>(
+        &mut self,
+        session_id: &str,
+        lineage_id: &str,
+        actor: &str,
+        entity_id: &str,
+        body: &str,
+        is_dup: F,
+    ) -> anyhow::Result<Event>
+    where
+        F: Fn(&str, Option<&str>, &str) -> bool,
+    {
+        let tx = self
+            .conn
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+
+        // The dup scan needs every entity's live heads, so this one loads the
+        // full log under the lock - creates are rare (a handful per session),
+        // unlike the per-entity mutate path above.
+        let events = query_all_events(&tx)?;
+        let head_sets = crate::cas::compute_head_sets(&events);
+        if let Some(head_set) = head_sets.get(entity_id) {
+            let mut heads: Vec<String> = head_set.heads.iter().cloned().collect();
+            heads.sort();
+            return Err(MutateConflict {
+                entity_id: entity_id.to_string(),
+                reason: "entity already exists (create is never an upsert): revise it, or omit \
+                         entity_id to mint a new one"
+                    .to_string(),
+                current_heads: heads,
+            }
+            .into());
+        }
+        let projects = crate::cas::compute_projects(&events);
+        let by_hash: std::collections::HashMap<&str, &Event> =
+            events.iter().map(|e| (e.this_hash.as_str(), e)).collect();
+        for (id, head_set) in &head_sets {
+            let project = projects.get(id).and_then(|p| p.as_deref());
+            for rev in &head_set.heads {
+                let Some(head_ev) = by_hash.get(rev.as_str()) else { continue };
+                if matches!(head_ev.kind, EventKind::FactRetracted) {
+                    continue; // a retracted head is not a live duplicate
+                }
+                if is_dup(id, project, &head_ev.body) {
+                    return Err(MutateConflict {
+                        entity_id: id.clone(),
+                        reason: "near-duplicate of an existing live fact".to_string(),
+                        current_heads: vec![rev.clone()],
+                    }
+                    .into());
+                }
+            }
+        }
+
+        let event =
+            insert_event(&tx, session_id, lineage_id, actor, EventKind::FactCreated, entity_id, None, body)?;
+        tx.commit()?;
+        Ok(event)
+    }
+
+    pub fn get_event_by_uuid(&self, event_uuid: &str) -> SqlResult<Option<Event>> {
+        let mut stmt = self
+            .conn
+            .prepare(&format!("SELECT {} FROM event WHERE event_uuid = ?", EVENT_COLUMNS))?;
+        match stmt.query_row([event_uuid], row_to_event) {
+            Ok(event) => Ok(Some(event)),
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+            Err(e) => Err(e),
+        }
+    }
+
+    pub fn get_all_events(&self) -> SqlResult<Vec<Event>> {
+        query_all_events(&self.conn)
+    }
+
+    /// Every event's `(kind, entity_id)` only, in log order - a far lighter
+    /// read than `get_all_events` for a caller that only ever inspects those
+    /// two fields. `serve::usefulness`'s two decay folds (`ever_marked_useful`,
+    /// `noise_counts`) used to call `get_all_events` and pay for a fully
+    /// materialized `Event` - body, body_ch, both hashes, session/lineage/
+    /// actor, parent_rev, all of it thrown away - on every row of the WHOLE
+    /// log, twice per hook call. This selects only the two columns either
+    /// fold ever reads, so there is nothing left to allocate for a row that
+    /// does not match. `prepare_cached`: both callers run this exact SQL text
+    /// back to back on the same connection, so the second pays no re-parse.
+    pub fn event_kinds(&self) -> SqlResult<Vec<(EventKind, String)>> {
+        let mut stmt = self.conn.prepare_cached("SELECT kind, entity_id FROM event ORDER BY seq")?;
+        let rows = stmt.query_map([], |row| {
+            let kind_str: &str = row.get_ref(0)?.as_str()?;
+            let kind = EventKind::from_str(kind_str).ok_or(rusqlite::Error::InvalidQuery)?;
+            let entity_id: String = row.get(1)?;
+            Ok((kind, entity_id))
+        })?;
+        rows.collect()
+    }
+
+    /// The ids this session was actually served, once each.
+    ///
+    /// Exists so a caller can ask about something the CURRENT reader has
+    /// really seen. A lifetime serving count says an item fired a hundred
+    /// times, but says nothing about whether the person being asked was ever
+    /// in the room: a rule scoped to another project fires only there, so
+    /// asking this session "did it belong where it fired" has no answerable
+    /// form. Indexed the same way `event_kinds` is - two columns, no bodies.
+    pub fn served_ids_in_session(&self, session_id: &str) -> SqlResult<Vec<String>> {
+        let mut stmt = self
+            .conn
+            .prepare_cached("SELECT DISTINCT entity_id FROM event WHERE kind = 'item_served' AND session_id = ?")?;
+        let rows = stmt.query_map([session_id], |row| row.get::<_, String>(0))?;
+        rows.collect()
+    }
+
+    pub fn get_events_by_entity(&self, entity_id: &str) -> SqlResult<Vec<Event>> {
+        let mut stmt = self.conn.prepare(&format!(
+            "SELECT {} FROM event WHERE entity_id = ? ORDER BY seq",
+            EVENT_COLUMNS
+        ))?;
+        let events = stmt.query_map([entity_id], row_to_event)?;
+        events.collect()
+    }
+
+    /// The hole-proof contiguous tip (contiguous_seq, tip_hash) - the resume
+    /// cursor and lag basis for log shipping.
+    pub fn contiguous_tip(&self) -> SqlResult<(i64, String)> {
+        contiguous_tip_conn(&self.conn)
+    }
+
+    /// A cheap key that changes whenever the log changes: (row count, max seq).
+    ///
+    /// EXACT for this table by construction: every statement that touches
+    /// `event` is a plain `INSERT` (`append_event`, `ingest_batch`, restore) -
+    /// there is no UPDATE, no DELETE and no INSERT OR REPLACE anywhere, so a row
+    /// can never change under a fixed count. Any append moves the count; `max
+    /// seq` rides along as a second witness and costs nothing.
+    ///
+    /// Deliberately NOT `contiguous_tip()`: that one is hole-proof (it scans for
+    /// the first gap) and measures ~30ms on a 16k-event log - a third of the
+    /// 81ms fold it is supposed to guard, which would eat the entire point of a
+    /// resident cache. It is not needed here anyway: `ingest_batch` only accepts
+    /// tip+1, so a replica cannot punch a hole below `MAX(seq)`. This pair costs
+    /// ~0.02ms (both index-only), i.e. ~4000x cheaper than the fold - and that
+    /// asymmetry is exactly what makes a resident cache worth holding.
+    /// Used by `recall::ResidentCache` to decide reuse-or-rebuild.
+    pub fn cache_fingerprint(&self) -> SqlResult<(i64, i64)> {
+        self.conn.query_row(
+            "SELECT COUNT(*), COALESCE(MAX(seq), 0) FROM event",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+    }
+
+    /// The shipper's read side: every event with seq > `after_seq`, in chain
+    /// order. Map with `Event::to_shipped` to ship the backlog to a replica.
+    pub fn events_since(&self, after_seq: i64) -> SqlResult<Vec<Event>> {
+        let mut stmt = self
+            .conn
+            .prepare(&format!("SELECT {} FROM event WHERE seq > ? ORDER BY seq", EVENT_COLUMNS))?;
+        let events = stmt.query_map([after_seq], row_to_event)?;
+        events.collect()
+    }
+
+    /// Log-shipping receiver: ingest a shipped batch that must CONTINUE this
+    /// store's chain. Events already present (seq <= our tip) are verified then
+    /// skipped (idempotent re-ship); the next event must be exactly our tip+1 and,
+    /// replayed onto our tail, reconstruct the shipped this_hash. That single
+    /// equality proves prev_hash continuity AND fact-content integrity (the
+    /// canonical quad: kind, entity_id, parent_rev, canonicalized body), because
+    /// `this_hash = sha256(our_tail || canonical(event))` - a fork (our tail is
+    /// not the authority's prefix) or an edit to any HASHED field diverges. NOT
+    /// covered (see canonical_repr_parts - an accepted M0 stance): provenance
+    /// fields (actor/session/lineage) and whitespace-only body differences sit
+    /// outside the hash, and ORIGIN authenticity comes from the transport's
+    /// bearer token, not this check. A gap, a fork on shared history, or a tampered payload rejects
+    /// the WHOLE batch atomically (nothing written - the tx rolls back) and
+    /// returns our unchanged contiguous tip so the shipper resumes from there.
+    /// Batch order is normalized by seq; the append reuses the exact same
+    /// insert_event path (so the FTS projection stays in lockstep).
+    pub fn ingest_batch(&mut self, recs: &[ShippedEvent]) -> anyhow::Result<IngestOutcome> {
+        let mut ordered: Vec<&ShippedEvent> = recs.iter().collect();
+        ordered.sort_by_key(|r| r.seq);
+
+        let tx = self
+            .conn
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        // Tip BEFORE the batch. Every rejection reports THIS (the batch is atomic,
+        // so on reject our tip is unchanged), letting the shipper resume exactly.
+        let (pre_cseq, pre_tip) = contiguous_tip_conn(&tx)?;
+        let reject = |reason: String, at_seq: i64| IngestOutcome::Rejected {
+            reason,
+            at_seq,
+            contiguous_seq: pre_cseq,
+            tip_hash: pre_tip.clone(),
+        };
+
+        let mut expected = next_seq(&tx)?; // our tip + 1
+        let mut applied = 0usize;
+        let mut skipped = 0usize;
+
+        for r in &ordered {
+            if r.seq < expected {
+                // Already have this seq: idempotent re-ship, but verify it is the
+                // SAME event (a fork on shared history must not be swallowed).
+                match this_hash_at(&tx, r.seq)? {
+                    Some(h) if h == r.this_hash => {
+                        skipped += 1;
+                        continue;
+                    }
+                    Some(_) => {
+                        return Ok(reject(
+                            format!("fork: shipped seq {} differs from the event already stored there", r.seq),
+                            r.seq,
+                        ))
+                    }
+                    None => {
+                        return Ok(reject(
+                            format!(
+                                "seq {} is below our next-seq but missing from the log: the replica has a hole (external corruption) - run fsck and rebuild; shipping cannot heal it",
+                                r.seq
+                            ),
+                            r.seq,
+                        ))
+                    }
+                }
+            }
+            if r.seq > expected {
+                return Ok(reject(format!("gap: expected seq {expected}, got {}", r.seq), r.seq));
+            }
+            // r.seq == expected: replay onto our tail and verify the hash.
+            // An unknown kind is adversarial / version-skew input, NOT a store
+            // error: classify it as a Rejected (carrying the resume cursor) like
+            // every other bad-batch branch, never a bare Err - a bare Err has no
+            // cursor and is indistinguishable from a transient DB failure.
+            let kind = match EventKind::from_str(&r.kind) {
+                Some(k) => k,
+                None => {
+                    return Ok(reject(
+                        format!(
+                            "unknown event kind '{}' at seq {} (receiver too old, or a corrupt/forged payload)",
+                            r.kind, r.seq
+                        ),
+                        r.seq,
+                    ))
+                }
+            };
+            let ev = insert_event(
+                &tx,
+                &r.session_id,
+                &r.lineage_id,
+                &r.actor,
+                kind,
+                &r.entity_id,
+                r.parent_rev.as_deref(),
+                &r.body,
+            )?;
+            if ev.this_hash != r.this_hash {
+                // Reconstruction diverged: fork or tampered payload. Return before
+                // commit; the tx drops here, rolling back this and every earlier
+                // insert in the batch (atomic all-or-nothing).
+                return Ok(reject(
+                    format!(
+                        "continuity/integrity fail at seq {}: replayed hash does not match the shipped one",
+                        r.seq
+                    ),
+                    r.seq,
+                ));
+            }
+            applied += 1;
+            expected += 1;
+        }
+        tx.commit()?;
+        let (cseq, tip) = self.contiguous_tip()?;
+        Ok(IngestOutcome::Applied { applied, skipped, contiguous_seq: cseq, tip_hash: tip })
+    }
+
+    pub fn conn(&self) -> &Connection {
+        &self.conn
+    }
+
+    pub fn conn_mut(&mut self) -> &mut Connection {
+        &mut self.conn
+    }
+}
+
+/// Assert the FTS recall projection matches the log: same row count AND the same
+/// rowid set as event.seq. This is the fsck-side half of the "projection written
+/// in the append tx" contract. A contentless FTS5 index stores no column text to
+/// read back, so per-row CONTENT is not independently compared here; content
+/// cannot drift from the code path anyway, because each FTS row is written in the
+/// same transaction as its event and body_ch is append-only (any body_ch edit is
+/// already caught by the hash chain in verify_chain_integrity). This row-set
+/// check catches a missing, extra, or orphan index entry (a pre-M1 store, an
+/// aborted backfill, or external tampering of event_fts).
+pub fn verify_fts_projection(conn: &Connection) -> Result<(), String> {
+    let db_err = |e: rusqlite::Error| format!("FTS projection check could not run: {}", e);
+    let events: i64 = conn
+        .query_row("SELECT COUNT(*) FROM event", [], |r| r.get(0))
+        .map_err(db_err)?;
+    let indexed: i64 = conn
+        .query_row("SELECT COUNT(*) FROM event_fts", [], |r| r.get(0))
+        .map_err(db_err)?;
+    if events != indexed {
+        return Err(format!(
+            "FTS index has {} rows but the log has {} (projection drift)",
+            indexed, events
+        ));
+    }
+    let missing: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM event WHERE seq NOT IN (SELECT rowid FROM event_fts)",
+            [],
+            |r| r.get(0),
+        )
+        .map_err(db_err)?;
+    if missing > 0 {
+        return Err(format!("{} event rows are missing from the FTS index", missing));
+    }
+    let orphan: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM event_fts WHERE rowid NOT IN (SELECT seq FROM event)",
+            [],
+            |r| r.get(0),
+        )
+        .map_err(db_err)?;
+    if orphan > 0 {
+        return Err(format!(
+            "{} FTS entries point at a non-existent event seq",
+            orphan
+        ));
+    }
+    Ok(())
+}
+
+/// Ask FTS5 to verify its own inverted index, which the row-set check above
+/// cannot do. The two are complements, not alternatives: verify_fts_projection
+/// catches a missing, extra or orphan ROW, this catches a row that is present
+/// but whose index blocks are damaged.
+///
+/// Why it matters: a corrupted segment inside event_fts_data leaves the row
+/// count, the rowid set and the orphan set all perfectly intact, so the check
+/// above reports OK - while MATCH silently returns FEWER rows, with no error.
+/// Measured on this crate's bundled SQLite: 500 events, one damaged block, and
+/// recall dropped to 259 of 500 while the row-set check passed. Nothing in THOR
+/// can cause that (each FTS row is written in the append transaction, under WAL
+/// and synchronous=FULL); it arrives from outside - a failing disk, a
+/// filesystem that lied about fsync, a bad copy of a shipped replica, or
+/// tampering. THOR ships stores over a wire and restores them from exports, so
+/// "the program cannot cause it" is not the same as "it cannot happen here".
+///
+/// The `rank` argument is 0 deliberately. On a contentless table there is no
+/// content table to compare against, and 1 (the "also compare the content"
+/// form) behaves identically here - claiming otherwise would be theatre.
+///
+/// The damage is repairable without touching history: the index is a projection
+/// of an append-only log, so rebuilding it loses nothing. `thor fsck --rebuild-fts`
+/// does exactly that. It is deliberately NOT automatic: sync_fts returns early
+/// when the counts match (which is the state after this kind of damage), and a
+/// silent rewrite of an index at the moment the disk under it is suspect is the
+/// wrong reflex.
+pub fn verify_fts_integrity(conn: &Connection) -> Result<(), String> {
+    conn.execute("INSERT INTO event_fts(event_fts, rank) VALUES('integrity-check', 0)", [])
+        .map(|_| ())
+        .map_err(|e| format!("FTS index is damaged: {}", e))
+}
+
+/// Rebuild the FTS index from the log, unconditionally. `sync_fts` is the
+/// cheap guard that runs on every open and returns early when the counts
+/// already match; this is the explicit repair for damage the counts cannot see
+/// (see verify_fts_integrity). Losing the index costs nothing - it is derived.
+pub fn rebuild_fts(conn: &Connection) -> Result<usize, String> {
+    let db_err = |e: rusqlite::Error| format!("FTS rebuild failed: {}", e);
+    conn.execute("INSERT INTO event_fts(event_fts) VALUES('delete-all')", [])
+        .map_err(db_err)?;
+    conn.execute(
+        "INSERT INTO event_fts(rowid, body_ch) SELECT seq, body_ch FROM event",
+        [],
+    )
+    .map_err(db_err)
+}
+
+#[cfg(test)]
+mod fts_integrity_tests {
+    use super::*;
+
+    /// Damage one index block the way a bad disk would: flip a byte inside
+    /// event_fts_data. Returns false when the table has no block to damage.
+    ///
+    /// It damages the LAST block on purpose. A contentless FTS5 index of a few
+    /// dozen rows is a single segment, so damaging it takes the whole index down
+    /// and even COUNT(*) fails - which proves nothing, because the row-set check
+    /// would then error too. The interesting case is the realistic one: a store
+    /// big enough to hold several segments, where one damaged segment leaves the
+    /// row set perfectly intact and only search goes quietly lossy.
+    fn damage_one_index_block(conn: &Connection) -> bool {
+        let id: Option<i64> = conn
+            .query_row("SELECT MAX(id) FROM event_fts_data", [], |r| r.get(0))
+            .unwrap_or(None);
+        let Some(id) = id else { return false };
+        let mut block: Vec<u8> = match conn.query_row(
+            "SELECT block FROM event_fts_data WHERE id = ?",
+            params![id],
+            |r| r.get(0),
+        ) {
+            Ok(b) => b,
+            Err(_) => return false,
+        };
+        if block.len() < 64 {
+            return false;
+        }
+        // Flip a byte AND drop a run of them: a lone flipped byte often lands in
+        // a region FTS5 does not have to trust, so it can survive its own check.
+        // Removing bytes changes the segment's structure, which is what a torn
+        // write or a bad sector actually looks like.
+        let mid = block.len() / 2;
+        block[mid] ^= 0xFF;
+        block.drain(mid + 1..mid + 20);
+        conn.execute("UPDATE event_fts_data SET block = ? WHERE id = ?", params![block, id])
+            .is_ok()
+    }
+
+    fn seeded(n: usize) -> EventStore {
+        let mut store = EventStore::in_memory().unwrap();
+        for i in 0..n {
+            store
+                .append_event(
+                    "s",
+                    "l",
+                    "a",
+                    EventKind::FactCreated,
+                    &format!("e{i}"),
+                    None,
+                    &format!("alpha beta gamma delta fact number {i} with enough words to index"),
+                )
+                .unwrap();
+        }
+        store
+    }
+
+    #[test]
+    fn healthy_store_passes_both_fts_checks() {
+        let store = seeded(40);
+        assert!(verify_fts_projection(&store.conn).is_ok(), "row set is intact");
+        assert!(verify_fts_integrity(&store.conn).is_ok(), "index is intact");
+    }
+
+    /// The load-bearing test. A damaged index block leaves the row count, the
+    /// rowid set and the orphan set perfectly intact, so the row-set check
+    /// reports OK - which is exactly how fsck used to print "FTS projection: OK"
+    /// over a store whose search had silently gone lossy.
+    #[test]
+    fn a_damaged_index_block_passes_the_row_set_check_and_fails_the_integrity_check() {
+        let store = seeded(500);
+        if !damage_one_index_block(&store.conn) {
+            return; // no block to damage on this SQLite build; nothing to assert
+        }
+        assert!(
+            verify_fts_projection(&store.conn).is_ok(),
+            "the row-set check cannot see block damage - that is the whole point"
+        );
+        assert!(
+            verify_fts_integrity(&store.conn).is_err(),
+            "FTS5's own integrity check must catch what the row-set check cannot"
+        );
+    }
+
+    #[test]
+    fn rebuild_repairs_a_damaged_index() {
+        let store = seeded(500);
+        if !damage_one_index_block(&store.conn) {
+            return;
+        }
+        assert!(verify_fts_integrity(&store.conn).is_err(), "damaged first");
+        let rows = rebuild_fts(&store.conn).expect("rebuild runs");
+        assert_eq!(rows, 500, "every event is re-indexed");
+        assert!(verify_fts_integrity(&store.conn).is_ok(), "repaired");
+        assert!(verify_fts_projection(&store.conn).is_ok(), "and still consistent");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The projection tables must equal the cas fold after EVERY append,
+    /// across the full torture set of fold arms: fast-forward, stale branch,
+    /// retract (both forms), valid resolve, partial/invalid resolve,
+    /// keep-in-discarded resolve, resolve-then-FF, reproject (valid,
+    /// malformed, before-birth), and the head-neutral kinds.
+    #[test]
+    fn heads_projection_equals_fold_after_every_append() {
+        let mut store = EventStore::in_memory().unwrap();
+        let assert_projection = |store: &EventStore, step: &str| {
+            assert!(store.heads_projection_current(), "projection current after {}", step);
+            let issues = store.verify_heads_projection().unwrap();
+            assert!(issues.is_empty(), "after {}: {:?}", step, issues);
+        };
+        let a = store
+            .append_event("s", "l", "t", EventKind::FactCreated, "P:mem-a", None, "a v1")
+            .unwrap();
+        assert_projection(&store, "create");
+        let a2 = store
+            .append_event("s", "l", "t", EventKind::FactRevised, "P:mem-a", Some(&a.this_hash), "a v2")
+            .unwrap();
+        assert_projection(&store, "fast-forward");
+        store
+            .append_event("s", "l", "t", EventKind::FactRevised, "P:mem-a", Some("stale"), "a branch")
+            .unwrap();
+        assert_projection(&store, "stale branch (diverged)");
+        assert_eq!(store.projected_head_count("P:mem-a"), 2, "diverged = two heads");
+        // invalid partial resolve = no-op
+        let bad = serde_json::json!({ "keep_rev": a2.this_hash, "discarded": ["nonsense"] }).to_string();
+        store
+            .append_event("s", "l", "t", EventKind::FactResolved, "P:mem-a", None, &bad)
+            .unwrap();
+        assert_projection(&store, "invalid resolve (no-op)");
+        assert_eq!(store.projected_head_count("P:mem-a"), 2);
+        // valid resolve down to one head
+        let heads: Vec<String> = {
+            let events = store.get_all_events().unwrap();
+            crate::cas::compute_head_sets(&events)["P:mem-a"].heads.iter().cloned().collect()
+        };
+        let discarded: Vec<&String> = heads.iter().filter(|h| **h != a2.this_hash).collect();
+        let good = serde_json::json!({ "keep_rev": a2.this_hash, "discarded": discarded }).to_string();
+        store
+            .append_event("s", "l", "t", EventKind::FactResolved, "P:mem-a", None, &good)
+            .unwrap();
+        assert_projection(&store, "valid resolve");
+        assert_eq!(store.projected_head_count("P:mem-a"), 1);
+        // resolve-then-FF
+        store
+            .append_event("s", "l", "t", EventKind::FactRevised, "P:mem-a", Some(&a2.this_hash), "a v3")
+            .unwrap();
+        assert_projection(&store, "FF from resolved winner");
+        // retract as fast-forward
+        let b = store
+            .append_event("s", "l", "t", EventKind::FactCreated, "01KGLOBALB", None, "b v1")
+            .unwrap();
+        store
+            .append_event("s", "l", "t", EventKind::FactRetracted, "01KGLOBALB", Some(&b.this_hash), "[gone]")
+            .unwrap();
+        assert_projection(&store, "retract FF");
+        // reproject valid, then a revise that must NOT clobber it
+        let c = store
+            .append_event("s", "l", "t", EventKind::FactCreated, "ProjC:mem-c", None, "c v1")
+            .unwrap();
+        store
+            .append_event(
+                "s", "l", "t", EventKind::FactReprojected, "ProjC:mem-c", None,
+                &serde_json::json!({ "project": "ProjD" }).to_string(),
+            )
+            .unwrap();
+        store
+            .append_event("s", "l", "t", EventKind::FactRevised, "ProjC:mem-c", Some(&c.this_hash), "c v2")
+            .unwrap();
+        assert_projection(&store, "reproject + revise");
+        assert_eq!(store.projected_project("ProjC:mem-c"), Some(Some("ProjD".to_string())));
+        // malformed reproject = full no-op
+        store
+            .append_event("s", "l", "t", EventKind::FactReprojected, "ProjC:mem-c", None, "not json")
+            .unwrap();
+        assert_projection(&store, "malformed reproject");
+        assert_eq!(store.projected_project("ProjC:mem-c"), Some(Some("ProjD".to_string())));
+        // reproject BEFORE birth, then birth must not clobber the override
+        store
+            .append_event(
+                "s", "l", "t", EventKind::FactReprojected, "ProjE:mem-e", None,
+                &serde_json::json!({ "project": null }).to_string(),
+            )
+            .unwrap();
+        store
+            .append_event("s", "l", "t", EventKind::FactCreated, "ProjE:mem-e", None, "e v1")
+            .unwrap();
+        assert_projection(&store, "reproject before birth");
+        assert_eq!(store.projected_project("ProjE:mem-e"), Some(None), "override to global sticks");
+        // head-neutral echo
+        store
+            .append_event("s", "l", "t", EventKind::FactEchoed, "ProjC:mem-c", None, "{}")
+            .unwrap();
+        assert_projection(&store, "echo (head-neutral)");
+    }
+
+    /// A write that bypasses append (raw insert, the restore/pre-M2 shape)
+    /// leaves the projection STALE - readers must fall back - and the next
+    /// ordinary append rebuilds it in-transaction from the whole log.
+    #[test]
+    fn heads_projection_rebuilds_after_bypass() {
+        let mut store = EventStore::in_memory().unwrap();
+        let a = store
+            .append_event("s", "l", "t", EventKind::FactCreated, "P:mem-a", None, "a v1")
+            .unwrap();
+        assert!(store.heads_projection_current());
+        // bypass: raw event insert without the projection delta
+        store
+            .conn()
+            .execute(
+                "INSERT INTO event (seq, event_uuid, session_id, lineage_id, actor, kind, entity_id,
+                 parent_rev, body, body_ch, prev_hash, this_hash)
+                 VALUES (2, 'bypass-uuid', 's', 'l', 't', 'fact_revised', 'P:mem-a', ?, 'a v2', 'a v2', ?, 'bypass-hash')",
+                params![&a.this_hash, &a.this_hash],
+            )
+            .unwrap();
+        assert!(!store.heads_projection_current(), "bypass leaves the projection stale");
+        // fold fallback still sees the truth
+        let folded = crate::cas::compute_head_sets(&store.get_all_events().unwrap());
+        assert_eq!(folded["P:mem-a"].heads.len(), 1);
+        assert!(folded["P:mem-a"].heads.contains("bypass-hash"));
+        // the next append rebuilds the whole projection
+        store
+            .append_event("s", "l", "t", EventKind::FactCreated, "P:mem-b", None, "b v1")
+            .unwrap();
+        assert!(store.heads_projection_current(), "append after bypass rebuilds");
+        assert!(store.verify_heads_projection().unwrap().is_empty());
+        assert!(store.projected_is_head("P:mem-a", "bypass-hash"));
+    }
+
+    /// projected_head_events serves every current head as its full event row
+    /// with the entity's head count - the anchored-pass workload.
+    #[test]
+    fn projected_head_events_match_fold() {
+        let mut store = EventStore::in_memory().unwrap();
+        let a = store
+            .append_event("s", "l", "t", EventKind::FactCreated, "P:mem-a", None, "a v1")
+            .unwrap();
+        store
+            .append_event("s", "l", "t", EventKind::FactRevised, "P:mem-a", Some("stale"), "a branch")
+            .unwrap();
+        store
+            .append_event("s", "l", "t", EventKind::FactCreated, "Q:doc.md#0", None, "doc chunk")
+            .unwrap();
+        let rows = store.projected_head_events().unwrap();
+        let folded = crate::cas::compute_head_sets(&store.get_all_events().unwrap());
+        let total: usize = folded.values().map(|h| h.heads.len()).sum();
+        assert_eq!(rows.len(), total);
+        for (ev, n, project) in &rows {
+            assert!(folded[&ev.entity_id].heads.contains(&ev.this_hash));
+            assert_eq!(*n as usize, folded[&ev.entity_id].heads.len());
+            assert_eq!(
+                project.as_deref(),
+                crate::repo::owner_project(&ev.entity_id),
+                "birth project served for {}",
+                ev.entity_id
+            );
+        }
+        assert!(rows.iter().any(|(e, n, _)| e.entity_id == "P:mem-a" && *n == 2));
+        let _ = a;
+    }
+
+    #[test]
+    fn test_canonicalize_body() {
+        assert_eq!(canonicalize_body("hello\r\nworld\r\n"), "hello\nworld");
+        assert_eq!(canonicalize_body("hello   \n"), "hello");
+        assert_eq!(canonicalize_body("test"), "test");
+        // lone CR (old-Mac endings) and mixed endings normalize like LF
+        assert_eq!(canonicalize_body("a\rb\r"), "a\nb");
+        assert_eq!(canonicalize_body("a\r\nb\rc\r\n"), "a\nb\nc");
+        assert_eq!(canonicalize_body("a\rb"), canonicalize_body("a\nb"));
+        assert_eq!(canonicalize_body("a\r\nb\rc"), canonicalize_body("a\nb\nc"));
+    }
+
+    #[test]
+    fn test_hash_consistency() {
+        let hash1 = hash_event("prev", "canonical1");
+        let hash2 = hash_event("prev", "canonical1");
+        assert_eq!(hash1, hash2);
+
+        let hash3 = hash_event("prev", "canonical2");
+        assert_ne!(hash1, hash3);
+    }
+
+    #[test]
+    fn test_event_store_creation() {
+        let store = EventStore::in_memory().unwrap();
+        let seq = store.get_next_seq().unwrap();
+        assert_eq!(seq, 1);
+    }
+
+    #[test]
+    fn test_prev_hash_genesis_on_empty_log() {
+        // the genuine no-rows case yields the genesis prev_hash ""
+        let store = EventStore::in_memory().unwrap();
+        assert_eq!(store.get_prev_hash().unwrap(), "");
+    }
+
+    #[test]
+    fn test_this_hash_follows_seqless_spec_formula() {
+        // Lock the wire format of the hash: this_hash = sha256(prev_hash ||
+        // canonical(event)) where canonical(event) is the length-framed SEMANTIC
+        // event and deliberately EXCLUDES the storage seq (design section 4).
+        // The framed format is spelled out here (NOT via frame()/canonical_repr)
+        // so a helper change cannot silently hide a wire-format regression; if
+        // someone reintroduces seq or drops framing, this test fails loudly.
+        let mut store = EventStore::in_memory().unwrap();
+        let ev = store
+            .append_event("s1", "l1", "a1", EventKind::FactCreated, "e1", None, "the body")
+            .unwrap();
+
+        // frame(s) = "<byte-len>:<s>"; canonical = frame(kind).frame(entity).frame(parent).frame(body)
+        let canonical = format!(
+            "{}:{}{}:{}{}:{}{}:{}",
+            "fact_created".len(), "fact_created",
+            "e1".len(), "e1",
+            "".len(), "",
+            "the body".len(), "the body",
+        );
+        let expected = hash_event(&ev.prev_hash, &canonical);
+        assert_eq!(
+            ev.this_hash, expected,
+            "this_hash must be sha256(prev_hash || framed(kind,entity,parent,body_ch)), no seq"
+        );
+
+        // A second event with a parent_rev: parent is in the canonical, seq is not.
+        let ev2 = store
+            .append_event(
+                "s1", "l1", "a1", EventKind::FactRevised, "e1", Some(&ev.this_hash), "next body",
+            )
+            .unwrap();
+        let canonical2 = format!(
+            "{}:{}{}:{}{}:{}{}:{}",
+            "fact_revised".len(), "fact_revised",
+            "e1".len(), "e1",
+            ev.this_hash.len(), &ev.this_hash,
+            "next body".len(), "next body",
+        );
+        assert_eq!(ev2.this_hash, hash_event(&ev2.prev_hash, &canonical2));
+    }
+
+    #[test]
+    fn test_seq_integrity_is_structural_not_hashed() {
+        // Two independent claims, each with its own assertion (the earlier
+        // version asserted only is_err(), which passes whether or not seq is
+        // hashed - so it proved neither half):
+        //   (a) seq is NOT in the hash: the stored this_hash still equals a
+        //       recompute over the semantic fields after seq is changed;
+        //   (b) the tamper is nonetheless caught, specifically by the
+        //       contiguity check (not incidentally by a hash mismatch).
+        use crate::auditor::verify_chain_integrity;
+        let mut store = EventStore::in_memory().unwrap();
+        store
+            .append_event("s1", "l1", "a1", EventKind::FactCreated, "e1", None, "b1")
+            .unwrap();
+        store
+            .append_event("s1", "l1", "a1", EventKind::FactCreated, "e2", None, "b2")
+            .unwrap();
+
+        let mut events = store.get_all_events().unwrap();
+        assert!(verify_chain_integrity(&events).is_ok(), "clean log passes");
+
+        events[1].seq = 99;
+
+        // (a) if seq WERE hashed, this recompute would diverge from the stored hash
+        assert_eq!(
+            events[1].this_hash,
+            hash_event(&events[1].prev_hash, &canonical_repr(&events[1])),
+            "this_hash must be independent of seq (seq is not part of the canonical)"
+        );
+
+        // (b) caught specifically by the contiguity branch
+        let err = verify_chain_integrity(&events).unwrap_err();
+        assert!(
+            err.contains("Non-contiguous seq"),
+            "a tampered seq must be caught by the contiguity check, got: {}",
+            err
+        );
+    }
+
+    #[test]
+    fn test_seq_swap_is_caught_by_prev_hash_chain() {
+        // A subtler seq tamper than a renumber: swap two events' seq values so
+        // the set {1,2} stays contiguous. Contiguity alone cannot see this; only
+        // the prev_hash chain does - the exact guarantee the canonical_repr doc
+        // comment leans on to justify dropping seq from the hash.
+        use crate::auditor::verify_chain_integrity;
+        let mut store = EventStore::in_memory().unwrap();
+        store
+            .append_event("s1", "l1", "a1", EventKind::FactCreated, "e1", None, "b1")
+            .unwrap();
+        store
+            .append_event("s1", "l1", "a1", EventKind::FactCreated, "e2", None, "b2")
+            .unwrap();
+
+        let mut events = store.get_all_events().unwrap();
+        let (s0, s1) = (events[0].seq, events[1].seq);
+        events[0].seq = s1;
+        events[1].seq = s0;
+        events.sort_by_key(|e| e.seq); // mimic get_all_events' ORDER BY seq
+
+        let err = verify_chain_integrity(&events).unwrap_err();
+        assert!(
+            err.contains("Hash chain broken"),
+            "a seq swap must be caught by the prev_hash chain, got: {}",
+            err
+        );
+    }
+
+    #[test]
+    fn test_empty_parent_rev_normalizes_to_none() {
+        // Some("") and None are the same event: an empty parent is "no parent".
+        // Normalizing at the write boundary keeps that state unrepresentable, so
+        // the None-vs-Some("") canonical alias can never become a latent hazard.
+        let mut store_none = EventStore::in_memory().unwrap();
+        let a = store_none
+            .append_event("s", "l", "act", EventKind::FactCreated, "e1", None, "body")
+            .unwrap();
+        let mut store_empty = EventStore::in_memory().unwrap();
+        let b = store_empty
+            .append_event("s", "l", "act", EventKind::FactCreated, "e1", Some(""), "body")
+            .unwrap();
+
+        assert_eq!(a.parent_rev, None);
+        assert_eq!(b.parent_rev, None, "Some(\"\") must be normalized to None");
+        assert_eq!(
+            a.this_hash, b.this_hash,
+            "an empty parent_rev must hash identically to no parent"
+        );
+    }
+
+    #[test]
+    fn test_canonical_is_injective_across_field_boundaries() {
+        // Length-framing must keep field boundaries unambiguous so two
+        // semantically DIFFERENT events never share a canonical (a bare
+        // '|'-join collides these, letting a stored row be rewritten to a
+        // different (entity_id, body) that hashes identically and passes fsck).
+        let a = canonical_repr_parts(EventKind::FactCreated, "x", None, "y||z");
+        let b = canonical_repr_parts(EventKind::FactCreated, "x||y", None, "z");
+        assert_ne!(a, b, "(entity_id, body_ch) boundary must be unambiguous");
+
+        let c = canonical_repr_parts(EventKind::FactCreated, "a|", None, "b");
+        let d = canonical_repr_parts(EventKind::FactCreated, "a", None, "|b");
+        assert_ne!(c, d, "a '|' at a field edge must not shift the boundary");
+    }
+
+    #[test]
+    fn test_verify_fts_projection_detects_drift() {
+        let mut store = EventStore::in_memory().unwrap();
+        store
+            .append_event("s", "l", "a", EventKind::FactCreated, "e1", None, "alpha body")
+            .unwrap();
+        store
+            .append_event("s", "l", "a", EventKind::FactCreated, "e2", None, "beta body")
+            .unwrap();
+        assert!(
+            verify_fts_projection(store.conn()).is_ok(),
+            "a store whose FTS was written in-tx must pass"
+        );
+
+        // inject an orphan FTS row: count + rowid-set now drift from the log
+        store
+            .conn()
+            .execute("INSERT INTO event_fts(rowid, body_ch) VALUES (999, 'orphan')", [])
+            .unwrap();
+        assert!(
+            verify_fts_projection(store.conn()).is_err(),
+            "fsck must catch an FTS index that drifted from the log"
+        );
+    }
+
+    #[test]
+    fn test_append_event() {
+        let mut store = EventStore::in_memory().unwrap();
+        let event = store
+            .append_event(
+                "session1",
+                "lineage1",
+                "actor1",
+                EventKind::FactCreated,
+                "entity1",
+                None,
+                "test body",
+            )
+            .unwrap();
+
+        assert_eq!(event.seq, 1);
+        assert_eq!(event.entity_id, "entity1");
+        assert_eq!(event.kind, EventKind::FactCreated);
+
+        let retrieved = store.get_event_by_uuid(&event.event_uuid).unwrap();
+        assert!(retrieved.is_some());
+        assert_eq!(retrieved.unwrap().seq, 1);
+    }
+
+    /// A retraction is a decision, not a pause (2026-07-30, found by an audit
+    /// swarm). Liveness is read everywhere from the KIND of the current head,
+    /// and nothing checked that kind before accepting a parent - so a revise
+    /// citing a retracted head fast-forwarded off the tombstone like any other
+    /// head and the fact was simply live again, indistinguishable from one that
+    /// had been revised twice, with no word about it in the reply. A stale id
+    /// from an earlier session was enough to bring back something deliberately
+    /// killed.
+    #[test]
+    fn a_retracted_fact_cannot_be_revived_by_revising_its_tombstone() {
+        let mut store = EventStore::in_memory().unwrap();
+        let v1 = store
+            .append_event("s", "l", "a", EventKind::FactCreated, "e1", None, "the wrong fact")
+            .unwrap();
+        let dead = store
+            .append_mutate_checked(
+                "s", "l", "a", EventKind::FactRetracted, "e1", Some(&v1.this_hash), "wrong",
+            )
+            .unwrap();
+
+        let auto = store.append_mutate_checked(
+            "s", "l", "a", EventKind::FactRevised, "e1", None, "back from the dead",
+        );
+        let err = auto.expect_err("a revise off a tombstone must not silently revive the fact");
+        let msg = format!("{err}");
+        assert!(msg.contains("RETRACTED"), "the refusal says WHY: {msg}");
+        assert!(msg.contains("remember"), "and names the way forward: {msg}");
+
+        // Citing the tombstone explicitly is the same act, so it is refused too.
+        let explicit = store.append_mutate_checked(
+            "s", "l", "a", EventKind::FactRevised, "e1", Some(&dead.this_hash), "sneaky",
+        );
+        assert!(explicit.is_err(), "naming the tombstone as parent is not a loophole");
+
+        // But a RETRACT of an already-retracted fact is the same decision
+        // arriving twice, not a revival, and it must stay idempotent: the
+        // replica inbox is at-least-once, and a deterministic refusal there
+        // froze the whole batch (found by two adversarial verifiers).
+        let again = store.append_mutate_checked(
+            "s", "l", "a", EventKind::FactRetracted, "e1", None, "still wrong",
+        );
+        assert!(again.is_ok(), "a repeated retract must not fail: {:?}", again.err().map(|e| e.to_string()));
+
+        // And the fact really did stay dead.
+        let events = store.get_all_events().unwrap();
+        let heads = crate::cas::compute_head_sets(&events);
+        let head = heads.get("e1").unwrap().heads.iter().next().unwrap().clone();
+        let kind = events.iter().find(|e| e.this_hash == head).map(|e| e.kind).unwrap();
+        assert_eq!(kind, EventKind::FactRetracted, "the tombstone is still the head");
+    }
+
+    /// A revise that rewrites the body must keep the fact's footer: it holds
+    /// the type, tags, fires-when vocabulary and the guard's ANCHORS, and losing
+    /// them is invisible (recall still finds the fact - it just never fires at
+    /// the moment of action again). Hit live: a revise meant to widen a memory's
+    /// anchors wiped them instead.
+    #[test]
+    fn revise_keeps_the_facts_footer_but_retract_does_not_inherit_it() {
+        let mut store = EventStore::in_memory().unwrap();
+        let footer = crate::footer::compose(
+            "gotcha",
+            &["nas".into()],
+            "global",
+            &["ssh".into()],
+            &["ssh admin@host".into()],
+            None,
+        );
+        let v1 = store
+            .append_event("s", "l", "a", EventKind::FactCreated, "e1", None, &format!("old\n\n{footer}"))
+            .unwrap();
+
+        // content-only revise: caller sends no footer, the fact keeps its own
+        let v2 = store
+            .append_mutate_checked("s", "l", "a", EventKind::FactRevised, "e1", Some(&v1.this_hash), "new content")
+            .unwrap();
+        assert_eq!(crate::footer::strip(&v2.body), "new content");
+        assert_eq!(crate::footer::anchors(&v2.body), vec!["ssh admin@host"], "anchors survive");
+        assert_eq!(crate::footer::fact_type(&v2.body), Some(crate::repo::FactType::Gotcha));
+
+        // a caller's own footer still wins (retyping in one call)
+        let retyped = format!(
+            "newer\n\n{}",
+            crate::footer::compose("decision", &["x".into()], "global", &[], &["other".into()], None)
+        );
+        let v3 = store
+            .append_mutate_checked("s", "l", "a", EventKind::FactRevised, "e1", Some(&v2.this_hash), &retyped)
+            .unwrap();
+        assert_eq!(crate::footer::anchors(&v3.body), vec!["other"], "caller's footer is respected");
+
+        // a RETRACT must not inherit the metadata: its body is the tombstone
+        let dead = store
+            .append_mutate_checked("s", "l", "a", EventKind::FactRetracted, "e1", Some(&v3.this_hash), "[retracted: gone]")
+            .unwrap();
+        assert_eq!(dead.body, "[retracted: gone]", "tombstone stays verbatim");
+    }
+
+    #[test]
+    fn test_append_mutate_checked_cas_semantics() {
+        let mut store = EventStore::in_memory().unwrap();
+        let v1 = store
+            .append_event("s", "l", "a", EventKind::FactCreated, "e1", None, "v1")
+            .unwrap();
+
+        // single head + no parent cited -> auto-fills the head (a safe FF revise)
+        let v2 = store
+            .append_mutate_checked("s", "l", "a", EventKind::FactRevised, "e1", None, "v2")
+            .unwrap();
+        assert_eq!(v2.parent_rev.as_deref(), Some(v1.this_hash.as_str()));
+
+        // a STALE parent is rejected with the fresh head-set, and nothing is written
+        let n_before = store.get_all_events().unwrap().len();
+        let err = store
+            .append_mutate_checked("s", "l", "a", EventKind::FactRevised, "e1", Some(&v1.this_hash), "v3")
+            .unwrap_err();
+        let conflict = err.downcast_ref::<MutateConflict>().expect("typed conflict");
+        assert!(conflict.reason.contains("not a current head"));
+        assert_eq!(conflict.current_heads, vec![v2.this_hash.clone()]);
+        assert_eq!(store.get_all_events().unwrap().len(), n_before, "rejected mutate writes nothing");
+
+        // unknown entity -> typed conflict, not a silent create
+        assert!(store
+            .append_mutate_checked("s", "l", "a", EventKind::FactRevised, "nope", None, "x")
+            .unwrap_err()
+            .downcast_ref::<MutateConflict>()
+            .is_some());
+
+        // force a divergence via the raw primitive; a parentless mutate then rejects
+        store
+            .append_event("s", "l", "a", EventKind::FactRevised, "e1", Some("stale-parent"), "branch")
+            .unwrap();
+        let err = store
+            .append_mutate_checked("s", "l", "a", EventKind::FactRetracted, "e1", None, "")
+            .unwrap_err();
+        let conflict = err.downcast_ref::<MutateConflict>().expect("typed conflict");
+        assert!(conflict.reason.contains("DIVERGED"));
+        assert_eq!(conflict.current_heads.len(), 2, "the fresh head-set is returned for the retry");
+
+        // ...but citing one exact contested head is allowed (an explicit choice)
+        let keep = conflict.current_heads[0].clone();
+        store
+            .append_mutate_checked("s", "l", "a", EventKind::FactRevised, "e1", Some(&keep), "explicit")
+            .unwrap();
+    }
+
+    // ---- log shipping (sync receiver) ----
+
+    /// An authority store with a small chain (2 revs of e1 + one e2).
+    fn authority() -> EventStore {
+        let mut a = EventStore::in_memory().unwrap();
+        let e1 = a.append_event("s", "l", "act", EventKind::FactCreated, "e1", None, "first").unwrap();
+        a.append_event("s", "l", "act", EventKind::FactRevised, "e1", Some(&e1.this_hash), "second").unwrap();
+        a.append_event("s", "l", "act", EventKind::FactCreated, "e2", None, "third").unwrap();
+        a
+    }
+
+    fn shipped_of(store: &EventStore) -> Vec<ShippedEvent> {
+        store.get_all_events().unwrap().iter().map(|e| e.to_shipped()).collect()
+    }
+
+    #[test]
+    fn test_ingest_extends_replica_and_is_hash_identical() {
+        let a = authority();
+        let batch = shipped_of(&a);
+        let mut r = EventStore::in_memory().unwrap();
+
+        match r.ingest_batch(&batch).unwrap() {
+            IngestOutcome::Applied { applied, skipped, contiguous_seq, tip_hash } => {
+                assert_eq!(applied, 3);
+                assert_eq!(skipped, 0);
+                assert_eq!(contiguous_seq, 3);
+                assert_eq!(tip_hash, a.contiguous_tip().unwrap().1, "replica tip must equal authority tip");
+            }
+            other => panic!("expected Applied, got {other:?}"),
+        }
+        // byte-for-byte the same chain
+        let (ra, aa) = (r.get_all_events().unwrap(), a.get_all_events().unwrap());
+        assert_eq!(ra.len(), aa.len());
+        for (x, y) in ra.iter().zip(aa.iter()) {
+            assert_eq!(x.this_hash, y.this_hash, "hash must match");
+            assert_eq!(x.body, y.body);
+            assert_eq!(x.entity_id, y.entity_id);
+        }
+    }
+
+    #[test]
+    fn test_ingest_incremental_prefix_then_tail() {
+        let a = authority();
+        let batch = shipped_of(&a);
+        let mut r = EventStore::in_memory().unwrap();
+        // seed the replica with just the first event...
+        assert!(matches!(
+            r.ingest_batch(&batch[..1]).unwrap(),
+            IngestOutcome::Applied { applied: 1, .. }
+        ));
+        // ...then ship the tail; it must continue the chain.
+        match r.ingest_batch(&batch[1..]).unwrap() {
+            IngestOutcome::Applied { applied, contiguous_seq, .. } => {
+                assert_eq!(applied, 2);
+                assert_eq!(contiguous_seq, 3);
+            }
+            other => panic!("expected Applied, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_ingest_idempotent_reship() {
+        let a = authority();
+        let batch = shipped_of(&a);
+        let mut r = EventStore::in_memory().unwrap();
+        r.ingest_batch(&batch).unwrap();
+        // shipping the exact same batch again applies nothing and skips all
+        match r.ingest_batch(&batch).unwrap() {
+            IngestOutcome::Applied { applied, skipped, contiguous_seq, .. } => {
+                assert_eq!(applied, 0);
+                assert_eq!(skipped, 3);
+                assert_eq!(contiguous_seq, 3);
+            }
+            other => panic!("expected Applied, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_ingest_rejects_gap() {
+        let a = authority();
+        let batch = shipped_of(&a);
+        let mut r = EventStore::in_memory().unwrap();
+        // ship seq 2,3 into an EMPTY replica (expects seq 1 first) -> a gap
+        match r.ingest_batch(&batch[1..]).unwrap() {
+            IngestOutcome::Rejected { contiguous_seq, reason, .. } => {
+                assert_eq!(contiguous_seq, 0);
+                assert!(reason.contains("gap"), "reason: {reason}");
+            }
+            other => panic!("expected Rejected, got {other:?}"),
+        }
+        assert!(r.get_all_events().unwrap().is_empty(), "a rejected gap writes nothing");
+    }
+
+    #[test]
+    fn test_ingest_rejects_tampered_payload() {
+        let a = authority();
+        let mut batch = shipped_of(&a);
+        // corrupt a body but keep the recorded this_hash -> replay must diverge
+        batch[0].body = "TAMPERED".to_string();
+        let mut r = EventStore::in_memory().unwrap();
+        match r.ingest_batch(&batch).unwrap() {
+            IngestOutcome::Rejected { reason, .. } => {
+                assert!(reason.contains("continuity/integrity"), "reason: {reason}");
+            }
+            other => panic!("expected Rejected, got {other:?}"),
+        }
+        assert!(r.get_all_events().unwrap().is_empty());
+    }
+
+    #[test]
+    fn test_ingest_is_atomic_on_midbatch_reject() {
+        let a = authority();
+        let mut batch = shipped_of(&a);
+        // first event is valid, second is tampered: the WHOLE batch must roll back
+        batch[1].body = "TAMPERED".to_string();
+        let mut r = EventStore::in_memory().unwrap();
+        match r.ingest_batch(&batch).unwrap() {
+            IngestOutcome::Rejected { at_seq, .. } => assert_eq!(at_seq, 2),
+            other => panic!("expected Rejected, got {other:?}"),
+        }
+        assert!(
+            r.get_all_events().unwrap().is_empty(),
+            "the valid first event must not survive a later rejection (atomic batch)"
+        );
+    }
+
+    #[test]
+    fn test_ingest_rejects_fork_on_shared_history() {
+        // replica has its OWN seq 1; the authority ships a DIFFERENT seq 1.
+        let mut r = EventStore::in_memory().unwrap();
+        r.append_event("s", "l", "act", EventKind::FactCreated, "e1", None, "local version").unwrap();
+        let mut a = EventStore::in_memory().unwrap();
+        a.append_event("s", "l", "act", EventKind::FactCreated, "e1", None, "authoritative version").unwrap();
+
+        match r.ingest_batch(&shipped_of(&a)).unwrap() {
+            IngestOutcome::Rejected { reason, at_seq, .. } => {
+                assert_eq!(at_seq, 1);
+                assert!(reason.contains("fork"), "reason: {reason}");
+            }
+            other => panic!("expected Rejected, got {other:?}"),
+        }
+        // the replica's own event is untouched
+        assert_eq!(r.get_all_events().unwrap()[0].body, "local version");
+    }
+
+    #[test]
+    fn test_contiguous_tip_stops_at_a_hole() {
+        let s = authority(); // seq 1,2,3
+        assert_eq!(s.contiguous_tip().unwrap().0, 3);
+        // simulate external tampering that leaves a hole: a raw row at seq 5
+        s.conn()
+            .execute(
+                "INSERT INTO event (seq,event_uuid,session_id,lineage_id,actor,kind,entity_id,parent_rev,body,body_ch,prev_hash,this_hash) \
+                 VALUES (5,'u5','s','l','a','fact_created','e9',NULL,'b','b','ph','th')",
+                [],
+            )
+            .unwrap();
+        assert_eq!(
+            s.contiguous_tip().unwrap().0,
+            3,
+            "contiguous tip must stop at the hole (3), never jump to MAX(seq)=5"
+        );
+    }
+
+    #[test]
+    fn test_ingest_rejects_unknown_kind_without_erroring() {
+        // An unknown kind is adversarial / version-skew input: it must come back
+        // as a structured Rejected (carrying a resume cursor), never a bare Err
+        // or a panic - the same uniform channel as gap/fork/tamper.
+        let a = authority();
+        let mut batch = shipped_of(&a);
+        batch[0].kind = "fact_teleported".to_string();
+        let mut r = EventStore::in_memory().unwrap();
+        match r.ingest_batch(&batch).unwrap() {
+            IngestOutcome::Rejected { reason, at_seq, contiguous_seq, .. } => {
+                assert_eq!(at_seq, 1);
+                assert_eq!(contiguous_seq, 0);
+                assert!(reason.contains("unknown event kind"), "reason: {reason}");
+            }
+            other => panic!("expected Rejected, got {other:?}"),
+        }
+        assert!(r.get_all_events().unwrap().is_empty(), "a rejected batch writes nothing");
+    }
+
+    #[test]
+    fn test_contiguous_tip_is_robust_to_injected_nonpositive_seq() {
+        // Regression: a COUNT(x.seq <= e.seq) frontier assumed seqs start at 1, so
+        // one injected seq <= 0 could mask a hole or sink a clean prefix. The
+        // computation is now scoped to seq >= 1.
+        let s = authority(); // dense 1,2,3
+        // (a) a stray seq-0 row must NOT drop the clean 1..3 prefix to 0
+        s.conn()
+            .execute(
+                "INSERT INTO event (seq,event_uuid,session_id,lineage_id,actor,kind,entity_id,parent_rev,body,body_ch,prev_hash,this_hash) \
+                 VALUES (0,'u0','s','l','a','fact_created','e0',NULL,'b','b','ph','th0')",
+                [],
+            )
+            .unwrap();
+        assert_eq!(s.contiguous_tip().unwrap().0, 3, "a seq-0 row must not sink a dense 1..3 prefix");
+        // (b) with the seq-0 present, a hole above must STILL cap the frontier
+        s.conn()
+            .execute(
+                "INSERT INTO event (seq,event_uuid,session_id,lineage_id,actor,kind,entity_id,parent_rev,body,body_ch,prev_hash,this_hash) \
+                 VALUES (5,'u5','s','l','a','fact_created','e9',NULL,'b','b','ph','th5')",
+                [],
+            )
+            .unwrap();
+        assert_eq!(
+            s.contiguous_tip().unwrap().0,
+            3,
+            "the hole at seq 4 must still cap the frontier at 3, not jump to 5 via the seq-0 offset"
+        );
+    }
+}
+
+#[cfg(test)]
+mod item_binding_tests {
+    use super::*;
+
+    /// A raw item body in the exact wire shape `model::item::Item` writes
+    /// (this crate cannot depend on `model` to build one directly - see
+    /// `extract_binding_rows`'s own doc comment). Pinned against the real
+    /// shape by `model/src/item.rs`'s own round-trip tests and by
+    /// `extract_binding_rows_reads_the_real_wire_shape` below.
+    fn body_with_bindings(bindings_json: &str) -> String {
+        format!(
+            r#"{{"id":"x","kind":"rule","text":"t","bindings":{bindings_json},"severity":null,"project":null,"tags":[],"expires":null,"key":null}}"#
+        )
+    }
+
+    fn binding_rows(store: &EventStore, entity_id: &str) -> Vec<(String, Option<String>, Option<String>)> {
+        let mut stmt = store
+            .conn()
+            .prepare("SELECT kind, value, target_kind FROM item_binding WHERE entity_id = ? ORDER BY kind, value")
+            .unwrap();
+        let rows = stmt.query_map([entity_id], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?))).unwrap();
+        rows.collect::<Result<_, _>>().unwrap()
+    }
+
+    #[test]
+    fn extract_binding_rows_reads_the_real_wire_shape() {
+        let body = body_with_bindings(
+            r#"["always",{"moment":"push"},{"target":{"kind":"path","value":"src/main.rs"}}]"#,
+        );
+        let rows = extract_binding_rows(&body);
+        assert_eq!(rows.len(), 3);
+        assert!(rows.iter().any(|r| r.kind == "always" && r.value.is_none() && r.target_kind.is_none()));
+        assert!(rows.iter().any(|r| r.kind == "moment" && r.value.as_deref() == Some("push")));
+        assert!(rows.iter().any(|r| r.kind == "target"
+            && r.value.as_deref() == Some("src/main.rs")
+            && r.target_kind.as_deref() == Some("path")));
+    }
+
+    #[test]
+    fn a_body_with_no_bindings_array_or_no_json_at_all_yields_no_rows() {
+        assert!(extract_binding_rows(r#"{"id":"x"}"#).is_empty());
+        assert!(extract_binding_rows("not json").is_empty());
+    }
+
+    #[test]
+    fn declaring_an_item_populates_its_binding_rows() {
+        let mut store = EventStore::in_memory().unwrap();
+        let body = body_with_bindings(r#"[{"moment":"push"},{"target":{"kind":"path","value":"a/b.rs"}}]"#);
+        store.append_event("s", "l", "a", EventKind::FactCreated, "e1", None, &body).unwrap();
+        assert_eq!(binding_rows(&store, "e1").len(), 2);
+    }
+
+    #[test]
+    fn revising_an_item_replaces_its_binding_rows_never_appends_to_them() {
+        let mut store = EventStore::in_memory().unwrap();
+        let body1 = body_with_bindings(r#"[{"moment":"push"}]"#);
+        let created =
+            store.append_event("s", "l", "a", EventKind::FactCreated, "e2", None, &body1).unwrap();
+        let body2 = body_with_bindings(r#"[{"moment":"commit"}]"#);
+        store
+            .append_mutate_checked("s", "l", "a", EventKind::FactRevised, "e2", Some(&created.this_hash), &body2)
+            .unwrap();
+        let rows = binding_rows(&store, "e2");
+        assert_eq!(rows.len(), 1, "the OLD binding row must be gone, not just appended to");
+        assert_eq!(rows[0].1.as_deref(), Some("commit"));
+    }
+
+    #[test]
+    fn retracting_an_item_removes_its_binding_rows() {
+        let mut store = EventStore::in_memory().unwrap();
+        let body = body_with_bindings(r#"[{"moment":"push"}]"#);
+        let created =
+            store.append_event("s", "l", "a", EventKind::FactCreated, "e3", None, &body).unwrap();
+        store
+            .append_mutate_checked("s", "l", "a", EventKind::FactRetracted, "e3", Some(&created.this_hash), "{}")
+            .unwrap();
+        assert!(binding_rows(&store, "e3").is_empty(), "a tombstone must publish no bindings");
+    }
+
+    #[test]
+    fn a_diverged_entity_publishes_no_binding_rows() {
+        let mut store = EventStore::in_memory().unwrap();
+        let body = body_with_bindings(r#"[{"moment":"push"}]"#);
+        store.append_event("s", "l", "a", EventKind::FactCreated, "e4", None, &body).unwrap();
+        // A second independent create under the same id: two heads, diverged
+        // (the same hand-crafted shape serve/src/live.rs's own fixture uses).
+        store.append_event("s", "l", "a", EventKind::FactCreated, "e4", None, &body).unwrap();
+        assert_eq!(store.projected_head_count("e4"), 2, "fixture sanity: diverged");
+        assert!(binding_rows(&store, "e4").is_empty(), "a diverged entity must publish no bindings, never guess");
+    }
+
+    #[test]
+    fn projected_binding_candidates_narrows_by_exact_moment_and_by_target_kind_only() {
+        let mut store = EventStore::in_memory().unwrap();
+        let b1 = body_with_bindings(r#"[{"moment":"push"}]"#);
+        store.append_event("s", "l", "a", EventKind::FactCreated, "m1", None, &b1).unwrap();
+        let b2 = body_with_bindings(r#"[{"moment":"commit"}]"#);
+        store.append_event("s", "l", "a", EventKind::FactCreated, "m2", None, &b2).unwrap();
+        let b3 = body_with_bindings(r#"[{"target":{"kind":"path","value":"a/b.rs"}}]"#);
+        store.append_event("s", "l", "a", EventKind::FactCreated, "t1", None, &b3).unwrap();
+        let b4 = body_with_bindings(r#"[{"target":{"kind":"symbol","value":"foo"}}]"#);
+        store.append_event("s", "l", "a", EventKind::FactCreated, "t2", None, &b4).unwrap();
+
+        let mut ids =
+            store.projected_binding_candidates(&["push".to_string()], &["path".to_string()]).unwrap();
+        ids.sort();
+        assert_eq!(ids, vec!["m1".to_string(), "t1".to_string()], "m2 (wrong moment) and t2 (wrong target kind) must both be excluded");
+    }
+
+    #[test]
+    fn projected_always_entities_returns_only_always_bound_ids() {
+        let mut store = EventStore::in_memory().unwrap();
+        let always = body_with_bindings(r#"["always"]"#);
+        store.append_event("s", "l", "a", EventKind::FactCreated, "a1", None, &always).unwrap();
+        let moment = body_with_bindings(r#"[{"moment":"push"}]"#);
+        store.append_event("s", "l", "a", EventKind::FactCreated, "a2", None, &moment).unwrap();
+        assert_eq!(store.projected_always_entities().unwrap(), vec!["a1".to_string()]);
+    }
+
+    #[test]
+    fn projected_head_events_for_returns_only_the_named_entities() {
+        let mut store = EventStore::in_memory().unwrap();
+        let body = body_with_bindings(r#"[{"moment":"push"}]"#);
+        store.append_event("s", "l", "a", EventKind::FactCreated, "h1", None, &body).unwrap();
+        store.append_event("s", "l", "a", EventKind::FactCreated, "h2", None, &body).unwrap();
+        let rows = store.projected_head_events_for(&["h1".to_string()]).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].0.entity_id, "h1");
+    }
+
+    #[test]
+    fn projected_head_events_for_an_empty_list_is_empty_without_querying() {
+        let store = EventStore::in_memory().unwrap();
+        assert!(store.projected_head_events_for(&[]).unwrap().is_empty());
+    }
+
+    /// An entirely empty store is never "current" by this check - not a
+    /// binding-projection quirk, but `heads_projection_current()`'s own
+    /// existing rule (no `tip_seq` row exists until the first append), which
+    /// this gates on deliberately (item_binding is only ever as trustworthy
+    /// as the head_state it is derived from). The very first declare is
+    /// what actually matters in practice, and that is what this pins.
+    #[test]
+    fn item_binding_projection_becomes_current_after_the_first_declare() {
+        let mut store = EventStore::in_memory().unwrap();
+        assert!(!store.item_binding_projection_current(), "nothing to be current about yet");
+        let body = body_with_bindings(r#"[{"moment":"push"}]"#);
+        store.append_event("s", "l", "a", EventKind::FactCreated, "e5", None, &body).unwrap();
+        assert!(store.item_binding_projection_current());
+    }
+
+    /// THE MIGRATION SCENARIO this backfill exists for: a store whose history
+    /// predates `item_binding` (head_state already fully caught up, the table
+    /// itself just never populated - exactly what copying an existing store
+    /// to a binary built with this feature looks like) must self-heal on the
+    /// very next check, exactly once, never leaving a reader silently stuck
+    /// on the full scan forever.
+    #[test]
+    fn ensure_item_binding_projection_backfills_a_store_that_predates_the_table() {
+        let mut store = EventStore::in_memory().unwrap();
+        let body = body_with_bindings(r#"[{"moment":"push"},{"target":{"kind":"path","value":"a/b.rs"}}]"#);
+        store.append_event("s", "l", "a", EventKind::FactCreated, "old1", None, &body).unwrap();
+        assert!(!binding_rows(&store, "old1").is_empty(), "fixture sanity: normally populated already");
+
+        // Simulate "the table was added after the fact": wipe it and its
+        // built flag, exactly what a store copied from before this feature
+        // existed looks like (head_state stays fully caught up throughout).
+        store.conn().execute("DELETE FROM item_binding", []).unwrap();
+        store.conn().execute("DELETE FROM projection_meta WHERE k = 'item_binding_built'", []).unwrap();
+        assert!(!store.item_binding_projection_current(), "fixture sanity: now looks unbuilt");
+
+        EventStore::ensure_item_binding_projection(store.conn()).unwrap();
+
+        assert!(store.item_binding_projection_current(), "must be current after the backfill");
+        assert_eq!(
+            binding_rows(&store, "old1").len(),
+            2,
+            "the backfill must reconstruct every existing entity's bindings from the log already on disk"
+        );
+    }
+}

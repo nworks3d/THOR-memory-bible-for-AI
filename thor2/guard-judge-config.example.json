@@ -1,0 +1,6 @@
+{
+  "_comment": "The CLAUDE CLI example - see JUDGE-TRANSPORT.md ('Claude CLI') for the full walkthrough written for someone who has never done this before. For a fully local model (Ollama or LM Studio, nothing leaving the machine) see the sibling file guard-judge-config-local-model.example.json instead - both are genuinely supported, neither is preferred over the other. UNVERIFIED: this machine has no ANTHROPIC_API_KEY and no `claude` CLI installed, so this exact invocation could not be run end to end before shipping. It is written as documentation of the intended shape, not a proven-working config. Before pointing a real session at this, confirm the command actually reads its prompt from stdin and prints plain text to stdout - e.g. `echo hello | claude -p --model claude-haiku-4-5` - and adjust 'command'/'args' to whatever actually works in your environment. This file is never read from its example name; copy it to guard-judge-config.json beside the store (same folder as thor.db) to activate it.",
+  "command": "claude",
+  "args": ["-p", "--model", "claude-haiku-4-5"],
+  "timeout_ms": 8000
+}

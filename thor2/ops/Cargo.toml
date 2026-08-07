@@ -1,0 +1,48 @@
+[package]
+name = "ops"
+version = "0.1.0"
+edition = "2021"
+license = "GPL-3.0-or-later"
+description = "The operational layer: replica sync over HTTP, agent-settings hook installer, and the plain-language health check"
+
+[dependencies]
+thor-core = { path = "../core" }
+serve = { path = "../serve" }
+# Named directly by the health check, which reports how many rules carry a
+# runnable proof and therefore has to know a Rule from a Report.
+model = { path = "../model" }
+codeindex = { path = "../codeindex" }
+# The drain replays a captured tool call through the very same handler the
+# local agent reaches, so the write gate runs once, here, at the authority.
+mcp = { path = "../mcp" }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+clap = { version = "4", features = ["derive"] }
+anyhow = "1.0"
+# HTTP transport for sync: the receiver is a small axum server, the shipper a
+# blocking reqwest client. No TLS backend: sync runs LAN/tailnet only (the
+# bearer token authenticates); this keeps the build free of a C/asm crypto
+# backend, matching the choice already made for thor 1.0's own sync layer.
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "net"] }
+axum = "0.8"
+reqwest = { version = "0.12", default-features = false, features = ["blocking", "json"] }
+
+[[bin]]
+name = "sync"
+path = "src/bin/sync.rs"
+
+[[bin]]
+name = "install"
+path = "src/bin/install.rs"
+
+[[bin]]
+name = "doctor"
+path = "src/bin/doctor.rs"
+
+[[bin]]
+name = "backup"
+path = "src/bin/backup.rs"
+
+[dev-dependencies]
+tempfile = "3"
+model = { path = "../model" }

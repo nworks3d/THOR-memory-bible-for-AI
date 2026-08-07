@@ -1,0 +1,26 @@
+[
+  {
+    "id": "trigger-house-style",
+    "tier": "warn",
+    "any_of": ["nieuwe huisstijl", "new house style", "the new primary color", "the new brand color", "nieuwe primaire kleur", "new visual identity", "nieuwe visuele identiteit", "de nieuwe stijl"],
+    "none_of": ["any_of", "example", "voorbeeld", "?", "their ", "concurrent", "used to say", "opgeschreven", "citeert", "rulebook", "contains this line", "het verhaal", "a quote from", "nooit meer dan", "nog nooit", "he said"]
+  },
+  {
+    "id": "trigger-standing-rule",
+    "tier": "warn",
+    "any_of": ["from now on", "vanaf nu", "voortaan", "nooit meer", "never again", "de nieuwe regel", "the new rule is", "the new rule:", "the new rule for", "the new rule going forward", "the new rule that", "going forward", "as of now", "as of today", "vanaf vandaag", "vanaf heden", "starting today", "starting now", "effective immediately"],
+    "none_of": ["any_of", "example", "voorbeeld", "?", "their ", "concurrent", "used to say", "opgeschreven", "citeert", "rulebook", "contains this line", "het verhaal", "a quote from", "nooit meer dan", "nog nooit", "he said"]
+  },
+  {
+    "id": "trigger-generic-weak",
+    "tier": "warn",
+    "any_of": ["altijd ", "de nieuwe ", "always ", "never ", "moet altijd", "mag nooit", "moet voortaan", "must always", "should always", "no longer allowed", "not allowed anymore", "niet meer toegestaan", "mag niet meer", "new standard", "nieuwe standaard", "the standard is now", "de norm is nu"],
+    "none_of": ["any_of", "example", "voorbeeld", "?", "their ", "concurrent", "used to say", "opgeschreven", "citeert", "rulebook", "contains this line", "het verhaal", "a quote from", "nooit meer dan", "nog nooit", "he said"]
+  },
+  {
+    "id": "trigger-soft-preference",
+    "tier": "warn",
+    "any_of": ["ik wil liever", "beter is", "prefer", "should", "let's always", "laten we altijd", "policy is", "ons beleid is", "convention is now", "de conventie is", "we've decided", "we have decided", "besloten dat", "we hebben besloten"],
+    "none_of": ["any_of", "example", "voorbeeld", "?", "their ", "concurrent", "used to say", "opgeschreven", "citeert", "rulebook", "contains this line", "het verhaal", "a quote from", "nooit meer dan", "nog nooit", "he said"]
+  }
+]

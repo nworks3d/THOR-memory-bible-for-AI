@@ -1,0 +1,16 @@
+{
+  "_comment": "UNVERIFIED - see JUDGE-TRANSPORT.md ('Local model (Ollama or LM Studio)'). This machine has neither Ollama nor LM Studio installed, so this exact invocation was never run end to end against a real local model. It runs guard-judge-local-model-wrapper.ps1 (repo root, a small PowerShell script - PowerShell ships with Windows already, nothing new to install for the wrapper itself), which talks to a local Ollama server by default. Before pointing a real session at this: (1) install Ollama from https://ollama.com/download and run 'ollama pull llama3.2' once from a terminal, (2) edit the '-File' argument below to the wrapper script's actual absolute path on your machine, (3) confirm it works with 'echo hello | powershell -NoProfile -File guard-judge-local-model-wrapper.ps1' - it should print a few lines of model text, not an error. This file is never read from its example name; copy it to guard-judge-config.json beside the store (same folder as thor.db) to activate it.",
+  "command": "powershell.exe",
+  "args": [
+    "-NoProfile",
+    "-ExecutionPolicy",
+    "Bypass",
+    "-File",
+    "C:\\path\\to\\guard-judge-local-model-wrapper.ps1",
+    "-Backend",
+    "ollama",
+    "-Model",
+    "llama3.2"
+  ],
+  "timeout_ms": 15000
+}

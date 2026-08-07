@@ -1,0 +1,6 @@
+target/
+**/target/
+data/
+*.db
+*.db-wal
+*.db-shm

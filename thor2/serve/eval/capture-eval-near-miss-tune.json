@@ -1,0 +1,142 @@
+[
+  {
+    "class": "question",
+    "text": "What's the rule about running the linter, do we always do that first?"
+  },
+  {
+    "class": "question",
+    "text": "Is it true that we never merge without passing tests?"
+  },
+  {
+    "class": "question",
+    "text": "Wat is de regel ook alweer - draaien we vanaf nu altijd eerst de linter?"
+  },
+  {
+    "class": "question",
+    "text": "Moeten we voortaan altijd een changelog-regel toevoegen, of is dat optioneel?"
+  },
+  {
+    "class": "question",
+    "text": "Zullen we afspreken dat we vanaf nu nooit meer op vrijdag deployen?"
+  },
+  {
+    "class": "question",
+    "text": "Should the new primary color really replace the old one everywhere?"
+  },
+  {
+    "class": "question",
+    "text": "Never again skip code review - is that already policy?"
+  },
+  {
+    "class": "quoted-rule",
+    "text": "The CLAUDE.md file says, for example, 'from now on always run the linter first' - can you check that's still there?"
+  },
+  {
+    "class": "quoted-rule",
+    "text": "Als voorbeeld van een huisstijlregel: 'de nieuwe huisstijl gebruikt navy en goud'."
+  },
+  {
+    "class": "quoted-rule",
+    "text": "Ter illustratie, als voorbeeld: 'nooit meer console.log in productiecode'."
+  },
+  {
+    "class": "quoted-rule",
+    "text": "The old README used to say 'the new rule is every commit needs a ticket', just for context."
+  },
+  {
+    "class": "quoted-rule",
+    "text": "One example of a house-style rule elsewhere: 'the new primary color is teal'."
+  },
+  {
+    "class": "quoted-rule",
+    "text": "The rulebook contains this line: from now on, always run the linter first."
+  },
+  {
+    "class": "quoted-rule",
+    "text": "For example the onboarding doc quotes: 'the new rule is no console.log in production'."
+  },
+  {
+    "class": "hypothetical",
+    "text": "Stel dat we ooit zouden besluiten om vanaf nu alles te automatiseren, wat zou er veranderen?"
+  },
+  {
+    "class": "hypothetical",
+    "text": "Suppose the new rule were that every PR needs two reviewers - would that slow us down?"
+  },
+  {
+    "class": "hypothetical",
+    "text": "Imagine we adopted 'never push to main' as a rule - just thinking out loud, not deciding anything yet."
+  },
+  {
+    "class": "hypothetical",
+    "text": "Hypothetically speaking, if we said always run the linter first, would CI even need to run it again?"
+  },
+  {
+    "class": "hypothetical",
+    "text": "In a hypothetical world where we never again touched the staging database directly, how would debugging work?"
+  },
+  {
+    "class": "hypothetical",
+    "text": "Just brainstorming: what if the new primary color were used only for the logo, not the whole site?"
+  },
+  {
+    "class": "hypothetical",
+    "text": "Purely hypothetically - if we said 'the new rule is no secrets in git', how would that interact with the CI vars?"
+  },
+  {
+    "class": "ordinary-work",
+    "text": "Can you run the test suite and tell me if anything fails?"
+  },
+  {
+    "class": "ordinary-work",
+    "text": "Kun je de linter draaien op de nieuwe module en de output laten zien?"
+  },
+  {
+    "class": "ordinary-work",
+    "text": "Refactor the parsing function to avoid the duplicate loop."
+  },
+  {
+    "class": "ordinary-work",
+    "text": "Update the dependency for the HTTP client to the latest version."
+  },
+  {
+    "class": "ordinary-work",
+    "text": "Investigate why the staging deploy is slower than production."
+  },
+  {
+    "class": "ordinary-work",
+    "text": "Write a short summary of what changed in this pull request."
+  },
+  {
+    "class": "ordinary-work",
+    "text": "Check whether the cache invalidation logic handles concurrent writes."
+  },
+  {
+    "class": "non-normative-trigger",
+    "text": "The tests always fail on CI when the network flakes out."
+  },
+  {
+    "class": "non-normative-trigger",
+    "text": "De teller loopt altijd door naar het volgende nummer, dat is gewoon hoe de counter werkt."
+  },
+  {
+    "class": "non-normative-trigger",
+    "text": "In chess, the new rule about castling was introduced centuries ago, long before computers existed."
+  },
+  {
+    "class": "non-normative-trigger",
+    "text": "He said he would never again eat that much food at a conference dinner."
+  },
+  {
+    "class": "non-normative-trigger",
+    "text": "Their new house style launched on their website today, completely unrelated to ours."
+  },
+  {
+    "class": "non-normative-trigger",
+    "text": "The sign at the old factory read 'from now on this lane is closed', a quote from decades ago."
+  },
+  {
+    "class": "non-normative-trigger",
+    "text": "Ik heb nog nooit meer zoiets smerigs geproefd als dat gerecht op die conferentie."
+  }
+]

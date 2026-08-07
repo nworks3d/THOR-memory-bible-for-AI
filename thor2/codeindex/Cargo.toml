@@ -1,0 +1,16 @@
+[package]
+name = "codeindex"
+version = "0.1.0"
+edition = "2021"
+license = "GPL-3.0-or-later"
+description = "A git-derived index of the owner's code: path, content in chunks, the commit each came from - and provenance (indexed commit vs. current branch) on every answer. Archive only: no serve path, findable only on explicit query."
+
+[dependencies]
+rusqlite = { version = "0.31", features = ["bundled"] }
+
+[dev-dependencies]
+tempfile = "3"
+
+[[bin]]
+name = "codeindex"
+path = "src/bin/codeindex.rs"

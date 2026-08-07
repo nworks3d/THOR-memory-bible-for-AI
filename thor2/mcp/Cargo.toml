@@ -1,0 +1,42 @@
+[package]
+name = "mcp"
+version = "0.1.0"
+edition = "2021"
+license = "GPL-3.0-or-later"
+description = "The agent-facing MCP surface: remember/revise/pin/unpin/get/lookup/mark/status through the model write gate and serve's lookup/status - never a tool onto session_start, the moment surface, or the prompt surface"
+
+[dependencies]
+thor-core = { path = "../core" }
+model = { path = "../model" }
+serve = { path = "../serve" }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+clap = { version = "4", features = ["derive"] }
+anyhow = "1.0"
+# rmcp (mimir/1.0's own proven recipe) plus what it needs to run: an async
+# runtime and a JSON-schema derive for the tool argument structs.
+#
+# The streamable-http transport is here for ONE deployment: the replica
+# connector, which accepts writes from away-from-the-desk sessions and queues
+# them for the authority to drain (see `run_http`, which refuses to open a
+# port without a capture inbox). The stdio transport stays the only way the
+# authority itself is ever reached.
+rmcp = { version = "1.7", features = ["server", "transport-io", "transport-streamable-http-server"] }
+axum = "0.8"
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "net"] }
+schemars = "1"
+
+[features]
+# Forwards to serve's own semantic build so `lookup` searches on meaning as
+# well as on the letter - the same thing the CLI already does. Without this
+# the agent's door and the terminal's door answer the same question
+# differently, which is exactly the defect `ThorMcpServer::with_vectors`
+# documents.
+semantic = ["serve/semantic"]
+
+[[bin]]
+name = "mcp"
+path = "src/bin/mcp.rs"
+
+[dev-dependencies]
+tempfile = "3"

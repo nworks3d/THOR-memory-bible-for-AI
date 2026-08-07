@@ -1,0 +1,10 @@
+[package]
+name = "intent"
+version = "0.1.0"
+edition = "2021"
+license = "GPL-3.0-or-later"
+description = "The closed action vocabulary and its detection - one house for every surface form of the same meaning"
+
+[dependencies]
+regex = "1"
+serde = { version = "1.0", features = ["derive"] }

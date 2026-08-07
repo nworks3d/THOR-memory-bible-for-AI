@@ -1,0 +1,107 @@
+# THOR 2.0 replica on the NAS. Its own container, its own volume, its own
+# port. Touches nothing that 1.0 owns: different project name, different
+# directory, different data volume, different port. Both can run side by side
+# for as long as that is useful, and stopping one never affects the other.
+#
+# Two roles, one image:
+#   thor2-recv       receives the shipped log, and holds the capture inbox
+#   thor2-connector  the surface a session away from the main machine talks to
+#
+# Neither applies a write to the chain here. The PC stays the only authority:
+# the connector QUEUES writes into /data/inbox.jsonl, and the PC drains that
+# queue (`sync drain --from`) and replays them into its own log, which then
+# ships back the normal way. See deploy/Dockerfile for why that is safe now
+# when a write surface here was not before.
+#
+# Start it (from this directory, on the NAS):
+#   sudo /usr/local/bin/docker compose -p thor2 up -d --build
+#
+# The shared secret lives in a .env file NEXT TO this one, never in this file
+# and never in git:
+#   THOR_SYNC_TOKEN=<the secret>
+
+services:
+  thor2-recv:
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile
+    container_name: thor2-recv
+    # Not "always": a receiver that keeps restarting through a real refusal
+    # hides the refusal. On-failure with a cap surfaces a genuine problem in
+    # `docker ps` instead of looping quietly.
+    restart: on-failure:5
+    environment:
+      # Read from .env beside this file. Empty means the receiver refuses to
+      # start, which is the intended behaviour - never listen unauthenticated.
+      THOR_SYNC_TOKEN: "${THOR_SYNC_TOKEN:?set THOR_SYNC_TOKEN in .env next to this compose file}"
+    volumes:
+      # Holds thor.db, the replica of the PC's chain, and inbox.jsonl, the
+      # queue of writes waiting for the PC to drain. Only `sync recv` ever
+      # writes the database; only the connector ever appends to the queue.
+      - ./data:/data
+    ports:
+      # The shipping authority (the PC) reaches this over the LAN/tailnet.
+      # This port IS bearer-token gated, unlike 1.0's MCP port, so exposing it
+      # on the LAN is fine. 5556 so it can never collide with 1.0's 5555.
+      - "5556:5555"
+
+  thor2-connector:
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile
+    container_name: thor2-connector
+    restart: on-failure:5
+    # Same volume as the receiver: it reads the replicated store to ANSWER
+    # (lookup, get, history) and appends to the queue to WRITE. The two
+    # containers share those two files on purpose - a queued line is written
+    # whole, and the pull moves the file aside in one step, so neither ever
+    # sees the other half-done.
+    volumes:
+      - ./data:/data
+    # The receiver creates thor.db on first receipt, and the connector opens
+    # it without ever creating one. On a brand new NAS, start the receiver and
+    # let one shipment land before this comes up, or it exits saying the store
+    # is not there - which is the honest answer, not a fresh empty memory.
+    depends_on:
+      - thor2-recv
+    # DELIBERATELY NOT PUBLISHED ON THE LAN. This surface carries no auth of
+    # its own, so the only way in is the tunnel, which is what sits in front
+    # of it. 1.0 was arranged the same way and for the same reason.
+    #
+    # It answers to the name `thor-mcp` on the tunnel's network because that
+    # is the origin the tunnel was already pointed at
+    # (thor-mcp.nworks3d.be -> http://thor-mcp:8078). Taking over the name
+    # instead of re-pointing the route means the switch from 1.0 to 2.0 needs
+    # no change in the Cloudflare dashboard and nothing on the owner's side.
+    # The 1.0 container must be stopped first: two containers cannot answer
+    # to one name on one network.
+    networks:
+      default: {}
+      cloudflared_net:
+        aliases:
+          - thor-mcp
+    # --capture-inbox is not optional: the binary refuses to open the port
+    # without it, because a reachable machine that APPLIES writes is exactly
+    # the fork this whole arrangement exists to prevent.
+    # --allowed-host is not decoration either: the transport refuses any
+    # request whose Host header is not listed and its default list is
+    # loopback only, so without this the connector comes up healthy, logs
+    # nothing, and answers every real call with 403. The tunnel rewrites the
+    # Host to `localhost` before forwarding (originRequest.httpHostHeader),
+    # so that entry is the one that actually carries the traffic; the others
+    # are for reaching it directly from the LAN if it is ever published again.
+    command: >
+      /usr/local/bin/mcp --db /data/thor.db
+      --http 0.0.0.0:8078
+      --capture-inbox /data/inbox.jsonl
+      --allowed-host localhost
+      --allowed-host thor-mcp.nworks3d.be
+      --allowed-host 10.0.0.50
+      --allowed-host fileserver
+
+networks:
+  # The tunnel's own network, created by another project. Joining it is what
+  # lets the tunnel reach this container by name without any route change.
+  cloudflared_net:
+    external: true
+    name: acme-shop_default

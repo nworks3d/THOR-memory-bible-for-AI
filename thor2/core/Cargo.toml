@@ -1,0 +1,23 @@
+[package]
+name = "thor-core"
+version = "1.0.0"
+edition = "2021"
+license = "GPL-3.0-or-later"
+
+[dependencies]
+# Only "bundled" is needed here: nothing in the ported storage layer touches
+# rusqlite's chrono trait impls (verified - grep for "chrono" across
+# event_store.rs/cas.rs/auditor.rs/backup.rs turns up none), so the "chrono"
+# rusqlite feature and the chrono crate itself are both left out. The 1.0
+# Cargo.toml carries chrono for layers that are not ported here (mcp.rs,
+# doctor.rs, footer.rs's non-ported half, ...).
+rusqlite = { version = "0.31", features = ["bundled"] }
+sha2 = "0.10"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+uuid = { version = "1.6", features = ["v4", "serde"] }
+anyhow = "1.0"
+thiserror = "1.0"
+
+[dev-dependencies]
+tempfile = "3"

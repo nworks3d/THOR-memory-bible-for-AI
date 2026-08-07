@@ -1,0 +1,18 @@
+[package]
+name = "model"
+version = "0.1.0"
+edition = "2021"
+license = "GPL-3.0-or-later"
+description = "The four item kinds, their typed bindings, and the write gate that refuses what cannot be honoured"
+
+[dependencies]
+thor-core = { path = "../core" }
+intent = { path = "../intent" }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+anyhow = "1.0"
+thiserror = "1.0"
+clap = { version = "4", features = ["derive"] }
+
+[dev-dependencies]
+tempfile = "3"

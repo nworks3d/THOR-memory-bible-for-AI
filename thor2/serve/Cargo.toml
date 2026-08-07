@@ -1,0 +1,68 @@
+[package]
+name = "serve"
+version = "0.1.0"
+edition = "2021"
+license = "GPL-3.0-or-later"
+description = "The one serving path: select, rank, cap and render items for every channel (hook/check/why/audit)"
+
+[dependencies]
+thor-core = { path = "../core" }
+intent = { path = "../intent" }
+model = { path = "../model" }
+codeindex = { path = "../codeindex" }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+regex = "1"
+clap = { version = "4", features = ["derive"] }
+anyhow = "1.0"
+# Optional semantic-recall layer for surface 4 (OPZOEKEN) only - never the
+# three injection surfaces, see serve/src/lookup.rs's own doc comment. OFF by
+# default: a plain build stays pure text-match and never pulls the ONNX
+# runtime. fastembed brings ort/onnxruntime (download-binaries); rusqlite and
+# sha2 back the vector sidecar and its staleness check. We load our own local
+# model file (read-only, never fetched) so this stays independent of any
+# external cache - see embed.rs / vectors.rs.
+fastembed = { version = "5.17", optional = true }
+rusqlite = { version = "0.31", features = ["bundled"], optional = true }
+sha2 = { version = "0.10", optional = true }
+
+[features]
+semantic = ["dep:fastembed", "dep:rusqlite", "dep:sha2"]
+
+[[bin]]
+name = "serve"
+path = "src/bin/serve.rs"
+
+[[bin]]
+name = "repair_project"
+path = "src/bin/repair_project.rs"
+
+[[bin]]
+name = "restore_attribution"
+path = "src/bin/restore_attribution.rs"
+
+[[bin]]
+name = "import_noise"
+path = "src/bin/import_noise.rs"
+required-features = ["semantic"]
+
+[[example]]
+name = "recall2_eval"
+required-features = ["semantic"]
+
+[[example]]
+name = "recall_native"
+required-features = ["semantic"]
+
+[[example]]
+name = "attach_checks"
+
+[[example]]
+name = "dump_corpus"
+
+[[example]]
+name = "identifier_battery_eval"
+required-features = ["semantic"]
+
+[dev-dependencies]
+tempfile = "3"

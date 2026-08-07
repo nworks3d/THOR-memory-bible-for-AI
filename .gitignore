@@ -25,3 +25,12 @@ hits*.json
 *_hits.json
 thor-src-*.tar.gz
 *.npy
+
+# THOR 2.0 is the same project, not a separate one, so it lives here in thor2/
+# rather than in a folder of its own. Two things inside it never belong in a
+# clone. Cargo's build output is 27 GB and one `cargo build` reproduces all of
+# it. The measurement material under thor2/eval/ is real memory text and real
+# project names, for the same reason thor/eval/ is ignored wholesale above.
+thor2/target/
+thor2/target-*/
+thor2/eval/

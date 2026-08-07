@@ -1,0 +1,26 @@
+[
+  {
+    "id": "style-house-style",
+    "tier": "block",
+    "any_of": ["nieuwe huisstijl", "new house style", "the new primary color", "the new brand color", "nieuwe primaire kleur"],
+    "none_of": ["any_of", "example", "voorbeeld", "?", "their ", "concurrent", "used to say", "opgeschreven", "citeert", "rulebook", "contains this line", "het verhaal", "a quote from", "nooit meer dan", "nog nooit", "he said"]
+  },
+  {
+    "id": "decision-standing-rule",
+    "tier": "block",
+    "any_of": ["from now on", "vanaf nu", "voortaan", "nooit meer", "never again", "de nieuwe regel", "the new rule is", "the new rule:", "the new rule for", "the new rule going forward"],
+    "none_of": ["any_of", "example", "voorbeeld", "?", "used to say", "opgeschreven", "citeert", "rulebook", "contains this line", "het verhaal", "a quote from", "nooit meer dan", "nog nooit", "he said"]
+  },
+  {
+    "id": "decision-generic-weak",
+    "tier": "warn",
+    "any_of": ["altijd ", "de nieuwe ", "always ", "never "],
+    "none_of": ["any_of", "?"]
+  },
+  {
+    "id": "decision-soft-preference",
+    "tier": "warn",
+    "any_of": ["ik wil liever", "beter is", "prefer", "should"],
+    "none_of": ["any_of", "example", "voorbeeld", "?"]
+  }
+]

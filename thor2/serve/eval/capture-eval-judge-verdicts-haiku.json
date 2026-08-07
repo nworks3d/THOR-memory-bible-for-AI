@@ -1,0 +1,1053 @@
+{
+  "experiment": "THOR 2.0 capture guard: judge model (haiku) vs deterministic rulebook - arm 2 (judge model)",
+  "date": "2026-08-05",
+  "judge_model": "claude-haiku-4-5 (invoked as model: \"haiku\" via the Agent/Task tool)",
+  "judging_method": "13 batches of ~10 items each, decisions and near-miss items shuffled together (seeded Fisher-Yates, seed 130726), each batch instructed to judge every item independently and in isolation. This is NOT identical to the real hook, where each call sees exactly one prompt in isolation - see caveat in AB-JUDGE-VS-RULEBOOK.md.",
+  "judge_prompt_verbatim": "You are the durable-decision judge for THOR's capture guard. THOR is a memory system for an AI coding assistant. The guard fires at the end of the assistant's turn and decides whether the owner's prompt stated a DURABLE DECISION that must be recorded before the turn ends - a standing rule, a naming or style convention, or a policy change meant to apply going forward. If such a decision is stated and never recorded, it is lost.\n\nA durable decision is a live, present-tense statement that establishes a rule for the future: \"from now on...\", \"we always...\", \"new rule:...\", \"hard rule:...\", a naming convention, a process the team should follow going forward, a reversal of a prior rule, etc. It does not need those exact words, but it must be adopting or declaring a standing rule right now, not merely discussing one.\n\nIt is NOT a durable decision when the prompt:\n- only asks a QUESTION about an existing rule, without stating one\n- QUOTES a rule that was already established elsewhere (a doc, a prior message, a teammate) and creates nothing new\n- is HYPOTHETICAL or exploratory (\"what if we did X\", \"suppose we always did Y\", \"stel dat we...\") - thinking out loud about a possible rule is not adopting one\n- describes ORDINARY WORK (a bug fix, a feature request, a one-off task) with no standing rule attached\n- uses \"always\"/\"never\"/\"nooit\"/\"voortaan\" in a NON-NORMATIVE sense - describing a recurring bug, a fact, or a complaint, not declaring a rule\n- describes a decision ALREADY MADE in the PAST and already in effect (\"we already decided...\", \"that's been live since...\") - nothing new needs capturing\n\nGiven ONE prompt (Dutch or English, coding-assistant context), return exactly one verdict:\n\n- BLOCK: a durable decision is clearly being stated right now. High confidence only.\n- WARN: possibly a decision, genuinely ambiguous or borderline. Use this instead of guessing between BLOCK and ALLOW.\n- ALLOW: no durable decision is being stated - covers questions, quotes, hypotheticals, ordinary work, non-normative language, and past-tense/already-recorded decisions.\n\nJudge each prompt entirely on its own, as if it were the only prompt you will ever see. Do not let any other prompt in this batch shift your calibration.\n\nFor each prompt, respond with exactly this format:\nVERDICT: <BLOCK|WARN|ALLOW>\nJUSTIFICATION: <one line, must quote the exact phrase from the prompt you relied on>\n",
+  "source_files": {
+    "decisions": "capture-eval-fresh-decisions.json (60 items, all class=decision)",
+    "nearmiss": "capture-eval-fresh-nearmiss.json (70 items, 6 classes, none are decisions)"
+  },
+  "verdicts": [
+    {
+      "id": "A001",
+      "set": "A",
+      "class": "decision",
+      "prompt": "ok from now on we write dates as ISO 8601 everywhere, no more dd/mm/yyyy in logs",
+      "verdict": "BLOCK",
+      "justification": "from now on we write dates as ISO 8601 everywhere, no more dd/mm/yyyy in logs"
+    },
+    {
+      "id": "A002",
+      "set": "A",
+      "class": "decision",
+      "prompt": "voortaan gebruiken we altijd snake_case voor python bestandsnamen, camelCase mag niet meer",
+      "verdict": "BLOCK",
+      "justification": "voortaan gebruiken we altijd snake_case voor python bestandsnamen, camelCase mag niet meer"
+    },
+    {
+      "id": "A003",
+      "set": "A",
+      "class": "decision",
+      "prompt": "new rule: every PR needs at least one test file touched, no exceptions",
+      "verdict": "BLOCK",
+      "justification": "new rule: every PR needs at least one test file touched, no exceptions"
+    },
+    {
+      "id": "A004",
+      "set": "A",
+      "class": "decision",
+      "prompt": "we stappen over van npm naar pnpm voor dit project, vanaf nu",
+      "verdict": "BLOCK",
+      "justification": "we stappen over van npm naar pnpm voor dit project, vanaf nu"
+    },
+    {
+      "id": "A005",
+      "set": "A",
+      "class": "decision",
+      "prompt": "kun je de login flow fixen? en trouwens, voortaan geen console.log meer in production code, dat is een harde regel",
+      "verdict": "BLOCK",
+      "justification": "voortaan geen console.log meer in production code, dat is een harde regel - explicitly adopts a new hard rule for the future"
+    },
+    {
+      "id": "A006",
+      "set": "A",
+      "class": "decision",
+      "prompt": "commit messages voortaan in het engels, ook al praten we hier nederlands",
+      "verdict": "BLOCK",
+      "justification": "commit messages voortaan in het engels"
+    },
+    {
+      "id": "A007",
+      "set": "A",
+      "class": "decision",
+      "prompt": "hard rule: never log the raw request body, could contain tokens",
+      "verdict": "BLOCK",
+      "justification": "hard rule: never log the raw request body, could contain tokens"
+    },
+    {
+      "id": "A008",
+      "set": "A",
+      "class": "decision",
+      "prompt": "ik wil dat we terminologie omdraaien: het heet geen 'user' meer maar 'member' overal in de codebase",
+      "verdict": "BLOCK",
+      "justification": "het heet geen 'user' meer maar 'member' overal in de codebase - establishes a new naming convention for the codebase going forward"
+    },
+    {
+      "id": "A009",
+      "set": "A",
+      "class": "decision",
+      "prompt": "can you refactor the auth module, and while you're at it: from now on all new endpoints must be versioned under /v2",
+      "verdict": "BLOCK",
+      "justification": "from now on all new endpoints must be versioned under /v2 - explicit future-tense adoption of a standing rule"
+    },
+    {
+      "id": "A010",
+      "set": "A",
+      "class": "decision",
+      "prompt": "sql migraties altijd met een down-script, geen enkele uitzondering meer",
+      "verdict": "BLOCK",
+      "justification": "sql migraties altijd met een down-script, geen enkele uitzondering meer - establishes a standing rule for all future migrations"
+    },
+    {
+      "id": "A011",
+      "set": "A",
+      "class": "decision",
+      "prompt": "let's standardize on 2-space indentation for all yaml files going forward",
+      "verdict": "BLOCK",
+      "justification": "let's standardize on 2-space indentation for all yaml files going forward"
+    },
+    {
+      "id": "A012",
+      "set": "A",
+      "class": "decision",
+      "prompt": "geen jquery meer in dit project, dat is nu verboden",
+      "verdict": "BLOCK",
+      "justification": "dat is nu verboden - present-tense declaration establishing a standing rule for the future"
+    },
+    {
+      "id": "A013",
+      "set": "A",
+      "class": "decision",
+      "prompt": "we switchen van moment.js naar date-fns, voortaan geen moment imports meer toevoegen",
+      "verdict": "BLOCK",
+      "justification": "voortaan geen moment imports meer toevoegen"
+    },
+    {
+      "id": "A014",
+      "set": "A",
+      "class": "decision",
+      "prompt": "please add pagination to the users endpoint. also: from here on out we cap page size at 100, hard limit",
+      "verdict": "BLOCK",
+      "justification": "from here on out we cap page size at 100, hard limit"
+    },
+    {
+      "id": "A015",
+      "set": "A",
+      "class": "decision",
+      "prompt": "vanaf nu heten feature branches altijd feat/<ticket>-korte-omschrijving, dat is de nieuwe conventie",
+      "verdict": "BLOCK",
+      "justification": "vanaf nu heten feature branches altijd feat/<ticket>-korte-omschrijving, dat is de nieuwe conventie"
+    },
+    {
+      "id": "A016",
+      "set": "A",
+      "class": "decision",
+      "prompt": "reversal: we used to allow force-push on shared branches, that's now banned",
+      "verdict": "BLOCK",
+      "justification": "reversal: we used to allow force-push on shared branches, that's now banned"
+    },
+    {
+      "id": "A017",
+      "set": "A",
+      "class": "decision",
+      "prompt": "ik wil dat elke nieuwe service een health endpoint heeft, standaard, geen discussie",
+      "verdict": "BLOCK",
+      "justification": "elke nieuwe service een health endpoint heeft, standaard - establishing a standing convention for future services"
+    },
+    {
+      "id": "A018",
+      "set": "A",
+      "class": "decision",
+      "prompt": "new convention: error codes are always prefixed with the module name, e.g. AUTH_001",
+      "verdict": "BLOCK",
+      "justification": "new convention: error codes are always prefixed with the module name"
+    },
+    {
+      "id": "A019",
+      "set": "A",
+      "class": "decision",
+      "prompt": "we doen voortaan geen soft deletes meer, gewoon hard delete met een audit log ernaast",
+      "verdict": "BLOCK",
+      "justification": "we doen voortaan geen soft deletes meer"
+    },
+    {
+      "id": "A020",
+      "set": "A",
+      "class": "decision",
+      "prompt": "check de failing test even, en oh - voortaan draaien we ci altijd op de laatste lts node versie, niet meer op de oude",
+      "verdict": "BLOCK",
+      "justification": "voortaan draaien we ci altijd op de laatste lts node versie - establishes forward-looking policy rule"
+    },
+    {
+      "id": "A021",
+      "set": "A",
+      "class": "decision",
+      "prompt": "decision: rest api responses always wrap data in a top-level 'data' key from now on",
+      "verdict": "BLOCK",
+      "justification": "rest api responses always wrap data in a top-level 'data' key from now on"
+    },
+    {
+      "id": "A022",
+      "set": "A",
+      "class": "decision",
+      "prompt": "voortaan geen any type meer in typescript, strict mode blijft altijd aan",
+      "verdict": "BLOCK",
+      "justification": "voortaan geen any type meer in typescript, strict mode blijft altijd aan - adopts standing rules for the future with normative voortaan"
+    },
+    {
+      "id": "A023",
+      "set": "A",
+      "class": "decision",
+      "prompt": "we're locking in eslint + prettier as the formatter, no more mixed configs across repos",
+      "verdict": "BLOCK",
+      "justification": "we're locking in eslint + prettier as the formatter, no more mixed configs across repos"
+    },
+    {
+      "id": "A024",
+      "set": "A",
+      "class": "decision",
+      "prompt": "nieuwe regel: pull requests mogen nooit groter zijn dan 400 regels, anders opsplitsen",
+      "verdict": "BLOCK",
+      "justification": "nieuwe regel: pull requests mogen nooit groter zijn dan 400 regels"
+    },
+    {
+      "id": "A025",
+      "set": "A",
+      "class": "decision",
+      "prompt": "can you look at the memory leak in the worker process. also, going forward we always set explicit timeouts on outbound http calls",
+      "verdict": "BLOCK",
+      "justification": "going forward we always set explicit timeouts on outbound http calls"
+    },
+    {
+      "id": "A026",
+      "set": "A",
+      "class": "decision",
+      "prompt": "we noemen environment variables voortaan altijd in schreeuwhoofdletters met underscore, dus GEEN camelCase env vars meer",
+      "verdict": "BLOCK",
+      "justification": "we noemen environment variables voortaan altijd in schreeuwhoofdletters"
+    },
+    {
+      "id": "A027",
+      "set": "A",
+      "class": "decision",
+      "prompt": "hard prohibition: no raw sql string concatenation anywhere, parameterized queries only, always",
+      "verdict": "BLOCK",
+      "justification": "hard prohibition: no raw sql string concatenation anywhere, parameterized queries only, always"
+    },
+    {
+      "id": "A028",
+      "set": "A",
+      "class": "decision",
+      "prompt": "vanaf nu is de standaard branch main, niet meer master, voor alle nieuwe repos",
+      "verdict": "BLOCK",
+      "justification": "vanaf nu is de standaard branch main, niet meer master, voor alle nieuwe repos - establishes forward-looking convention"
+    },
+    {
+      "id": "A029",
+      "set": "A",
+      "class": "decision",
+      "prompt": "de deploy is gelukt trouwens. nieuwe afspraak: hotfixes gaan altijd via een aparte hotfix/ branch, nooit direct op main",
+      "verdict": "BLOCK",
+      "justification": "nieuwe afspraak: hotfixes gaan altijd via een aparte hotfix/ branch, nooit direct op main"
+    },
+    {
+      "id": "A030",
+      "set": "A",
+      "class": "decision",
+      "prompt": "we're switching the default json serializer to reduce payload size, and from now on all timestamps go out in utc, never local time",
+      "verdict": "BLOCK",
+      "justification": "from now on all timestamps go out in utc, never local time"
+    },
+    {
+      "id": "A031",
+      "set": "A",
+      "class": "decision",
+      "prompt": "ik wil dat error messages voortaan altijd in het engels zijn, ook al is de rest van de ui nederlands",
+      "verdict": "BLOCK",
+      "justification": "ik wil dat error messages voortaan altijd in het engels zijn"
+    },
+    {
+      "id": "A032",
+      "set": "A",
+      "class": "decision",
+      "prompt": "new standing rule: every public function needs a docstring, private helpers are exempt",
+      "verdict": "BLOCK",
+      "justification": "new standing rule: every public function needs a docstring"
+    },
+    {
+      "id": "A033",
+      "set": "A",
+      "class": "decision",
+      "prompt": "voortaan draaien we tests altijd in docker, niet meer los op de host machine",
+      "verdict": "BLOCK",
+      "justification": "voortaan draaien we tests altijd in docker, niet meer los op de host machine"
+    },
+    {
+      "id": "A034",
+      "set": "A",
+      "class": "decision",
+      "prompt": "let's cap retries at 3 with exponential backoff as the default policy for all external calls, going forward",
+      "verdict": "BLOCK",
+      "justification": "as the default policy for all external calls, going forward"
+    },
+    {
+      "id": "A035",
+      "set": "A",
+      "class": "decision",
+      "prompt": "oh en nog iets - config files worden voortaan altijd yaml, geen json configs meer toevoegen aub",
+      "verdict": "BLOCK",
+      "justification": "config files worden voortaan altijd yaml, geen json configs meer toevoegen - establishes forward-looking convention"
+    },
+    {
+      "id": "A036",
+      "set": "A",
+      "class": "decision",
+      "prompt": "we gebruiken vanaf nu semantic versioning strikt, geen losse versienummers meer verzinnen",
+      "verdict": "BLOCK",
+      "justification": "we gebruiken vanaf nu semantic versioning strikt"
+    },
+    {
+      "id": "A037",
+      "set": "A",
+      "class": "decision",
+      "prompt": "decision: all new microservices must ship with a dockerfile and a docker-compose entry, no manual setup docs",
+      "verdict": "BLOCK",
+      "justification": "decision: all new microservices must ship with a dockerfile and a docker-compose entry, no manual setup docs - explicitly adopts a new standing rule"
+    },
+    {
+      "id": "A038",
+      "set": "A",
+      "class": "decision",
+      "prompt": "geen inline styles meer in de components, voortaan alles via de css module",
+      "verdict": "BLOCK",
+      "justification": "voortaan alles via de css module"
+    },
+    {
+      "id": "A039",
+      "set": "A",
+      "class": "decision",
+      "prompt": "we're deprecating the old v1 endpoints for good, mark them all as sunset and never add new features there again",
+      "verdict": "BLOCK",
+      "justification": "never add new features there again"
+    },
+    {
+      "id": "A040",
+      "set": "A",
+      "class": "decision",
+      "prompt": "nieuwe conventie: database tabellen altijd meervoud, dus 'users' niet 'user'",
+      "verdict": "BLOCK",
+      "justification": "nieuwe conventie: database tabellen altijd meervoud, dus 'users' niet 'user'"
+    },
+    {
+      "id": "A041",
+      "set": "A",
+      "class": "decision",
+      "prompt": "kan je de build pipeline even nakijken. en voortaan: geen secrets meer in .env files die gecommit worden, altijd via de vault",
+      "verdict": "BLOCK",
+      "justification": "voortaan: geen secrets meer in .env files die gecommit worden, altijd via de vault"
+    },
+    {
+      "id": "A042",
+      "set": "A",
+      "class": "decision",
+      "prompt": "from now on, feature flags always default to off in production until explicitly enabled",
+      "verdict": "BLOCK",
+      "justification": "from now on, feature flags always default to off in production until explicitly enabled"
+    },
+    {
+      "id": "A043",
+      "set": "A",
+      "class": "decision",
+      "prompt": "ik wil dat we voortaan altijd conventional commits gebruiken, dus feat:, fix:, chore: enzo",
+      "verdict": "BLOCK",
+      "justification": "we voortaan altijd conventional commits gebruiken"
+    },
+    {
+      "id": "A044",
+      "set": "A",
+      "class": "decision",
+      "prompt": "hard rule going forward: no direct database access from the frontend, everything through the api layer",
+      "verdict": "BLOCK",
+      "justification": "hard rule going forward: no direct database access from the frontend"
+    },
+    {
+      "id": "A045",
+      "set": "A",
+      "class": "decision",
+      "prompt": "vanaf vandaag is het verplicht om elke nieuwe dependency eerst hier te melden voor we die toevoegen",
+      "verdict": "BLOCK",
+      "justification": "vanaf vandaag is het verplicht om elke nieuwe dependency eerst hier te melden voor we die toevoegen"
+    },
+    {
+      "id": "A046",
+      "set": "A",
+      "class": "decision",
+      "prompt": "we're standardizing logs to structured json output from now on, plain text logging is done",
+      "verdict": "BLOCK",
+      "justification": "we're standardizing logs to structured json output from now on"
+    },
+    {
+      "id": "A047",
+      "set": "A",
+      "class": "decision",
+      "prompt": "test dit even lokaal voor me. en trouwens, nieuwe regel: releases gaan voortaan altijd op dinsdag, niet meer ad hoc",
+      "verdict": "BLOCK",
+      "justification": "nieuwe regel: releases gaan voortaan altijd op dinsdag, niet meer ad hoc"
+    },
+    {
+      "id": "A048",
+      "set": "A",
+      "class": "decision",
+      "prompt": "we noemen het voortaan geen 'admin panel' meer maar 'control center', overal in code en ui",
+      "verdict": "BLOCK",
+      "justification": "we noemen het voortaan geen 'admin panel' meer maar 'control center', overal in code en ui"
+    },
+    {
+      "id": "A049",
+      "set": "A",
+      "class": "decision",
+      "prompt": "decision: unit tests must not hit the network, ever, mock everything external",
+      "verdict": "BLOCK",
+      "justification": "unit tests must not hit the network, ever, mock everything external"
+    },
+    {
+      "id": "A050",
+      "set": "A",
+      "class": "decision",
+      "prompt": "vanaf nu gebruiken we altijd uuid v4 voor nieuwe primary keys, geen auto-increment ints meer",
+      "verdict": "BLOCK",
+      "justification": "vanaf nu gebruiken we altijd uuid v4 voor nieuwe primary keys, geen auto-increment ints meer"
+    },
+    {
+      "id": "A051",
+      "set": "A",
+      "class": "decision",
+      "prompt": "let's fix the flaky test first. separately: from now on ci must pass on windows and linux both before merge, no more linux-only gate",
+      "verdict": "BLOCK",
+      "justification": "from now on ci must pass on windows and linux both before merge - explicit future-tense adoption of a standing rule"
+    },
+    {
+      "id": "A052",
+      "set": "A",
+      "class": "decision",
+      "prompt": "ik wil een harde regel: geen enkele api key ooit in de source code, altijd via environment variables",
+      "verdict": "BLOCK",
+      "justification": "ik wil een harde regel: geen enkele api key ooit in de source code, altijd via environment variables - explicitly adopts a new hard rule right now"
+    },
+    {
+      "id": "A053",
+      "set": "A",
+      "class": "decision",
+      "prompt": "new naming rule: boolean variables always start with is/has/can, no bare adjectives as var names anymore",
+      "verdict": "BLOCK",
+      "justification": "new naming rule: boolean variables always start with is/has/can, no bare adjectives as var names anymore"
+    },
+    {
+      "id": "A054",
+      "set": "A",
+      "class": "decision",
+      "prompt": "voortaan reviewen we altijd met minimaal twee mensen voor iets naar main mag, een reviewer is niet meer genoeg",
+      "verdict": "BLOCK",
+      "justification": "voortaan reviewen we altijd met minimaal twee mensen voor iets naar main mag - explicitly adopting a standing rule for the future"
+    },
+    {
+      "id": "A055",
+      "set": "A",
+      "class": "decision",
+      "prompt": "de refactor ziet er goed uit. nog een dingetje: voortaan altijd node lts gebruiken in de dockerfiles, geen vaste oude versie meer pinnen",
+      "verdict": "BLOCK",
+      "justification": "voortaan altijd node lts gebruiken in de dockerfiles"
+    },
+    {
+      "id": "A056",
+      "set": "A",
+      "class": "decision",
+      "prompt": "we're moving to trunk-based development, feature branches now live at most a few days, no more long-lived branches",
+      "verdict": "BLOCK",
+      "justification": "we're moving to trunk-based development, feature branches now live at most a few days, no more long-lived branches - establishing new standing rules going forward"
+    },
+    {
+      "id": "A057",
+      "set": "A",
+      "class": "decision",
+      "prompt": "nieuwe afspraak: elke bugfix krijgt voortaan verplicht een regressietest erbij, anders wordt de pr niet gemerged",
+      "verdict": "BLOCK",
+      "justification": "voortaan verplicht een regressietest erbij"
+    },
+    {
+      "id": "A058",
+      "set": "A",
+      "class": "decision",
+      "prompt": "hard rule: passwords are always hashed with argon2 from now on, bcrypt is retired for new code",
+      "verdict": "BLOCK",
+      "justification": "hard rule: passwords are always hashed with argon2 from now on, bcrypt is retired for new code - explicitly adopts a new hard rule with future orientation"
+    },
+    {
+      "id": "A059",
+      "set": "A",
+      "class": "decision",
+      "prompt": "we gebruiken voortaan tabs in plaats van spaties voor alle go bestanden, dat is nu de standaard",
+      "verdict": "BLOCK",
+      "justification": "we gebruiken voortaan tabs in plaats van spaties voor alle go bestanden, dat is nu de standaard"
+    },
+    {
+      "id": "A060",
+      "set": "A",
+      "class": "decision",
+      "prompt": "kan je even naar de css kijken, het ziet er raar uit op mobile. en oh, voortaan gebruiken we altijd rem in plaats van px voor font sizes, nieuwe regel",
+      "verdict": "BLOCK",
+      "justification": "voortaan gebruiken we altijd rem in plaats van px voor font sizes, nieuwe regel"
+    },
+    {
+      "id": "B001",
+      "set": "B",
+      "class": "question",
+      "prompt": "wat is ons huidige beleid rond force-pushen naar main?",
+      "verdict": "ALLOW",
+      "justification": "wat is ons huidige beleid rond force-pushen naar main? - question about existing policy without stating one"
+    },
+    {
+      "id": "B002",
+      "set": "B",
+      "class": "question",
+      "prompt": "do we always use snake_case for python filenames or was that only for this repo?",
+      "verdict": "ALLOW",
+      "justification": "do we always use snake_case for python filenames or was that only for this repo?"
+    },
+    {
+      "id": "B003",
+      "set": "B",
+      "class": "question",
+      "prompt": "hoe zit het ook alweer met de branch naming conventie, was het feat/ of feature/?",
+      "verdict": "ALLOW",
+      "justification": "was het feat/ of feature/? (asking, not stating)"
+    },
+    {
+      "id": "B004",
+      "set": "B",
+      "class": "question",
+      "prompt": "what's our stance on using any in typescript again, is that ever allowed?",
+      "verdict": "ALLOW",
+      "justification": "what's our stance...is that ever allowed - only asking a question about existing rules"
+    },
+    {
+      "id": "B005",
+      "set": "B",
+      "class": "question",
+      "prompt": "welke node versie moeten we eigenlijk altijd gebruiken in ci?",
+      "verdict": "ALLOW",
+      "justification": "welke node versie moeten we eigenlijk altijd gebruiken in ci?"
+    },
+    {
+      "id": "B006",
+      "set": "B",
+      "class": "question",
+      "prompt": "is er een regel over hoeveel regels een pr max mag hebben?",
+      "verdict": "ALLOW",
+      "justification": "is er een regel over hoeveel regels een pr max mag hebben? - question only, no new rule being stated"
+    },
+    {
+      "id": "B007",
+      "set": "B",
+      "class": "question",
+      "prompt": "do we have a standing rule about mocking network calls in tests?",
+      "verdict": "ALLOW",
+      "justification": "do we have a standing rule about mocking network calls in tests? - asks a question about an existing rule without stating one"
+    },
+    {
+      "id": "B008",
+      "set": "B",
+      "class": "question",
+      "prompt": "wat was de afspraak rond commit message taal, engels of nederlands?",
+      "verdict": "ALLOW",
+      "justification": "wat was de afspraak - asking a question about an existing rule, not establishing one"
+    },
+    {
+      "id": "B009",
+      "set": "B",
+      "class": "question",
+      "prompt": "should timestamps always be in utc or is that just a suggestion?",
+      "verdict": "ALLOW",
+      "justification": "should timestamps always be in utc or is that just a suggestion?"
+    },
+    {
+      "id": "B010",
+      "set": "B",
+      "class": "question",
+      "prompt": "is soft delete nog steeds de standaard of zijn we daarvan afgestapt?",
+      "verdict": "ALLOW",
+      "justification": "is soft delete nog steeds de standaard of zijn we daarvan afgestapt? - question about existing rule without stating one"
+    },
+    {
+      "id": "B011",
+      "set": "B",
+      "class": "question",
+      "prompt": "what's the policy on adding new dependencies, do i need approval first?",
+      "verdict": "ALLOW",
+      "justification": "what's the policy on adding new dependencies, do i need approval first?"
+    },
+    {
+      "id": "B012",
+      "set": "B",
+      "class": "question",
+      "prompt": "gebruiken we hier eigenlijk altijd uuid's of mag het ook een integer id zijn?",
+      "verdict": "ALLOW",
+      "justification": "gebruiken we hier eigenlijk altijd uuid's of mag het ook een integer id zijn?"
+    },
+    {
+      "id": "B013",
+      "set": "B",
+      "class": "quoted-rule",
+      "prompt": "in de docs staat: 'commit messages altijd in het engels', dus daar houd ik me aan",
+      "verdict": "ALLOW",
+      "justification": "in de docs staat: 'commit messages altijd in het engels'"
+    },
+    {
+      "id": "B014",
+      "set": "B",
+      "class": "quoted-rule",
+      "prompt": "the style guide says 'never use tabs in yaml files', just flagging that before i push this",
+      "verdict": "ALLOW",
+      "justification": "the style guide says 'never use tabs in yaml files'"
+    },
+    {
+      "id": "B015",
+      "set": "B",
+      "class": "quoted-rule",
+      "prompt": "je zei laatst letterlijk: 'voortaan altijd conventional commits gebruiken' - klopt dat nog?",
+      "verdict": "ALLOW",
+      "justification": "je zei laatst letterlijk: 'voortaan altijd conventional commits gebruiken' - klopt dat nog? - quotes existing rule and asks if still applies, creates nothing new"
+    },
+    {
+      "id": "B016",
+      "set": "B",
+      "class": "quoted-rule",
+      "prompt": "readme says 'all new services must ship with a dockerfile', so i added one for this service",
+      "verdict": "ALLOW",
+      "justification": "readme says 'all new services must ship with a dockerfile' - quoting existing rule"
+    },
+    {
+      "id": "B017",
+      "set": "B",
+      "class": "quoted-rule",
+      "prompt": "volgens het onboarding document is de regel 'geen console.log in productie', dus ik heb ze eruit gehaald",
+      "verdict": "ALLOW",
+      "justification": "volgens het onboarding document is de regel 'geen console.log in productie'"
+    },
+    {
+      "id": "B018",
+      "set": "B",
+      "class": "quoted-rule",
+      "prompt": "the linked ticket quotes the team lead: 'we never allow force-push on main', so i reverted that setting",
+      "verdict": "ALLOW",
+      "justification": "the linked ticket quotes the team lead - quotes an existing rule rather than establishing a new one"
+    },
+    {
+      "id": "B019",
+      "set": "B",
+      "class": "quoted-rule",
+      "prompt": "in het vorige gesprek staat genoteerd: 'error messages altijd in het engels' - ik neem aan dat nog steeds geldt",
+      "verdict": "ALLOW",
+      "justification": "in het vorige gesprek staat genoteerd: 'error messages altijd in het engels' - quotes an existing rule from a prior conversation without stating a new one"
+    },
+    {
+      "id": "B020",
+      "set": "B",
+      "class": "quoted-rule",
+      "prompt": "the wiki page states 'passwords are always hashed with argon2', matches what we already do here right",
+      "verdict": "ALLOW",
+      "justification": "the wiki page states 'passwords are always hashed with argon2' - quoting existing rule"
+    },
+    {
+      "id": "B021",
+      "set": "B",
+      "class": "quoted-rule",
+      "prompt": "you told me before 'never log the raw request body', so that's why this pr strips it out",
+      "verdict": "ALLOW",
+      "justification": "you told me before 'never log the raw request body' - quoting a rule already established elsewhere"
+    },
+    {
+      "id": "B022",
+      "set": "B",
+      "class": "quoted-rule",
+      "prompt": "de contributing guide zegt: 'pull requests mogen nooit groter zijn dan 400 regels', vandaar de opsplitsing",
+      "verdict": "ALLOW",
+      "justification": "de contributing guide zegt: 'pull requests mogen nooit groter zijn dan 400 regels'"
+    },
+    {
+      "id": "B023",
+      "set": "B",
+      "class": "quoted-rule",
+      "prompt": "found this in an old slack thread: 'from now on releases always go out on tuesday' - is that still the plan",
+      "verdict": "ALLOW",
+      "justification": "found this in an old slack thread and is that still the plan (quoting and questioning, not stating)"
+    },
+    {
+      "id": "B024",
+      "set": "B",
+      "class": "quoted-rule",
+      "prompt": "de changelog vermeldt: 'v1 endpoints zijn nu permanent gesunset' - klopt dat, mag ik daar dan vanuit gaan",
+      "verdict": "ALLOW",
+      "justification": "de changelog vermeldt and klopt dat (quoting existing record and asking for confirmation)"
+    },
+    {
+      "id": "B025",
+      "set": "B",
+      "class": "hypothetical",
+      "prompt": "what if we always used trunk-based development instead of feature branches, would that even work here",
+      "verdict": "ALLOW",
+      "justification": "what if we always used trunk-based development (hypothetical question)"
+    },
+    {
+      "id": "B026",
+      "set": "B",
+      "class": "hypothetical",
+      "prompt": "stel dat we nooit meer soft deletes zouden gebruiken, wat zou er dan allemaal moeten veranderen",
+      "verdict": "ALLOW",
+      "justification": "stel dat we nooit meer soft deletes zouden gebruiken, wat zou er dan allemaal moeten veranderen - hypothetical/exploratory thinking, not adopting a rule"
+    },
+    {
+      "id": "B027",
+      "set": "B",
+      "class": "hypothetical",
+      "prompt": "suppose we always cap retries at 3, would that break the payment integration",
+      "verdict": "ALLOW",
+      "justification": "suppose we always cap retries at 3"
+    },
+    {
+      "id": "B028",
+      "set": "B",
+      "class": "hypothetical",
+      "prompt": "als we voortaan altijd uuid's zouden gebruiken ipv auto-increment ids, hoeveel migraties raakt dat",
+      "verdict": "ALLOW",
+      "justification": "als we voortaan altijd uuid's zouden gebruiken - hypothetical conditional exploration, not adopting a rule"
+    },
+    {
+      "id": "B029",
+      "set": "B",
+      "class": "hypothetical",
+      "prompt": "what if we never allowed direct db access from the frontend, how big would that refactor be",
+      "verdict": "ALLOW",
+      "justification": "what if we never allowed direct db access from the frontend (hypothetical question)"
+    },
+    {
+      "id": "B030",
+      "set": "B",
+      "class": "hypothetical",
+      "prompt": "stel dat we altijd tabs zouden gebruiken in plaats van spaties, zou de linter dat zomaar accepteren",
+      "verdict": "ALLOW",
+      "justification": "stel dat we altijd tabs zouden gebruiken in plaats van spaties"
+    },
+    {
+      "id": "B031",
+      "set": "B",
+      "class": "hypothetical",
+      "prompt": "hypothetically, if we always shipped feature flags off by default, would that break the current rollout",
+      "verdict": "ALLOW",
+      "justification": "hypothetically, if we always shipped - exploratory/hypothetical thinking, not adopting a rule"
+    },
+    {
+      "id": "B032",
+      "set": "B",
+      "class": "hypothetical",
+      "prompt": "wat als we nooit meer json configs zouden toestaan, alleen yaml, hoeveel bestanden moeten we dan omzetten",
+      "verdict": "ALLOW",
+      "justification": "wat als we nooit meer json configs zouden toestaan, alleen yaml"
+    },
+    {
+      "id": "B033",
+      "set": "B",
+      "class": "hypothetical",
+      "prompt": "suppose we always required two reviewers before merge, would the team even have bandwidth for that",
+      "verdict": "ALLOW",
+      "justification": "suppose we always required two reviewers (hypothetical exploration)"
+    },
+    {
+      "id": "B034",
+      "set": "B",
+      "class": "hypothetical",
+      "prompt": "stel dat we voortaan altijd semantic versioning zouden afdwingen met een linter, is dat het waard",
+      "verdict": "ALLOW",
+      "justification": "stel dat we voortaan altijd semantic versioning zouden afdwingen - hypothetical/exploratory framing ('suppose that'), thinking out loud without adopting a rule"
+    },
+    {
+      "id": "B035",
+      "set": "B",
+      "class": "hypothetical",
+      "prompt": "what if from now on every microservice always needed its own health endpoint, is that overkill for the small ones",
+      "verdict": "ALLOW",
+      "justification": "what if from now on every microservice always needed its own health endpoint (hypothetical framing)"
+    },
+    {
+      "id": "B036",
+      "set": "B",
+      "class": "hypothetical",
+      "prompt": "als we ooit zouden besluiten om nooit meer bcrypt te gebruiken, wat breekt daar dan allemaal van",
+      "verdict": "ALLOW",
+      "justification": "als we ooit zouden besluiten om nooit meer bcrypt te gebruiken, wat breekt daar dan allemaal van"
+    },
+    {
+      "id": "B037",
+      "set": "B",
+      "class": "ordinary-work",
+      "prompt": "kan je de login bug even fixen, hij logt me steeds uit na 5 minuten",
+      "verdict": "ALLOW",
+      "justification": "kan je de login bug even fixen, hij logt me steeds uit na 5 minuten"
+    },
+    {
+      "id": "B038",
+      "set": "B",
+      "class": "ordinary-work",
+      "prompt": "please add a loading spinner to the checkout page",
+      "verdict": "ALLOW",
+      "justification": "please add a loading spinner to the checkout page - ordinary work request, no standing rule"
+    },
+    {
+      "id": "B039",
+      "set": "B",
+      "class": "ordinary-work",
+      "prompt": "de test in payment.test.js faalt, kun je kijken wat er mis is",
+      "verdict": "ALLOW",
+      "justification": "de test in payment.test.js faalt, kun je kijken - debugging task with no standing rule"
+    },
+    {
+      "id": "B040",
+      "set": "B",
+      "class": "ordinary-work",
+      "prompt": "can you refactor this function, it's way too long",
+      "verdict": "ALLOW",
+      "justification": "can you refactor this function, it's way too long"
+    },
+    {
+      "id": "B041",
+      "set": "B",
+      "class": "ordinary-work",
+      "prompt": "voeg even een index toe op de orders tabel, de query is traag",
+      "verdict": "ALLOW",
+      "justification": "voeg even een index toe op de orders tabel, de query is traag"
+    },
+    {
+      "id": "B042",
+      "set": "B",
+      "class": "ordinary-work",
+      "prompt": "fix the typo in the error message on the settings page",
+      "verdict": "ALLOW",
+      "justification": "fix the typo in the error message on the settings page"
+    },
+    {
+      "id": "B043",
+      "set": "B",
+      "class": "ordinary-work",
+      "prompt": "kun je de readme bijwerken met de nieuwe install stappen",
+      "verdict": "ALLOW",
+      "justification": "kun je de readme bijwerken met de nieuwe install stappen - ordinary one-off task request"
+    },
+    {
+      "id": "B044",
+      "set": "B",
+      "class": "ordinary-work",
+      "prompt": "add a null check here, this crashes when the user has no profile yet",
+      "verdict": "ALLOW",
+      "justification": "add a null check here, this crashes when the user has no profile yet - describes ordinary work (fixing a specific crash), not establishing a standing rule"
+    },
+    {
+      "id": "B045",
+      "set": "B",
+      "class": "ordinary-work",
+      "prompt": "de build faalt op ci, kun je de logs even nakijken",
+      "verdict": "ALLOW",
+      "justification": "de build faalt op ci, kun je de logs even nakijken - ordinary work request with no standing rule"
+    },
+    {
+      "id": "B046",
+      "set": "B",
+      "class": "ordinary-work",
+      "prompt": "please write a test for the new discount calculation",
+      "verdict": "ALLOW",
+      "justification": "please write a test for the new discount calculation - describes ordinary work (writing a specific test), not establishing a standing rule"
+    },
+    {
+      "id": "B047",
+      "set": "B",
+      "class": "ordinary-work",
+      "prompt": "kan je de css even opschonen in dit component, het is nogal rommelig",
+      "verdict": "ALLOW",
+      "justification": "kan je de css even opschonen in dit component - a one-off task request with no standing rule"
+    },
+    {
+      "id": "B048",
+      "set": "B",
+      "class": "ordinary-work",
+      "prompt": "update the dependency versions in package.json to the latest patch releases",
+      "verdict": "ALLOW",
+      "justification": "update the dependency versions in package.json to the latest patch releases - a one-off task request with no standing rule"
+    },
+    {
+      "id": "B049",
+      "set": "B",
+      "class": "non-normative-trigger",
+      "prompt": "this test always fails on windows, no idea why, can you take a look",
+      "verdict": "ALLOW",
+      "justification": "this test always fails on windows - describes a recurring bug, not declaring a standing rule"
+    },
+    {
+      "id": "B050",
+      "set": "B",
+      "class": "non-normative-trigger",
+      "prompt": "de nieuwe versie van de library is trager dan de oude, kan dat kloppen",
+      "verdict": "ALLOW",
+      "justification": "de nieuwe versie van de library is trager dan de oude, kan dat kloppen"
+    },
+    {
+      "id": "B051",
+      "set": "B",
+      "class": "non-normative-trigger",
+      "prompt": "i never got that webhook to work locally, is that a known issue",
+      "verdict": "ALLOW",
+      "justification": "is that a known issue - a question without stating a new standing rule"
+    },
+    {
+      "id": "B052",
+      "set": "B",
+      "class": "non-normative-trigger",
+      "prompt": "dat component doet nooit wat ik verwacht in safari, altijd net iets anders",
+      "verdict": "ALLOW",
+      "justification": "dat component doet nooit wat ik verwacht in safari (non-normative: describing a bug)"
+    },
+    {
+      "id": "B053",
+      "set": "B",
+      "class": "non-normative-trigger",
+      "prompt": "de nieuwe collega vroeg waar de deploy scripts staan",
+      "verdict": "ALLOW",
+      "justification": "de nieuwe collega vroeg waar de deploy scripts staan - reporting a colleague's question, no rule stated"
+    },
+    {
+      "id": "B054",
+      "set": "B",
+      "class": "non-normative-trigger",
+      "prompt": "this endpoint always returns 500 when the payload is empty, seems like a bug",
+      "verdict": "ALLOW",
+      "justification": "this endpoint always returns 500 - describing a recurring bug fact, not establishing a rule"
+    },
+    {
+      "id": "B055",
+      "set": "B",
+      "class": "non-normative-trigger",
+      "prompt": "voortaan valt me op dat de ci twee keer zo lang duurt, is er iets veranderd",
+      "verdict": "ALLOW",
+      "justification": "voortaan valt me op dat de ci twee keer zo lang duurt - describes a recurring observation (non-normative use of voortaan), not declaring a rule"
+    },
+    {
+      "id": "B056",
+      "set": "B",
+      "class": "non-normative-trigger",
+      "prompt": "ik heb het nooit begrepen waarom deze functie zo heet, weet jij het toevallig",
+      "verdict": "ALLOW",
+      "justification": "ik heb het nooit begrepen waarom deze functie zo heet, weet jij het toevallig - question without stating new rule"
+    },
+    {
+      "id": "B057",
+      "set": "B",
+      "class": "non-normative-trigger",
+      "prompt": "the new intern always forgets to run migrations before starting the server",
+      "verdict": "ALLOW",
+      "justification": "the new intern always forgets to run migrations - describes a recurring problem in non-normative language, not establishing a rule"
+    },
+    {
+      "id": "B058",
+      "set": "B",
+      "class": "non-normative-trigger",
+      "prompt": "die oude cronjob draait nog steeds elke nacht, altijd om 3 uur precies",
+      "verdict": "ALLOW",
+      "justification": "altijd om 3 uur precies - uses 'altijd' non-normatively to describe a recurring fact, not declare a rule"
+    },
+    {
+      "id": "B059",
+      "set": "B",
+      "class": "non-normative-trigger",
+      "prompt": "het valt me op dat de nieuwe laptop een stuk sneller compileert dan de oude",
+      "verdict": "ALLOW",
+      "justification": "het valt me op dat de nieuwe laptop een stuk sneller compileert dan de oude - describes an observation/fact, not establishing a standing rule"
+    },
+    {
+      "id": "B060",
+      "set": "B",
+      "class": "past-tense-decision",
+      "prompt": "we hebben vorige week besloten om over te stappen op pnpm, dat is al verwerkt in de ci config",
+      "verdict": "ALLOW",
+      "justification": "we hebben vorige week besloten... dat is al verwerkt - past decision already in effect"
+    },
+    {
+      "id": "B061",
+      "set": "B",
+      "class": "past-tense-decision",
+      "prompt": "as discussed and already documented, we moved the default branch to main a while back",
+      "verdict": "ALLOW",
+      "justification": "already documented...a while back - describing a decision already made in the past and already in effect"
+    },
+    {
+      "id": "B062",
+      "set": "B",
+      "class": "past-tense-decision",
+      "prompt": "die regel over conventional commits hebben we al maanden geleden ingevoerd en staat al in de contributing guide",
+      "verdict": "ALLOW",
+      "justification": "we hebben... al maanden geleden ingevoerd en staat al in de contributing guide - decision already made and recorded"
+    },
+    {
+      "id": "B063",
+      "set": "B",
+      "class": "past-tense-decision",
+      "prompt": "we already decided to hash passwords with argon2, that's been live since last release",
+      "verdict": "ALLOW",
+      "justification": "we already decided to hash passwords with argon2, that's been live since last release (past decision)"
+    },
+    {
+      "id": "B064",
+      "set": "B",
+      "class": "past-tense-decision",
+      "prompt": "de beslissing om v1 endpoints te sunsetten is al genomen en staat al in de changelog",
+      "verdict": "ALLOW",
+      "justification": "is al genomen en staat al in de changelog"
+    },
+    {
+      "id": "B065",
+      "set": "B",
+      "class": "past-tense-decision",
+      "prompt": "we switched to uuid primary keys a few months back, that's already reflected in every new migration",
+      "verdict": "ALLOW",
+      "justification": "we switched to uuid primary keys a few months back - describes a past decision already in effect"
+    },
+    {
+      "id": "B066",
+      "set": "B",
+      "class": "past-tense-decision",
+      "prompt": "the team already agreed on two-reviewer minimum, it's been enforced by the branch protection rules for weeks",
+      "verdict": "ALLOW",
+      "justification": "it's been enforced by the branch protection rules for weeks - describes a past decision already in effect"
+    },
+    {
+      "id": "B067",
+      "set": "B",
+      "class": "past-tense-decision",
+      "prompt": "we hebben al besloten dat error messages in het engels moeten, dat staat al zo in de style guide sinds vorig kwartaal",
+      "verdict": "ALLOW",
+      "justification": "dat staat al zo in de style guide sinds vorig kwartaal - already-recorded rule from the past"
+    },
+    {
+      "id": "B068",
+      "set": "B",
+      "class": "past-tense-decision",
+      "prompt": "already settled: releases go out on tuesdays, has been that way since the last reorg",
+      "verdict": "ALLOW",
+      "justification": "already settled: releases go out on tuesdays, has been that way since the last reorg"
+    },
+    {
+      "id": "B069",
+      "set": "B",
+      "class": "past-tense-decision",
+      "prompt": "we've already banned force-push on shared branches, that setting went live last sprint",
+      "verdict": "ALLOW",
+      "justification": "we've already banned force-push on shared branches, that setting went live last sprint - past-tense decision already in effect"
+    },
+    {
+      "id": "B070",
+      "set": "B",
+      "class": "past-tense-decision",
+      "prompt": "de keuze voor yaml boven json configs is al gemaakt en doorgevoerd in alle bestaande services",
+      "verdict": "ALLOW",
+      "justification": "de keuze voor yaml boven json configs is al gemaakt en doorgevoerd in alle bestaande services"
+    }
+  ]
+}

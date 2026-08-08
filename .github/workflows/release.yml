@@ -167,9 +167,9 @@ jobs:
             install). Run `thor doctor` if anything looks off - it reports the store, model,
             sidecars and daemon, which is what recall behaviour depends on.
 
-            New here? docs/FEATURES.md explains in plain words what each part does and whether it
-            is worth turning on. Full walkthrough: docs/SETUP.md. Exact costs and undo steps for
-            every optional piece: docs/OPTIONAL-FEATURES.md.
+            New here? docs/1.0/FEATURES.md explains in plain words what each part does and whether it
+            is worth turning on. Full walkthrough: docs/1.0/SETUP.md. Exact costs and undo steps for
+            every optional piece: docs/1.0/OPTIONAL-FEATURES.md.
 
             **What has actually been run**
 

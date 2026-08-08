@@ -1,3 +1,8 @@
+> **This page describes THOR 1.0.** It is kept because the 1.0 program is still
+> in this repository and some people still run it. The current version is 2.0,
+> which is the same THOR rebuilt, and its commands are different. Start at
+> [the main README](../../README.md) instead.
+
 # Setting up THOR, start to finish
 
 For a person or for an AI assistant doing it on their behalf. It assumes you have
@@ -20,7 +25,7 @@ that layer and nothing else.
 
 ### The easy way: download it
 
-Take the file for your system from [Releases](../../../releases). Next to each
+Take the file for your system from [Releases](../../../../releases). Next to each
 download is a `.sha256` file - a short code you can use to confirm the download
 arrived intact.
 

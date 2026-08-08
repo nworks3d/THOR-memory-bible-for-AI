@@ -1,3 +1,8 @@
+> **This page describes THOR 1.0.** It is kept because the 1.0 program is still
+> in this repository and some people still run it. The current version is 2.0,
+> which is the same THOR rebuilt, and its commands are different. Start at
+> [the main README](../../README.md) instead.
+
 # What THOR actually does, in plain words
 
 This page is for someone who has just found THOR and wants to know what it is

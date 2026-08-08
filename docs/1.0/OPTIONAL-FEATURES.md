@@ -1,3 +1,8 @@
+> **This page describes THOR 1.0.** It is kept because the 1.0 program is still
+> in this repository and some people still run it. The current version is 2.0,
+> which is the same THOR rebuilt, and its commands are different. Start at
+> [the main README](../../README.md) instead.
+
 # Optional features - what to turn on, and what to leave alone
 
 THOR does one thing on its own: it stores facts in a local, append-only log and

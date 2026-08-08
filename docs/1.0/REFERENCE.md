@@ -1,3 +1,8 @@
+> **This page describes THOR 1.0.** It is kept because the 1.0 program is still
+> in this repository and some people still run it. The current version is 2.0,
+> which is the same THOR rebuilt, and its commands are different. Start at
+> [the main README](../../README.md) instead.
+
 # THOR reference
 
 The full tour, moved here from the front page to keep that page readable. This
@@ -312,7 +317,7 @@ file for your own network and route.
 ## Measuring it yourself
 
 This repository publishes no scores and ships no corpus. The reason is in
-[CONTRIBUTING.md](../CONTRIBUTING.md): a corpus written alongside the mechanism
+[CONTRIBUTING.md](../../CONTRIBUTING.md): a corpus written alongside the mechanism
 it validates measures its author, not the tool.
 
 If you want a number for your own store, the shape that works is a **drift

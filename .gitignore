@@ -10,6 +10,9 @@ __pycache__/
 *.zip
 # Local MCP connector config (machine-specific absolute path)
 .mcp.json
+# Rollback copies of the connector config. They hold real absolute paths with
+# the maintainer's username, and a stranger has no use for them.
+.mcp.json.pre-*
 # Measurement corpora and their outputs, mirrored from thor/.gitignore. A gold
 # body is a real memory and an entity id names a real project, so these belong in
 # the per-user data directory and never here. Mirrored because the eval harness

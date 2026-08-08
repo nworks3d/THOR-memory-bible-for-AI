@@ -65,119 +65,119 @@ It reads your code too. Point it at a project and it takes in the source and the
 documentation, so "how does this bit work here" gets answered from your actual
 project instead of a guess.
 
-Everything stays on your machine. One program, one file. No cloud, no account,
-no subscription. And if some optional piece is missing, THOR quietly falls back
-to a simpler way of working instead of breaking.
+Everything stays on your machine. No cloud, no account, no subscription, and
+nothing to sign up for. If some optional piece is missing, THOR quietly falls
+back to a simpler way of working instead of breaking.
+
+## What version 2 adds: a note that can actually stop you
+
+Showing a warning at the right moment is worth a lot, and for a long time that
+was all THOR could do. A note could speak. It could not refuse.
+
+Version 2 lets a note carry a **proof of its own currency**: a small check THOR
+can run right now to see whether the note is still true of your project. "This
+file still contains that line." "That file is still there." "This character
+never appears in anything we write."
+
+That changes what a note is allowed to do:
+
+- A note whose proof **runs and holds right now** may stop a wrong change
+  outright.
+- A note backed by words alone may warn, and only warn. It can inform your
+  assistant; it can never forbid.
+- If the proof **cannot run** - the file moved, the path is gone - nothing is
+  blocked. It is reported as needing a look.
+
+The reason for the split is uncomfortable and worth saying out loud. Notes rot.
+You write one, the project moves on, and the note quietly becomes wrong. A tool
+that let any old note block your work would spend most of its time blocking you
+for reasons that stopped being true months ago. So THOR only hands that power to
+notes that can prove, at that exact second, that they still describe your
+project.
+
+There is an honest consequence: **most of your notes will never be able to block
+anything, and that is by design.** The health check prints the number, and you
+should look at it. On the author's own memory, when this was first measured, 2
+notes out of 2999 could prove themselves. A day of deliberate work took that to
+256. It moves by hand and only by hand, because deciding what proves a note is a
+judgement about that one note.
+
+That number being printed at all is the point: a safety net nothing is attached
+to looks exactly like a safety net that works.
 
 ## Getting started
 
-**Step 1 - get the program.** Download it from
-[Releases](../../releases). Pick `thor-windows-x86_64.zip` or
-`thor-linux-x86_64.tar.gz` for your own computer (on Windows you also need
-Microsoft's Visual C++ Redistributable, a free one-time install from Microsoft).
-Pick `thor-linux-x86_64-bm25.tar.gz` if you are putting it on a small server or
-a NAS. Each download has a matching `.sha256` file so you can check it arrived
-intact.
-
-Rather build it yourself? `cd thor && cargo build --release`.
-
-Unpack it somewhere permanent, and know this before the next command: unless
-that folder is one your shell already searches, typing `thor` will come back as
-"command not found". That is normal and nothing is broken - write the path out
-instead, or put the folder on your PATH once and every example below works as
-printed. [docs/SETUP.md](docs/SETUP.md#1-get-the-program) has both, with the
-exact form for PowerShell.
-
-**Step 2 - connect it to your assistant.** One command:
+**Step 1 - build it.** You need a Rust toolchain. Nothing else: no key to get,
+no model to download first, no account.
 
 ```sh
-thor install --with-courier --with-guard --with-daemon
+cd thor2 && cargo build --release --features semantic
 ```
 
-It backs up your settings first, only adds its own lines, and you can safely run
-it again later.
+> **`--features semantic` is not optional, and leaving it off fails silently.**
+> Without it everything still builds, still runs, and still answers every
+> word-for-word search correctly. What stops working is searching by meaning: it
+> returns nothing at all, with no error anywhere. The reliable way to tell the
+> two apart is size. Look at `thor2/target/release/serve.exe` - over 20 MB is
+> the right build, a few MB is the wrong one. Build it again with the flag.
 
-**Step 3 - introduce it to a project.** From that project's folder:
+The downloads on the [Releases](../../releases) page are still version 1. If you
+want a ready-made binary rather than a build, that is version 1 you are getting,
+and [docs/1.0/SETUP.md](docs/1.0/SETUP.md) is the page for it.
+
+**Step 2 - install it.** One command does the whole setup:
 
 ```sh
-thor init
+thor2/target/release/install.exe --settings "C:\Users\you\.claude\settings.json" --mcp-json "C:\Users\you\.mcp.json"
 ```
 
-That is it. From here on, your memory gets checked on every message, and your
-assistant can save new things as you work.
+It creates your memory if you do not have one yet, wires THOR into your
+assistant, and registers the part your assistant writes through. It backs up
+both files before it touches them, it never removes anything it did not put
+there, and running it twice changes nothing the second time.
 
-Forget this step and just start working in a fresh folder? Your assistant now
-notices that the folder is not a project yet and offers to set it up first, so
-your notes get their own scope instead of piling up in the shared memory every
-project sees. A brand-new folder with no git repository used to get no such
-hint - a poor first impression that is now fixed.
+A brand new memory does not arrive empty. It gets four short notes on how to
+write a note that comes back to you later, and your assistant is handed them at
+the start of every conversation from then on. That matters more than it sounds:
+an assistant with nothing in front of it writes notes in a shape that never
+fires again, and neither of you would notice for weeks. They are ordinary notes
+- unpin one, rewrite it in your own words, or throw it out. An existing memory
+is never seeded, so upgrading never pushes anything into your own notes.
 
-**Step 4 - there is no step 4.** Your assistant needs to know how to use a
-memory well, or it will save notes in a shape that never comes back to it later
-- and neither of you would notice for weeks, because a memory that fails does it
-silently.
+Those two paths are the only ones it will not guess, because they are the two
+files it writes to. Everything else it works out on its own: the programs next
+to itself, and your memory in the usual per-user place for your system. Name
+them yourself with `--db` and `--serve-exe` if you would rather decide.
 
-That used to be a page we asked you to make it read. It is now a rule THOR puts
-into the memory itself during step 2, and hands to your assistant at the start
-of every conversation. Nothing to read, nothing to skip. You can see it with
-`thor get thor-working-contract`, edit it like any other note, or unpin it if
-you would rather write your own.
+**Then restart your assistant.** It reads both of those files once, when it
+starts. Until you restart it, nothing you just installed is running.
 
-**Optional - start with a few example rules.** A brand-new memory is empty, and
-an empty memory makes it hard to see what a rule worth keeping even looks like:
+**Step 3 - check it.**
 
 ```sh
-thor starter-pack
+thor2/target/release/doctor.exe --db "C:\Users\you\AppData\Local\thor2\thor.db"
 ```
 
-That puts three short working rules in your memory: finish what you start, split
-work by what it costs to be wrong, and let nothing leave your machine without
-being asked for it. They sit in the background - your assistant only sees one
-when it happens to be relevant - so they change nothing until you decide they
-should. Read one with `thor get`, keep the ones that fit by pinning them, rewrite
-them in your own words, or throw them out. Run the command twice and nothing
-doubles up; throw one away and it stays away.
+Nine plain-language lines, one per part: whether your memory is healthy, whether
+searching by meaning is switched on, how many of your notes can prove
+themselves, and how many point at files that are no longer there. It changes
+nothing.
+
+**Step 4 - give each project its own memory.** From that project's folder:
+
+```sh
+thor2/target/release/install.exe --settings "C:\Users\you\.claude\settings.json" --project "my-project"
+```
+
+This matters more than it sounds. Skip it and THOR gets *worse* the more you use
+it, because every search starts competing with projects you were not asking
+about. All it does is write a small file called `.thor-project` holding that
+name, so you can also just create that file yourself. It refuses to change a
+name that is already there, because renaming a project's scope would strand
+every note already filed under the old one.
 
 If you are the assistant doing the setup, [AGENTS.md](AGENTS.md) is the
 walkthrough for the steps above.
-
-### What that command switches on
-
-No menu to work through - it turns on the lot, which is what the author runs:
-
-- **A memory check on every message** - the whole point. Without it you have a
-  notebook you must remember to open, which is the problem you started with.
-- **A warning at the moment you act** - the one thing searching cannot do. Your
-  question rarely mentions the trap; the file path always does.
-- **A check before your assistant finishes replying**, for the rules that are
-  about how it answers rather than about a file.
-- **A background process that keeps it quick** - roughly two thirds off the wait
-  on every message, for a few hundred MB of memory. The only one worth leaving
-  out, and only if memory is tight; everything still works, just slower.
-
-Then **step 3 keeps your projects apart**, which matters more than it sounds:
-skip it and THOR gets *worse* the more you use it, because every search starts
-competing with projects you were not asking about.
-
-A few things are not switched on for you only because they need something you
-have to fetch or choose - the model file for searching by meaning, somewhere to
-back up to, a second machine to sync with. Set them up too.
-[docs/FEATURES.md](docs/FEATURES.md) walks through each one, and is straight
-about the only two you can genuinely skip and about what got tried and thrown
-away.
-
-**Never done any of this before?** Read these in order. They assume nothing:
-
-1. **[docs/FEATURES.md](docs/FEATURES.md)** - what each part does, in plain
-   words, and whether it is worth your time.
-2. **[docs/SETUP.md](docs/SETUP.md)** - the full walkthrough, one step at a
-   time.
-3. **[AGENTS.md](AGENTS.md)** - the setup, written for your assistant to follow.
-   How to *use* the memory well is not a page at all any more: THOR puts that
-   into the memory during setup and hands it over at the start of every
-   conversation.
-4. **[docs/OPTIONAL-FEATURES.md](docs/OPTIONAL-FEATURES.md)** - the extras. What
-   each one costs, how to switch it on, how to undo it.
 
 ## Stay in one conversation
 
@@ -185,32 +185,15 @@ The old advice was to start a fresh chat often, because long ones got worse and
 you lost everything anyway. With THOR that advice is out of date. **One long
 conversation is now the better habit.**
 
-When a conversation gets long, the assistant's tools squeeze out the older
-parts to make room. THOR covers that moment: your standing rules come straight
-back, it hands the assistant the list of things it remembered for you so far so
-it can say which were useful, and it nudges it to save anything important that
-was never written down. Starting a fresh chat is covered too - your rules and
-your project's background are loaded in from the start.
+When a conversation gets long, the assistant's tools squeeze out the older parts
+to make room. THOR covers that moment: your standing rules come straight back,
+and it nudges your assistant to write down anything important that was never
+saved. Starting a fresh chat is covered too - your rules and your project's
+background are loaded in from the start.
 
 So stay in one conversation while you are on one piece of work. Start a fresh
 one on purpose - because you have moved on to something else, or because this
 one has talked itself into a corner - not because it is getting long.
-
-One honest note: the "which of these were useful" moment only happens when a
-conversation gets long enough to need squeezing. A short chat never reaches it.
-Nothing breaks and nothing is lost; THOR just learns what is useful to you a
-little slower.
-
-## Documentation
-
-| page | what it answers |
-|---|---|
-| [AGENTS.md](AGENTS.md) | for your AI assistant: how to set THOR up (using it well is seeded into the memory instead) |
-| [docs/FEATURES.md](docs/FEATURES.md) | what does each part do, and should I care? (plain words, no commands) |
-| [docs/SETUP.md](docs/SETUP.md) | the full walkthrough, for someone who has never done this |
-| [docs/OPTIONAL-FEATURES.md](docs/OPTIONAL-FEATURES.md) | the extras: what each costs, switching on, checking, undoing |
-| [docs/REFERENCE.md](docs/REFERENCE.md) | the technical depth: how it is built, every command, every setting |
-| [CONTRIBUTING.md](CONTRIBUTING.md) | changing THOR: the bar for a pull request |
 
 ## Does it work?
 
@@ -221,6 +204,17 @@ THOR was measured head to head against another memory tool for months, and those
 numbers are not here any more. Not because they were bad - they were good - but
 because a score measured on someone else's notes tells you about them, not about
 you. The tool is here. The verdict is yours.
+
+## Documentation
+
+| page | what it answers |
+|---|---|
+| [AGENTS.md](AGENTS.md) | for your AI assistant: how to set THOR up |
+| [thor2/README.md](thor2/README.md) | the version 2 program: how it is built and what each part does |
+| [thor2/CONTRACT.md](thor2/CONTRACT.md) | the standard version 2 is judged against, and the test enforcing each rule |
+| [thor2/SPEC-ENFORCEMENT.md](thor2/SPEC-ENFORCEMENT.md) | how a note proves itself, in detail |
+| [CONTRIBUTING.md](CONTRIBUTING.md) | changing THOR: the bar for a pull request |
+| [docs/1.0/](docs/1.0/) | version 1, kept for anyone still running it |
 
 ## Thanks
 
@@ -246,8 +240,10 @@ earned its keep - saved you an explanation, caught a mistake before it cost you,
 or just meant you did not have to start from scratch - there are two easy ways
 to help keep it going:
 
-- **Ko-fi**: https://ko-fi.com/noizieworks
-- **YouTube members**: https://www.youtube.com/channel/UCrEZc_oJR9mywNjqY115mRg/join
+- **[Buy me a Ko-fi](https://ko-fi.com/noizieworks)** - a one-off, whenever you
+  feel like it.
+- **[Become a YouTube member](https://www.youtube.com/channel/UCrEZc_oJR9mywNjqY115mRg/join)** -
+  monthly, if you want to keep it going.
 
 No pressure and no paywall - it all stays open either way. Skål, and thanks for
 reading this far.

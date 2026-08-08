@@ -24,23 +24,25 @@ runs on this machine, in one process, next to the agent.
 `CONTRACT.md` is the full version: nine requirements, each naming the failure it
 makes structurally impossible and the test that enforces it.
 
-## What is in this repository
+## What is in this directory
 
 | where | what |
 |---|---|
-| `thor2/` | the Rust workspace. This is the product. |
+| `core/`, `model/`, `intent/`, `serve/`, `mcp/`, `codeindex/`, `ops/` | the seven crates. This is the product. |
 | `CONTRACT.md` | the standard the build is judged against. Read this first. |
-| `PLAN-NEXT.md` | the roadmap that is still open. |
-| `SWITCH.md` | step by step, in Dutch: how to switch a live 1.0 setup over to 2.0. |
 | `SPEC-ENFORCEMENT.md` | how the enforcement layer is specified. |
-| the other `*.md` at the root | the measurement record. Every number 2.0 claims was measured, and these are the write-ups: A/B tests, blind hold-outs, recall batteries, guard evaluations. They are kept because a claim without its measurement is a habit. |
-| `harness/`, `probe/`, `slices/`, `tools/` | one-off measurement scaffolding, not shipped. |
-| `nas-pakket/`, `rollback/`, `reuse/` | operational scratch from the 1.0 to 2.0 move. |
+| `JUDGE-TRANSPORT.md` | the write-up of the judge transport experiment. |
+| `deploy/` | the container build for running a copy on a NAS or a server. |
+| `eval/` | the measurement record and the one-off scaffolding behind it. Ignored by git in full. |
 
-The build directories (`target/`, `target-p*/`) and every data directory
-(`out*/`, `store-copy*/`, `migrated*/`, `fixtures/`) are ignored by git. They
-hold real private memory, or six gigabytes of build output that one `cargo
-build` reproduces.
+`eval/` is ignored deliberately and not as an oversight. It holds measurement
+data taken from a live memory - real notes, real project names - and that is
+private by definition, however neutral any individual file looks. The same goes
+for `target/`: several gigabytes that one `cargo build` reproduces.
+
+This directory sits inside the THOR repository rather than beside it. Every
+numbered version of THOR is the same project rebuilt, so it belongs in the same
+place; the number says a real rebuild happened, not that a new project started.
 
 ## The seven crates
 
@@ -73,42 +75,66 @@ The reliable way to tell the two builds apart is size. A semantic `serve.exe` or
 without the flag is a few megabytes:
 
 ```bash
-ls -la thor2/target/release/serve.exe
+ls -la target/release/serve.exe
 ```
 
 Under 20 MB means you built the wrong thing. Build again with the flag.
 
-## Check that it works before you install anything
+## Install it
+
+One command does the whole setup:
+
+```bash
+target/release/install.exe --settings "<agent settings.json>" --mcp-json "<.mcp.json>"
+```
+
+It creates the store if there is not one yet, wires in the four hooks, and
+registers the tool server the agent writes through. Both files are backed up to
+`<path>.bak` before anything touches them, nothing this tool did not put there
+is ever removed, and a second run reports everything as already present and
+writes nothing.
+
+A store it just created also gets four pinned notes on how to write a fact that
+comes back: anchoring, correcting instead of duplicating, what a refusal is, and
+that words inform while only a proof forbids. They go in through
+`model::store::declare`, the same gate every other write uses, and a refusal is
+reported rather than worked around - a memory whose own gate rejects the notes
+it ships with is worth seeing. An EXISTING store is never seeded, so upgrading
+never pushes anything into someone's real notes.
+
+Those two paths have no defaults, on purpose: they are the two files this
+command WRITES to, and a tool that rewrites a config file should never guess
+which one. Everything else is worked out - the binaries next to the installer,
+and the store in the per-user data directory. `--db`, `--serve-exe`, `--mcp-exe`
+and `--code-index-root` override each of those.
+
+`--project <key>` additionally writes a `.thor-project` marker in the current
+directory, which is what gives a checkout its own scope. It refuses to change a
+key that is already there: re-scoping strands every item filed under the old one
+while leaving them in the store, which is invisible from every surface.
+
+The four hooks are `SessionStart` (what the agent is handed at the start),
+`PreToolUse` (the gate that can block a write), `UserPromptSubmit`, and `Stop`
+(the check on the reply itself). All four run the same `serve hook` command and
+tell themselves apart by the payload.
+
+A hook pointing at a binary that is not there fails OPEN: the agent carries on
+and the memory simply never speaks again, with no error anywhere. The installer
+prints a warning when the path it is about to write does not exist yet, which is
+the only moment that is cheap to notice.
+
+## Check it
 
 `doctor` reports one plain-language line per component and touches nothing:
 
 ```bash
-thor2/target/release/doctor.exe --db "C:\Users\dev\thor2\thor.db"
+target/release/doctor.exe --db "<store>"
 ```
 
-It tells you whether the store is healthy, whether the code index is current,
-whether the replica is reachable, and how many rules still lack a falsifier.
-
-## Install it into Claude Code
-
-THOR hangs off three hooks: `SessionStart` (what you get handed at the start),
-`PreToolUse` (the gate that can block a write), and `UserPromptSubmit`.
-
-The `install` binary wires all three into an agent's `settings.json` for you. It
-writes a `.bak` copy of that file first, so the step is reversible:
-
-```bash
-thor2/target/release/install.exe --settings "C:\Users\dev\.claude\settings.json" --serve-exe "C:\Users\dev\thor2\bin\serve.exe" --db "C:\Users\dev\thor2\thor.db"
-```
-
-`--settings` deliberately has no default. A tool that rewrites a config file
-should never guess which one.
-
-The hooks alone let THOR hand facts to the agent and stop a wrong write. To also
-let the agent write to its own memory, register `mcp.exe` as a tool server with
-the same `--db`, in the same settings file. `SWITCH.md` walks through both
-files line by line, in Dutch, with the exact blocks to paste and how to undo
-each step.
+It tells you whether the store is healthy, whether searching by meaning is on,
+how many rules carry a runnable proof, how many anchors point at nothing, and
+how many rules still lack a falsifier. It works on a store with nothing in it
+yet, which is what a first run looks like.
 
 ## Writing to it from somewhere else
 
@@ -156,7 +182,7 @@ protection. Run it on a LAN or a private tunnel, never on the open internet.
 cd thor2 && cargo test --workspace --all-targets
 ```
 
-1007 tests across 71 binaries, all green as of 2026-08-06. Every refusal the
+1043 tests across 72 binaries, all green as of 2026-08-07. Every refusal the
 write gate can produce has a test named after the defect it prevents. A refusal
 reason with no test does not exist, by the contract's own rule.
 
@@ -171,6 +197,11 @@ The first time this was measured on a real store, on 2026-08-06, the answer
 was 2 rules out of 2999. Every other line of the health check was green.
 That is the failure this line exists to make visible: a capability nothing is
 wired into looks exactly like a capability that works.
+
+A day of deliberate work took the same store to 256 of 2979. The number moves
+by hand and only by hand, which is the design rather than a shortcoming: each
+proof is a judgement about one rule, and attaching them wholesale is exactly
+how the noise gets back in.
 
 There is a second gate that keeps the number from rotting once you start
 using it. Adding a fact to a target that already holds one whose own proof

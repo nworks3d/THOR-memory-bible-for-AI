@@ -67,6 +67,49 @@ jobs:
         working-directory: thor
         run: cargo test --release ${{ matrix.features }} --lib
 
+  # Version 2, which had NO automated coverage at all until 2026-08-08 - the
+  # job above builds `thor/` only, so every one of 2.0's tests ran solely on
+  # the maintainer's own machine. A rebuild that nothing tests is a rebuild
+  # nobody can trust.
+  #
+  # `--all-targets`, not `--lib`: 2.0 puts the refusals it cares most about in
+  # integration tests (the write path, the neighbourhood toll, the global tier)
+  # and those are exactly the ones a regression would break quietly.
+  thor2:
+    name: ${{ matrix.name }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # The server/NAS shape: no ONNX, so the semantic path degrades to
+          # literal search. Everything else has to keep working.
+          - name: thor2 / linux (default)
+            os: ubuntu-latest
+            features: ""
+          # The client shape, and the one the owner actually runs.
+          - name: thor2 / windows (semantic)
+            os: windows-latest
+            features: "--features semantic"
+
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: thor2
+
+      - name: Build
+        working-directory: thor2
+        run: cargo build --release ${{ matrix.features }}
+
+      # No embedding model and no store on a clean runner, which is the point:
+      # every one of these has to pass without either. Measured 2026-08-08:
+      # 1137 tests across 78 binaries.
+      - name: Test
+        working-directory: thor2
+        run: cargo test --release ${{ matrix.features }} --all-targets
+
   # This repository is public and its test fixtures are written while looking at
   # the maintainer's real, private memory store - so private identifiers leak in
   # by default, not by accident. A full history rewrite on 2026-07-23 scrubbed

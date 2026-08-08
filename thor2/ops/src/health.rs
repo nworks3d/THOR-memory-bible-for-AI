@@ -202,9 +202,18 @@ pub fn proof_line(db: &Path) -> String {
     let (mut forbidding, mut protecting, mut location, mut blocks_nothing) = (0usize, 0usize, 0usize, 0usize);
     for i in &fireable {
         let always_bound = i.item.bindings.iter().any(|b| matches!(b, model::item::Binding::Always));
+        // A `Forbidden` check reaches wherever its BINDING says, and there are
+        // exactly two bindings that carry a reach it can honour: Always (every
+        // file write, via `absent_guard::find_forbidden_violation`) and Command
+        // (that one command, via `find_command_violation`). Anything else -
+        // a moment, a path, a directory - passes the write gate, looks like the
+        // strongest form, and can never fire.
+        let command_bound = i.item.bindings.iter().any(|b| {
+            matches!(b, model::item::Binding::Target { kind: model::item::TargetKind::Command, .. })
+        });
         match &i.item.check {
             Some(model::item::Check::Absent { .. }) | Some(model::item::Check::AbsentAll { .. }) => forbidding += 1,
-            Some(model::item::Check::Forbidden { .. }) if always_bound => forbidding += 1,
+            Some(model::item::Check::Forbidden { .. }) if always_bound || command_bound => forbidding += 1,
             Some(model::item::Check::Forbidden { .. }) => blocks_nothing += 1,
             Some(model::item::Check::Contains { .. }) => protecting += 1,
             Some(model::item::Check::PathExists { path }) => {

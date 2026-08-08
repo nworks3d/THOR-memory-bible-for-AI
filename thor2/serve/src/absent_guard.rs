@@ -533,6 +533,29 @@ fn absent_literals(check: &Check) -> Option<(&str, &[String])> {
     }
 }
 
+/// The literals a check forbids in a COMMAND, and the file (if any) whose
+/// existence still has to prove the rule current.
+///
+/// WHY THIS IS NOT JUST `absent_literals`. A command prohibition - never run
+/// `gh repo edit --visibility public`, never run `thor import` - is not about
+/// a file, and demanding one was a category error that kept the whole class
+/// out of enforcement. `Absent`/`AbsentAll` name a file and must still prove
+/// it is there; `Forbidden` names none, so its reach is its BINDING, and a
+/// `Command` binding says exactly which command it reaches. There is nothing
+/// to prove current: the rule is stale only when its owner changes their mind,
+/// which is what the falsifier is for, never a check.
+///
+/// This is the same reasoning `find_forbidden_violation` already applies to an
+/// `Always` binding on the file side. One form, two bindings, no new check
+/// kind, and no file invented to satisfy a formality - which is precisely the
+/// thing this project's own doctrine warns against.
+fn command_literals(check: &Check) -> Option<(Option<&str>, &[String])> {
+    match check {
+        Check::Forbidden { literals } => Some((None, literals.as_slice())),
+        _ => absent_literals(check).map(|(path, literals)| (Some(path), literals)),
+    }
+}
+
 /// The first literal, in the check's own declared order, that is actually
 /// present in `content` - never simply the first literal in the list
 /// regardless of whether IT matched. For a single-literal `Absent` check
@@ -1014,6 +1037,60 @@ fn command_binding(item: &Item) -> Option<&str> {
     })
 }
 
+/// EVERY command anchor an item carries, not just the first.
+///
+/// `command_binding` above returns one, which was fine while nothing declared
+/// two - and silently wrong the moment something did. Measured on the owner's
+/// own store: a rule given two spellings of the same command only ever
+/// considered the first, so the spelling actually typed went unguarded while
+/// the second binding read as protection that was not there.
+fn command_bindings(item: &Item) -> Vec<&str> {
+    if !item.kind.can_fire() {
+        return Vec::new();
+    }
+    item.bindings
+        .iter()
+        .filter_map(|b| match b {
+            Binding::Target { kind: TargetKind::Command, value } => Some(value.as_str()),
+            _ => None,
+        })
+        .collect()
+}
+
+/// The command as the RULE means it, with the wrapping that shell syntax adds
+/// taken off: a leading `sudo`, leading `VAR=value` assignments, the directory
+/// part of the executable, and a `.exe` suffix.
+///
+/// WHY THIS IS NOT A WIDENING. Running a program under `sudo`, by absolute
+/// path, or by its Windows spelling is the same act; only the typing differs.
+/// A matcher that treats them as different commands is not being strict, it is
+/// mistaking shell syntax for intent - and it fails in the one direction that
+/// matters, because the dangerous form is usually the one typed with a full
+/// path or under sudo. The prohibition still lives entirely in the literal;
+/// this only decides which rules get to look.
+///
+/// KNOWN GAP, stated rather than left to be rediscovered: a command run
+/// THROUGH another one, such as a container exec, still does not match an
+/// anchor naming the inner command, because the anchor would have to match in
+/// the middle rather than at the front. Making an anchor match anywhere is a
+/// real widening, and this project has twice measured what unvalidated
+/// widening costs, so it needs a blind hold-out first, not an argument.
+fn strip_invocation_wrapper(command: &str) -> String {
+    let mut words: Vec<&str> = command.split_whitespace().collect();
+    while let Some(first) = words.first() {
+        if *first == "sudo" || (first.contains('=') && !first.starts_with('-')) {
+            words.remove(0);
+        } else {
+            break;
+        }
+    }
+    if let Some(first) = words.first_mut() {
+        let base = first.rsplit(['/', '\\']).next().unwrap_or(first);
+        *first = base.strip_suffix(".exe").or_else(|| base.strip_suffix(".EXE")).unwrap_or(base);
+    }
+    words.join(" ")
+}
+
 /// Whether `anchor` (a rule's own declared `Command` target value, e.g. "git
 /// commit") names the command actually about to run (`command`, the raw
 /// string read off the tool payload) - deliberately its OWN comparison,
@@ -1067,15 +1144,25 @@ fn first_command_violation<'a>(
     root: Option<&Path>,
 ) -> Option<(&'a LiveItem, &'a str, &'a str)> {
     let root = root?;
+    let normalised = strip_invocation_wrapper(command);
     for candidate in items {
-        let Some(anchor) = command_binding(&candidate.item) else { continue };
-        if !command_anchor_matches(anchor, command) {
+        // EVERY anchor the item carries, and the command with its shell
+        // wrapping taken off - see `command_bindings` and
+        // `strip_invocation_wrapper` for what each of those two fixed.
+        let Some(anchor) = command_bindings(&candidate.item)
+            .into_iter()
+            .find(|a| command_anchor_matches(a, command) || command_anchor_matches(a, &normalised))
+        else {
             continue;
-        }
+        };
         let Some(check) = &candidate.item.check else { continue };
-        let Some((check_path, literals)) = absent_literals(check) else { continue };
-        if !anchor_is_current(check_path, root) {
-            continue;
+        let Some((check_path, literals)) = command_literals(check) else { continue };
+        // A path, when the check names one, still has to be there. A
+        // `Forbidden` check names none and needs none: see `command_literals`.
+        if let Some(check_path) = check_path {
+            if !anchor_is_current(check_path, root) {
+                continue;
+            }
         }
         if let Some(literal) = first_present_literal(literals, command) {
             return Some((candidate, anchor, literal));
@@ -2617,6 +2704,122 @@ mod tests {
                 check: Some(Check::Absent { path: check_path.to_string(), literal: literal.to_string() }),
             },
         }
+    }
+
+    /// A command prohibition that names no file at all: the self-contained
+    /// form, reaching exactly the command its binding names.
+    fn command_item_with_forbidden_check(id: &str, command_anchor: &str, literals: &[&str]) -> LiveItem {
+        let mut item = command_item_with_check(id, command_anchor, "unused", "unused");
+        item.item.check =
+            Some(Check::Forbidden { literals: literals.iter().map(|l| l.to_string()).collect() });
+        item
+    }
+
+    /// THE CLASS THIS OPENS. A command prohibition - never run `gh repo edit
+    /// --visibility public`, never run `thor import` - is not about a file, and
+    /// the arm used to demand one anyway: `absent_literals` returned nothing
+    /// for `Forbidden`, so the only way in was an `Absent` check pointed at
+    /// some file picked to satisfy the currency proof. That is the formality
+    /// this project's own doctrine warns against, and it kept the entire class
+    /// out of enforcement.
+    ///
+    /// A `Forbidden` check names no path, so its reach is its BINDING - the
+    /// same reasoning the file arm already applies to `Always`. Nothing here
+    /// needs to prove itself current, because such a rule goes stale only when
+    /// its owner changes their mind, which is what the falsifier is for.
+    #[test]
+    fn a_command_prohibition_needs_no_file_to_prove_itself_by() {
+        let dir = tempfile::tempdir().unwrap();
+        let items = vec![command_item_with_forbidden_check("no-public", "gh repo edit", &["--visibility public"])];
+
+        let (reason, anchor) =
+            find_command_violation(&items, "gh repo edit --visibility public", Some(dir.path()))
+                .expect("a self-contained command prohibition must block with no file anywhere");
+        assert!(reason.contains("no-public"), "{reason}");
+        assert!(reason.contains("--visibility public"), "must quote what matched: {reason}");
+        assert_eq!(anchor, "gh repo edit");
+
+        // The same rule, a harmless invocation of the same command: no block.
+        assert!(
+            find_command_violation(&items, "gh repo edit --description x", Some(dir.path())).is_none(),
+            "the anchor alone must never block; the literal has to be there"
+        );
+
+        // And a DIFFERENT command carrying the literal is not this rule's
+        // business - the binding is what carries the reach.
+        assert!(
+            find_command_violation(&items, "echo --visibility public", Some(dir.path())).is_none(),
+            "a Forbidden check on a Command binding reaches that command and nothing else"
+        );
+    }
+
+    /// THE TWO DEFECTS THIS PINS, both found by probing the real gate rather
+    /// than by reading it. A rule carrying TWO command anchors only ever used
+    /// the first, so the spelling its owner actually types went unguarded. And
+    /// the same program run under sudo, by absolute path, or with a .exe
+    /// suffix read as a different command entirely - which fails in the one
+    /// direction that matters, since the dangerous form is usually the one
+    /// typed with a full path.
+    #[test]
+    fn a_command_prohibition_survives_sudo_a_full_path_and_an_exe_suffix() {
+        let dir = tempfile::tempdir().unwrap();
+        let items = vec![command_item_with_forbidden_check("no-reset", "git reset", &["--hard"])];
+
+        for command in [
+            "git reset --hard origin/main",
+            "sudo git reset --hard origin/main",
+            "/usr/bin/git reset --hard origin/main",
+            "GIT_DIR=/srv/x git reset --hard origin/main",
+        ] {
+            assert!(
+                find_command_violation(&items, command, Some(dir.path())).is_some(),
+                "the same act, differently typed, must still be refused: {command}"
+            );
+        }
+
+        // A different subcommand of the same program is not this rule.
+        assert!(find_command_violation(&items, "sudo git pull --ff-only", Some(dir.path())).is_none());
+
+        // THE LIMIT, pinned rather than hidden: an executable path containing
+        // a SPACE is split into two words before anything else runs, so the
+        // first word is not the program at all and the anchor cannot match.
+        // Handling it properly means parsing shell quoting, which is the one
+        // thing both reviews of this guard said not to build - a false
+        // positive machine aimed at exactly the place false positives teach
+        // people to route around the gate. Stated here so the next reader
+        // knows it is a decision, not an oversight.
+        assert!(
+            find_command_violation(&items, r"C:\Program Files\Git\git.exe reset --hard x", Some(dir.path()))
+                .is_none(),
+            "if this starts blocking, someone taught the matcher about quoting - update this test on purpose"
+        );
+    }
+
+    /// Every anchor an item declares is considered, not just the first.
+    #[test]
+    fn a_second_command_anchor_is_not_silently_ignored() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut item = command_item_with_forbidden_check("two-spellings", "alpha run", &["--wipe"]);
+        item.item.bindings.push(Binding::Target { kind: TargetKind::Command, value: "beta run".to_string() });
+
+        let one = vec![LiveItem { id: item.id.clone(), item: item.item.clone() }];
+        let two = vec![LiveItem { id: item.id.clone(), item: item.item.clone() }];
+        assert!(find_command_violation(&one, "alpha run --wipe", Some(dir.path())).is_some());
+        assert!(
+            find_command_violation(&two, "beta run --wipe", Some(dir.path())).is_some(),
+            "the SECOND anchor must guard too, or it is protection that is not there"
+        );
+    }
+
+    /// The separation that keeps the two arms honest: a command prohibition
+    /// must never leak into the FILE arm, where its binding means nothing.
+    #[test]
+    fn a_command_bound_forbidden_check_never_blocks_a_file_write() {
+        let items = vec![command_item_with_forbidden_check("no-public", "gh repo edit", &["--visibility public"])];
+        assert!(
+            find_forbidden_violation(&items, "a document that mentions --visibility public").is_none(),
+            "only an Always binding reaches every file write"
+        );
     }
 
     /// The set-form counterpart to `command_item_with_check` above, mirroring

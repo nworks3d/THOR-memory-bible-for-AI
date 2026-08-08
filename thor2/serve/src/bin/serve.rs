@@ -947,9 +947,12 @@ const JUDGEMENT_DEBT_AFTER: usize = 40;
 ///
 /// It terminates by construction. Claude Code sets `stop_hook_active` on the
 /// Stop that follows a block, and this whole arm returns early on that, so
-/// the ask happens at most once per turn and cannot loop. The set it draws
-/// from only ever shrinks: a judged item is never asked about again, by
-/// anyone, forever.
+/// the ask happens at most once per turn and cannot loop. A verdict buys
+/// quiet, not immunity: the count resets, and another `JUDGEMENT_DEBT_AFTER`
+/// firings earn another question. This comment used to say a judged item was
+/// never asked about again, by anyone, forever - which was true of the
+/// lifetime judged-set it once held, and stopped being true the same day the
+/// fold below started counting since the last verdict.
 ///
 /// `mark` is the only thing in this system that ever retires noise - a
 /// serving count decides nothing, and silence decides nothing either (see
@@ -1035,7 +1038,7 @@ fn judgement_debt(store: &EventStore, session_id: &str) -> Option<String> {
     let remaining = owed.len();
     let text = model::store::show(store, id).ok().map(|i| i.text).unwrap_or_default();
     Some(format!(
-        "[THOR] '{id}' has been served {count} times and has never once been judged, and {remaining} item(s) are in that state. Judge this one before ending the turn: call mark with its id, noise:true if it did not belong where it fired, or plain if it helped. Two noise judgements since the last mark of usefulness retire an item from every injection surface while leaving it findable; a mark of usefulness clears the noise recorded before it, and a noise mark recorded after it still counts. Nothing else in this system ever retires noise - a serving count decides nothing and silence decides nothing. The item says: {text}"
+        "[THOR] '{id}' has been served {count} times since it was last judged, if ever, and {remaining} item(s) are in that state. Judge this one before ending the turn: call mark with its id, noise:true if it did not belong where it fired, or plain if it helped. Two noise judgements since the last mark of usefulness retire an item from every injection surface while leaving it findable; a mark of usefulness clears the noise recorded before it, and a noise mark recorded after it still counts. Nothing else in this system ever retires noise - a serving count decides nothing and silence decides nothing. The item says: {text}"
     ))
 }
 
@@ -1159,9 +1162,13 @@ fn capture_sink_check(
 /// must never wait on, or be lost to, a writable one. Fail-silent from top
 /// to bottom, for the same reason every sidecar here is - a log that cannot
 /// take a measurement must never cost a refusal.
-fn record_gate(db_path: &Path, session_id: &str, refused: bool, reason: &str, target: &str) {
-    let Some(rule_id) = absent_guard::rule_id_of(reason) else { return };
-    let rule_id = rule_id.to_string();
+/// `subject` is the id the outcome is filed under: a rule id for a real
+/// prohibition (read back out of the wording with `absent_guard::rule_id_of`
+/// by the caller, which is where that knowledge belongs), or the NAME of a
+/// guard when what stood aside was the guard itself rather than any one rule.
+/// Head-neutral either way, so neither can ever create or move an item.
+fn record_gate(db_path: &Path, session_id: &str, refused: bool, subject: &str, target: &str) {
+    let rule_id = subject.to_string();
     let Ok(mut store) = thor_core::event_store::EventStore::open_existing(db_path) else { return };
     deliver::record_gate_outcome(
         &mut store,
@@ -1234,7 +1241,7 @@ fn absent_guard_block(
     // least excuse for being silenced, because the way out of it is not to
     // satisfy the rule, it is to write somewhere else.
     let reason = absent_guard::find_location_violation(&location_candidates, file_path, root)
-        .or_else(|| absent_guard::find_violation(&ranked, content, root))
+        .or_else(|| absent_guard::find_violation(&ranked, file_path, content, root))
         .or_else(|| absent_guard::find_dir_content_violation(&location_candidates, file_path, content, root))
         .or_else(|| absent_guard::find_forbidden_violation(&always_candidates, content))
         // And the mirror image of all four: not a literal that must not
@@ -1270,7 +1277,9 @@ fn absent_guard_block(
         }
     }
     let reason = if repeat { absent_guard::escalated(&reason) } else { reason };
-    record_gate(db_path, session_id, true, &reason, file_path);
+    if let Some(id) = absent_guard::rule_id_of(&reason) {
+        record_gate(db_path, session_id, true, id, file_path);
+    }
     Some(reason)
 }
 
@@ -1372,28 +1381,35 @@ fn command_guard_block(
 
     let (reason, anchor) = absent_guard::find_command_violation(&candidates, command, root)?;
 
+    // WHAT THIS USED TO DO, AND WHY IT WAS THE WORSE HALF OF A FIXED DEFECT.
+    // This arm stood aside on a repeat, keyed on the ANCHOR alone, so ONE
+    // refusal disarmed that rule for the whole session no matter what the next
+    // command carried. The file arm had the same defect and lost it earlier the
+    // same day; this arm kept it, and this is the arm that covers shell work -
+    // where the irreversible rules live. Two independent reviews found it the
+    // same evening, and both put it first.
+    //
+    // The old reasoning was about the KEY: a commit message differs on every
+    // retry, so keying on the command text would suppress almost nothing. That
+    // was true, and it stopped mattering the moment nothing gets suppressed.
+    // The key now only decides the WORDING, so it carries the command's own
+    // fingerprint alongside the anchor: the same command again is told it is a
+    // repeat, a different one tripping the same rule gets its own plain
+    // verdict, and neither of them gets through.
+    let attempt = absent_guard::attempt_key(&anchor, Some(command));
     let marker_path = absent_guard::default_command_marker_path(db_path);
     let marker_text = std::fs::read_to_string(&marker_path).ok();
     let markers = marker_text.as_deref().map(absent_guard::read_blocked).unwrap_or_default();
-    // The command arm keys on the ANCHOR alone, deliberately, and unlike the
-    // file arm that choice is reasoned in this module's own doc comment: two
-    // runs that trip the same rule rarely share the same text (a commit
-    // message differs on every retry by design), so keying on the command
-    // would suppress almost nothing and the protection would hold in name
-    // only. The file arm had no such reasoning, which is why only that one
-    // moved to a per-attempt key.
-    if absent_guard::already_blocked(&markers, session_id, &anchor) {
-        // The one place in the gate that still stands aside on purpose, and
-        // therefore the one place that has to say so out loud. If this
-        // number ever grows large, the reasoning above is wrong and this arm
-        // needs the file arm's treatment.
-        record_gate(db_path, session_id, false, &reason, command);
-        return None;
+    let repeat = absent_guard::already_blocked(&markers, session_id, &attempt);
+    if !repeat {
+        if let Some(text) = absent_guard::mark_blocked_text(marker_text.as_deref(), session_id, &attempt) {
+            let _ = std::fs::write(&marker_path, text);
+        }
     }
-    if let Some(text) = absent_guard::mark_blocked_text(marker_text.as_deref(), session_id, &anchor) {
-        let _ = std::fs::write(&marker_path, text);
+    let reason = if repeat { absent_guard::escalated(&reason) } else { reason };
+    if let Some(id) = absent_guard::rule_id_of(&reason) {
+        record_gate(db_path, session_id, true, id, command);
     }
-    record_gate(db_path, session_id, true, &reason, command);
     Some(reason)
 }
 
@@ -1464,6 +1480,13 @@ fn stale_guard_stop_check(db_path: &Path, session_id: &str) -> Option<HookOutput
     let marker_text = std::fs::read_to_string(&marker_path).ok();
     let blocked = marker_text.as_deref().map(stale_guard::read_blocked).unwrap_or_default();
     if stale_guard::already_blocked(&blocked, session_id) {
+        // The one place left in this binary that has something to say and
+        // chooses not to say it. That is correct here - a maintenance nudge
+        // that blocked every turn would be routed around within a day - but
+        // it is the exact shape that hid a broken gate for the whole of 2.0,
+        // so it is counted. Filed under the guard's own name rather than a
+        // rule id, because what stood aside is the guard, not one rule.
+        record_gate(db_path, session_id, false, "stale-guard", "stop");
         return None;
     }
 

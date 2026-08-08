@@ -516,39 +516,24 @@ pub enum Capacity {
 /// item is compared only against other globals, because the projects it will
 /// land in are not knowable at write time and guessing them would refuse
 /// writes for crowding that may never happen.
-/// Does a rival bound to a DIRECTORY compete with an item bound to a FILE
-/// inside it? Yes, and `target_matches` alone cannot say so, because it
-/// requires the two kinds to be equal.
+/// A DIRECTORY rival is deliberately NOT counted against a file inside it,
+/// and this note exists because the opposite was tried for a few hours on
+/// 2026-08-08 and was wrong.
 ///
-/// WHY THIS MATTERS AND WHY IT IS ONE-WAY. Every serving surface builds its
-/// input with `ServeInput::add_file`, which adds a Path target AND a Dir
-/// target for the same touch, so a directory anchor is in the pool every
-/// single time a file under it is touched. Missing that made the crowding
-/// count a lower bound rather than the pool - and the count decides a
-/// REFUSAL, so undercounting is the only direction that is merely wrong
-/// rather than harmful.
+/// The reasoning that failed: "every serving surface adds a Path target AND a
+/// Dir target for the same touch, so a directory anchor is in the pool every
+/// time a file under it is touched". It does not. `ServeInput::add_file` adds
+/// a Path target only, and `normalize::target_matches` refuses a kind
+/// mismatch, so that pool is never assembled anywhere.
 ///
-/// One-way on purpose. The mirror case - my item is bound to the directory,
-/// a rival to one file inside it - is NOT a rival: that file's anchor fires
-/// only when that particular file is touched, and my directory anchor fires
-/// for every file under it. Counting all of them would call a directory
-/// anchor crowded by rivals it will usually never meet, which is exactly the
-/// kind of bought catch CONTRACT R9 forbids.
-fn covering_dir(
-    rival_kind: crate::item::TargetKind,
-    rival_value: &str,
-    my_kind: crate::item::TargetKind,
-    my_value: &str,
-) -> bool {
-    use crate::item::TargetKind;
-    if rival_kind != TargetKind::Dir || my_kind != TargetKind::Path {
-        return false;
-    }
-    let mine = crate::normalize::normalize_target(my_value);
-    let Some((parent, _)) = mine.rsplit_once('/') else { return false };
-    crate::normalize::target_matches(TargetKind::Dir, rival_value, TargetKind::Dir, parent)
-}
-
+/// Why that mattered rather than being a harmless extra: this count decides a
+/// REFUSAL. Over-counting refuses an honest write for rivals it will never
+/// meet, and the comment justifying it claimed the safe direction while doing
+/// the unsafe one. Two independent reviews found it the same evening, both by
+/// reading `input.rs` instead of the comment.
+///
+/// What is true about a Dir binding is said where it belongs, in `capacity`:
+/// it reaches no automatic serving surface at all.
 fn pool_rivals<'a>(
     candidates: &'a [(String, Item)],
     item: &Item,
@@ -559,7 +544,7 @@ fn pool_rivals<'a>(
         Binding::Moment(_) => Some(&|b: &Binding| matches!((b, binding), (Binding::Moment(x), Binding::Moment(y)) if x == y)),
         Binding::Target { .. } => Some(&|b: &Binding| match (b, binding) {
             (Binding::Target { kind: bk, value: bv }, Binding::Target { kind, value }) => {
-                crate::normalize::target_matches(*bk, bv, *kind, value) || covering_dir(*bk, bv, *kind, value)
+                crate::normalize::target_matches(*bk, bv, *kind, value)
             }
             _ => false,
         }),
@@ -618,6 +603,30 @@ pub fn capacity(store: &EventStore, item: &Item) -> anyhow::Result<Capacity> {
     } else {
         live_items_from_fold(store)?
     };
+
+    // A Dir target reaches NO automatic serving surface. `ServeInput::add_file`
+    // adds a Path target only, and `normalize::target_matches` refuses a kind
+    // mismatch, so `rank::select` drops a Dir-bound item before it compares a
+    // single path. Such an item can still REFUSE - the guard's location and
+    // dir-content arms narrow their own pool by kind and decide containment
+    // themselves - but it will never appear as advice at a file touch.
+    //
+    // Said out loud rather than refused, because "only ever refuses" is a
+    // legitimate thing for a rule to be. But it has to be SAID, because this
+    // is exactly the case the crowding count below cannot see: a directory
+    // pool holding three items reads as roomy while being unreachable.
+    let all_dir = bindings
+        .iter()
+        .all(|b| matches!(b, Binding::Target { kind: crate::item::TargetKind::Dir, .. }));
+    if all_dir {
+        return Ok(Capacity::Crowded(
+            "every binding on this item is a DIRECTORY, which no automatic serving surface can \
+             reach: a file touch offers the path, never its parent directory, so this item will \
+             never be shown as advice. It can still refuse a write inside that directory. If you \
+             meant it to be read rather than only enforced, bind it to the exact file it is about."
+                .to_string(),
+        ));
+    }
 
     let mine = crate::item::severity_rank(item.severity);
     let mut every_binding_is_hopeless = true;
@@ -1359,17 +1368,24 @@ mod tests {
         declare(&mut store, "s", "l", "t", &light).expect("the free target binding must save it");
     }
 
-    /// THE DEFECT THIS PREVENTS: counting the wrong pool. Every serving
-    /// surface builds its input with `ServeInput::add_file`, which adds a
-    /// Path target AND a Dir target for the same touch, so a directory
-    /// anchor is in the pool every time a file under it is touched. The
-    /// crowding count compared bindings by kind, so it never saw them, and a
-    /// file whose directory was already full of heavier rules read as an
-    /// empty target.
+    /// THE DEFECT THIS PREVENTS, and it is one this file caused itself. For a
+    /// few hours on 2026-08-08 a rule here made a Dir-bound rival compete with
+    /// a Path-bound item, on the belief that a file touch offers the parent
+    /// directory as a second target. It does not: `ServeInput::add_file` adds
+    /// one target, a Path, and `normalize::target_matches` refuses a kind
+    /// mismatch, so that pool is never assembled anywhere. (The false sentence
+    /// itself is not repeated here; `serve/tests/
+    /// a_comment_never_claims_what_the_code_does_not_do.rs` fails if it comes
+    /// back, because copying it from one file to another is how it spread.)
+    ///
+    /// This count decides a REFUSAL, so an over-count is not an error in the
+    /// safe direction: it refuses an honest write for rivals it will never
+    /// meet. Two independent reviews found it the same evening, both by
+    /// reading `input.rs` rather than the comment that claimed otherwise.
     #[test]
-    fn a_directory_full_of_heavier_rules_crowds_a_file_inside_it() {
+    fn a_directory_bound_rival_does_not_crowd_a_file_inside_it() {
         let mut store = EventStore::in_memory().unwrap();
-        for i in 0..crate::item::MAX_ITEMS {
+        for i in 0..crate::item::MAX_ITEMS + 2 {
             let mut heavy = sample_with(&format!("dir-{i}"), DISTINCT[i % DISTINCT.len()]);
             heavy.bindings = vec![Binding::Target { kind: TargetKind::Dir, value: "src/deep".to_string() }];
             heavy.severity = Some(Severity::Irreversible);
@@ -1378,29 +1394,41 @@ mod tests {
         let mut light = sample_with("newcomer", "a webhook retry backs off before it gives up entirely");
         light.bindings = vec![Binding::Target { kind: TargetKind::Path, value: "src/deep/mod.rs".to_string() }];
         light.severity = Some(Severity::HouseStyle);
-        let refusal = declare(&mut store, "s", "l", "t", &light)
-            .expect_err("a file under a full directory can never reach a block");
-        assert!(format!("{refusal}").contains("dir-0"), "the refusal must name a holder: {refusal}");
+        declare(&mut store, "s", "l", "t", &light)
+            .expect("a directory anchor is not in the pool a file touch assembles, so it crowds nothing");
     }
 
-    /// The mirror case, and it must NOT refuse. A rule bound to one file
-    /// inside my directory fires only when that file is touched; my
-    /// directory anchor fires for every file under it. Counting all of them
-    /// would call a directory anchor crowded by rivals it will usually never
-    /// meet - a catch bought by widening, which CONTRACT R9 forbids.
+    /// A note, never a refusal: "only ever refuses" is a legitimate thing for
+    /// a rule to be. But it has to be SAID, because the crowding count cannot
+    /// see it - a directory pool holding three items reads as roomy while
+    /// being unreachable by every automatic surface.
     #[test]
-    fn files_inside_a_directory_do_not_crowd_the_directory_itself() {
+    fn a_directory_only_item_is_told_it_will_never_be_shown_as_advice() {
         let mut store = EventStore::in_memory().unwrap();
-        for i in 0..crate::item::MAX_ITEMS + 2 {
-            let mut heavy = sample_with(&format!("file-{i}"), DISTINCT[i % DISTINCT.len()]);
-            heavy.bindings = vec![Binding::Target { kind: TargetKind::Path, value: format!("src/deep/f{i}.rs") }];
-            heavy.severity = Some(Severity::Irreversible);
-            declare(&mut store, "s", "l", "t", &heavy).expect("fixture must store");
+        let mut item = sample_with("dir-only", "a webhook retry backs off before it gives up entirely");
+        item.bindings = vec![Binding::Target { kind: TargetKind::Dir, value: "src/deep".to_string() }];
+
+        match capacity(&store, &item).unwrap() {
+            Capacity::Crowded(note) => {
+                assert!(note.contains("DIRECTORY"), "{note}");
+                assert!(note.contains("never be shown"), "{note}");
+                assert!(note.contains("can still refuse"), "it must not read as useless: {note}");
+            }
+            other => panic!("a directory-only item must be warned about, got {other:?}"),
         }
-        let mut dir_rule = sample_with("the-dir-rule", "a webhook retry backs off before it gives up entirely");
-        dir_rule.bindings = vec![Binding::Target { kind: TargetKind::Dir, value: "src/deep".to_string() }];
-        dir_rule.severity = Some(Severity::HouseStyle);
-        declare(&mut store, "s", "l", "t", &dir_rule).expect("a directory anchor is not crowded by its own files");
+        declare(&mut store, "s", "l", "t", &item).expect("a note never refuses the write");
+
+        // A Path binding beside it takes the note away, because then the item
+        // really is reachable at a file touch.
+        let mut reachable = sample_with("dir-plus-path", "the estimator rounds a quote up to whole cents");
+        reachable.bindings = vec![
+            Binding::Target { kind: TargetKind::Dir, value: "src/deep".to_string() },
+            Binding::Target { kind: TargetKind::Path, value: "src/deep/mod.rs".to_string() },
+        ];
+        assert!(
+            matches!(capacity(&store, &reachable).unwrap(), Capacity::Fine),
+            "a path binding beside the directory makes it reachable"
+        );
     }
 
     /// A pinned item is never in a pool: session start serves every pin in

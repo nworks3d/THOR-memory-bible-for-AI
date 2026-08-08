@@ -544,12 +544,37 @@ fn first_present_literal<'a>(literals: &'a [String], content: &str) -> Option<&'
 /// disk. `root` is where a check's own relative path is resolved for the
 /// currency proof; `None` (no cwd could be resolved at all) means currency
 /// can never be proven for anything, so nothing here can ever match.
-fn first_violation<'a>(ranked: &'a [RankedItem], content: &str, root: Option<&Path>) -> Option<(&'a RankedItem, &'a str)> {
+fn first_violation<'a>(
+    ranked: &'a [RankedItem],
+    file_path: &str,
+    content: &str,
+    root: Option<&Path>,
+) -> Option<(&'a RankedItem, &'a str)> {
     let root = root?;
     for candidate in ranked {
         let Some(check) = &candidate.item.check else { continue };
         let Some((check_path, literals)) = absent_literals(check) else { continue };
         if !anchor_is_current(check_path, root) {
+            continue;
+        }
+        // THE FALSE BLOCK THIS PREVENTS. An item reaches this pool either
+        // because a TARGET matched the file being written, or because a
+        // MOMENT matched - and `ServeInput::add_file` derives moments from the
+        // path, so a filename containing the word "prod" is enough. For a
+        // target-matched item the binding already scopes the prohibition to
+        // this file. For a moment-matched one, nothing did: the check's path
+        // was treated as a currency proof only, so a rule whose check names
+        // one file would refuse a write to any OTHER file whose name happened
+        // to trigger the same moment. Measured 2026-08-08: `prod_data` fired
+        // 47 times in one session on filenames alone.
+        //
+        // So a moment-only match must additionally land inside the file the
+        // check itself names. An `Absent` check names a file; refusing a write
+        // to a different file is not the rule doing its job.
+        let target_matched = candidate.item.bindings.iter().any(|b| {
+            matches!(b, model::item::Binding::Target { .. })
+        });
+        if !target_matched && !path_is_or_contains(&root.join(check_path), Path::new(file_path)) {
             continue;
         }
         if let Some(literal) = first_present_literal(literals, content) {
@@ -565,8 +590,8 @@ fn first_violation<'a>(ranked: &'a [RankedItem], content: &str, root: Option<&Pa
 /// `content`). `ranked` is expected to already be the caller's own
 /// `rank::select` output for the file being touched - this function never
 /// re-derives which items apply, only what to do once it already knows.
-pub fn find_violation(ranked: &[RankedItem], content: &str, root: Option<&Path>) -> Option<String> {
-    let (item, literal) = first_violation(ranked, content, root)?;
+pub fn find_violation(ranked: &[RankedItem], file_path: &str, content: &str, root: Option<&Path>) -> Option<String> {
+    let (item, literal) = first_violation(ranked, file_path, content, root)?;
     Some(block_message(&item.id, &item.item.text, content, literal))
 }
 
@@ -1410,6 +1435,52 @@ mod tests {
 
     // --------------------------------------------------------------- block
 
+    /// THE FALSE BLOCK THIS PREVENTS. An item reaches this pool either because
+    /// a TARGET matched the file, or because a MOMENT matched - and moments are
+    /// derived from the path, so a filename carrying the word "prod" is enough
+    /// (`prod_data` fired 47 times in one session on filenames alone,
+    /// 2026-08-08). The check's path was a currency proof only, so a rule whose
+    /// check named ONE file would refuse a write to any OTHER file that
+    /// happened to trigger the same moment.
+    ///
+    /// A moment-only match now has to land inside the file the check itself
+    /// names. A target-matched item is unaffected: its binding already said
+    /// this file.
+    #[test]
+    fn a_moment_bound_rule_does_not_refuse_a_write_to_a_file_its_check_never_names() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("NOTES.md"), "# notes
+").unwrap();
+        std::fs::write(dir.path().join("OTHER.md"), "# other
+").unwrap();
+
+        // Absolute, exactly as the hook payload delivers a written path.
+        let notes = dir.path().join("NOTES.md").to_string_lossy().to_string();
+        let other = dir.path().join("OTHER.md").to_string_lossy().to_string();
+
+        let mut moment_only = item_with_check("m1", "NOTES.md", "forbidden");
+        moment_only.item.bindings = vec![Binding::Moment(intent::Action::ProdData)];
+        let content = "this write carries the forbidden word";
+
+        assert_eq!(
+            find_violation(&[moment_only.clone()], &other, content, Some(dir.path())),
+            None,
+            "a rule whose check names NOTES.md must not refuse a write to OTHER.md"
+        );
+        assert!(
+            find_violation(&[moment_only], &notes, content, Some(dir.path())).is_some(),
+            "the file the check actually names must still be protected"
+        );
+
+        // And a TARGET-bound item keeps blocking wherever the pool put it:
+        // its binding is what scoped it, and the ranking already matched.
+        let anchored = item_with_check("t1", "NOTES.md", "forbidden");
+        assert!(
+            find_violation(&[anchored], &other, content, Some(dir.path())).is_some(),
+            "an anchored rule is scoped by its binding, not by the check path"
+        );
+    }
+
     /// THE DEFECT THIS PREVENTS: a write containing the forbidden literal
     /// into the anchored file goes through unblocked, or blocks with a
     /// message that cannot be traced back to which rule fired or where the
@@ -1421,7 +1492,7 @@ mod tests {
         let ranked = vec![item_with_check("r1", "NOTES.md", "forbidden")];
         let content = "the quick brown fox jumps over the forbidden fence into the garden";
 
-        let reason = find_violation(&ranked, content, Some(dir.path())).expect("must block");
+        let reason = find_violation(&ranked, "NOTES.md", content, Some(dir.path())).expect("must block");
 
         let marker_idx = reason.find("[THOR]").expect("must carry the THOR marker");
         let id_idx = reason.find("r1").expect("must name the rule id");
@@ -1456,7 +1527,7 @@ mod tests {
         assert!(ranked.is_empty(), "fixture sanity: an unrelated file must not even match the binding");
 
         let content = "this text contains the forbidden word too";
-        assert_eq!(find_violation(&ranked, content, Some(dir.path())), None);
+        assert_eq!(find_violation(&ranked, "NOTES.md", content, Some(dir.path())), None);
     }
 
     /// THE DEFECT THIS PREVENTS: an item with prose describing a rule but no
@@ -1471,7 +1542,7 @@ mod tests {
         ranked_item.item.check = None;
 
         let content = "this text contains the forbidden word";
-        assert_eq!(find_violation(&[ranked_item], content, Some(dir.path())), None);
+        assert_eq!(find_violation(&[ranked_item], "NOTES.md", content, Some(dir.path())), None);
     }
 
     /// THE DEFECT THIS PREVENTS: a rule anchored to a file that has since
@@ -1483,7 +1554,7 @@ mod tests {
         // NOTES.md is deliberately never created.
         let ranked = vec![item_with_check("r1", "NOTES.md", "forbidden")];
         let content = "this text contains the forbidden word";
-        assert_eq!(find_violation(&ranked, content, Some(dir.path())), None);
+        assert_eq!(find_violation(&ranked, "NOTES.md", content, Some(dir.path())), None);
     }
 
     /// The other half of the currency requirement: with no root at all to
@@ -1493,7 +1564,7 @@ mod tests {
     fn no_resolvable_root_means_currency_can_never_be_proven_so_nothing_blocks() {
         let ranked = vec![item_with_check("r1", "NOTES.md", "forbidden")];
         let content = "this text contains the forbidden word";
-        assert_eq!(find_violation(&ranked, content, None), None);
+        assert_eq!(find_violation(&ranked, "NOTES.md", content, None), None);
     }
 
     /// THE DEFECT THIS PREVENTS (step 2's own scope rule): a check of the
@@ -1510,7 +1581,7 @@ mod tests {
             Some(Check::Contains { path: "NOTES.md".to_string(), literal: "forbidden".to_string() });
 
         let content = "this text contains the forbidden word";
-        assert_eq!(find_violation(&[ranked_item], content, Some(dir.path())), None);
+        assert_eq!(find_violation(&[ranked_item], "NOTES.md", content, Some(dir.path())), None);
     }
 
     /// Multi-byte safety: the quoted context must never panic by slicing a
@@ -1524,7 +1595,7 @@ mod tests {
         let ranked = vec![item_with_check("r1", "NOTES.md", "\u{2014}")];
         let content = format!("some notes here {} more notes right after it", '\u{2014}');
 
-        let reason = find_violation(&ranked, &content, Some(dir.path())).unwrap();
+        let reason = find_violation(&ranked, "NOTES.md", &content, Some(dir.path())).unwrap();
         assert!(reason.contains('\u{2014}'), "{reason}");
     }
 
@@ -1553,7 +1624,7 @@ mod tests {
             vec![item_with_absent_all_check("r10", "STYLE.md", &["forbidden-one", "forbidden-two", "forbidden-three"])];
         let content = "this text carries forbidden-one right here";
 
-        let reason = find_violation(&ranked, content, Some(dir.path())).expect("must block");
+        let reason = find_violation(&ranked, "NOTES.md", content, Some(dir.path())).expect("must block");
         assert!(reason.contains("forbidden-one"), "{reason}");
         assert!(!reason.contains("forbidden-two"), "{reason}");
         assert!(!reason.contains("forbidden-three"), "{reason}");
@@ -1569,7 +1640,7 @@ mod tests {
             vec![item_with_absent_all_check("r11", "STYLE.md", &["forbidden-one", "forbidden-two", "forbidden-three"])];
         let content = "this text carries forbidden-two right here";
 
-        let reason = find_violation(&ranked, content, Some(dir.path())).expect("must block");
+        let reason = find_violation(&ranked, "NOTES.md", content, Some(dir.path())).expect("must block");
         assert!(reason.contains("forbidden-two"), "{reason}");
         assert!(!reason.contains("forbidden-one"), "{reason}");
         assert!(!reason.contains("forbidden-three"), "{reason}");
@@ -1587,7 +1658,7 @@ mod tests {
             vec![item_with_absent_all_check("r12", "STYLE.md", &["forbidden-one", "forbidden-two", "forbidden-three"])];
         let content = "this text carries forbidden-three right here";
 
-        let reason = find_violation(&ranked, content, Some(dir.path())).expect("must block");
+        let reason = find_violation(&ranked, "NOTES.md", content, Some(dir.path())).expect("must block");
         assert!(reason.contains("forbidden-three"), "{reason}");
         assert!(!reason.contains("forbidden-one"), "{reason}");
         assert!(!reason.contains("forbidden-two"), "{reason}");
@@ -1604,7 +1675,7 @@ mod tests {
             vec![item_with_absent_all_check("r13", "STYLE.md", &["forbidden-one", "forbidden-two", "forbidden-three"])];
         let content = "this text carries none of the forbidden words";
 
-        assert_eq!(find_violation(&ranked, content, Some(dir.path())), None);
+        assert_eq!(find_violation(&ranked, "NOTES.md", content, Some(dir.path())), None);
     }
 
     // ----------------------------------------------------------- payload
@@ -2834,7 +2905,7 @@ mod tests {
         let ranked = vec![item_with_check("r1", "NOTES.md", "forbidden")];
         let content = "this text contains the forbidden word";
 
-        assert_eq!(find_violation(&ranked, content, Some(dir.path())), None, "must still allow");
+        assert_eq!(find_violation(&ranked, "NOTES.md", content, Some(dir.path())), None, "must still allow");
 
         let findings = stale_in_content(&ranked, "NOTES.md", Some(dir.path()));
         assert_eq!(findings.len(), 1);
@@ -2855,7 +2926,7 @@ mod tests {
         let ranked = vec![item_with_check("r2", "../escape.txt", "forbidden")];
         let content = "this text contains the forbidden word";
 
-        assert_eq!(find_violation(&ranked, content, Some(dir.path())), None, "must still allow");
+        assert_eq!(find_violation(&ranked, "NOTES.md", content, Some(dir.path())), None, "must still allow");
 
         let findings = stale_in_content(&ranked, "whatever.md", Some(dir.path()));
         assert_eq!(findings.len(), 1);
@@ -2882,7 +2953,7 @@ mod tests {
         let ranked = vec![item_with_absent_all_check("r14", "STYLE.md", &["forbidden-one", "forbidden-two"])];
         let content = "this text carries forbidden-one";
 
-        assert_eq!(find_violation(&ranked, content, Some(dir.path())), None, "must still allow");
+        assert_eq!(find_violation(&ranked, "NOTES.md", content, Some(dir.path())), None, "must still allow");
 
         let findings = stale_in_content(&ranked, "STYLE.md", Some(dir.path()));
         assert_eq!(findings.len(), 1);
@@ -2903,7 +2974,7 @@ mod tests {
         let ranked = vec![item_with_check("r3", "NOTES.md", "forbidden")];
         let content = "the quick brown fox jumps over the forbidden fence";
 
-        assert!(find_violation(&ranked, content, Some(dir.path())).is_some(), "sanity: this must actually block");
+        assert!(find_violation(&ranked, "NOTES.md", content, Some(dir.path())).is_some(), "sanity: this must actually block");
         assert!(stale_in_content(&ranked, "NOTES.md", Some(dir.path())).is_empty());
     }
 

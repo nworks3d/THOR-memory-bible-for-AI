@@ -181,31 +181,55 @@ pub fn proof_line(db: &Path) -> String {
     // percentage suggested:
     //   Absent / AbsentAll - refuse a write that INTRODUCES the literal into
     //     the file the check names. The strongest form.
-    //   Forbidden - the same, with no file at all, so it applies wherever the
-    //     literal might be written.
+    //   Forbidden - the same, with no file at all - but ONLY on an item bound
+    //     Always. `serve::absent_guard::find_forbidden_violation` is fed the
+    //     Always pool and nothing else, so a Forbidden check on a moment- or
+    //     target-bound item passes the write gate, looks like the strongest
+    //     form, and can never block. It is counted as blocking nothing.
     //   Contains - refuses only a write to that same file that REMOVES the
     //     literal (`absent_guard::find_missing_required`). Real, but narrow:
     //     it protects a line, it never tests whether the rule's claim is true.
-    //   PathExists - proves the anchor is current and blocks nothing.
+    //   PathExists - blocks nothing ON ITS OWN, but it is exactly what the
+    //     LOCATION arm blocks with: Irreversible severity plus a Path/Dir
+    //     binding equal to the check's own path makes the whole location out
+    //     of bounds (`absent_guard::location_anchor`). Counted separately,
+    //     because it refuses a write for WHERE it lands, not what it carries.
+    //
     // Reporting one figure let a store full of Contains checks read as if it
-    // were enforced. It is not wrong to have them; it is wrong to count them
-    // as the same thing.
-    let (mut forbidding, mut protecting, mut currency_only) = (0usize, 0usize, 0usize);
+    // were enforced. Counting by FORM rather than by capability then let a
+    // Forbidden-without-Always read as the strongest thing in the store. Both
+    // corrections came from a review reading the arms rather than the checks.
+    let (mut forbidding, mut protecting, mut location, mut blocks_nothing) = (0usize, 0usize, 0usize, 0usize);
     for i in &fireable {
+        let always_bound = i.item.bindings.iter().any(|b| matches!(b, model::item::Binding::Always));
         match &i.item.check {
-            Some(model::item::Check::Absent { .. })
-            | Some(model::item::Check::AbsentAll { .. })
-            | Some(model::item::Check::Forbidden { .. }) => forbidding += 1,
+            Some(model::item::Check::Absent { .. }) | Some(model::item::Check::AbsentAll { .. }) => forbidding += 1,
+            Some(model::item::Check::Forbidden { .. }) if always_bound => forbidding += 1,
+            Some(model::item::Check::Forbidden { .. }) => blocks_nothing += 1,
             Some(model::item::Check::Contains { .. }) => protecting += 1,
-            Some(model::item::Check::PathExists { .. }) => currency_only += 1,
+            Some(model::item::Check::PathExists { path }) => {
+                let bar = i.item.severity == Some(model::item::Severity::Irreversible)
+                    && i.item.bindings.iter().any(|b| {
+                        matches!(
+                            b,
+                            model::item::Binding::Target { kind: model::item::TargetKind::Path | model::item::TargetKind::Dir, value }
+                                if value == path
+                        )
+                    });
+                if bar {
+                    location += 1;
+                } else {
+                    blocks_nothing += 1;
+                }
+            }
             None => {}
         }
     }
     format!(
         "provable rules: {} of {} rule(s)/orientation(s) carry a runnable check ({:.1}%) - of those, \
-         {forbidding} can refuse a write that introduces something forbidden, {protecting} can only \
-         refuse one that removes a required line from their own file, and {currency_only} prove \
-         their anchor is current without blocking anything",
+         {forbidding} can refuse a write that introduces something forbidden, {location} can refuse a \
+         write for landing in a place that is out of bounds, {protecting} can only refuse one that \
+         removes a required line from their own file, and {blocks_nothing} block nothing at all",
         with_check,
         fireable.len(),
         100.0 * with_check as f64 / fireable.len() as f64
@@ -514,7 +538,7 @@ pub fn gate_line(db: &Path) -> String {
         return "gate: has never refused a write, and has never stood aside from one".to_string();
     }
     format!(
-        "gate: {refused} refusals by {} distinct rules, {stood_aside} stand-asides (a repeat on the command arm, which keys on the anchor by design)",
+        "gate: {refused} refusals by {} distinct rules, {stood_aside} stand-asides (the stale-rule nudge holding off for the rest of a session - no prohibition ever stands aside any more)",
         rules.len()
     )
 }
@@ -769,6 +793,72 @@ mod tests {
         let db = dir.path().join("t.db");
         EventStore::new(&db).unwrap();
         assert_eq!(replica_line(&db, None), "replica: not configured");
+    }
+
+    /// THE DEFECT THIS PREVENTS: counting a check by its FORM instead of by
+    /// what it can do. A `Forbidden` check reads as the strongest thing in the
+    /// store, and it is - but only on an item bound Always, because
+    /// `absent_guard::find_forbidden_violation` is fed the Always pool and
+    /// nothing else. Bound to a moment instead, it passes the write gate,
+    /// counted as blocking, and can never block. Found by a review reading the
+    /// guard's arms rather than the check list.
+    #[test]
+    fn a_forbidden_check_without_an_always_binding_is_counted_as_blocking_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("t.db");
+        {
+            let mut s = EventStore::new(&db).unwrap();
+
+            let mut reaches = rule("forbidden-and-pinned");
+            reaches.check = Some(model::item::Check::Forbidden { literals: vec!["\u{2014}".to_string()] });
+            store::declare(&mut s, "s", "l", "a", &reaches).unwrap();
+
+            let mut cannot = rule("forbidden-but-not-pinned");
+            cannot.text = "a webhook retry backs off before it gives up entirely".to_string();
+            cannot.project = Some("fixture-project".to_string());
+            cannot.bindings = vec![model::item::Binding::Target {
+                kind: model::item::TargetKind::Path,
+                value: "server/lib/mail.js".to_string(),
+            }];
+            cannot.check = Some(model::item::Check::Forbidden { literals: vec!["\u{2014}".to_string()] });
+            store::declare(&mut s, "s", "l", "a", &cannot).unwrap();
+        }
+        let line = proof_line(&db);
+        assert!(line.contains("1 can refuse a write that introduces"), "{line}");
+        assert!(line.contains("1 block nothing at all"), "{line}");
+    }
+
+    /// The mirror: a `PathExists` check is NOT merely a currency proof when it
+    /// meets the location arm's bar (Irreversible, plus a binding equal to the
+    /// check's own path). Then it refuses a write for WHERE it lands.
+    #[test]
+    fn a_path_exists_check_that_meets_the_location_bar_is_counted_as_blocking() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("t.db");
+        {
+            let mut s = EventStore::new(&db).unwrap();
+
+            let mut blocks = rule("frozen-place");
+            blocks.severity = Some(model::item::Severity::Irreversible);
+            blocks.project = Some("fixture-project".to_string());
+            blocks.bindings =
+                vec![model::item::Binding::Target { kind: model::item::TargetKind::Dir, value: "frozen".to_string() }];
+            blocks.check = Some(model::item::Check::PathExists { path: "frozen".to_string() });
+            store::declare(&mut s, "s", "l", "a", &blocks).unwrap();
+
+            let mut currency = rule("just-currency");
+            currency.text = "the estimator rounds a quote up to whole cents".to_string();
+            currency.project = Some("fixture-project".to_string());
+            currency.bindings = vec![model::item::Binding::Target {
+                kind: model::item::TargetKind::Path,
+                value: "server/lib/quote.js".to_string(),
+            }];
+            currency.check = Some(model::item::Check::PathExists { path: "server/lib/quote.js".to_string() });
+            store::declare(&mut s, "s", "l", "a", &currency).unwrap();
+        }
+        let line = proof_line(&db);
+        assert!(line.contains("1 can refuse a write for landing in a place"), "{line}");
+        assert!(line.contains("1 block nothing at all"), "severity below Irreversible does not block: {line}");
     }
 
     /// THE DEFECT THIS PREVENTS: a health check that reads as fully healthy

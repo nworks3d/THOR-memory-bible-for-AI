@@ -345,7 +345,7 @@ fn decide(store: &EventStore, root: &Path, tool_name: &str, tool_input: &serde_j
         input.add_file(file_path);
         let candidates = live::candidates_for(store, &input);
         let ranked = rank::select(&candidates, &input);
-        absent_guard::find_violation(&ranked, content, Some(root))
+        absent_guard::find_violation(&ranked, file_path, content, Some(root))
     })
 }
 

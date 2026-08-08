@@ -146,16 +146,17 @@ fn a_non_matching_command_carrying_the_same_literal_is_never_blocked() {
     assert_not_blocked(&out);
 }
 
-/// At most one block per session: the SAME command shape, sent again in the
-/// SAME session with a different (still-violating) message, must not block a
-/// second time - mirrors
-/// `a_second_write_to_the_same_file_in_the_same_session_is_not_blocked_again`,
-/// proving the command guard's own (session, anchor)-keyed marker (see
-/// `serve::absent_guard`'s own top-of-file doc comment for why the key is
-/// the matched ANCHOR - "git commit" - never the raw, ever-changing command
-/// text).
+/// THE DEFECT THIS PREVENTS. This test used to assert the OPPOSITE: that a
+/// SECOND, DIFFERENT commit message carrying a FRESH violation of the same
+/// rule went through, because the marker was keyed on the matched anchor
+/// ("git commit") alone. One refusal disarmed that rule for the rest of the
+/// session no matter what the next command carried - and this is the arm that
+/// covers shell work, where the irreversible rules are.
+///
+/// The file arm lost the same defect earlier on 2026-08-08; this arm kept it
+/// until two independent reviews put it first, the same evening.
 #[test]
-fn a_second_run_of_the_same_command_in_the_same_session_is_not_blocked_again() {
+fn a_second_different_command_tripping_the_same_rule_is_refused_again() {
     let dir = tempfile::tempdir().unwrap();
     let db = fixture_with_em_dash_commit_rule(dir.path());
 
@@ -165,7 +166,39 @@ fn a_second_run_of_the_same_command_in_the_same_session_is_not_blocked_again() {
 
     let second =
         run_hook(&db, &bash_payload("s1", dir.path(), "git commit -m \"another em dash \u{2014} here too\""));
-    assert_not_blocked(&second);
+    let v2: serde_json::Value =
+        serde_json::from_str(&second).unwrap_or_else(|e| panic!("a fresh violation must still be judged: {e}: {second}"));
+    assert_eq!(v2["decision"], "block", "a second, different violation must not ride in free: {second}");
+    assert!(
+        !v2["reason"].as_str().unwrap().contains("SECOND time"),
+        "a DIFFERENT command is not a repeat and must not be told it is: {second}"
+    );
+}
+
+/// And the identical command again: still refused, and told it is a repeat.
+/// The key carries the command's own fingerprint alongside the anchor, which
+/// is only possible because the key no longer decides whether to suppress -
+/// it decides the wording. The old reasoning against fingerprinting the
+/// command (a commit message differs on every retry, so it would suppress
+/// almost nothing) was true and stopped mattering when nothing is suppressed.
+#[test]
+fn the_same_command_sent_again_is_refused_again_and_says_so() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = fixture_with_em_dash_commit_rule(dir.path());
+
+    let same = "git commit -m \"one em dash \u{2014} here\"";
+    let first = run_hook(&db, &bash_payload("s1", dir.path(), same));
+    let v: serde_json::Value = serde_json::from_str(&first).unwrap();
+    assert_eq!(v["decision"], "block", "{first}");
+    let first_reason = v["reason"].as_str().unwrap().to_string();
+
+    let second = run_hook(&db, &bash_payload("s1", dir.path(), same));
+    let v2: serde_json::Value =
+        serde_json::from_str(&second).unwrap_or_else(|e| panic!("an identical resend must still be judged: {e}: {second}"));
+    assert_eq!(v2["decision"], "block", "{second}");
+    let again = v2["reason"].as_str().unwrap();
+    assert!(again.starts_with(&first_reason), "the original reason must survive: {again}");
+    assert!(again.contains("SECOND time"), "{again}");
 }
 
 /// A DIFFERENT session gets its own say: the once-per-session marker must

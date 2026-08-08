@@ -28,6 +28,22 @@ struct Cli {
     checkouts: Option<PathBuf>,
     #[arg(long = "model-dir")]
     model_dir: Option<PathBuf>,
+    /// Turn this report into a gate: exit 1 when something gate-worthy was
+    /// found (a broken event chain, a dead anchor, or a proof that now comes
+    /// out false), exit 0 when clean. Without this flag doctor always exits
+    /// 0, findings or not - that behaviour is unchanged. See
+    /// `ops::health::gate_verdict` for exactly what counts as gate-worthy and
+    /// why, and for why a store that could not even be judged (missing, or
+    /// present but unreadable) exits 0 as well: a cloud session with no
+    /// thor.db must never be blocked by its own absence.
+    #[arg(long)]
+    gate: bool,
+    /// With --gate, narrow the dead-anchor/false-proof check to this
+    /// project's own items, so one repository's gate can never fail because
+    /// of another checkout's rot under the same --checkouts directory.
+    /// Ignored without --gate.
+    #[arg(long)]
+    project: Option<String>,
 }
 
 fn main() -> ExitCode {
@@ -51,5 +67,17 @@ fn main() -> ExitCode {
     for line in ops::health::report(&cli.db, cli.index_db.as_deref(), cli.repo.as_deref(), replica, cli.model_dir.as_deref(), cli.checkouts.as_deref()) {
         println!("{line}");
     }
+
+    // --gate turns the report above into an exit code, reusing its verdict
+    // rather than deciding anything new here - see `ops::health::gate_verdict`
+    // for which findings count and why. Without --gate, cli.gate is false and
+    // control falls straight through to the unchanged ExitCode::SUCCESS below.
+    if cli.gate {
+        match ops::health::gate_verdict(&cli.db, cli.checkouts.as_deref(), cli.project.as_deref()) {
+            ops::health::GateVerdict::Failing => return ExitCode::FAILURE,
+            ops::health::GateVerdict::Clean | ops::health::GateVerdict::NotAvailable => return ExitCode::SUCCESS,
+        }
+    }
+
     ExitCode::SUCCESS
 }

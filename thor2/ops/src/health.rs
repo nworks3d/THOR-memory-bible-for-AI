@@ -6,24 +6,41 @@
 
 use std::path::Path;
 use thor_core::auditor::{verify_chain_integrity, DifferentialAuditor};
-use thor_core::event_store::EventStore;
+use thor_core::event_store::{Event, EventStore};
+
+/// Open `db` and read every event, or explain in one line (no "memory
+/// store: " prefix - the caller adds whatever prefix fits it) why that
+/// could not be done. The one place that decides what "the store is not
+/// available" means: shared by `store_line` (which turns a failure here
+/// into the first health line) and `gate_verdict` (which fails OPEN on
+/// exactly the same two cases - missing, or present but unreadable).
+fn open_and_read(db: &Path) -> Result<Vec<Event>, String> {
+    if !db.exists() {
+        return Err(format!("not found at {}", db.display()));
+    }
+    let store = EventStore::open_existing(db)
+        .map_err(|e| format!("found at {}, but could not be opened ({e})", db.display()))?;
+    store
+        .get_all_events()
+        .map_err(|e| format!("found at {} but could not be read ({e})", db.display()))
+}
+
+/// Whether the event log's hash chain, and the independent differential
+/// fold, both hold. The one place that decides "is the chain broken",
+/// shared by `store_line`'s prose and `gate_verdict`'s pass/fail check, so
+/// the two can never disagree about what counts as intact.
+fn chain_intact(events: &[Event]) -> bool {
+    verify_chain_integrity(events).is_ok() && DifferentialAuditor::verify_consistency(events).is_ok()
+}
 
 /// Component 1+2: does the store exist, how many events, is the chain
 /// (hash continuity + the independent differential fold) intact.
 pub fn store_line(db: &Path) -> String {
-    if !db.exists() {
-        return format!("memory store: not found at {}", db.display());
-    }
-    let store = match EventStore::open_existing(db) {
-        Ok(s) => s,
-        Err(e) => return format!("memory store: found at {}, but could not be opened ({e})", db.display()),
-    };
-    let events = match store.get_all_events() {
+    let events = match open_and_read(db) {
         Ok(e) => e,
-        Err(e) => return format!("memory store: found at {} but could not be read ({e})", db.display()),
+        Err(msg) => return format!("memory store: {msg}"),
     };
-    let chain_ok = verify_chain_integrity(&events).is_ok() && DifferentialAuditor::verify_consistency(&events).is_ok();
-    if chain_ok {
+    if chain_intact(&events) {
         format!("memory store: {} events, chain intact", events.len())
     } else {
         let reason = verify_chain_integrity(&events)
@@ -156,8 +173,39 @@ pub fn proof_line(db: &Path) -> String {
         return "provable rules: no rules or orientations declared yet".to_string();
     }
     let with_check = fireable.iter().filter(|i| i.item.check.is_some()).count();
+
+    // WHY THIS LINE BREAKS THE NUMBER DOWN, since 2026-08-08. "Carries a
+    // check" was reported as if it meant "can block", and two independent
+    // reviews caught that it does not. What a check can actually do depends
+    // entirely on its FORM, and the forms differ more than the single
+    // percentage suggested:
+    //   Absent / AbsentAll - refuse a write that INTRODUCES the literal into
+    //     the file the check names. The strongest form.
+    //   Forbidden - the same, with no file at all, so it applies wherever the
+    //     literal might be written.
+    //   Contains - refuses only a write to that same file that REMOVES the
+    //     literal (`absent_guard::find_missing_required`). Real, but narrow:
+    //     it protects a line, it never tests whether the rule's claim is true.
+    //   PathExists - proves the anchor is current and blocks nothing.
+    // Reporting one figure let a store full of Contains checks read as if it
+    // were enforced. It is not wrong to have them; it is wrong to count them
+    // as the same thing.
+    let (mut forbidding, mut protecting, mut currency_only) = (0usize, 0usize, 0usize);
+    for i in &fireable {
+        match &i.item.check {
+            Some(model::item::Check::Absent { .. })
+            | Some(model::item::Check::AbsentAll { .. })
+            | Some(model::item::Check::Forbidden { .. }) => forbidding += 1,
+            Some(model::item::Check::Contains { .. }) => protecting += 1,
+            Some(model::item::Check::PathExists { .. }) => currency_only += 1,
+            None => {}
+        }
+    }
     format!(
-        "provable rules: {} of {} rule(s)/orientation(s) carry a runnable check ({:.1}%) - only those can ever block a wrong write, the rest can only inform",
+        "provable rules: {} of {} rule(s)/orientation(s) carry a runnable check ({:.1}%) - of those, \
+         {forbidding} can refuse a write that introduces something forbidden, {protecting} can only \
+         refuse one that removes a required line from their own file, and {currency_only} prove \
+         their anchor is current without blocking anything",
         with_check,
         fireable.len(),
         100.0 * with_check as f64 / fireable.len() as f64
@@ -179,12 +227,31 @@ pub fn proof_line(db: &Path) -> String {
 /// Needs `--checkouts`, for the same reason `orphan_projects_line` does: an
 /// anchor is relative to a project's own working copy, and this refuses to
 /// guess where that is.
-pub fn decay_line(db: &Path, checkouts: Option<&Path>) -> String {
+/// The result of trying to check decay: either it could not be checked at
+/// all (and why), or it was, with counts. The one place that computes decay
+/// - shared by `decay_line` (prose, every project under `checkouts`) and
+/// `gate_verdict` (pass/fail, optionally narrowed to one project).
+enum DecayCheck {
+    StoreUnreadable,
+    NoCheckouts,
+    Counted { dead: usize, failing: usize, judged: usize },
+}
+
+/// For every live, fireable item whose project resolves to a checkout under
+/// `checkouts`, does its anchor exist and does its proof still hold.
+///
+/// `project_filter`, when given, skips every item whose project does not
+/// match it - this is what lets the gate narrow decay to one repository's
+/// own items, so that repository cannot be failed by another checkout's rot
+/// under the same `--checkouts` directory. `decay_line` always passes
+/// `None`, so its own output is unchanged by this function existing:
+/// every project's rot, exactly as before this was split out.
+fn decay_check(db: &Path, checkouts: Option<&Path>, project_filter: Option<&str>) -> DecayCheck {
     let Ok(store) = EventStore::open_existing(db) else {
-        return "decay: store unreadable, not checked".to_string();
+        return DecayCheck::StoreUnreadable;
     };
     let Some(root) = checkouts else {
-        return "decay: pass --checkouts <dir> to check anchors and proofs against real working copies".to_string();
+        return DecayCheck::NoCheckouts;
     };
 
     let mut roots: std::collections::BTreeMap<String, std::path::PathBuf> = Default::default();
@@ -203,7 +270,19 @@ pub fn decay_line(db: &Path, checkouts: Option<&Path>) -> String {
     let (mut dead, mut failing, mut judged) = (0usize, 0usize, 0usize);
     for li in items.iter().filter(|li| li.item.kind.can_fire()) {
         let Some(project) = li.item.project.as_deref() else { continue };
+        if let Some(only) = project_filter {
+            if only != project {
+                continue;
+            }
+        }
         let Some(base) = roots.get(project) else { continue };
+        // An anchor on something DELIBERATELY absent is not decay. A rule
+        // guarding a gitignored secrets file is anchored there exactly so it
+        // fires the moment that file appears; counting it as rot is what got
+        // six of them swept into the archive on 2026-08-07.
+        if li.item.tags.iter().any(|t| t == model::store::DELIBERATE_ANCHOR_TAG) {
+            continue;
+        }
         judged += 1;
         for binding in &li.item.bindings {
             if let model::item::Binding::Target { kind: model::item::TargetKind::Path, value } = binding {
@@ -223,16 +302,25 @@ pub fn decay_line(db: &Path, checkouts: Option<&Path>) -> String {
             }
         }
     }
+    DecayCheck::Counted { dead, failing, judged }
+}
 
-    if judged == 0 {
-        return "decay: no project under --checkouts answers to any item's key, nothing checked".to_string();
+pub fn decay_line(db: &Path, checkouts: Option<&Path>) -> String {
+    match decay_check(db, checkouts, None) {
+        DecayCheck::StoreUnreadable => "decay: store unreadable, not checked".to_string(),
+        DecayCheck::NoCheckouts => {
+            "decay: pass --checkouts <dir> to check anchors and proofs against real working copies".to_string()
+        }
+        DecayCheck::Counted { judged: 0, .. } => {
+            "decay: no project under --checkouts answers to any item's key, nothing checked".to_string()
+        }
+        DecayCheck::Counted { dead: 0, failing: 0, judged } => {
+            format!("decay: none - every anchor of {judged} project-scoped item(s) resolves, every proof holds")
+        }
+        DecayCheck::Counted { dead, failing, judged } => format!(
+            "decay: {dead} anchor(s) point at nothing (those facts fire NOWHERE) and {failing} proof(s) now come out FALSE, across {judged} project-scoped item(s)"
+        ),
     }
-    if dead == 0 && failing == 0 {
-        return format!("decay: none - every anchor of {judged} project-scoped item(s) resolves, every proof holds");
-    }
-    format!(
-        "decay: {dead} anchor(s) point at nothing (those facts fire NOWHERE) and {failing} proof(s) now come out FALSE, across {judged} project-scoped item(s)"
-    )
 }
 
 /// How many items have been put in front of a reader over and over without
@@ -370,6 +458,152 @@ pub fn orphan_projects_line(db: &Path, checkouts: Option<&Path>) -> String {
 
 /// The whole report: one line per component, in a fixed order, so a person
 /// (or a script) can read it top to bottom without guessing what is missing.
+/// How many items are eligible at one of their own triggers and never shown
+/// there, because the block has fewer places than the pool has claimants.
+///
+/// WHY THIS LINE EXISTS, and why it did not until 2026-08-08. CONTRACT R2 used
+/// to declare crowding reports unnecessary, on the reasoning that nothing is
+/// truncated at delivery because nothing delivered is long. That is true of
+/// truncation INSIDE an item and says nothing about how many items are dropped
+/// FROM the list. The contract therefore argued this project out of the one
+/// measurement that would have shown the damage, and nobody looked for months.
+/// First measurement, the day R2 was corrected: 239 items eligible somewhere
+/// and shown nowhere, out of 698; the worst single pool held 38 for 4 places.
+///
+/// It asks the REAL selector (`serve::serve`), never a second copy of the
+/// selection rule, for the same reason `why` does: a report that disagrees
+/// with the thing it reports on is worse than no report.
+///
+/// Deliberately NOT part of `gate_verdict`. This is whole-store debt, the same
+/// class as proof coverage and the unjudged count, and a commit gate that
+/// fails on those teaches people to bypass it.
+/// How often the gate actually did its job, read straight out of the log.
+///
+/// THE POINT OF THIS LINE. Everything else in this report counts what the
+/// store CONTAINS. This is the only line that counts what it DID. Until
+/// 2026-08-08 no such number existed anywhere, which is how a gate that
+/// stood down after one refusal per file per session survived unnoticed from
+/// the first day of 2.0: an allow left no trace, so the failure mode was
+/// literally unobservable. Two counts, deliberately side by side - a refusal
+/// is visible to whoever it refused, a stand-aside is visible to nobody.
+///
+/// Reads history, so the numbers are lifetime totals for this store, not for
+/// this session. That is the useful frame: "this memory has refused 40
+/// writes" is the sentence that says whether 2.0 works.
+pub fn gate_line(db: &Path) -> String {
+    let Ok(store) = EventStore::open_existing(db) else {
+        return "gate: store unreadable, not checked".to_string();
+    };
+    let Ok(events) = store.get_all_events() else {
+        return "gate: log unreadable, not checked".to_string();
+    };
+    let mut refused = 0usize;
+    let mut stood_aside = 0usize;
+    let mut rules: std::collections::BTreeSet<String> = Default::default();
+    for event in &events {
+        match event.kind {
+            thor_core::event_store::EventKind::GateRefused => {
+                refused += 1;
+                rules.insert(event.entity_id.clone());
+            }
+            thor_core::event_store::EventKind::GateStoodAside => stood_aside += 1,
+            _ => {}
+        }
+    }
+    if refused == 0 && stood_aside == 0 {
+        return "gate: has never refused a write, and has never stood aside from one".to_string();
+    }
+    format!(
+        "gate: {refused} refusals by {} distinct rules, {stood_aside} stand-asides (a repeat on the command arm, which keys on the anchor by design)",
+        rules.len()
+    )
+}
+
+pub fn crowding_line(db: &Path, checkouts: Option<&Path>) -> String {
+    let Ok(store) = EventStore::open_existing(db) else {
+        return "crowding: store unreadable, not checked".to_string();
+    };
+    let Some(root) = checkouts else {
+        return "crowding: pass --checkouts <dir> to see how many facts never win a place".to_string();
+    };
+
+    let mut roots: std::collections::BTreeMap<String, std::path::PathBuf> = Default::default();
+    if let Ok(entries) = std::fs::read_dir(root) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                if let Some(key) = serve::project::resolve_project(&path) {
+                    roots.insert(key, path);
+                }
+            }
+        }
+    }
+
+    // Every distinct anchor that resolves, and the pool it stands for.
+    let mut anchors: std::collections::BTreeSet<(String, String)> = Default::default();
+    for li in serve::live::live_items(&store).iter().filter(|li| li.item.kind.can_fire()) {
+        let Some(project) = li.item.project.clone() else { continue };
+        let Some(base) = roots.get(&project) else { continue };
+        for binding in &li.item.bindings {
+            let model::item::Binding::Target { kind: model::item::TargetKind::Path, value } = binding else {
+                continue;
+            };
+            if value.contains(':') || value.starts_with('/') || value.starts_with("\\\\") {
+                continue;
+            }
+            if base.join(value.replace('\\', "/")).exists() {
+                anchors.insert((project.clone(), value.clone()));
+            }
+        }
+    }
+    if anchors.is_empty() {
+        return "crowding: no resolvable anchor to probe, nothing to say".to_string();
+    }
+
+    let (mut eligible, mut reachable) = (
+        std::collections::HashSet::new(),
+        std::collections::HashSet::new(),
+    );
+    let mut worst: Option<(usize, String, String)> = None;
+    for (project, path) in &anchors {
+        let mut input = serve::input::ServeInput::default();
+        input.add_file(path);
+        // The project is what `rank::select` filters on. Leaving it out serves
+        // only global items and makes every pool look empty.
+        input.project = Some(project.clone());
+        let served = serve::serve(&store, &input);
+        let shown: std::collections::HashSet<&str> =
+            served.selection.shown.iter().map(|r| r.id.as_str()).collect();
+        for r in &served.all {
+            eligible.insert(r.id.clone());
+            if shown.contains(r.id.as_str()) {
+                reachable.insert(r.id.clone());
+            }
+        }
+        if worst.as_ref().map(|(n, _, _)| served.all.len() > *n).unwrap_or(true) {
+            worst = Some((served.all.len(), project.clone(), path.clone()));
+        }
+    }
+
+    let invisible = eligible.len() - reachable.len();
+    if invisible == 0 {
+        return format!("crowding: none - every one of {} eligible item(s) wins a place somewhere", eligible.len());
+    }
+    match worst {
+        Some((n, project, path)) if n > serve::render::MAX_ITEMS => format!(
+            "crowding: {invisible} of {} item(s) are eligible at their own trigger and NEVER shown there, \
+             because a block holds {} - they are current and correctly bound, just permanently outranked; \
+             worst pool: {n} claimants at {path} in {project}",
+            eligible.len(),
+            serve::render::MAX_ITEMS
+        ),
+        _ => format!(
+            "crowding: {invisible} of {} item(s) are eligible at their own trigger and never shown there",
+            eligible.len()
+        ),
+    }
+}
+
 pub fn report(
     db: &Path,
     index_db: Option<&Path>,
@@ -384,17 +618,106 @@ pub fn report(
         replica_line(db, replica),
         falsifier_line(db),
         proof_line(db),
+        gate_line(db),
         decay_line(db, checkouts),
+        crowding_line(db, checkouts),
         unjudged_line(db),
         semantic_line(model_dir),
         orphan_projects_line(db, checkouts),
     ]
 }
 
+/// The three-way answer `--gate` needs. See `gate_verdict` for exactly what
+/// separates `Clean` from `Failing`, and why a store that could not be
+/// judged is neither.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GateVerdict {
+    /// The store could not be judged at all: missing, or present but
+    /// unreadable. The caller must treat this as a PASS, never a failure -
+    /// see `gate_verdict`'s doc comment.
+    NotAvailable,
+    /// The store was judged and nothing gate-worthy was found.
+    Clean,
+    /// The store was judged and at least one real finding was found.
+    Failing,
+}
+
+/// Decide `--gate`'s verdict, reusing exactly the computations the plain-
+/// language lines above already do - never a second evaluation of what they
+/// evaluate. This function is the one place that decides which finding is
+/// gate-worthy; `doctor` only turns its answer into an exit code.
+///
+/// FAILS the gate (`Failing`):
+///
+/// - The event chain is broken (`chain_intact`, the same check `store_line`
+///   reports as "CHAIN BROKEN"): the store's own audit trail no longer
+///   holds together. Not a matter of degree or opinion, and worse than any
+///   single item being wrong, so this applies regardless of `project`.
+/// - A dead anchor, or a proof that now comes out FALSE (`decay_check`): a
+///   fact that fires nowhere, or a rule whose own machine-checkable claim is
+///   presently untrue. Both are current and concrete, not historical debt -
+///   scoped to `project`'s own items when one is given, so one repository's
+///   gate can never be failed by another checkout's rot under the same
+///   `--checkouts` directory.
+///
+/// Does NOT fail the gate (`Clean`, even where the line above may read as
+/// less than perfect) - and why each was left out:
+///
+/// - Code index / replica lines report a COMPANION system's staleness or
+///   reachability, never the memory's own correctness. A replica that is
+///   merely unreachable (no network, a cloud sandbox) would fail every
+///   single commit for a reason that has nothing to do with what changed -
+///   exactly the kind of noise that trains people to skip a gate.
+/// - Falsifier coverage and provable-rule coverage are whole-store
+///   PERCENTAGES of historical debt, not a defect introduced by this run.
+///   Forcing either up in bulk was already tried and explicitly rejected
+///   (raise per fact where being wrong is costly, never bulk-link the whole
+///   store) because it reintroduces the noise this whole feature exists to
+///   keep out - so the gate must not recreate that same pressure by another
+///   route. (Also: `declare` already requires a falsifier for anything that
+///   can fire, so a missing one is legacy debt from before that rule
+///   existed, never something a normal write can create today.)
+/// - Unjudged items are explicitly a nudge, not a defect: silence decides
+///   nothing about whether an item belongs where it fired.
+/// - Semantic search mode is a build/deploy fact (is the feature compiled
+///   in, is a model installed on THIS machine) - never a statement about
+///   any store's content, so it can never be a store's finding.
+/// - Orphan project keys are real, but only as trustworthy as the
+///   `--checkouts` directory is complete. Miss one sibling checkout, rename
+///   a project, or archive one on purpose, and this reports an orphan that
+///   has nothing to do with the commit being gated - a false positive with
+///   no way for `project` to rule it out the way it can for decay. Left out
+///   until it can be scoped as safely as decay already is, rather than risk
+///   exactly the false positive this function exists to avoid.
+///
+/// FAILS OPEN (`NotAvailable`) when the store is missing or cannot be read.
+/// A cloud session has no thor.db at all, and must never be blocked by its
+/// absence - nor may a store that is present but corrupt/mid-sync turn into
+/// a build failure, since neither case says anything about whether THIS
+/// change is wrong. A gate that cries wolf gets bypassed, and this codebase
+/// has a measured instance of exactly that, which is the reason every
+/// "does not fail" case above errs toward `Clean` as well.
+pub fn gate_verdict(db: &Path, checkouts: Option<&Path>, project: Option<&str>) -> GateVerdict {
+    let events = match open_and_read(db) {
+        Ok(e) => e,
+        Err(_) => return GateVerdict::NotAvailable,
+    };
+    let chain_broken = !chain_intact(&events);
+    let decay_finding = matches!(
+        decay_check(db, checkouts, project),
+        DecayCheck::Counted { dead, failing, .. } if dead > 0 || failing > 0
+    );
+    if chain_broken || decay_finding {
+        GateVerdict::Failing
+    } else {
+        GateVerdict::Clean
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use model::item::{Binding, Item, Kind};
+    use model::item::{Binding, Check, Item, Kind, TargetKind};
     use model::store;
 
     fn rule(id: &str) -> Item {
@@ -466,6 +789,57 @@ mod tests {
     }
 
     #[test]
+    fn the_gate_line_says_plainly_when_the_gate_has_never_done_anything() {
+        // A fresh store must not read as "fine". A gate with zero refusals is
+        // either a very well behaved session or a gate that is not wired in,
+        // and the line has to leave both readings open rather than print a
+        // reassuring nothing.
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("t.db");
+        {
+            let _ = EventStore::new(&db).unwrap();
+        }
+        let line = gate_line(&db);
+        assert!(line.contains("never refused"), "{line}");
+    }
+
+    #[test]
+    fn the_gate_line_counts_refusals_and_stand_asides_apart() {
+        // Apart, and never summed: a refusal is visible to whoever it
+        // refused, a stand-aside is visible to nobody, and it was exactly the
+        // invisible half that hid a broken gate for the whole of 2.0 until
+        // 2026-08-08.
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("t.db");
+        {
+            let mut s = EventStore::new(&db).unwrap();
+            for (kind, id) in [
+                (thor_core::event_store::EventKind::GateRefused, "rule-a"),
+                (thor_core::event_store::EventKind::GateRefused, "rule-a"),
+                (thor_core::event_store::EventKind::GateRefused, "rule-b"),
+                (thor_core::event_store::EventKind::GateStoodAside, "rule-c"),
+            ] {
+                s.append_event("s", "l", "t", kind, id, None, "{}").unwrap();
+            }
+        }
+        let line = gate_line(&db);
+        assert!(line.contains("3 refusals"), "{line}");
+        assert!(line.contains("2 distinct rules"), "the same rule twice is one rule: {line}");
+        assert!(line.contains("1 stand-aside"), "{line}");
+    }
+
+    #[test]
+    fn the_gate_line_is_part_of_the_report_not_an_optional_extra() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("t.db");
+        {
+            let _ = EventStore::new(&db).unwrap();
+        }
+        let lines = report(&db, None, None, None, None, None);
+        assert!(lines.iter().any(|l| l.starts_with("gate:")), "{lines:#?}");
+    }
+
+    #[test]
     fn the_proof_line_is_part_of_the_report_not_an_optional_extra() {
         let dir = tempfile::tempdir().unwrap();
         let db = dir.path().join("t.db");
@@ -505,16 +879,48 @@ mod tests {
         let db = dir.path().join("t.db");
         EventStore::new(&db).unwrap();
         let lines = report(&db, None, None, None, None, None);
-        assert_eq!(lines.len(), 9);
+        assert_eq!(lines.len(), 11);
         assert!(lines[0].starts_with("memory store:"));
         assert!(lines[1].starts_with("code index:"));
         assert!(lines[2].starts_with("replica:"));
         assert!(lines[3].starts_with("falsifiers:"));
         assert!(lines[4].starts_with("provable rules:"));
-        assert!(lines[5].starts_with("decay:"));
-        assert!(lines[6].starts_with("unjudged:"));
-        assert!(lines[7].starts_with("semantic search:"));
-        assert!(lines[8].starts_with("project keys:"));
+        // Straight after the coverage number, on purpose: one says how many
+        // rules COULD refuse, the next says how often one DID. Read apart
+        // they mislead in opposite directions.
+        assert!(lines[5].starts_with("gate:"));
+        assert!(lines[6].starts_with("decay:"));
+        assert!(lines[7].starts_with("crowding:"));
+        assert!(lines[8].starts_with("unjudged:"));
+        assert!(lines[9].starts_with("semantic search:"));
+        assert!(lines[10].starts_with("project keys:"));
+    }
+
+    /// THE DEFECT THIS PREVENTS: a health line that goes quiet exactly when it
+    /// has nothing to read. Without a checkout there is no way to know which
+    /// pool an item competes in, and guessing would be worse than saying so -
+    /// the same stance `decay_line` takes one line above.
+    #[test]
+    fn crowding_says_what_it_needs_rather_than_guessing() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("t.db");
+        EventStore::new(&db).unwrap();
+        assert!(crowding_line(&db, None).contains("--checkouts"), "{}", crowding_line(&db, None));
+    }
+
+    /// The empty case has to read as an answer, not as a failure: a store whose
+    /// every item wins a place somewhere is healthy, and a line that stays
+    /// silent about that is indistinguishable from one that broke.
+    #[test]
+    fn crowding_on_a_store_with_nothing_to_probe_says_so() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("t.db");
+        EventStore::new(&db).unwrap();
+        let checkouts = dir.path().join("checkouts");
+        std::fs::create_dir_all(&checkouts).unwrap();
+        let line = crowding_line(&db, Some(&checkouts));
+        assert!(line.starts_with("crowding:"), "{line}");
+        assert!(!line.contains("--checkouts"), "a checkout WAS given: {line}");
     }
 
     // ------------------------------------------------------- semantic_line
@@ -586,5 +992,197 @@ mod tests {
         }
         let line = orphan_projects_line(&db, Some(&checkouts));
         assert!(line.contains("every key in use resolves"), "{line}");
+    }
+
+    // --------------------------------------------------------- gate_verdict
+
+    /// THE DEFECT THIS PREVENTS: a cloud session with no thor.db at all
+    /// getting blocked by --gate for the absence of something it was never
+    /// going to have. FAIL OPEN on a missing store is not a nicety here - it
+    /// is the one behaviour --gate must never regress on.
+    #[test]
+    fn gate_verdict_fails_open_when_the_store_does_not_exist() {
+        let dir = tempfile::tempdir().unwrap();
+        let missing = dir.path().join("nope.db");
+        assert_eq!(gate_verdict(&missing, None, None), GateVerdict::NotAvailable);
+        assert!(!missing.exists(), "judging the gate must never create a store");
+    }
+
+    /// THE DEFECT THIS PREVENTS: a store that is present but corrupt or
+    /// mid-sync (a half-written replica, a file that is not a database at
+    /// all) turning --gate into a build failure that says nothing about
+    /// whether the change actually being gated is wrong.
+    #[test]
+    fn gate_verdict_fails_open_when_the_store_cannot_be_read() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("not-a-store.db");
+        std::fs::write(&db, b"not a sqlite file").unwrap();
+        assert_eq!(gate_verdict(&db, None, None), GateVerdict::NotAvailable);
+    }
+
+    /// THE DEFECT THIS PREVENTS: --gate failing every single commit just
+    /// because decay could never be checked (no --checkouts given) or
+    /// because most rules are prose-only - neither is a defect in what
+    /// changed, both are whole-store debt, and failing on either is exactly
+    /// the noise that trains people to bypass a gate.
+    #[test]
+    fn gate_verdict_is_clean_on_a_healthy_store_with_nothing_gate_worthy() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("t.db");
+        {
+            let mut s = EventStore::new(&db).unwrap();
+            store::declare(&mut s, "s", "l", "a", &rule("prose-only")).unwrap();
+        }
+        assert_eq!(gate_verdict(&db, None, None), GateVerdict::Clean);
+    }
+
+    /// THE DEFECT THIS PREVENTS: an item whose anchor points at nothing - it
+    /// fires nowhere - reading as a clean gate, the exact rot that sat
+    /// undetected across 128 anchors in four projects until `decay_line` was
+    /// built (see `decay_check`'s own doc comment).
+    #[test]
+    fn gate_verdict_fails_on_a_dead_anchor() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("t.db");
+        let checkouts = dir.path().join("dev");
+        let repo = checkouts.join("Real-Repo");
+        std::fs::create_dir_all(repo.join(".git")).unwrap();
+        {
+            let mut s = EventStore::new(&db).unwrap();
+            let mut item = rule("dead-anchor-1");
+            item.project = Some("Real-Repo".to_string());
+            item.bindings = vec![Binding::Target { kind: TargetKind::Path, value: "missing.txt".to_string() }];
+            store::declare(&mut s, "s", "l", "a", &item).unwrap();
+        }
+        assert_eq!(gate_verdict(&db, Some(&checkouts), None), GateVerdict::Failing);
+    }
+
+    /// The contrast case for the test above: an anchor that DOES resolve
+    /// must never fail the gate, or every project would fail on day one.
+    #[test]
+    fn gate_verdict_is_clean_when_every_anchor_resolves() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("t.db");
+        let checkouts = dir.path().join("dev");
+        let repo = checkouts.join("Real-Repo");
+        std::fs::create_dir_all(repo.join(".git")).unwrap();
+        std::fs::write(repo.join("present.txt"), "content").unwrap();
+        {
+            let mut s = EventStore::new(&db).unwrap();
+            let mut item = rule("live-anchor-1");
+            item.project = Some("Real-Repo".to_string());
+            item.bindings = vec![Binding::Target { kind: TargetKind::Path, value: "present.txt".to_string() }];
+            store::declare(&mut s, "s", "l", "a", &item).unwrap();
+        }
+        assert_eq!(gate_verdict(&db, Some(&checkouts), None), GateVerdict::Clean);
+    }
+
+    /// THE DEFECT THIS PREVENTS: a rule whose own machine-runnable claim is
+    /// presently false reading as a clean gate because nothing besides the
+    /// anchor was ever checked.
+    #[test]
+    fn gate_verdict_fails_on_a_proof_that_now_comes_out_false() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("t.db");
+        let checkouts = dir.path().join("dev");
+        let repo = checkouts.join("Real-Repo");
+        std::fs::create_dir_all(repo.join(".git")).unwrap();
+        {
+            let mut s = EventStore::new(&db).unwrap();
+            let mut item = rule("false-proof-1");
+            item.project = Some("Real-Repo".to_string());
+            item.check = Some(Check::PathExists { path: "missing.txt".to_string() });
+            store::declare(&mut s, "s", "l", "a", &item).unwrap();
+        }
+        assert_eq!(gate_verdict(&db, Some(&checkouts), None), GateVerdict::Failing);
+    }
+
+    /// THE DEFECT THIS PREVENTS: two checkouts sharing one --checkouts
+    /// directory means one repository's rot could fail a DIFFERENT
+    /// repository's gate - the exact reason --project exists.
+    #[test]
+    fn gate_verdict_with_a_project_filter_ignores_another_projects_rot() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("t.db");
+        let checkouts = dir.path().join("dev");
+        std::fs::create_dir_all(checkouts.join("Repo-A").join(".git")).unwrap();
+        std::fs::create_dir_all(checkouts.join("Repo-B").join(".git")).unwrap();
+        {
+            let mut s = EventStore::new(&db).unwrap();
+            let mut rotten = rule("rotten-in-a");
+            rotten.project = Some("Repo-A".to_string());
+            rotten.bindings = vec![Binding::Target { kind: TargetKind::Path, value: "missing.txt".to_string() }];
+            store::declare(&mut s, "s", "l", "a", &rotten).unwrap();
+
+            let mut clean = rule("clean-in-b");
+            clean.project = Some("Repo-B".to_string());
+            store::declare(&mut s, "s", "l", "a", &clean).unwrap();
+        }
+
+        assert_eq!(
+            gate_verdict(&db, Some(&checkouts), None),
+            GateVerdict::Failing,
+            "unscoped, Repo-A's dead anchor must still fail the gate"
+        );
+        assert_eq!(
+            gate_verdict(&db, Some(&checkouts), Some("Repo-B")),
+            GateVerdict::Clean,
+            "Repo-B's own items are fine, and Repo-A's rot must not reach it"
+        );
+        assert_eq!(
+            gate_verdict(&db, Some(&checkouts), Some("Repo-A")),
+            GateVerdict::Failing,
+            "scoped to its own project, Repo-A's dead anchor must still fail"
+        );
+    }
+
+    /// THE DEFECT THIS PREVENTS: a tampered event log reading as a clean
+    /// gate because --gate only ever looked at decay. A broken chain is
+    /// worse than any single item's rot, so it fails regardless of
+    /// --project, exactly as `gate_verdict`'s own doc comment says it must.
+    #[test]
+    fn gate_verdict_fails_on_a_broken_chain_regardless_of_project() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("t.db");
+        {
+            let mut s = EventStore::new(&db).unwrap();
+            store::declare(&mut s, "s", "l", "a", &rule("r1")).unwrap();
+        }
+        {
+            // Tamper the row directly, the same way
+            // `test_fsck_recomputes_hashes_on_tampered_fields` (core::auditor)
+            // proves a stale body_ch does not hide a body flip: this_hash was
+            // computed over the ORIGINAL body at write time, so recomputing it
+            // over the tampered body can never match again.
+            let s = EventStore::open_existing(&db).unwrap();
+            s.conn().execute("UPDATE event SET body = 'tampered' WHERE seq = 1", []).unwrap();
+        }
+        assert_eq!(gate_verdict(&db, None, None), GateVerdict::Failing);
+        assert_eq!(
+            gate_verdict(&db, None, Some("some-project-that-does-not-exist")),
+            GateVerdict::Failing,
+            "a broken chain must not be scoped away by --project"
+        );
+    }
+
+    /// THE DEFECT THIS PREVENTS: an incomplete --checkouts directory (one
+    /// sibling checkout missing, a project renamed or archived on purpose)
+    /// failing a commit for a reason that has nothing to do with the commit
+    /// itself - exactly the false positive `gate_verdict`'s own doc comment
+    /// names as the reason orphan project keys are left out of --gate.
+    #[test]
+    fn gate_verdict_does_not_fail_when_a_projects_own_checkout_is_missing() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("t.db");
+        let checkouts = dir.path().join("dev");
+        std::fs::create_dir_all(&checkouts).unwrap();
+        {
+            let mut s = EventStore::new(&db).unwrap();
+            let mut item = rule("ghost-1");
+            item.project = Some("Ghost-Project".to_string());
+            item.bindings = vec![Binding::Target { kind: TargetKind::Path, value: "missing.txt".to_string() }];
+            store::declare(&mut s, "s", "l", "a", &item).unwrap();
+        }
+        assert_eq!(gate_verdict(&db, Some(&checkouts), None), GateVerdict::Clean);
     }
 }

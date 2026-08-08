@@ -70,7 +70,7 @@ services:
     #
     # It answers to the name `thor-mcp` on the tunnel's network because that
     # is the origin the tunnel was already pointed at
-    # (thor-mcp.nworks3d.be -> http://thor-mcp:8078). Taking over the name
+    # (mcp.example.com -> http://thor-mcp:8078). Taking over the name
     # instead of re-pointing the route means the switch from 1.0 to 2.0 needs
     # no change in the Cloudflare dashboard and nothing on the owner's side.
     # The 1.0 container must be stopped first: two containers cannot answer
@@ -95,7 +95,7 @@ services:
       --http 0.0.0.0:8078
       --capture-inbox /data/inbox.jsonl
       --allowed-host localhost
-      --allowed-host thor-mcp.nworks3d.be
+      --allowed-host mcp.example.com
       --allowed-host 10.0.0.50
       --allowed-host fileserver
 

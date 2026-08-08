@@ -201,20 +201,26 @@ pub fn proof_line(db: &Path) -> String {
     // corrections came from a review reading the arms rather than the checks.
     let (mut forbidding, mut protecting, mut location, mut blocks_nothing) = (0usize, 0usize, 0usize, 0usize);
     for i in &fireable {
-        let always_bound = i.item.bindings.iter().any(|b| matches!(b, model::item::Binding::Always));
+        // One definition, shared with `teeth_line` via `can_refuse`, so the
+        // two lines can never disagree about what "can refuse" means.
+        let refuses = can_refuse(&i.item);
         // A `Forbidden` check reaches wherever its BINDING says, and there are
         // exactly two bindings that carry a reach it can honour: Always (every
         // file write, via `absent_guard::find_forbidden_violation`) and Command
         // (that one command, via `find_command_violation`). Anything else -
         // a moment, a path, a directory - passes the write gate, looks like the
         // strongest form, and can never fire.
-        let command_bound = i.item.bindings.iter().any(|b| {
-            matches!(b, model::item::Binding::Target { kind: model::item::TargetKind::Command, .. })
-        });
         match &i.item.check {
-            Some(model::item::Check::Absent { .. }) | Some(model::item::Check::AbsentAll { .. }) => forbidding += 1,
-            Some(model::item::Check::Forbidden { .. }) if always_bound || command_bound => forbidding += 1,
-            Some(model::item::Check::Forbidden { .. }) => blocks_nothing += 1,
+            Some(model::item::Check::Absent { .. })
+            | Some(model::item::Check::AbsentAll { .. })
+            | Some(model::item::Check::Forbidden { .. })
+                if refuses =>
+            {
+                forbidding += 1
+            }
+            Some(model::item::Check::Absent { .. })
+            | Some(model::item::Check::AbsentAll { .. })
+            | Some(model::item::Check::Forbidden { .. }) => blocks_nothing += 1,
             Some(model::item::Check::Contains { .. }) => protecting += 1,
             Some(model::item::Check::PathExists { path }) => {
                 let bar = i.item.severity == Some(model::item::Severity::Irreversible)
@@ -510,6 +516,113 @@ pub fn orphan_projects_line(db: &Path, checkouts: Option<&Path>) -> String {
 /// Deliberately NOT part of `gate_verdict`. This is whole-store debt, the same
 /// class as proof coverage and the unjudged count, and a commit gate that
 /// fails on those teaches people to bypass it.
+/// Whether the rules the owner marked most costly are the ones that can
+/// actually refuse - because measured on the real store, they are the exact
+/// opposite.
+///
+/// WHY THIS LINE EXISTS. Severity is the FIRST ranking key, so a heavy item
+/// takes a place from every lighter one at the same trigger. It is meant to
+/// say what it costs when this goes wrong. Measured 2026-08-08: of 228 items
+/// marked irreversible or costly, ZERO could refuse anything, while all 17
+/// that could refuse were marked house style or nothing at all. The store's
+/// own sense of danger and its actual teeth point in opposite directions, and
+/// no line said so.
+///
+/// This is a worklist, not a fault: these are exactly the rules where a check
+/// is worth writing, because being wrong about them is what the owner already
+/// said is expensive.
+pub fn teeth_line(db: &Path) -> String {
+    let Ok(store) = EventStore::open_existing(db) else {
+        return "teeth: store unreadable, not checked".to_string();
+    };
+    let live = serve::live::live_items(&store);
+    let (mut heavy, mut heavy_with_teeth) = (0usize, 0usize);
+    for li in live.iter().filter(|li| li.item.kind.can_fire()) {
+        if !matches!(
+            li.item.severity,
+            Some(model::item::Severity::Irreversible) | Some(model::item::Severity::Costly)
+        ) {
+            continue;
+        }
+        heavy += 1;
+        if can_refuse(&li.item) {
+            heavy_with_teeth += 1;
+        }
+    }
+    if heavy == 0 {
+        return "teeth: no rule is marked irreversible or costly yet".to_string();
+    }
+    format!(
+        "teeth: {heavy_with_teeth} of {heavy} rule(s) marked irreversible or costly can actually refuse something - the other {} can only inform, and they are the ones where being wrong was already called expensive",
+        heavy - heavy_with_teeth
+    )
+}
+
+/// What the only maintenance loop in this system never looks at.
+///
+/// WHY THIS LINE EXISTS. A pinned item is excluded from the judgement debt
+/// (pinning is itself a verdict, so "did it belong where it fired" has no
+/// honest answer) and from decay (same reason). It is also served IN FULL at
+/// every session start, uncapped. Both choices are defensible on their own and
+/// together they produce a blind spot nobody had counted: measured
+/// 2026-08-08, 31 pinned items were 48.9% of every serving this store had ever
+/// made, and 23 of them had never been examined by anything.
+///
+/// No mechanism is proposed here. The number is the point: half of what this
+/// memory says comes from the part of it nothing checks.
+pub fn pinned_line(db: &Path) -> String {
+    let Ok(store) = EventStore::open_existing(db) else {
+        return "pinned: store unreadable, not checked".to_string();
+    };
+    let Ok(events) = store.event_kinds() else {
+        return "pinned: log unreadable, not checked".to_string();
+    };
+    let mut served: std::collections::HashMap<String, usize> = Default::default();
+    let mut judged: std::collections::HashSet<String> = Default::default();
+    for (kind, id) in events {
+        match kind {
+            thor_core::event_store::EventKind::ItemServed => *served.entry(id).or_default() += 1,
+            thor_core::event_store::EventKind::ItemMarkedUseful
+            | thor_core::event_store::EventKind::ItemMarkedNoise => {
+                judged.insert(id);
+            }
+            _ => {}
+        }
+    }
+    let live = serve::live::live_items(&store);
+    let pinned: Vec<_> = live
+        .iter()
+        .filter(|li| li.item.kind.can_fire())
+        .filter(|li| li.item.bindings.iter().any(|b| matches!(b, model::item::Binding::Always)))
+        .collect();
+    if pinned.is_empty() {
+        return "pinned: nothing is pinned".to_string();
+    }
+    let never_judged = pinned.iter().filter(|li| !judged.contains(&li.id)).count();
+    let their_servings: usize = pinned.iter().map(|li| served.get(&li.id).copied().unwrap_or(0)).sum();
+    let all: usize = served.values().sum();
+    format!(
+        "pinned: {} item(s), {never_judged} never examined by anything, together {:.0}% of every serving this store has made - the judgement debt and decay both skip them on purpose, so this share is the part of your memory nothing ever re-reads",
+        pinned.len(),
+        100.0 * their_servings as f64 / all.max(1) as f64
+    )
+}
+
+/// The one definition of "this check can refuse something", shared by
+/// `proof_line` and `teeth_line` so the two can never disagree about it.
+fn can_refuse(item: &model::item::Item) -> bool {
+    let always = item.bindings.iter().any(|b| matches!(b, model::item::Binding::Always));
+    let command = item
+        .bindings
+        .iter()
+        .any(|b| matches!(b, model::item::Binding::Target { kind: model::item::TargetKind::Command, .. }));
+    match &item.check {
+        Some(model::item::Check::Absent { .. }) | Some(model::item::Check::AbsentAll { .. }) => true,
+        Some(model::item::Check::Forbidden { .. }) => always || command,
+        _ => false,
+    }
+}
+
 /// How often the gate actually did its job, read straight out of the log.
 ///
 /// THE POINT OF THIS LINE. Everything else in this report counts what the
@@ -652,6 +765,8 @@ pub fn report(
         falsifier_line(db),
         proof_line(db),
         gate_line(db),
+        teeth_line(db),
+        pinned_line(db),
         decay_line(db, checkouts),
         crowding_line(db, checkouts),
         unjudged_line(db),
@@ -887,6 +1002,74 @@ mod tests {
         assert!(line.contains("block"), "and say what the number decides: {line}");
     }
 
+    /// THE INVERSION THIS REPORTS. Severity is the first ranking key, so a
+    /// heavy item takes a place from every lighter one at the same trigger -
+    /// and measured on the owner's real store, not one heavy rule could refuse
+    /// anything, while every rule that could was marked house style or nothing.
+    /// The store's sense of danger and its actual teeth pointed in opposite
+    /// directions and no line said so.
+    #[test]
+    fn the_teeth_line_counts_heavy_rules_that_can_actually_refuse() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("t.db");
+        {
+            let mut s = EventStore::new(&db).unwrap();
+
+            let mut heavy_prose = rule("heavy-but-toothless");
+            heavy_prose.severity = Some(model::item::Severity::Irreversible);
+            store::declare(&mut s, "s", "l", "a", &heavy_prose).unwrap();
+
+            let mut heavy_armed = rule("heavy-and-armed");
+            heavy_armed.text = "a webhook retry backs off before it gives up entirely".to_string();
+            heavy_armed.severity = Some(model::item::Severity::Costly);
+            heavy_armed.check = Some(model::item::Check::Forbidden { literals: vec!["\u{2014}".to_string()] });
+            store::declare(&mut s, "s", "l", "a", &heavy_armed).unwrap();
+
+            // Light and armed: counted by proof_line, never by this line.
+            let mut light_armed = rule("light-and-armed");
+            light_armed.text = "the estimator rounds a quote up to whole cents".to_string();
+            light_armed.check = Some(model::item::Check::Forbidden { literals: vec!["\u{2026}".to_string()] });
+            store::declare(&mut s, "s", "l", "a", &light_armed).unwrap();
+        }
+        let line = teeth_line(&db);
+        assert!(line.contains("1 of 2"), "{line}");
+        assert!(line.contains("the other 1 can only inform"), "{line}");
+    }
+
+    /// THE BLIND SPOT THIS REPORTS. A pinned item is skipped by the judgement
+    /// debt and by decay, both on the reasoning that pinning is itself a
+    /// verdict - and it is served in full at every session start. Measured on
+    /// the real store, that made 31 items 48.9% of every serving ever made,
+    /// with 23 of them never examined by anything. Both design choices are
+    /// defensible; the number they produce together had never been counted.
+    #[test]
+    fn the_pinned_line_counts_what_no_maintenance_loop_ever_looks_at() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("t.db");
+        {
+            let mut s = EventStore::new(&db).unwrap();
+            store::declare(&mut s, "s", "l", "a", &rule("pinned-one")).unwrap();
+
+            let mut anchored = rule("anchored-one");
+            anchored.text = "a webhook retry backs off before it gives up entirely".to_string();
+            anchored.bindings = vec![model::item::Binding::Target {
+                kind: model::item::TargetKind::Path,
+                value: "docs/NOTES.md".to_string(),
+            }];
+            anchored.project = Some("fixture-project".to_string());
+            store::declare(&mut s, "s", "l", "a", &anchored).unwrap();
+
+            for _ in 0..3 {
+                serve::deliver::record_delivery(&mut s, "s", "s", "t", "2026-08-08T00:00:00Z", &["pinned-one".to_string()]);
+            }
+            serve::deliver::record_delivery(&mut s, "s", "s", "t", "2026-08-08T00:00:00Z", &["anchored-one".to_string()]);
+        }
+        let line = pinned_line(&db);
+        assert!(line.contains("1 item(s)"), "{line}");
+        assert!(line.contains("1 never examined"), "{line}");
+        assert!(line.contains("75%"), "three of four servings came from the pin: {line}");
+    }
+
     #[test]
     fn the_gate_line_says_plainly_when_the_gate_has_never_done_anything() {
         // A fresh store must not read as "fine". A gate with zero refusals is
@@ -978,7 +1161,7 @@ mod tests {
         let db = dir.path().join("t.db");
         EventStore::new(&db).unwrap();
         let lines = report(&db, None, None, None, None, None);
-        assert_eq!(lines.len(), 11);
+        assert_eq!(lines.len(), 13);
         assert!(lines[0].starts_with("memory store:"));
         assert!(lines[1].starts_with("code index:"));
         assert!(lines[2].starts_with("replica:"));
@@ -988,11 +1171,15 @@ mod tests {
         // rules COULD refuse, the next says how often one DID. Read apart
         // they mislead in opposite directions.
         assert!(lines[5].starts_with("gate:"));
-        assert!(lines[6].starts_with("decay:"));
-        assert!(lines[7].starts_with("crowding:"));
-        assert!(lines[8].starts_with("unjudged:"));
-        assert!(lines[9].starts_with("semantic search:"));
-        assert!(lines[10].starts_with("project keys:"));
+        // Next to the gate on purpose: one says how often it fired, the next
+        // two say where it has no teeth and what nothing ever re-reads.
+        assert!(lines[6].starts_with("teeth:"));
+        assert!(lines[7].starts_with("pinned:"));
+        assert!(lines[8].starts_with("decay:"));
+        assert!(lines[9].starts_with("crowding:"));
+        assert!(lines[10].starts_with("unjudged:"));
+        assert!(lines[11].starts_with("semantic search:"));
+        assert!(lines[12].starts_with("project keys:"));
     }
 
     /// THE DEFECT THIS PREVENTS: a health line that goes quiet exactly when it

@@ -38,6 +38,38 @@ pub fn record_delivery(
     }
 }
 
+/// Record what the write guard actually DID: refused a call, or stood aside
+/// on a call it had already refused once.
+///
+/// WHY BOTH, AND WHY THE SECOND ONE MATTERS MORE. A refusal is visible to the
+/// person it refused. A gate that quietly declines to look is visible to
+/// nobody, which is exactly how the once-per-session marker survived from the
+/// first day of 2.0 until four separate reviews read it out loud on
+/// 2026-08-08. Until this function existed, nothing in the log recorded that
+/// enforcement had happened at all: the gate was the whole reason this
+/// version was built and the one capability with no measurement, which is the
+/// third time this project has been caught by that exact shape.
+///
+/// Fail-silent like every other telemetry write here: a log that cannot take
+/// a measurement must never cost a refusal.
+pub fn record_gate_outcome(
+    store: &mut EventStore,
+    session_id: &str,
+    lineage_id: &str,
+    actor: &str,
+    at: &str,
+    refused: bool,
+    entity_id: &str,
+    target: &str,
+) {
+    let body = match serde_json::to_string(&serde_json::json!({ "at": at, "target": target })) {
+        Ok(b) => b,
+        Err(_) => return,
+    };
+    let kind = if refused { EventKind::GateRefused } else { EventKind::GateStoodAside };
+    let _ = store.append_event(session_id, lineage_id, actor, kind, entity_id, None, &body);
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

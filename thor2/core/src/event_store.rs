@@ -95,6 +95,28 @@ pub enum EventKind {
     /// judgements the migration left behind. An explicit negative is a real
     /// observation; the absence of a positive is not.
     ItemMarkedNoise,
+    /// The write guard REFUSED a call. Head-neutral telemetry, exactly like
+    /// the three above: it records that enforcement happened, never fact
+    /// content. Body carries the rule id, the target, and the reason.
+    ///
+    /// WHY THIS EXISTS (2026-08-08). Nothing in this log ever recorded that
+    /// the gate did anything. Four independent reviews of this system on one
+    /// day all reached the same place: the gate is the whole reason 2.0 was
+    /// built, and it was the one capability with no measurement at all. This
+    /// project had already been caught twice by exactly that shape - proof
+    /// coverage nobody counted, crowding the contract forbade reporting - and
+    /// both times the lesson was written down and both times it was applied
+    /// to something other than the gate itself.
+    GateRefused,
+    /// The write guard STOOD ASIDE: it had something to say and did not say
+    /// it, because this session had already been refused for this attempt.
+    ///
+    /// Recorded for the same reason a refusal is, and it is the more
+    /// important half. A gate that refuses is visible to the person it
+    /// refused. A gate that quietly declines to look is visible to nobody,
+    /// which is how the once-per-session marker survived unexamined from the
+    /// first day of 2.0 until it was read out loud.
+    GateStoodAside,
 }
 
 impl EventKind {
@@ -111,6 +133,8 @@ impl EventKind {
             EventKind::ItemServed => "item_served",
             EventKind::ItemMarkedUseful => "item_marked_useful",
             EventKind::ItemMarkedNoise => "item_marked_noise",
+            EventKind::GateRefused => "gate_refused",
+            EventKind::GateStoodAside => "gate_stood_aside",
         }
     }
 
@@ -127,6 +151,8 @@ impl EventKind {
             "item_served" => Some(EventKind::ItemServed),
             "item_marked_useful" => Some(EventKind::ItemMarkedUseful),
             "item_marked_noise" => Some(EventKind::ItemMarkedNoise),
+            "gate_refused" => Some(EventKind::GateRefused),
+            "gate_stood_aside" => Some(EventKind::GateStoodAside),
             _ => None,
         }
     }
@@ -692,7 +718,11 @@ impl EventStore {
             // never a birth event, so it must not mint a phantom project
             // entry for an entity id that was only ever served or marked,
             // never created.
-            EventKind::ItemServed | EventKind::ItemMarkedUseful | EventKind::ItemMarkedNoise => {}
+            EventKind::ItemServed
+            | EventKind::ItemMarkedUseful
+            | EventKind::ItemMarkedNoise
+            | EventKind::GateRefused
+            | EventKind::GateStoodAside => {}
             _ => {
                 conn.execute(
                     "INSERT OR IGNORE INTO entity_meta (entity_id, project) VALUES (?, ?)",
@@ -752,7 +782,9 @@ impl EventStore {
             | EventKind::FactReprojected
             | EventKind::ItemServed
             | EventKind::ItemMarkedUseful
-            | EventKind::ItemMarkedNoise => {}
+            | EventKind::ItemMarkedNoise
+            | EventKind::GateRefused
+            | EventKind::GateStoodAside => {}
         }
         // Binding projection mirror: only the kinds above that can move a
         // head need it, so a delivery/usefulness telemetry event (ItemServed
@@ -771,7 +803,9 @@ impl EventStore {
             | EventKind::FactReprojected
             | EventKind::ItemServed
             | EventKind::ItemMarkedUseful
-            | EventKind::ItemMarkedNoise => {}
+            | EventKind::ItemMarkedNoise
+            | EventKind::GateRefused
+            | EventKind::GateStoodAside => {}
         }
         Ok(())
     }

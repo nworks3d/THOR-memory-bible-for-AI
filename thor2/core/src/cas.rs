@@ -50,7 +50,11 @@ pub fn compute_projects(events: &[Event]) -> HashMap<String, Option<String>> {
                     projects.insert(event.entity_id.clone(), override_project);
                 }
             }
-            EventKind::ItemServed | EventKind::ItemMarkedUseful | EventKind::ItemMarkedNoise => {
+            EventKind::ItemServed
+            | EventKind::ItemMarkedUseful
+            | EventKind::ItemMarkedNoise
+            | EventKind::GateRefused
+            | EventKind::GateStoodAside => {
                 // Delivery/usefulness telemetry only: never a birth event,
                 // never a project override. Left out of the birth-project
                 // fold below so a served-or-marked-but-never-created entity
@@ -130,7 +134,11 @@ pub fn compute_head_sets(events: &[Event]) -> HashMap<String, HeadSet> {
             | EventKind::FactReprojected
             | EventKind::ItemServed
             | EventKind::ItemMarkedUseful
-            | EventKind::ItemMarkedNoise => {}
+            | EventKind::ItemMarkedNoise
+            // Gate telemetry: records that enforcement happened, never fact
+            // content, so it can never move a head either.
+            | EventKind::GateRefused
+            | EventKind::GateStoodAside => {}
         }
     }
 

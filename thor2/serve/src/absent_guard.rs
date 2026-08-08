@@ -235,6 +235,92 @@ pub fn read_blocked(text: &str) -> HashMap<String, HashSet<String>> {
 }
 
 /// Has this session already been blocked once for this exact file path?
+/// The key one blocked ATTEMPT is remembered under: the file (or command
+/// anchor) plus a fingerprint of the text that call was carrying.
+///
+/// THE DEFECT THIS CLOSES. The key used to be the file alone, so the first
+/// block in a session disarmed this guard for that file entirely: every later
+/// write to it passed unexamined, including one carrying a different and
+/// genuinely forbidden change, and including under an Irreversible rule. The
+/// allow path writes no event either, so nothing measured it. "The gate
+/// refuses" was true for exactly one attempt.
+///
+/// Why not simply drop the marker. It is loop protection, and that need is
+/// real: an agent that retries the IDENTICAL write after a block would be
+/// blocked forever, and a gate that cannot be satisfied is a gate people
+/// route around. Fingerprinting the carried text keeps precisely that
+/// escape - and on 2026-08-08 even that stopped being an escape: a repeat is
+/// now refused too, and the marker only decides whether the refusal says it
+/// is a repeat (see [`escalated`]). A DIFFERENT attempt is a fresh decision
+/// and gets its own plain verdict. Version 1 reached the same answer for a
+/// sibling problem: its session dedup key carries a fingerprint of the
+/// content for exactly this reason.
+///
+/// FNV-1a, not a cryptographic hash: this key lives in a session-scoped
+/// sidecar and never crosses a trust boundary, so collision resistance buys
+/// nothing here and a dependency would cost something.
+/// The whole of what a call is attempting, as one string, for
+/// [`attempt_key`] to fingerprint.
+///
+/// NOT [`proposed_content`], and the difference matters on an `Edit`. That
+/// function returns `new_string` alone, because for "does this write
+/// introduce a forbidden literal" the replacement text is exactly the right
+/// question. But two edits that replace DIFFERENT text with the SAME
+/// replacement are two different attempts, and keying both under one
+/// fingerprint would call the second one a repeat of the first. Since a
+/// repeat now escalates rather than passes, that mistake costs a wrong
+/// message rather than a missed refusal - which is why this is a correction
+/// and not an emergency, and it is still a thing the gate should not say.
+pub fn attempt_text(tool_name: &str, tool_input: Option<&Value>) -> Option<String> {
+    match tool_name {
+        "Write" => tool_input?.get("content")?.as_str().map(str::to_string),
+        "Edit" => {
+            let input = tool_input?;
+            let old = input.get("old_string")?.as_str()?;
+            let new = input.get("new_string")?.as_str()?;
+            // A NUL separator, so ("ab", "c") and ("a", "bc") never collide.
+            Some(format!("{old}\u{0}{new}"))
+        }
+        _ => None,
+    }
+}
+
+pub fn attempt_key(target: &str, carried: Option<&str>) -> String {
+    let Some(text) = carried else {
+        // No readable payload: fall back to the old behaviour rather than
+        // inventing a key, so an unknown tool shape can never accidentally
+        // re-arm the guard on every call.
+        return target.to_string();
+    };
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    for byte in text.as_bytes() {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x1000_0000_01b3);
+    }
+    format!("{target}#{hash:016x}")
+}
+
+/// The wording a repeat of an ALREADY refused attempt gets.
+///
+/// WHY THIS EXISTS AT ALL. Until 2026-08-08 a repeat did not get wording, it
+/// got through: the marker returned before any rule was read, so the second
+/// send of a refused write landed. The fear behind that was a retry loop -
+/// an agent resending the same bytes forever against a gate that says no
+/// forever. The fear was reasonable and the cure was worse than the disease,
+/// because the one moment a gate has to hold is the moment somebody insists.
+///
+/// So a repeat is still refused, and the only thing the marker changes now is
+/// what the refusal SAYS. That is also the loop answer: the text differs from
+/// the first refusal, so a caller that reads its input at all has new
+/// information, and the new information is "stop resending this one".
+pub fn escalated(reason: &str) -> String {
+    format!(
+        "{reason}
+
+This is the SECOND time this exact write was refused in this session. Resending it again will be refused again. Change what the write carries, or ask the user whether the rule itself is wrong - and if it is, correct the rule (revise or retract it, with a reason) rather than working around it."
+    )
+}
+
 pub fn already_blocked(markers: &HashMap<String, HashSet<String>>, session_id: &str, file_path: &str) -> bool {
     markers.get(session_id).is_some_and(|files| files.contains(file_path))
 }
@@ -394,6 +480,19 @@ fn quote_with_context(content: &str, literal: &str) -> String {
 /// The block message, in the exact required order: a marker making clear it
 /// comes from THOR, the rule's id, the rule's own text as the reason, then
 /// the offending fragment quoted with a little surrounding context.
+/// The id of the rule a refusal names, read back out of the message.
+///
+/// Every refusal this module builds opens `[THOR] rule {id} ` - all four
+/// builders, enforced by `every_refusal_message_names_a_readable_rule_id`.
+/// Reading it back beats threading an id through five arms that all return a
+/// String today, and it keeps the coupling inside the one module that owns
+/// the wording. `None` for anything that is not one of our own messages,
+/// which is what an escalated repeat still is not (it keeps the original
+/// first line, so it still parses).
+pub fn rule_id_of(message: &str) -> Option<&str> {
+    message.strip_prefix("[THOR] rule ")?.split_whitespace().next()
+}
+
 fn block_message(rule_id: &str, rule_text: &str, content: &str, literal: &str) -> String {
     let quote = quote_with_context(content, literal);
     format!(
@@ -1227,6 +1326,39 @@ pub fn record_stale_text(existing_text: Option<&str>, findings: &[StaleFinding],
 
 #[cfg(test)]
 mod tests {
+
+    /// THE DEFECT THIS PREVENTS, and it went to the heart of what this system
+    /// claims to be. The block marker used to be keyed on the file alone, so
+    /// the first refusal in a session disarmed this guard for that file
+    /// entirely: every later write to it passed unexamined, including one
+    /// carrying a different and genuinely forbidden change, and including
+    /// under an Irreversible rule. Nothing recorded the allow, so nothing
+    /// measured it either.
+    #[test]
+    fn a_different_attempt_on_the_same_file_is_judged_again() {
+        let first = attempt_key("src/config.rs", Some("a harmless line"));
+        let second = attempt_key("src/config.rs", Some("a line carrying the forbidden literal"));
+        assert_ne!(first, second, "a different write to the same file must get its own verdict");
+    }
+
+    /// The other half, and the reason the marker exists at all: an agent that
+    /// retries the IDENTICAL write must not be blocked forever. A gate that
+    /// cannot be satisfied is a gate people learn to route around.
+    #[test]
+    fn the_same_attempt_twice_still_passes_the_second_time() {
+        let once = attempt_key("src/config.rs", Some("exactly the same text"));
+        let twice = attempt_key("src/config.rs", Some("exactly the same text"));
+        assert_eq!(once, twice, "an unchanged retry must keep its loop protection");
+    }
+
+    /// An unknown tool shape carries no readable text. Inventing a key from
+    /// nothing would re-arm the guard on every single call and turn the loop
+    /// protection off by accident, so it falls back to the old behaviour.
+    #[test]
+    fn an_unreadable_payload_falls_back_to_the_bare_target() {
+        assert_eq!(attempt_key("src/config.rs", None), "src/config.rs");
+    }
+
     use super::*;
     use model::item::{Binding, Item, Kind, Severity, TargetKind};
 
@@ -1589,6 +1721,63 @@ mod tests {
     /// session blocks again, turning one violation into a repeated nag - and
     /// the converse defect, a marker so coarse it suppresses an unrelated
     /// file or an unrelated session too.
+    #[test]
+    fn two_edits_with_the_same_replacement_but_different_targets_are_two_attempts() {
+        // THE DEFECT THIS PREVENTS. The fingerprint used to be taken over
+        // `new_string` alone, so replacing "alpha" with "x" and replacing
+        // "beta" with "x" hashed identically and the second one was called a
+        // repeat of the first. Different edits, one key.
+        let one = serde_json::json!({"old_string": "alpha", "new_string": "x"});
+        let two = serde_json::json!({"old_string": "beta", "new_string": "x"});
+        let key_one = attempt_key("f.rs", attempt_text("Edit", Some(&one)).as_deref());
+        let key_two = attempt_key("f.rs", attempt_text("Edit", Some(&two)).as_deref());
+        assert_ne!(key_one, key_two, "two different edits must not share one attempt key");
+
+        // And the same edit twice still is one attempt, which is the whole
+        // point of having a key at all.
+        let again = serde_json::json!({"old_string": "alpha", "new_string": "x"});
+        assert_eq!(key_one, attempt_key("f.rs", attempt_text("Edit", Some(&again)).as_deref()));
+
+        // The separator is load-bearing: without it ("ab","c") and ("a","bc")
+        // would concatenate to the same string.
+        let split_one = serde_json::json!({"old_string": "ab", "new_string": "c"});
+        let split_two = serde_json::json!({"old_string": "a", "new_string": "bc"});
+        assert_ne!(
+            attempt_key("f.rs", attempt_text("Edit", Some(&split_one)).as_deref()),
+            attempt_key("f.rs", attempt_text("Edit", Some(&split_two)).as_deref())
+        );
+    }
+
+    #[test]
+    fn every_refusal_message_names_a_readable_rule_id() {
+        // The gate's telemetry reads the id back out of the wording, so the
+        // wording is load-bearing. All four builders, plus an escalated
+        // repeat, which must still parse.
+        let content = block_message("a-1", "no dashes", "a - b", "-");
+        let location = location_block_message("a-2", "keep out", "secrets/", "secrets/key.txt");
+        let missing = format!(
+            "[THOR] rule {} requires this to stay in {} (\"{}\"); it is missing from what is about to be written: \"{}\"",
+            "a-3", "NOTES.md", "keep the header", "header"
+        );
+        for (message, expected) in [(&content, "a-1"), (&location, "a-2"), (&missing, "a-3")] {
+            assert_eq!(rule_id_of(message), Some(expected), "{message}");
+            assert_eq!(rule_id_of(&escalated(message)), Some(expected), "escalated: {message}");
+        }
+        assert_eq!(rule_id_of("something else entirely"), None);
+    }
+
+    #[test]
+    fn an_escalated_repeat_keeps_the_original_reason_and_says_it_is_a_repeat() {
+        // The point of the escalation is that a repeat is still REFUSED. It
+        // must therefore still carry why, or the caller loses the one thing
+        // it needs to fix the write.
+        let first = block_message("a-1", "no dashes", "a - b", "-");
+        let again = escalated(&first);
+        assert!(again.starts_with(&first), "the original reason must survive verbatim: {again}");
+        assert!(again.contains("SECOND time"), "{again}");
+        assert_ne!(again, first, "a repeat that reads identically teaches the caller nothing new");
+    }
+
     #[test]
     fn a_session_that_already_blocked_a_file_is_not_blocked_again_for_that_file() {
         let text = mark_blocked_text(None, "s1", "NOTES.md").unwrap();

@@ -147,13 +147,43 @@ fn a_write_outside_the_protected_directory_is_never_blocked() {
     assert_not_blocked(&out);
 }
 
-/// At most one block per session per file: the SAME write, sent again in the
-/// SAME session, must not block a second time - proves the location guard
-/// reuses the SAME marker mechanism the content guard already relies on
-/// (mirrors `absent_check_guard.rs`'s own twin of this test), not a second
-/// one.
+/// THE GAP THIS CLOSES, and it was a documented one: this test used to
+/// assert that an identical repeat into a frozen directory went THROUGH,
+/// because the content arm's marker returned before the location check ever
+/// ran. A location prohibition does not care what a write carries - the way
+/// out of it is to write elsewhere, not to change the bytes - so a marker
+/// about bytes had no business silencing it.
+///
+/// The marker now sits at the END of the guard, after a verdict exists,
+/// where the only thing it can change is the wording of a refusal. So both
+/// halves hold at once: a repeat is still refused, and it says it is a
+/// repeat.
 #[test]
-fn a_second_write_to_the_same_file_in_the_same_session_is_not_blocked_again() {
+fn an_identical_repeat_write_into_a_frozen_directory_is_still_refused() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = fixture_with_frozen_directory_rule(dir.path());
+    let target = dir.path().join("frozen").join("cli.rs");
+
+    let same = "fn main() {}";
+    let first = run_hook(&db, &write_payload("s1", dir.path(), &target, same));
+    let v: serde_json::Value = serde_json::from_str(&first).unwrap();
+    assert_eq!(v["decision"], "block", "{first}");
+
+    let second = run_hook(&db, &write_payload("s1", dir.path(), &target, same));
+    let v: serde_json::Value = serde_json::from_str(&second)
+        .unwrap_or_else(|e| panic!("a frozen path must not open up on the second try: {e}: {second}"));
+    assert_eq!(v["decision"], "block", "{second}");
+    assert!(v["reason"].as_str().unwrap().contains("SECOND time"), "{second}");
+}
+
+/// THE DEFECT THIS PREVENTS, and it was pinned by the test above asserting
+/// something wider than its own doc comment claimed. A location rule says the
+/// directory is frozen. Under a marker keyed on the file alone, one block
+/// disarmed the rule for that file for the rest of the session, so a second
+/// and entirely different write into the frozen directory went through - and
+/// the allow path records nothing, so nothing measured it.
+#[test]
+fn a_different_write_into_the_frozen_directory_is_blocked_again() {
     let dir = tempfile::tempdir().unwrap();
     let db = fixture_with_frozen_directory_rule(dir.path());
     let target = dir.path().join("frozen").join("cli.rs");
@@ -163,7 +193,9 @@ fn a_second_write_to_the_same_file_in_the_same_session_is_not_blocked_again() {
     assert_eq!(v["decision"], "block", "{first}");
 
     let second = run_hook(&db, &write_payload("s1", dir.path(), &target, "fn other() {}"));
-    assert_not_blocked(&second);
+    let v: serde_json::Value = serde_json::from_str(&second)
+        .unwrap_or_else(|e| panic!("a fresh write into a frozen directory must still be judged: {e}: {second}"));
+    assert_eq!(v["decision"], "block", "a second, different write must not ride in free: {second}");
 }
 
 /// THE ORDERING THIS PINS (requirement 5): when a location rule and a

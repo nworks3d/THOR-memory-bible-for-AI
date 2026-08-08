@@ -120,10 +120,93 @@ fn a_write_introducing_an_em_dash_into_the_anchored_file_is_blocked_end_to_end()
     assert!(reason.contains('\u{2014}'), "the quoted fragment must carry the offending character itself: {reason}");
 }
 
-/// At most one block per session per file: the SAME write, sent again in the
-/// SAME session, must not block a second time.
+/// THE DEFECT THIS PREVENTS. This test used to assert the OPPOSITE: that an
+/// identical resend was let through, on the reasoning that a gate saying no
+/// forever invites a retry loop. That reasoning traded away the one moment a
+/// gate exists for - the moment somebody insists - and it bought loop safety
+/// with the forbidden write actually landing.
+///
+/// A repeat is refused again. The loop answer is now the WORDING: the second
+/// refusal differs from the first and says stop resending, so a caller that
+/// reads its input at all has something new to act on, and a caller that
+/// does not was never going to be saved by being allowed through.
 #[test]
-fn a_second_write_to_the_same_file_in_the_same_session_is_not_blocked_again() {
+fn the_same_write_sent_again_in_the_same_session_is_refused_again_and_says_so() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = fixture_with_em_dash_rule(dir.path());
+    let notes = dir.path().join("NOTES.md");
+
+    let same = "one em dash \u{2014} here";
+    let first = run_hook(&db, &write_payload("s1", dir.path(), &notes, same));
+    let v: serde_json::Value = serde_json::from_str(&first).unwrap();
+    assert_eq!(v["decision"], "block", "{first}");
+    let first_reason = v["reason"].as_str().unwrap().to_string();
+
+    let second = run_hook(&db, &write_payload("s1", dir.path(), &notes, same));
+    let v: serde_json::Value = serde_json::from_str(&second)
+        .unwrap_or_else(|e| panic!("an identical resend must still be judged: {e}: {second}"));
+    assert_eq!(v["decision"], "block", "the forbidden write must not land on the second try: {second}");
+    let second_reason = v["reason"].as_str().unwrap();
+    assert!(second_reason.starts_with(&first_reason), "the original reason must survive: {second_reason}");
+    assert!(second_reason.contains("SECOND time"), "a repeat must say it is one: {second_reason}");
+}
+
+/// THE DEFECT THIS PREVENTS, and this test exists because the one above used
+/// to assert it by accident. Its own doc comment says "the SAME write, sent
+/// again", but its body sent a DIFFERENT one carrying a fresh violation of
+/// the same rule, and asserted that it passed. The marker was keyed on the
+/// file alone, so it did: one block disarmed this guard for that file for the
+/// rest of the session, under any rule, including an Irreversible one, and
+/// the allow path records nothing so nothing measured it.
+///
+/// A refusal that nothing records is a refusal nobody can count, and for the
+/// whole of 2.0 up to 2026-08-08 that was every refusal there had ever been:
+/// the gate was the reason this version exists and the one capability with no
+/// measurement at all. So the event is part of the behaviour, not a nicety,
+/// and it gets a test like any other behaviour here.
+#[test]
+fn a_refusal_is_written_into_the_log_naming_the_rule_that_refused() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = fixture_with_em_dash_rule(dir.path());
+    let notes = dir.path().join("NOTES.md");
+
+    let before = gate_events(&db);
+    assert!(before.is_empty(), "nothing should have refused anything yet: {before:?}");
+
+    let out = run_hook(&db, &write_payload("s1", dir.path(), &notes, "one em dash \u{2014} here"));
+    let v: serde_json::Value = serde_json::from_str(&out).unwrap();
+    assert_eq!(v["decision"], "block", "{out}");
+
+    let after = gate_events(&db);
+    assert_eq!(after.len(), 1, "exactly one refusal, recorded once: {after:?}");
+    assert_eq!(after[0].0, "gate_refused");
+    assert_eq!(after[0].1, "no-em-dash-in-notes", "the event must name the rule that refused");
+
+    // And a repeat is still a refusal, so it is still counted. This is the
+    // number that tells you whether callers are arguing with the gate.
+    run_hook(&db, &write_payload("s1", dir.path(), &notes, "one em dash \u{2014} here"));
+    assert_eq!(gate_events(&db).len(), 2, "a repeat refusal must be counted too");
+}
+
+/// (kind, entity_id) for every gate telemetry event in the store, oldest
+/// first. Reads the real log through the real reader - the point of the test
+/// is that the binary WROTE these, so nothing here may fake them.
+fn gate_events(db: &Path) -> Vec<(String, String)> {
+    let store = thor_core::event_store::EventStore::open_existing(db).expect("store must open");
+    store
+        .get_all_events()
+        .expect("events must read")
+        .into_iter()
+        .filter(|e| matches!(e.kind, thor_core::event_store::EventKind::GateRefused | thor_core::event_store::EventKind::GateStoodAside))
+        .map(|e| (e.kind.as_str().to_string(), e.entity_id))
+        .collect()
+}
+
+/// The test above holds the unchanged-retry half of the same rule; this one
+/// holds the changed half. A different attempt is a different decision and
+/// gets its own verdict, not an inherited one.
+#[test]
+fn a_different_write_carrying_a_fresh_violation_is_blocked_again() {
     let dir = tempfile::tempdir().unwrap();
     let db = fixture_with_em_dash_rule(dir.path());
     let notes = dir.path().join("NOTES.md");
@@ -133,7 +216,9 @@ fn a_second_write_to_the_same_file_in_the_same_session_is_not_blocked_again() {
     assert_eq!(v["decision"], "block", "{first}");
 
     let second = run_hook(&db, &write_payload("s1", dir.path(), &notes, "another em dash \u{2014} here too"));
-    assert_not_blocked(&second);
+    let v: serde_json::Value = serde_json::from_str(&second)
+        .unwrap_or_else(|e| panic!("a fresh violation must still be judged: {e}: {second}"));
+    assert_eq!(v["decision"], "block", "a second, different violation must not ride in free: {second}");
 }
 
 /// The once-per-session marker keys on (session, file), never on session

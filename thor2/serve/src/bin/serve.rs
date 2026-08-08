@@ -310,6 +310,7 @@ fn decay_notice(store: &EventStore, db: &Path, cwd: Option<&Path>) -> Option<Str
     }
 
     let (mut dead, mut failing) = (0usize, 0usize);
+    let mut found: Vec<absent_guard::StaleFinding> = Vec::new();
     for li in serve::live::live_items(store).iter().filter(|li| li.item.kind.can_fire()) {
         if li.item.project.as_deref() != Some(project.as_str()) {
             continue;
@@ -327,12 +328,50 @@ fn decay_notice(store: &EventStore, db: &Path, cwd: Option<&Path>) -> Option<Str
         if let Some(check) = li.item.check.as_ref() {
             if model::check::run(check, &root) == model::check::Outcome::Fails {
                 failing += 1;
+                // A proof that RAN and came out false is the strongest thing
+                // this system can say about a stored fact: it is provably out
+                // of date. Recording it here is what makes the difference
+                // between telling somebody and asking them.
+                found.push(absent_guard::StaleFinding {
+                    id: li.id.clone(),
+                    outcome: absent_guard::StaleOutcome::Failed,
+                    check: format!("{check:?}"),
+                    file: root.display().to_string(),
+                });
             }
         }
     }
     if dead == 0 && failing == 0 {
         return None;
     }
+
+    // WHY THIS WRITES INTO THE SAME SIDECAR THE FILE GUARD USES. Until now
+    // this scan was a dead end: it is the only thing that looks at EVERY
+    // fact of a project, including the ones whose file nobody touched, and
+    // all it did was print a count. The two Stop-time guards that actually
+    // make somebody act only ever saw what was written during the turn. So
+    // the mechanism that finds the rot could not ask, and the mechanisms
+    // that ask could not see it - which is exactly why a session only ever
+    // worked on staleness when the owner brought it up himself.
+    //
+    // Handing the findings to `absent_guard`'s staleness sidecar closes that
+    // without inventing a second loop: `serve::stale_guard` already reads it
+    // at Stop, already asks about one at a time, and already treats an item
+    // as settled once it has been revised or retracted. Only FAILING proofs
+    // go in - a dead anchor means a fact fires nowhere, which is bad but is
+    // not evidence that it is wrong, and some of them are dead on purpose.
+    if !found.is_empty() {
+        if let Ok(next_seq) = store.get_next_seq() {
+            let stale_path = absent_guard::default_stale_path(db);
+            let existing = std::fs::read_to_string(&stale_path).ok();
+            if let Some(text) =
+                absent_guard::record_stale_text(existing.as_deref(), &found, next_seq.saturating_sub(1))
+            {
+                let _ = std::fs::write(&stale_path, text);
+            }
+        }
+    }
+
     let _ = std::fs::write(&stamp, &today);
     Some(format!(
         "[THOR] {project}: {dead} anchor(s) point at a file that is not there, so those facts fire nowhere, and {failing} proof(s) now come out false. Run `doctor --checkouts` to see them, or ask me to repair them."
@@ -880,9 +919,19 @@ fn capture_stop_check(db_path: &Path, session_id: &str) -> Option<HookOutput> {
     }
 }
 
-/// How many times an item must have fired, with no verdict ever, before the
-/// turn is held for one. High on purpose: this is about the handful of rules
-/// that are in front of a reader constantly, not about everything served.
+/// How many times an item must have fired SINCE its last verdict before the
+/// turn is held for another. High on purpose: this is about the handful of
+/// rules that are in front of a reader constantly, not about everything
+/// served.
+///
+/// "SINCE its last verdict", not "with no verdict ever", and the difference
+/// is the whole point. A lifetime judged-set meant one answer settled an
+/// item for good, which is the same defect `decay::is_stale` carried until
+/// 2026-08-08: a verdict given once, about an item that has since drifted,
+/// outranked a reader who would answer differently today. It also made the
+/// cheap answer the damaging one, because the debt asks first about the
+/// items that fire most - exactly the ones whose bindings are worth
+/// revisiting. Forty more firings is a long way to earn a second question.
 const JUDGEMENT_DEBT_AFTER: usize = 40;
 
 /// Ask for a verdict on ONE item that has fired over and over and has never
@@ -921,13 +970,17 @@ const JUDGEMENT_DEBT_AFTER: usize = 40;
 fn judgement_debt(store: &EventStore, session_id: &str) -> Option<String> {
     use thor_core::event_store::EventKind;
     let events = store.event_kinds().ok()?;
+    // Servings SINCE the last verdict, not servings ever: a judgement resets
+    // its item's count to zero rather than removing it from the question
+    // forever. Depends on `event_kinds()` yielding the log in order, which is
+    // what it does - it is the same fold `usefulness::noise_since_last_useful`
+    // performs on the other side of the same doctrine.
     let mut served: std::collections::HashMap<String, usize> = Default::default();
-    let mut judged: std::collections::HashSet<String> = Default::default();
     for (kind, id) in events {
         match kind {
             EventKind::ItemServed => *served.entry(id).or_default() += 1,
             EventKind::ItemMarkedUseful | EventKind::ItemMarkedNoise => {
-                judged.insert(id);
+                served.insert(id, 0);
             }
             _ => {}
         }
@@ -937,7 +990,7 @@ fn judgement_debt(store: &EventStore, session_id: &str) -> Option<String> {
     // than being walked through a random tour of the backlog.
     let mut owed: Vec<(String, usize)> = served
         .into_iter()
-        .filter(|(id, n)| *n >= JUDGEMENT_DEBT_AFTER && !judged.contains(id))
+        .filter(|(_, n)| *n >= JUDGEMENT_DEBT_AFTER)
         .collect();
     if owed.is_empty() {
         return None;
@@ -945,12 +998,26 @@ fn judgement_debt(store: &EventStore, session_id: &str) -> Option<String> {
     // Only now, and only when something is actually owed, is the whole live
     // set folded to drop the pinned ones - the empty case stays a cheap
     // count over event kinds, which is what every quiet turn pays.
-    let pinned: std::collections::HashSet<String> = serve::live::live_items(store)
-        .into_iter()
+    let live = serve::live::live_items(store);
+    let pinned: std::collections::HashSet<&String> = live
+        .iter()
         .filter(|li| li.item.bindings.iter().any(|b| matches!(b, model::item::Binding::Always)))
-        .map(|li| li.id)
+        .map(|li| &li.id)
         .collect();
     owed.retain(|(id, _)| !pinned.contains(id));
+    // And only what is still LIVE. The served/judged counts are folded from
+    // event kinds, which keep every serving an item ever had, including the
+    // ones it had before somebody retracted it. So a retracted item stayed
+    // owed forever and could never be settled: the question is "did it belong
+    // where it fired", and there is no honest answer for something that is
+    // gone. Found the moment it bit, on 2026-08-08: merging 57 duplicates
+    // turned all 57 into permanent unanswerable asks, and the very next Stop
+    // asked about one of them by name.
+    let live_ids: std::collections::HashSet<&String> = live.iter().map(|li| &li.id).collect();
+    owed.retain(|(id, _)| live_ids.contains(id));
+    if owed.is_empty() {
+        return None;
+    }
     // And only what THIS session was actually served. A lifetime count says
     // an item fired a hundred times; it says nothing about whether the
     // reader being asked was ever in the room. A rule scoped to another
@@ -968,7 +1035,7 @@ fn judgement_debt(store: &EventStore, session_id: &str) -> Option<String> {
     let remaining = owed.len();
     let text = model::store::show(store, id).ok().map(|i| i.text).unwrap_or_default();
     Some(format!(
-        "[THOR] '{id}' has been served {count} times and has never once been judged, and {remaining} item(s) are in that state. Judge this one before ending the turn: call mark with its id, noise:true if it did not belong where it fired, or plain if it helped. Two noise judgements with no mark of usefulness retire an item from every injection surface while leaving it findable; a mark of usefulness overrides any amount of noise permanently. Nothing else in this system ever retires noise - a serving count decides nothing and silence decides nothing. The item says: {text}"
+        "[THOR] '{id}' has been served {count} times and has never once been judged, and {remaining} item(s) are in that state. Judge this one before ending the turn: call mark with its id, noise:true if it did not belong where it fired, or plain if it helped. Two noise judgements since the last mark of usefulness retire an item from every injection surface while leaving it findable; a mark of usefulness clears the noise recorded before it, and a noise mark recorded after it still counts. Nothing else in this system ever retires noise - a serving count decides nothing and silence decides nothing. The item says: {text}"
     ))
 }
 
@@ -1078,6 +1145,36 @@ fn capture_sink_check(
 /// guard in this file already follows. Mirrors `capture_sink_check`'s own
 /// shape (read store/marker, decide, no side effect on the non-block path).
 #[allow(clippy::too_many_arguments)]
+/// Write down what the gate just DID.
+///
+/// This is the measurement that did not exist until 2026-08-08. Every other
+/// part of 2.0 was counted - items, checks, dead anchors, crowding - and the
+/// one capability the whole version was built for, refusing a wrong write,
+/// had no number at all. Nobody could say how often the gate fired, and
+/// nobody could say how often it had something to say and said nothing,
+/// which is how a once-per-session stand-down survived from the first day
+/// until four independent reviews read the code out loud.
+///
+/// Opens its OWN handle: the guard holds a read-only store and a refusal
+/// must never wait on, or be lost to, a writable one. Fail-silent from top
+/// to bottom, for the same reason every sidecar here is - a log that cannot
+/// take a measurement must never cost a refusal.
+fn record_gate(db_path: &Path, session_id: &str, refused: bool, reason: &str, target: &str) {
+    let Some(rule_id) = absent_guard::rule_id_of(reason) else { return };
+    let rule_id = rule_id.to_string();
+    let Ok(mut store) = thor_core::event_store::EventStore::open_existing(db_path) else { return };
+    deliver::record_gate_outcome(
+        &mut store,
+        session_id,
+        session_id,
+        "hook",
+        &time::now_iso8601(),
+        refused,
+        &rule_id,
+        target,
+    );
+}
+
 fn absent_guard_block(
     store: &EventStore,
     db_path: &Path,
@@ -1091,13 +1188,15 @@ fn absent_guard_block(
     let file_path = file_path?;
     let content = absent_guard::proposed_content(tool_name, tool_input)?;
 
-    let marker_path = absent_guard::default_marker_path(db_path);
-    let marker_text = std::fs::read_to_string(&marker_path).ok();
-    let markers = marker_text.as_deref().map(absent_guard::read_blocked).unwrap_or_default();
-    if absent_guard::already_blocked(&markers, session_id, file_path) {
-        return None;
-    }
-
+    // NOTE THE ABSENCE. The marker used to be read HERE, and an attempt it
+    // recognised returned before a single rule was evaluated. It now lives at
+    // the bottom of this function, after a verdict exists, where the only
+    // thing it can still change is the WORDING of a refusal. Two defects died
+    // with that move: a repeat no longer passes unexamined (see
+    // `absent_guard::escalated`), and a LOCATION prohibition can no longer be
+    // suppressed by a marker set for a content one - it says the path is out
+    // of bounds, so there is no such thing as "the same attempt again" for it
+    // and every write there is the same violation.
     let mut location_input = ServeInput::default();
     location_input.add_target(TargetKind::Path, file_path);
     location_input.add_target(TargetKind::Dir, file_path);
@@ -1129,6 +1228,11 @@ fn absent_guard_block(
     // file, and the more specific reason is the more useful one to report.
     // It needs no root: there is nothing to resolve.
     let always_candidates = serve::live::always_candidates(store);
+    // Location first of the five, and now genuinely first: nothing returns
+    // before it any more. It was the arm the old marker placement could
+    // silence, which was the wrong way round - it is also the arm with the
+    // least excuse for being silenced, because the way out of it is not to
+    // satisfy the rule, it is to write somewhere else.
     let reason = absent_guard::find_location_violation(&location_candidates, file_path, root)
         .or_else(|| absent_guard::find_violation(&ranked, content, root))
         .or_else(|| absent_guard::find_dir_content_violation(&location_candidates, file_path, content, root))
@@ -1150,9 +1254,23 @@ fn absent_guard_block(
                 .and_then(|after| absent_guard::find_missing_required(&location_candidates, file_path, &after, root))
         })?;
 
-    if let Some(text) = absent_guard::mark_blocked_text(marker_text.as_deref(), session_id, file_path) {
-        let _ = std::fs::write(&marker_path, text);
+    // Per ATTEMPT, not per file: see `absent_guard::attempt_key`. Keying on
+    // the file alone disarmed this guard for the rest of the session after
+    // one block, so a second, different, genuinely forbidden write passed
+    // unexamined.
+    let attempt_text = absent_guard::attempt_text(tool_name, tool_input);
+    let attempt = absent_guard::attempt_key(file_path, attempt_text.as_deref());
+    let marker_path = absent_guard::default_marker_path(db_path);
+    let marker_text = std::fs::read_to_string(&marker_path).ok();
+    let markers = marker_text.as_deref().map(absent_guard::read_blocked).unwrap_or_default();
+    let repeat = absent_guard::already_blocked(&markers, session_id, &attempt);
+    if !repeat {
+        if let Some(text) = absent_guard::mark_blocked_text(marker_text.as_deref(), session_id, &attempt) {
+            let _ = std::fs::write(&marker_path, text);
+        }
     }
+    let reason = if repeat { absent_guard::escalated(&reason) } else { reason };
+    record_gate(db_path, session_id, true, &reason, file_path);
     Some(reason)
 }
 
@@ -1228,6 +1346,19 @@ fn command_guard_block(
 
     let mut input = ServeInput::default();
     input.add_target(TargetKind::Command, command);
+    // The files and hosts the command NAMES, as doelen of their own. Without
+    // these, a fact anchored at a file fired when that file was opened with a
+    // file tool and stayed silent when a shell command read the same file -
+    // measured 2026-08-07, and it cost a real mistake in a log-grep the very
+    // fact warned about. Deliberately only the targets: the moments a command
+    // implies are the file guard's business, and adding them here would change
+    // what fires far beyond this defect.
+    for path in serve::input::paths_in_command(command) {
+        input.add_target(TargetKind::Path, &path);
+    }
+    for host in serve::input::hosts_in_command(command) {
+        input.add_target(TargetKind::Host, &host);
+    }
     let candidates = serve::live::candidates_for(store, &input);
 
     // The staleness half of the doctrine, scanned every call over the SAME
@@ -1244,12 +1375,25 @@ fn command_guard_block(
     let marker_path = absent_guard::default_command_marker_path(db_path);
     let marker_text = std::fs::read_to_string(&marker_path).ok();
     let markers = marker_text.as_deref().map(absent_guard::read_blocked).unwrap_or_default();
+    // The command arm keys on the ANCHOR alone, deliberately, and unlike the
+    // file arm that choice is reasoned in this module's own doc comment: two
+    // runs that trip the same rule rarely share the same text (a commit
+    // message differs on every retry by design), so keying on the command
+    // would suppress almost nothing and the protection would hold in name
+    // only. The file arm had no such reasoning, which is why only that one
+    // moved to a per-attempt key.
     if absent_guard::already_blocked(&markers, session_id, &anchor) {
+        // The one place in the gate that still stands aside on purpose, and
+        // therefore the one place that has to say so out loud. If this
+        // number ever grows large, the reasoning above is wrong and this arm
+        // needs the file arm's treatment.
+        record_gate(db_path, session_id, false, &reason, command);
         return None;
     }
     if let Some(text) = absent_guard::mark_blocked_text(marker_text.as_deref(), session_id, &anchor) {
         let _ = std::fs::write(&marker_path, text);
     }
+    record_gate(db_path, session_id, true, &reason, command);
     Some(reason)
 }
 
@@ -1395,6 +1539,81 @@ fn is_remember_moment(tool_name: &str) -> bool {
 }
 
 #[cfg(test)]
+mod decay_notice_tests {
+    use super::*;
+    use model::item::{Binding, Check, Item, Kind, TargetKind};
+
+    /// A checkout the way `project::resolve_project` recognises one, holding
+    /// one file, plus a store on disk beside it.
+    fn checkout(name: &str) -> (tempfile::TempDir, std::path::PathBuf) {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join(name);
+        std::fs::create_dir_all(root.join(".git")).unwrap();
+        std::fs::write(root.join("guarded.rs"), "fn kept() {}\n").unwrap();
+        (dir, root)
+    }
+
+    fn rule_with_check(store: &mut EventStore, id: &str, project: &str, literal: &str) {
+        let item = Item {
+            id: id.to_string(),
+            kind: Kind::Rule,
+            text: format!("guarded.rs still says {literal}"),
+            bindings: vec![Binding::Target { kind: TargetKind::Path, value: "guarded.rs".to_string() }],
+            severity: None,
+            project: Some(project.to_string()),
+            tags: vec![],
+            expires: None,
+            key: None,
+            falsifier: Some("the file stops saying it".to_string()),
+            check: Some(Check::Contains { path: "guarded.rs".to_string(), literal: literal.to_string() }),
+        };
+        model::store::declare(store, "t", "t", "t", &item).expect("fixture must store");
+    }
+
+    /// THE DEFECT THIS CLOSES, and it is a mechanism defect rather than a
+    /// bug. This scan is the only thing that looks at EVERY fact of a
+    /// project, including ones whose file nobody touched all session. It used
+    /// to print a count and stop there, while the two Stop-time guards that
+    /// actually make somebody act only ever saw files written during the
+    /// turn. So the thing that could find rot could not ask, and the things
+    /// that ask could not see it - which is why a session only worked on
+    /// staleness when the owner raised it himself. Recording into the same
+    /// sidecar `serve::stale_guard` already reads is what turns the finding
+    /// into a question.
+    #[test]
+    fn a_proof_that_comes_out_false_is_handed_to_the_stop_guard() {
+        let (dir, root) = checkout("Some-Project");
+        let db = dir.path().join("thor.db");
+        let mut store = EventStore::new(&db).unwrap();
+        rule_with_check(&mut store, "gone-literal", "Some-Project", "fn vanished()");
+
+        let notice = decay_notice(&store, &db, Some(&root));
+        assert!(notice.is_some(), "a false proof must still produce the owner's line");
+
+        let sidecar = serve::absent_guard::default_stale_path(&db);
+        let text = std::fs::read_to_string(&sidecar).expect("the finding must be recorded, not just counted");
+        assert!(text.contains("gone-literal"), "the item has to be nameable at Stop: {text}");
+    }
+
+    /// The other half: a proof that HOLDS says nothing at all. A scan that
+    /// recorded every fact it looked at would hand the Stop guard a backlog
+    /// of non-problems, and a guard that cries wolf gets bypassed.
+    #[test]
+    fn a_proof_that_holds_is_never_recorded() {
+        let (dir, root) = checkout("Some-Project");
+        let db = dir.path().join("thor.db");
+        let mut store = EventStore::new(&db).unwrap();
+        rule_with_check(&mut store, "still-true", "Some-Project", "fn kept()");
+
+        assert!(decay_notice(&store, &db, Some(&root)).is_none(), "nothing is wrong, so nothing is said");
+        assert!(
+            !serve::absent_guard::default_stale_path(&db).exists(),
+            "a healthy store must not grow a staleness sidecar out of nowhere"
+        );
+    }
+}
+
+#[cfg(test)]
 mod judgement_debt_tests {
     use super::*;
     use model::item::{Binding, Item, Kind};
@@ -1428,6 +1647,55 @@ mod judgement_debt_tests {
         for _ in 0..times {
             deliver::record_delivery(store, session, session, "t", "2026-08-07T00:00:00Z", &[id.to_string()]);
         }
+    }
+
+    /// THE DEFECT THIS PREVENTS, and it bit within minutes of being possible.
+    /// The served and judged counts are folded from event kinds, which keep
+    /// every serving an item ever had - including the ones from before
+    /// somebody retracted it. So a retracted item stayed owed forever, and
+    /// the ask had no honest answer: "did it belong where it fired" cannot be
+    /// answered about something that is gone. On 2026-08-08 a de-duplication
+    /// retracted 57 items and the very next Stop asked about one of them by
+    /// name, quoting an empty text because `show` refuses a tombstone.
+    #[test]
+    fn a_retracted_item_is_never_asked_about() {
+        let mut store = EventStore::in_memory().unwrap();
+        declare(&mut store, "gone", false);
+        serve_it(&mut store, "gone", JUDGEMENT_DEBT_AFTER);
+        assert!(judgement_debt(&store, "s").is_some(), "fixture sanity: it is owed while it is live");
+
+        model::store::retract(&mut store, "t", "t", "t", "gone", "merged into another item").unwrap();
+        assert!(
+            judgement_debt(&store, "s").is_none(),
+            "a retracted item must drop out of the debt, or it is owed forever with no way to settle it"
+        );
+    }
+
+    /// THE DEFECT THIS PREVENTS: one answer settling an item for life. The
+    /// debt used to hold a lifetime judged-set, so the first verdict about an
+    /// item was also the last, however far the item drifted afterwards. That
+    /// is the same shape `decay::is_stale` carried until 2026-08-08, and it
+    /// bit hardest here, because the debt asks first about the items that
+    /// fire most - the ones whose bindings are most worth a second look.
+    ///
+    /// A verdict now buys quiet, not immunity: the count resets, and another
+    /// `JUDGEMENT_DEBT_AFTER` firings earn another question.
+    #[test]
+    fn a_judged_item_is_asked_about_again_after_it_has_fired_that_many_times_since() {
+        let mut store = EventStore::in_memory().unwrap();
+        declare(&mut store, "drifter", false);
+        serve_it(&mut store, "drifter", JUDGEMENT_DEBT_AFTER);
+        assert!(judgement_debt(&store, "s").is_some(), "fixture sanity: it is owed");
+
+        serve::mark::record_useful(&mut store, "s", "s", "t", "2026-08-08T00:00:00Z", "drifter").unwrap();
+        assert!(judgement_debt(&store, "s").is_none(), "a verdict must settle it for now");
+
+        serve_it(&mut store, "drifter", JUDGEMENT_DEBT_AFTER - 1);
+        assert!(judgement_debt(&store, "s").is_none(), "one short of the threshold is not owed yet");
+
+        serve_it(&mut store, "drifter", 1);
+        let asked = judgement_debt(&store, "s").expect("forty more firings must earn a second question");
+        assert!(asked.contains("drifter"), "{asked}");
     }
 
     /// THE DEFECT THIS PREVENTS: asking for a verdict that has no honest
@@ -1875,7 +2143,7 @@ fn cmd_status(db_path: &Path, index_db: Option<&Path>, repo: Option<&Path>) {
         s.served_never_marked, s.fireable_total
     );
     println!(
-        "retired as noise (called noise {}+ times, never marked useful): {} of {} fireable item(s) - still fully findable via search",
+        "retired as noise (called noise {}+ times since the last mark of usefulness): {} of {} fireable item(s) - still fully findable via search",
         serve::decay::NOISE_MARKS_BEFORE_STALE, s.decayed, s.fireable_total
     );
     println!("missing falsifier: {} of {} fireable item(s)", s.missing_falsifier, s.fireable_total);
@@ -1965,7 +2233,7 @@ fn cmd_mark(db_path: &Path, id: &str, noise: bool) {
             "marked noise: {id} ({}+ of these, with no mark of usefulness, retires it from the injection surfaces; it stays findable via search)",
             serve::decay::NOISE_MARKS_BEFORE_STALE
         ),
-        Ok(_) => println!("marked useful: {id} (this overrides any amount of noise, permanently)"),
+        Ok(_) => println!("marked useful: {id} (clears the noise recorded before it; a later noise mark still counts)"),
         Err(e) => {
             eprintln!("could not record the mark for {id}: {e}");
             std::process::exit(1);

@@ -326,6 +326,40 @@ enum Commands {
         #[arg(long)]
         apply: bool,
     },
+    /// Fill the facets table (typed fact_type/tags/triggers/anchors/expires/
+    /// provenance) for events written before it existed, by parsing their
+    /// footer. Dry-run unless --apply. Reports every body counted: filled,
+    /// already present, without a footer, or unparseable - nothing is
+    /// skipped in silence.
+    BackfillFacets {
+        /// Actually write the facets rows (default: dry-run preview only).
+        #[arg(long)]
+        apply: bool,
+    },
+    /// THE M4 GATE: for every event whose body carries a `[memory/...]`
+    /// footer, check whether composing that footer back from its own parsed
+    /// facets reproduces the ORIGINAL body BYTE FOR BYTE. Reports how many
+    /// are identical (safe to strip the footer out of storage) versus
+    /// different (must keep it), printing entity id + both variants for
+    /// every mismatch. Read-only diagnostic - never writes anything; the
+    /// same check `thor migrate-facets-store` uses to decide what to
+    /// convert.
+    VerifyFooterRoundtrip,
+    /// Build a NEW store at NEW_DB from the current one: every event whose
+    /// footer round-trips losslessly (see `verify-footer-roundtrip`) gets its
+    /// footer moved OUT of the body and into its facets row; every other
+    /// event keeps its original body, footer and all, completely unchanged.
+    /// `parent_rev` (and a `fact_resolved` event's keep_rev/discarded) are
+    /// remapped to the new store's freshly rebuilt hash chain. Dry-run
+    /// (reports only) unless --apply. After building, verifies the new store
+    /// (event count, entity set, per-entity live content, fsck) and prints
+    /// the outcome.
+    MigrateFacetsStore {
+        new_db: PathBuf,
+        /// Actually build the new store (default: dry-run preview only).
+        #[arg(long)]
+        apply: bool,
+    },
     /// Settle a fact whose versions disagree. When two edits conflict THOR keeps
     /// BOTH rather than picking one for you, and serves both until you say which
     /// one is right. KEEP_REV is the winner; the others stay readable in
@@ -915,12 +949,57 @@ pub fn fsck_report(db: &Path, rebuild_fts: bool, rebuild_heads: bool) -> Result<
         }
     }
 
+    // Facets projection (M3): where a facets row exists, it must agree with
+    // its own event's (immutable) footer. A MISSING row is never checked
+    // here (not backfilled yet is not a failure - see the check's own doc);
+    // only a stored row that CONTRADICTS the current footer is an error, and
+    // that can only mean a write-time bug, a bad backfill, or tampering.
+    match store.verify_facets_projection() {
+        Ok(issues) if issues.is_empty() => println!("Facets projection: OK"),
+        Ok(issues) => {
+            println!(
+                "FACETS PROJECTION ERROR: {} mismatch(es), first: {}",
+                issues.len(),
+                issues[0]
+            );
+            return Ok(FsckOutcome::IntegrityFailure);
+        }
+        Err(e) => {
+            println!("FACETS PROJECTION ERROR: {}", e);
+            return Ok(FsckOutcome::IntegrityFailure);
+        }
+    }
+
     // Footer integrity is CONTENT health, not log integrity: the checks
     // above assert the store is internally consistent, this one asserts
     // that live facts still carry the metadata they were written with.
     // A wiped footer can therefore never fail fsck - nothing is corrupt,
     // and an old binary elsewhere writing one must not block a release.
-    let defects = crate::footer::defects(&events);
+    //
+    // M4: `footer::defects` reads `head.body` directly, and knows nothing
+    // about the footer-free storage shape - on a MIGRATED store that is the
+    // wrong body to look at twice over. First, false "Wiped": a
+    // successfully converted head's raw body legitimately carries no inline
+    // footer any more (it lives in the facets row instead), which otherwise
+    // reads exactly like lost metadata. Second, and more subtly, a false
+    // "Malformed": `write_defect` finds the LAST `[memory/` substring in the
+    // body to locate "the footer" - a footer-free body whose CONTENT happens
+    // to mention `[memory/` in prose (a fact ABOUT the footer format, which
+    // this project's own store genuinely contains) then reads as a broken
+    // footer, because the raw stored body no longer ends in `]` at all.
+    // Measured on the real store's own migration: one entity misfired in
+    // exactly this way. Its id is deliberately not written here - an id
+    // points into a private memory and means nothing to a reader.
+    //
+    // The fix for both is the same: content health is a DISPLAY-level
+    // question ("does what a consumer actually sees have a broken footer"),
+    // so it must run against `display_body`'s output, not the raw stored
+    // bytes - for a converted head that reattaches the real footer, whose
+    // `[memory/` is then (by construction) the LAST one in the text and the
+    // final line, so neither false positive can occur; for an unconverted
+    // or pre-M3 body `display_body` is a no-op and this is unchanged.
+    let display_events = store.with_display_bodies(events.clone());
+    let defects = crate::footer::defects(&display_events);
     if defects.is_empty() {
         println!("Footer integrity: OK");
         println!("fsck: all checks passed");
@@ -1048,11 +1127,17 @@ pub fn run() -> Result<()> {
         Commands::Get { entity_id } => {
             let store = EventStore::new(&db)?;
             let events = store.get_all_events()?;
+            // Display seam (M4): a footer-free (migrated) body gets its
+            // footer recomposed from facets here; a body that still carries
+            // its own footer inline (every event on a pre-migration store)
+            // passes through unchanged - see EventStore::display_body.
+            let events = store.with_display_bodies(events);
             print!("{}", render_get(&entity_id, &events));
         }
         Commands::History { entity_id } => {
             let store = EventStore::new(&db)?;
             let events = store.get_events_by_entity(&entity_id)?;
+            let events = store.with_display_bodies(events);
             print!("{}", render_history(&entity_id, &events));
         }
         Commands::Recall { query, all_projects, project, rerank } => {
@@ -1140,6 +1225,15 @@ pub fn run() -> Result<()> {
         }
         Commands::BackfillProjects { apply } => {
             run_backfill_projects(&db, apply)?;
+        }
+        Commands::BackfillFacets { apply } => {
+            run_backfill_facets(&db, apply)?;
+        }
+        Commands::VerifyFooterRoundtrip => {
+            run_verify_footer_roundtrip(&db)?;
+        }
+        Commands::MigrateFacetsStore { new_db, apply } => {
+            run_migrate_facets_store(&db, &new_db, apply)?;
         }
         Commands::Resolve {
             entity_id,
@@ -1515,6 +1609,12 @@ steward review prepared: {}", path.display());
             }
             if let Ok(store) = EventStore::new(&db) {
                 if let Ok(events) = store.get_all_events() {
+                    // Display seam (M4): pinned bodies are served IN FULL, so
+                    // a migrated (footer-free) pin must still show its type/
+                    // tags/anchors here - see EventStore::display_body. Also
+                    // feeds review::candidates below, so its preview line
+                    // stays correct on a migrated store too.
+                    let events = store.with_display_bodies(events);
                     // Pinned brief: standing project rules, guaranteed present at
                     // every start (startup / resume / compact) - prompt-recall can
                     // never re-surface them after a compaction on its own, because
@@ -2174,6 +2274,374 @@ fn run_backfill_projects(db: &Path, apply: bool) -> Result<()> {
     Ok(())
 }
 
+/// Summary of a `thor backfill-facets` run. Every content-bearing, non-chunk
+/// event lands in exactly ONE of these four buckets - silent skipping is
+/// refused by construction, not just by convention.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct FacetsBackfillSummary {
+    pub filled: usize,
+    pub already_present: usize,
+    pub no_footer: usize,
+    pub unparseable: usize,
+}
+
+/// `thor backfill-facets`: fill the facets table for events written before it
+/// existed (or by a binary that predates it), by parsing their footer -
+/// exactly the parser the live write path itself uses (`footer::parse_facets`),
+/// so a backfilled row can never mean something different than one written
+/// fresh. Every content-bearing (`fact_created`/`fact_revised`), non-chunk
+/// event is counted into exactly one bucket: already had a row (untouched -
+/// idempotent re-run), filled just now, carried no footer at all
+/// (legitimately untyped), or carried one that could not be parsed
+/// (`footer::write_defect`, printed with the reason). Dry-run unless `apply`.
+fn run_backfill_facets(db: &Path, apply: bool) -> Result<FacetsBackfillSummary> {
+    let store = EventStore::new(db)?;
+    let events = store.get_all_events()?;
+    let mut summary = FacetsBackfillSummary::default();
+    let mut to_write: Vec<(String, String, crate::footer::Facets)> = Vec::new();
+    for ev in &events {
+        if !matches!(ev.kind, EventKind::FactCreated | EventKind::FactRevised) {
+            continue;
+        }
+        if crate::repo::is_chunk_id(&ev.entity_id) {
+            continue;
+        }
+        if store.facets_row_exists(&ev.entity_id, &ev.this_hash) {
+            summary.already_present += 1;
+            continue;
+        }
+        if let Some(reason) = crate::footer::write_defect(&ev.body) {
+            summary.unparseable += 1;
+            eprintln!(
+                "backfill-facets: unparseable footer on {} rev {}: {}",
+                ev.entity_id,
+                &ev.this_hash[..ev.this_hash.len().min(8)],
+                reason
+            );
+            continue;
+        }
+        match crate::footer::parse_facets(&ev.body) {
+            Some(facets) => {
+                summary.filled += 1;
+                to_write.push((ev.entity_id.clone(), ev.this_hash.clone(), facets));
+            }
+            None => summary.no_footer += 1,
+        }
+    }
+    println!(
+        "backfill-facets: {} to fill, {} already present, {} without a footer, {} unparseable",
+        to_write.len(),
+        summary.already_present,
+        summary.no_footer,
+        summary.unparseable
+    );
+    if !apply {
+        println!("(dry-run; re-run with --apply to write the facets rows)");
+        return Ok(summary);
+    }
+    for (entity_id, rev_hash, facets) in &to_write {
+        store.write_facets_row(entity_id, rev_hash, facets)?;
+    }
+    println!("backfill-facets: wrote {} facets row(s).", to_write.len());
+    Ok(summary)
+}
+
+/// The M4 gate's verdict for one event's body: does composing its footer
+/// back from its own parsed facets reproduce the ORIGINAL body byte for
+/// byte? Shared by the standalone `verify-footer-roundtrip` diagnostic and
+/// `migrate-facets-store`, which uses the SAME verdict to decide, per
+/// event, whether to strip the footer out of the new store's body - the
+/// report and the migration can therefore never disagree about which events
+/// are eligible.
+enum RoundtripVerdict {
+    /// No memory footer at all (untyped fact, chunk, tombstone, resolve/
+    /// reproject payload, ...): nothing to convert, not counted as identical
+    /// or different.
+    NoFooter,
+    /// The footer parses and composing it back from the parsed facets
+    /// reproduces the original body BYTE FOR BYTE: safe to store footer-free.
+    Identical { footer_free_body: String, facets: crate::footer::Facets },
+    /// The footer parses but composing it back does NOT reproduce the
+    /// original body (a non-canonical field order, a missing always-written
+    /// field, unusual whitespace, ...): this event keeps its footer in the
+    /// body, unconverted.
+    Different { composed: String, facets: crate::footer::Facets },
+}
+
+fn roundtrip_check(body: &str) -> RoundtripVerdict {
+    let Some(facets) = crate::footer::parse_facets(body) else {
+        return RoundtripVerdict::NoFooter;
+    };
+    let footer_free_body = crate::footer::strip(body).to_string();
+    let composed = crate::footer::compose_from_facets(&footer_free_body, &facets);
+    if composed == body {
+        RoundtripVerdict::Identical { footer_free_body, facets }
+    } else {
+        RoundtripVerdict::Different { composed, facets }
+    }
+}
+
+/// Summary of a `thor verify-footer-roundtrip` (or the same check run
+/// inside `migrate-facets-store`) pass over every event in a store.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct RoundtripSummary {
+    pub identical: usize,
+    pub different: usize,
+    pub no_footer: usize,
+}
+
+/// THE GATE (task 3): loop over every event and report, for each one whose
+/// body carries a memory footer, whether composing that footer back from its
+/// own parsed facets reproduces the original body byte for byte. Never
+/// writes anything - a pure diagnostic, runnable on any store (before a
+/// migration, to preview it; or on its own, out of curiosity).
+fn run_verify_footer_roundtrip(db: &Path) -> Result<RoundtripSummary> {
+    let store = EventStore::open_existing(db)?;
+    let events = store.get_all_events()?;
+    let mut summary = RoundtripSummary::default();
+    for ev in &events {
+        match roundtrip_check(&ev.body) {
+            RoundtripVerdict::NoFooter => summary.no_footer += 1,
+            RoundtripVerdict::Identical { .. } => summary.identical += 1,
+            RoundtripVerdict::Different { composed, .. } => {
+                summary.different += 1;
+                let short = &ev.this_hash[..ev.this_hash.len().min(8)];
+                println!("ROUNDTRIP MISMATCH: {} rev {}", ev.entity_id, short);
+                println!("  original: {:?}", ev.body);
+                println!("  composed: {:?}", composed);
+            }
+        }
+    }
+    println!(
+        "footer roundtrip: {} event(s) total - {} identical (safe to strip), {} different (must \
+         keep their footer), {} carry no footer at all",
+        events.len(),
+        summary.identical,
+        summary.different,
+        summary.no_footer
+    );
+    Ok(summary)
+}
+
+/// Remap the rev-hash references INSIDE a `fact_resolved` body (`keep_rev` +
+/// `discarded[]`) from old hashes to new ones, via the same old->new map the
+/// migration builds as it replays the log. These are references between
+/// revisions exactly like `parent_rev` - just carried in the JSON body
+/// instead of the dedicated column - and silently leaving them pointing at
+/// hashes that no longer exist in the new store would leave a resolved,
+/// DIVERGED fact silently diverged again post-migration (see
+/// cas::compute_head_sets: an invalid resolve is a no-op on the head-set).
+/// A malformed body (parse_resolve_body returns None) is passed through
+/// UNCHANGED: it was already a no-op in the old store, so leaving its
+/// (meaningless) content as-is changes nothing about what either store
+/// computes.
+fn remap_resolve_body(body: &str, hash_map: &HashMap<String, String>) -> String {
+    let Some((keep_rev, discarded)) = crate::cas::parse_resolve_body(body) else {
+        return body.to_string();
+    };
+    let remap = |h: &str| hash_map.get(h).cloned().unwrap_or_else(|| h.to_string());
+    let new_keep = remap(&keep_rev);
+    let new_discarded: Vec<String> = discarded.iter().map(|d| remap(d)).collect();
+    serde_json::json!({ "keep_rev": new_keep, "discarded": new_discarded }).to_string()
+}
+
+/// Summary of a `thor migrate-facets-store` run.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct MigrationSummary {
+    pub total_events: usize,
+    pub converted: usize,
+    pub kept_footer: usize,
+    pub no_footer: usize,
+}
+
+/// Task 2 + 3 + 4: build a NEW store at `new_db` from `db`, moving every
+/// losslessly-convertible event's footer out of its body and into its
+/// facets row, then verify the result. Dry-run (reports the same counts
+/// `verify-footer-roundtrip` would) unless `apply`.
+///
+/// Replays the log in seq order into a fresh store via the raw
+/// `append_event` primitive (never `append_mutate_checked`'s CAS checks -
+/// this is a faithful REPLAY of already-valid history, not a new write), so
+/// the hash chain is rebuilt from scratch - legitimate, since this is a new
+/// store (event_uuid is freshly minted the same way). `parent_rev` and a
+/// `fact_resolved` body's keep_rev/discarded are remapped through a
+/// `HashMap<old_hash, new_hash>` built incrementally as events are
+/// replayed - by construction every reference an event N cites was appended
+/// (and is therefore already in the map) before event N itself, since a
+/// hash-chained log can only ever reference something earlier in seq order.
+fn run_migrate_facets_store(db: &Path, new_db: &Path, apply: bool) -> Result<MigrationSummary> {
+    anyhow::ensure!(
+        !new_db.exists(),
+        "refusing to overwrite an existing file at {} - pass a path that does not exist yet",
+        new_db.display()
+    );
+    let old_store = EventStore::open_existing(db)?;
+    let events = old_store.get_all_events()?;
+
+    let mut summary = MigrationSummary { total_events: events.len(), ..Default::default() };
+    for ev in &events {
+        match roundtrip_check(&ev.body) {
+            RoundtripVerdict::NoFooter => summary.no_footer += 1,
+            RoundtripVerdict::Identical { .. } => summary.converted += 1,
+            RoundtripVerdict::Different { .. } => summary.kept_footer += 1,
+        }
+    }
+    println!(
+        "migrate-facets-store: {} event(s) total - {} to convert (footer moves to facets), {} keep \
+         their footer (round-trip not lossless), {} carry no footer at all",
+        summary.total_events, summary.converted, summary.kept_footer, summary.no_footer
+    );
+    if !apply {
+        println!("(dry-run; re-run with --apply to actually build {})", new_db.display());
+        return Ok(summary);
+    }
+
+    let mut new_store = EventStore::new(new_db)?;
+    let mut hash_map: HashMap<String, String> = HashMap::new();
+    for ev in &events {
+        let new_parent = match &ev.parent_rev {
+            None => None,
+            Some(p) => match hash_map.get(p) {
+                Some(mapped) => Some(mapped.clone()),
+                None => {
+                    // A parent_rev that was never appended before its child in
+                    // THIS store's own seq order: the source log is already
+                    // broken (a dangling reference `thor fsck` on the old
+                    // store should have caught first). Carry the old value
+                    // through rather than silently inventing one - the new
+                    // store's chain-integrity check will then fail loudly on
+                    // it instead of hiding it.
+                    eprintln!(
+                        "migrate-facets-store: WARNING - {} rev {} cites parent {} which was never \
+                         seen earlier in the log; carrying it through unmapped",
+                        ev.entity_id, &ev.this_hash[..8.min(ev.this_hash.len())], p
+                    );
+                    Some(p.clone())
+                }
+            },
+        };
+        let verdict = roundtrip_check(&ev.body);
+        let (new_body, facets_to_write) = match &verdict {
+            RoundtripVerdict::Identical { footer_free_body, facets } => {
+                (footer_free_body.clone(), Some(facets.clone()))
+            }
+            RoundtripVerdict::Different { facets, .. } => (ev.body.clone(), Some(facets.clone())),
+            RoundtripVerdict::NoFooter if ev.kind == EventKind::FactResolved => {
+                (remap_resolve_body(&ev.body, &hash_map), None)
+            }
+            RoundtripVerdict::NoFooter => (ev.body.clone(), None),
+        };
+        let new_ev = new_store.append_event(
+            &ev.session_id, &ev.lineage_id, &ev.actor, ev.kind, &ev.entity_id,
+            new_parent.as_deref(), &new_body,
+        )?;
+        hash_map.insert(ev.this_hash.clone(), new_ev.this_hash.clone());
+        // Facets row: written for every event whose ORIGINAL footer parsed,
+        // converted or not (M3's own live-write behavior does the same for
+        // an unconverted event - it upserts on the appended body's own
+        // footer during apply_facets_delta above; this call for a converted
+        // event fills in what apply_facets_delta could NOT see, since
+        // new_body is now footer-free). Reuses the SAME parse roundtrip_check
+        // already did - never a second, independent parse of the same body.
+        if let Some(facets) = facets_to_write {
+            new_store.write_facets_row(&new_ev.entity_id, &new_ev.this_hash, &facets)?;
+        }
+    }
+    println!("migrate-facets-store: new store built at {}", new_db.display());
+
+    let issues = verify_migrated_store(&events, &new_store, &hash_map)?;
+    if issues.is_empty() {
+        println!("migrate-facets-store: new-store verification OK (event count, entity set, per-entity live content all match)");
+    } else {
+        println!("migrate-facets-store: NEW-STORE VERIFICATION FAILED ({} issue(s)):", issues.len());
+        for issue in &issues {
+            println!("  {issue}");
+        }
+    }
+
+    match fsck_report(new_db, false, false)? {
+        FsckOutcome::Clean => println!("fsck on new store: clean"),
+        FsckOutcome::FooterDefects(n) => println!("fsck on new store: {n} footer defect(s) (see above)"),
+        FsckOutcome::IntegrityFailure => println!("fsck on new store: INTEGRITY FAILURE (see above)"),
+    }
+
+    if !issues.is_empty() {
+        anyhow::bail!("migrate-facets-store: {} new-store verification issue(s); see above", issues.len());
+    }
+    Ok(summary)
+}
+
+/// Task 4: compare the OLD store's events against the freshly-built NEW
+/// store. `hash_map` is the SAME old-hash -> new-hash map the migration
+/// built while replaying, so a head can be matched up 1:1 across the two
+/// stores without depending on entity/rev string layout.
+fn verify_migrated_store(
+    old_events: &[Event],
+    new_store: &EventStore,
+    hash_map: &HashMap<String, String>,
+) -> Result<Vec<String>> {
+    use std::collections::HashSet;
+
+    let mut issues = Vec::new();
+    let new_events = new_store.get_all_events()?;
+    if old_events.len() != new_events.len() {
+        issues.push(format!(
+            "event count differs: old store has {}, new store has {}",
+            old_events.len(),
+            new_events.len()
+        ));
+    }
+
+    let old_heads = compute_head_sets(old_events);
+    let new_heads = compute_head_sets(&new_events);
+    let old_by_hash: HashMap<&str, &Event> = old_events.iter().map(|e| (e.this_hash.as_str(), e)).collect();
+    let new_by_hash: HashMap<&str, &Event> = new_events.iter().map(|e| (e.this_hash.as_str(), e)).collect();
+
+    let old_entities: HashSet<&String> = old_heads.keys().collect();
+    let new_entities: HashSet<&String> = new_heads.keys().collect();
+    for e in old_entities.difference(&new_entities) {
+        issues.push(format!("entity {e} is present in the old store but missing from the new one"));
+    }
+    for e in new_entities.difference(&old_entities) {
+        issues.push(format!("entity {e} is present in the new store but was not in the old one"));
+    }
+
+    for (entity_id, old_hs) in &old_heads {
+        let Some(new_hs) = new_heads.get(entity_id) else { continue }; // already reported above
+        let expected_new_heads: HashSet<String> =
+            old_hs.heads.iter().map(|h| hash_map.get(h).cloned().unwrap_or_else(|| h.clone())).collect();
+        if expected_new_heads != new_hs.heads {
+            issues.push(format!(
+                "entity {entity_id}: head-set does not correspond 1:1 after remapping (old {} head(s), new {} head(s))",
+                old_hs.heads.len(),
+                new_hs.heads.len()
+            ));
+            continue;
+        }
+        for old_head in &old_hs.heads {
+            let Some(old_ev) = old_by_hash.get(old_head.as_str()) else { continue };
+            let Some(new_head) = hash_map.get(old_head) else { continue };
+            let Some(new_ev) = new_by_hash.get(new_head.as_str()) else {
+                issues.push(format!("entity {entity_id}: mapped head {new_head} not found in the new store"));
+                continue;
+            };
+            // The consumer-visible content: the OLD store always shows its
+            // own body verbatim (it still carries its own footer inline, on
+            // every event, by construction); the NEW store must show the
+            // SAME bytes via display_body, whether that event was converted
+            // (footer recomposed from facets) or kept its footer as-is.
+            let displayed_new = new_store.display_body(entity_id, new_head, &new_ev.body);
+            if displayed_new != old_ev.body {
+                issues.push(format!(
+                    "entity {entity_id} head {}: live content differs after migration",
+                    &old_head[..old_head.len().min(8)]
+                ));
+            }
+        }
+    }
+    Ok(issues)
+}
+
 /// Build/sync/status the dense vectors sidecar. A model-id mismatch (or --force)
 /// triggers a full rebuild; `sync` otherwise embeds only events past the sidecar
 /// tip (index maintenance for newly-remembered facts). Fails loudly if the model
@@ -2812,6 +3280,125 @@ mod tests {
         }
     }
 
+    /// A store that has never run `backfill-facets` (or predates the facets
+    /// table entirely) must fsck GREEN - a missing row is not a defect, only
+    /// a contradiction is. `seed_store` writes plain `[memory/note | ...]`
+    /// facts and never backfills them.
+    #[test]
+    fn fsck_stays_clean_with_no_facets_rows_at_all() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = seed_store(dir.path());
+        assert_eq!(fsck_report(&db, false, false).unwrap(), FsckOutcome::Clean);
+    }
+
+    /// The new fsck check's whole reason to exist: a facets row that
+    /// CONTRADICTS its own event's (immutable) footer is a real integrity
+    /// problem - direct tampering, or a write-time/backfill bug - and must
+    /// fail fsck loudly, exactly like a heads-projection mismatch does.
+    #[test]
+    fn fsck_fails_when_a_facets_row_contradicts_its_footer() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("thor.db");
+        let this_hash;
+        {
+            let mut store = EventStore::new(&db).unwrap();
+            let ev = store
+                .append_event(
+                    "s", "l", "a", EventKind::FactCreated, "e-tampered", None,
+                    "never deploy on friday\n\n[memory/gotcha | tags: deploy | project: global]",
+                )
+                .unwrap();
+            this_hash = ev.this_hash.clone();
+        }
+        {
+            let conn = rusqlite::Connection::open(&db).unwrap();
+            conn.execute(
+                "UPDATE fact_facets SET fact_type = 'decision' WHERE entity_id = 'e-tampered' AND rev_hash = ?",
+                [&this_hash],
+            )
+            .unwrap();
+        }
+        assert_eq!(
+            fsck_report(&db, false, false).unwrap(),
+            FsckOutcome::IntegrityFailure,
+            "a facets row that disagrees with its own footer must fail fsck"
+        );
+    }
+
+    /// The backfill's own accounting contract: every content-bearing event is
+    /// counted into exactly one bucket (filled / already present / no footer
+    /// / unparseable), dry-run changes nothing, and --apply is idempotent.
+    #[test]
+    fn backfill_facets_counts_every_bucket_and_is_idempotent() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("thor.db");
+        let typed_hash;
+        {
+            let mut store = EventStore::new(&db).unwrap();
+            // Filled: a real, parseable memory footer. The live write path
+            // populates its facets row immediately - delete it below to
+            // simulate the actual backfill target: an event written by a
+            // binary that predates this table (or a bulk path that bypassed
+            // it), which is the only way a row can be legitimately missing.
+            let ev = store
+                .append_event(
+                    "s", "l", "a", EventKind::FactCreated, "e-typed", None,
+                    "never deploy on friday\n\n[memory/gotcha | tags: deploy | project: global]",
+                )
+                .unwrap();
+            typed_hash = ev.this_hash.clone();
+            // No footer at all: legitimately untyped.
+            store
+                .append_event("s", "l", "a", EventKind::FactCreated, "e-plain", None, "just a note")
+                .unwrap();
+            // Unparseable: trailing garbage after the footer's closing bracket.
+            store
+                .append_event(
+                    "s", "l", "a", EventKind::FactCreated, "e-broken", None,
+                    "a fact\n\n[memory/note | project: global]\nKind: fact_created",
+                )
+                .unwrap();
+        }
+        {
+            let conn = rusqlite::Connection::open(&db).unwrap();
+            conn.execute(
+                "DELETE FROM fact_facets WHERE entity_id = 'e-typed' AND rev_hash = ?",
+                [&typed_hash],
+            )
+            .unwrap();
+        }
+        // Dry-run changes nothing.
+        let dry = run_backfill_facets(&db, false).unwrap();
+        assert_eq!(
+            (dry.filled, dry.already_present, dry.no_footer, dry.unparseable),
+            (1, 0, 1, 1)
+        );
+        {
+            let store = EventStore::new(&db).unwrap();
+            assert!(!store.facets_row_exists("e-typed", &typed_hash), "dry-run wrote nothing");
+        }
+
+        let applied = run_backfill_facets(&db, true).unwrap();
+        assert_eq!(
+            (applied.filled, applied.already_present, applied.no_footer, applied.unparseable),
+            (1, 0, 1, 1)
+        );
+        {
+            let store = EventStore::new(&db).unwrap();
+            let ev = store.get_all_events().unwrap().into_iter().find(|e| e.entity_id == "e-typed").unwrap();
+            assert!(store.facets_row_exists("e-typed", &ev.this_hash), "the row is now there");
+        }
+
+        // Re-running with --apply must not double-count what is now present.
+        let second = run_backfill_facets(&db, true).unwrap();
+        assert_eq!(
+            (second.filled, second.already_present, second.no_footer, second.unparseable),
+            (0, 1, 1, 1),
+            "the typed fact is now 'already present', not filled again"
+        );
+        assert_eq!(fsck_report(&db, false, false).unwrap(), FsckOutcome::FooterDefects(1));
+    }
+
     /// `thor init` is the command docs/SETUP.md tells a new user to run, so it must
     /// leave where_used/impact with a sidecar to answer from - not just a marker
     /// file. The refresh used to sit in the Ingest match arm, which init bypassed.
@@ -2919,5 +3506,250 @@ mod tests {
             crate::ledger::read_pins(&db).is_empty(),
             "seeding must never fight the user's own unpin"
         );
+    }
+
+    /// THE GATE ITSELF (task 3): a canonical footer (compose()'s own output)
+    /// must round-trip identical; a footer missing the always-written `tags`
+    /// field (a shape compose()/edit_footer never produce, but a plausible
+    /// hand-written one) must NOT - it keeps its footer, and is reported as
+    /// `different`, never silently smoothed over into `identical`.
+    #[test]
+    fn verify_footer_roundtrip_separates_canonical_footers_from_non_canonical_ones() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("thor.db");
+        {
+            let mut store = EventStore::new(&db).unwrap();
+            let canonical_footer = crate::footer::compose("gotcha", &["deploy".into()], "global", &[], &[], None);
+            store
+                .append_event(
+                    "s", "l", "a", EventKind::FactCreated, "e-canonical", None,
+                    &format!("never deploy on friday\n\n{canonical_footer}"),
+                )
+                .unwrap();
+            // Missing the `tags:` field entirely - compose()/edit_footer never
+            // omit it, so this cannot round-trip through compose_from_facets.
+            store
+                .append_event(
+                    "s", "l", "a", EventKind::FactCreated, "e-non-canonical", None,
+                    "a rule\n\n[memory/gotcha | project: global]",
+                )
+                .unwrap();
+            // No footer at all: out of scope for identical/different.
+            store.append_event("s", "l", "a", EventKind::FactCreated, "e-untyped", None, "just a note").unwrap();
+        }
+        let summary = run_verify_footer_roundtrip(&db).unwrap();
+        assert_eq!(
+            (summary.identical, summary.different, summary.no_footer),
+            (1, 1, 1),
+            "exactly one canonical (identical), one non-canonical (different), one footer-less"
+        );
+    }
+
+    /// Builds a small store exercising every migration-relevant shape in one
+    /// place: a plain create+revise chain (both convertible), a
+    /// non-canonical footer that must keep it, an untyped fact, and a
+    /// diverged-then-resolved entity (the fact_resolved keep_rev/discarded
+    /// remap - "the real work", per the task brief). Returns the db path and
+    /// the FactResolved entity's id for the resolve-specific assertions.
+    fn seed_migration_fixture(dir: &std::path::Path) -> (std::path::PathBuf, String) {
+        let db = dir.join("thor.db");
+        let mut store = EventStore::new(&db).unwrap();
+
+        // e1: create -> revise, both canonical footers - fully convertible,
+        // and the revise's parent_rev is exactly the reference that must be
+        // remapped to the new store's freshly minted hash.
+        let f1 = crate::footer::compose("gotcha", &["a".into()], "global", &[], &[], None);
+        let v1 = store
+            .append_event("s", "l", "a", EventKind::FactCreated, "e1", None, &format!("v1\n\n{f1}"))
+            .unwrap();
+        let f2 = crate::footer::compose("decision", &["b".into()], "global", &[], &[], None);
+        store
+            .append_mutate_checked(
+                "s", "l", "a", EventKind::FactRevised, "e1", Some(&v1.this_hash), &format!("v2\n\n{f2}"),
+            )
+            .unwrap();
+
+        // e2: a non-canonical footer - must keep its footer, unconverted.
+        store
+            .append_event(
+                "s", "l", "a", EventKind::FactCreated, "e2", None,
+                "a rule\n\n[memory/gotcha | project: global]",
+            )
+            .unwrap();
+
+        // e3: untyped - nothing to convert.
+        store.append_event("s", "l", "a", EventKind::FactCreated, "e3", None, "just a note").unwrap();
+
+        // e4: create -> two competing revises (DIVERGED) -> resolved. Both
+        // branches carry canonical footers so they convert too; the resolve
+        // itself carries rev-hash references that must be remapped.
+        let f4 = crate::footer::compose("gotcha", &["c".into()], "global", &[], &[], None);
+        let e4v1 = store
+            .append_event("s", "l", "a", EventKind::FactCreated, "e4", None, &format!("e4 v1\n\n{f4}"))
+            .unwrap();
+        let f4a = crate::footer::compose("gotcha", &["c".into()], "global", &[], &[], None);
+        let branch_a = store
+            .append_event(
+                "s", "l", "a", EventKind::FactRevised, "e4", Some(&e4v1.this_hash), &format!("e4 branch A\n\n{f4a}"),
+            )
+            .unwrap();
+        let f4b = crate::footer::compose("gotcha", &["c".into()], "global", &[], &[], None);
+        let branch_b = store
+            .append_event(
+                "s", "l", "a", EventKind::FactRevised, "e4", Some(&e4v1.this_hash), &format!("e4 branch B\n\n{f4b}"),
+            )
+            .unwrap();
+        store
+            .append_resolve("s", "l", "a", "e4", &branch_a.this_hash, &[branch_b.this_hash.clone()])
+            .unwrap();
+
+        (db, "e4".to_string())
+    }
+
+    /// Task 2 + 3 + 4, end to end on a synthetic fixture: dry-run changes
+    /// nothing and reports the exact per-bucket counts; --apply builds a
+    /// real new store that passes its own verification AND fsck; and the
+    /// PARENT_REV / RESOLVE remapping specifically did its job - e4 is a
+    /// single, non-diverged head in the new store, not silently re-diverged.
+    #[test]
+    fn migrate_facets_store_converts_what_it_can_and_verifies_the_result() {
+        let dir = tempfile::tempdir().unwrap();
+        let (db, resolved_entity) = seed_migration_fixture(dir.path());
+        let new_db = dir.path().join("new.db");
+
+        // Dry-run: reports, writes nothing.
+        let dry = run_migrate_facets_store(&db, &new_db, false).unwrap();
+        assert!(!new_db.exists(), "dry-run must not create the new store file");
+        // e1 create + revise = 2 converted; e4 create + 2 branches = 3
+        // converted (all canonical); e2 = 1 kept_footer; e3 (untyped) + e4's
+        // own fact_resolved event (a JSON body, no memory footer at all) = 2
+        // no_footer. Total 8 events: 5 + 1 + 2 = 8.
+        assert_eq!(
+            (dry.converted, dry.kept_footer, dry.no_footer),
+            (5, 1, 2),
+            "{dry:?}"
+        );
+
+        let applied = run_migrate_facets_store(&db, &new_db, true).unwrap();
+        assert_eq!((applied.converted, applied.kept_footer, applied.no_footer), (5, 1, 2));
+        assert!(new_db.exists(), "--apply must build the new store file");
+
+        // The resolve's rev-hash references were remapped correctly: e4 has
+        // exactly ONE live head in the new store, not two (which is what a
+        // silently-broken remap would produce - the resolve would then cite
+        // hashes that do not exist in the new chain and be a no-op).
+        let new_store = EventStore::new(&new_db).unwrap();
+        let new_events = new_store.get_all_events().unwrap();
+        let new_heads = crate::cas::compute_head_sets(&new_events);
+        let e4_heads = new_heads.get(&resolved_entity).expect("e4 exists in the new store");
+        assert_eq!(e4_heads.heads.len(), 1, "the resolve must still resolve after remapping: {e4_heads:?}");
+        assert!(!e4_heads.is_diverged);
+
+        // e1's revise parent_rev was remapped too: the new store's own
+        // fold must see a normal fast-forward (one live head), not a branch.
+        let e1_heads = new_heads.get("e1").expect("e1 exists in the new store");
+        assert_eq!(e1_heads.heads.len(), 1, "the revise must fast-forward on the remapped parent");
+
+        // Same event count as the old store.
+        let old_store = EventStore::new(&db).unwrap();
+        assert_eq!(new_events.len(), old_store.get_all_events().unwrap().len());
+
+        // fsck on the new store must be green.
+        assert_eq!(fsck_report(&new_db, false, false).unwrap(), FsckOutcome::Clean);
+    }
+
+    /// The event whose footer could not round-trip (e2, from the fixture)
+    /// must show up in the new store EXACTLY as it was in the old one - body
+    /// byte-identical, footer still inline - never silently forced through.
+    #[test]
+    fn migrate_facets_store_leaves_a_non_lossless_event_completely_unconverted() {
+        let dir = tempfile::tempdir().unwrap();
+        let (db, _) = seed_migration_fixture(dir.path());
+        let new_db = dir.path().join("new.db");
+        run_migrate_facets_store(&db, &new_db, true).unwrap();
+
+        let old_store = EventStore::new(&db).unwrap();
+        let old_body = old_store.get_events_by_entity("e2").unwrap()[0].body.clone();
+        let new_store = EventStore::new(&new_db).unwrap();
+        let new_ev = new_store.get_events_by_entity("e2").unwrap().into_iter().next().unwrap();
+        assert_eq!(new_ev.body, old_body, "an unconvertible event's body must be carried over byte for byte");
+        assert!(crate::footer::extract(&new_ev.body).is_some(), "it still carries its footer inline");
+    }
+
+    /// THE BUG FOUND ON THE REAL STORE: a fact whose CONTENT happens to
+    /// mention `[memory/` as prose (a fact ABOUT the footer format itself -
+    /// entirely plausible in a store that documents its own conventions)
+    /// converts cleanly (the round-trip gate only compares the RECOMPOSED
+    /// footer, which is unaffected by an earlier substring match). But once
+    /// migrated, the raw stored body no longer ends in `]`, and
+    /// `footer::write_defect` locates "the footer" by the LAST `[memory/`
+    /// substring in the body - which is now that prose mention, not a real
+    /// footer - so fsck misread a perfectly healthy migrated fact as
+    /// MALFORMED. `fsck_report` must check the DISPLAY body (footer
+    /// reattached from facets), where the reattached footer is, by
+    /// construction, both the last `[memory/` occurrence and the final line.
+    #[test]
+    fn migrate_facets_store_does_not_misflag_content_that_mentions_the_footer_format() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("thor.db");
+        {
+            let mut store = EventStore::new(&db).unwrap();
+            // The prose mentions "[memory/" (an earlier occurrence than the
+            // REAL trailing footer) but deliberately carries none of the
+            // " | tags: " / " | project: " etc. field markers, so it cannot
+            // also confuse parse_facets - only write_defect's marker search
+            // is at stake here.
+            let footer = crate::footer::compose("gotcha", &["docs".into()], "global", &[], &[], None);
+            let body = format!(
+                "THOR's footer starts with the literal text [memory/ followed by a type name - \
+                 do not hand-edit it.\n\n{footer}"
+            );
+            store.append_event("s", "l", "a", EventKind::FactCreated, "e-self-referential", None, &body).unwrap();
+        }
+        let new_db = dir.path().join("new.db");
+        let summary = run_migrate_facets_store(&db, &new_db, true).unwrap();
+        assert_eq!(summary.converted, 1, "the round-trip gate must accept this - only the LAST match is the real footer");
+
+        let new_store = EventStore::new(&new_db).unwrap();
+        let new_ev = new_store.get_events_by_entity("e-self-referential").unwrap().into_iter().next().unwrap();
+        assert!(
+            crate::footer::extract(&new_ev.body).is_none(),
+            "the raw stored body is footer-free after conversion, and now ends mid-prose"
+        );
+        assert_eq!(
+            fsck_report(&new_db, false, false).unwrap(),
+            FsckOutcome::Clean,
+            "fsck must judge the DISPLAY body (footer reattached), not the raw footer-free storage"
+        );
+    }
+
+    /// "An old store without facets just keeps working": running the
+    /// migration chain against a store that has NEVER run `backfill-facets`
+    /// (the everyday shape of the real store today) must work exactly the
+    /// same - the migration derives facets fresh from parsing each body, it
+    /// never depends on the fact_facets table being pre-populated.
+    #[test]
+    fn migrate_facets_store_works_on_a_store_that_never_ran_backfill_facets() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = seed_store(dir.path()); // seed_store's own facts have no `tags:` field
+        let new_db = dir.path().join("new.db");
+        let summary = run_migrate_facets_store(&db, &new_db, true).unwrap();
+        // seed_store's 5 facts all carry `[memory/note | project: global]`
+        // with no tags field - non-canonical, so none convert; nothing here
+        // is untyped or errors.
+        assert_eq!(summary.no_footer, 0);
+        assert_eq!(summary.converted + summary.kept_footer, 5);
+        assert_eq!(fsck_report(&new_db, false, false).unwrap(), FsckOutcome::Clean);
+    }
+
+    /// `migrate-facets-store` must refuse to clobber an existing file rather
+    /// than silently overwriting whatever is there.
+    #[test]
+    fn migrate_facets_store_refuses_to_overwrite_an_existing_new_db_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = seed_store(dir.path());
+        let new_db = dir.path().join("already-here.db");
+        std::fs::write(&new_db, b"not a thor store").unwrap();
+        assert!(run_migrate_facets_store(&db, &new_db, true).is_err());
     }
 }

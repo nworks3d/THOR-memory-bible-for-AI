@@ -744,6 +744,8 @@ impl ThorServer {
             if events.iter().any(|e| e.entity_id == target) {
                 crate::ledger::increment(&db, "access", &target);
             }
+            // Display seam (M4): see EventStore::display_body.
+            let events = s.with_display_bodies(events);
             Ok(render_get(&target, &events))
         })
         .await
@@ -919,6 +921,7 @@ impl ThorServer {
     async fn history(&self, Parameters(args): Parameters<EntityArgs>) -> String {
         self.blocking(move |s| {
             let events = s.get_events_by_entity(&args.entity_id).map_err(|e| format!("error: {e}"))?;
+            let events = s.with_display_bodies(events);
             Ok(render_history(&args.entity_id, &events))
         })
         .await
@@ -1358,6 +1361,9 @@ impl ThorServer {
             } else {
                 let (rev, head_body, project) =
                     head_for_field_edit(s, &args.entity_id, parent_arg.as_deref())?;
+                // Kept for the drop-gate below: `head_body` itself is moved
+                // into `base` in the body_arg:None arm.
+                let head_body_for_gate = head_body.clone();
                 let base = match body_arg {
                     Some(b) => {
                         crate::footer::carry_over(b, &head_body).unwrap_or_else(|| b.to_string())
@@ -1391,6 +1397,29 @@ impl ThorServer {
                         format!("{}\n\n{}", base.trim_end(), footer)
                     }
                 };
+                // The write-gate: does the FINAL new_body drop a metadata
+                // field the current head had, without any of THIS call's
+                // parameters naming it? `edit_footer` itself can never do
+                // that (it only edits named fields), but `base` may already
+                // be an INCOMPLETE retype the caller supplied via `body`
+                // (carry_over steps aside the moment body brings its own
+                // footer) - so a field neither `body`'s own footer nor any
+                // parameter mentions can still vanish. Reads the OLD side via
+                // the facets table first (read_facets), falling back to the
+                // footer for a pre-facets event - the same fallback every
+                // other reader gets.
+                let old_facets = s.read_facets(&args.entity_id, &rev, &head_body_for_gate);
+                let new_facets = crate::footer::parse_facets(&new_body).unwrap_or_default();
+                if let Some(field) = crate::footer::dropped_fields(&old_facets, &new_facets, &edits) {
+                    return Err(format!(
+                        "rejected: this revise would drop the current fact's '{field}' field - \
+                         'body' brought its own footer that does not mention it, and nothing else \
+                         in this call said {field} was meant to change. Pass {field} explicitly \
+                         (its current value, a new one, or empty/\"\" to clear it on purpose), or \
+                         drop the footer from 'body' so the current one carries over untouched. \
+                         Nothing was written."
+                    ));
+                }
                 (new_body, Some(rev))
             };
             let body = body.as_str();
@@ -1788,6 +1817,11 @@ impl ThorServer {
         self.blocking(move |s| {
             let project = args.project.or(server_project);
             let events = s.get_all_events().map_err(|e| format!("error: {e}"))?;
+            // Display seam (M4): a footer-free (migrated) body gets its
+            // footer recomposed from facets here - the type stats, recent-
+            // memory snippets and the pinned brief all read `event.body`
+            // downstream, so this ONE seam covers all three at once.
+            let events = s.with_display_bodies(events);
             Ok(render_overview(&events, &db, project.as_deref()))
         })
         .await
@@ -2538,6 +2572,66 @@ mod tests {
              deploy/watcher.sh, docker compose up | project: P | mimir:01KIMPORT]",
             "content, type, tags, project and the mimir marker survive byte-for-byte"
         );
+    }
+
+    /// The write-gate (task 4): a `body` that brings its OWN retyped footer,
+    /// combined with an explicit metadata parameter for a DIFFERENT field,
+    /// must not be allowed to silently drop a field neither the body's
+    /// footer nor any parameter mentions. `carry_over` cannot see this - the
+    /// caller's body is a real footer, so "theirs wins" - and unlike a plain
+    /// full-body retype with no other signal at all (which stays legal, see
+    /// carry_over_never_overrides_a_supplied_footer / the expires test
+    /// above), naming `tags` here while `anchors` silently vanishes is
+    /// exactly the case where the writer did not "explicitly know".
+    #[tokio::test]
+    async fn revise_rejects_a_body_retype_that_silently_drops_an_untouched_field() {
+        let mut store = EventStore::in_memory().unwrap();
+        let body = "never deploy on friday\n\n\
+                    [memory/gotcha | tags: deploy | anchors: deploy/watcher.sh | project: global]";
+        store.append_event("s", "l", "a", EventKind::FactCreated, "e-drop", None, body).unwrap();
+        let shared = Arc::new(Mutex::new(store));
+        let dir = tempfile::tempdir().unwrap();
+        let server = ThorServer::from_shared(shared.clone(), None, dir.path().join("thor.db"), None);
+
+        let out = server
+            .revise(Parameters(ReviseArgs {
+                entity_id: "e-drop".into(),
+                // A full retype that keeps tags but never mentions anchors...
+                body: Some(
+                    "never deploy on friday\n\n[memory/gotcha | tags: deploy | project: global]"
+                        .into(),
+                ),
+                // ...combined with an explicit, unrelated field parameter.
+                tags: Some(vec!["deploy".into()]),
+                ..Default::default()
+            }))
+            .await;
+        assert!(out.contains("rejected"), "{out}");
+        assert!(out.contains("'anchors'"), "names the dropped field: {out}");
+        assert!(out.contains("Nothing was written"), "{out}");
+
+        // Nothing was appended: still exactly the one original event.
+        assert_eq!(
+            shared.lock().unwrap().get_all_events().unwrap().len(),
+            1,
+            "the rejected revise wrote nothing"
+        );
+
+        // Passing anchors explicitly (even restating the same value) lifts
+        // the refusal - the writer now clearly knows.
+        let ok = server
+            .revise(Parameters(ReviseArgs {
+                entity_id: "e-drop".into(),
+                body: Some(
+                    "never deploy on friday\n\n[memory/gotcha | tags: deploy | project: global]"
+                        .into(),
+                ),
+                tags: Some(vec!["deploy".into()]),
+                anchors: Some(vec![]),
+                ..Default::default()
+            }))
+            .await;
+        assert!(ok.starts_with("revised e-drop"), "an explicit clear is allowed: {ok}");
     }
 
     #[tokio::test]

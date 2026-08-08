@@ -1,4 +1,4 @@
-use rusqlite::{Connection, OpenFlags, Result as SqlResult, params};
+use rusqlite::{Connection, OpenFlags, OptionalExtension, Result as SqlResult, params};
 use sha2::{Sha256, Digest};
 use uuid::Uuid;
 use std::collections::HashSet;
@@ -403,6 +403,12 @@ fn insert_event(
         EventStore::rebuild_projection(conn)?;
     }
 
+    // Facets projection (M3), SAME transaction. Unlike the block above this is
+    // NOT a fold: one event's facets are a pure function of its own body, so
+    // there is no tip to track and no rebuild-from-scratch branch - it simply
+    // runs for every content-bearing event, every time, in the same append.
+    EventStore::apply_facets_delta(conn, kind, entity_id, body, &this_hash)?;
+
     Ok(Event {
         seq,
         event_uuid,
@@ -533,9 +539,318 @@ impl EventStore {
                 k TEXT PRIMARY KEY,
                 v INTEGER NOT NULL
             );
+            -- Facets projection (M3): typed metadata per (entity, revision) -
+            -- the SCHEMA-backed counterpart of the footer's free text (fact
+            -- type, tags, fires-when triggers, anchors, expires, provenance).
+            -- Written in the SAME transaction as the append (see
+            -- apply_facets_delta), from the SAME body text every footer
+            -- parser already reads - so it can never drift from what the
+            -- footer says for a GIVEN revision, whose body is immutable once
+            -- written. NOT the source of truth: the footer stays that, for
+            -- every existing reader. This is a second, authoritative place a
+            -- caller may read a typed field from FIRST (EventStore::
+            -- read_facets), falling back to the footer for events written
+            -- before this table existed (`thor backfill-facets` fills those
+            -- in from their footer, on request; a MISSING row is not an
+            -- error - see verify_facets_projection). tags/triggers/anchors
+            -- are stored as JSON arrays (serde_json, already a dependency) -
+            -- SQLite has no native array/list column type.
+            -- `project`/`mimir_id` (M4): the two remaining footer fields a
+            -- facets row needs to reconstruct a revision's ORIGINAL footer
+            -- text byte for byte (see footer::compose_from_facets) - project
+            -- is the LITERAL value THIS revision's footer carried (frozen at
+            -- write time; the entity's EFFECTIVE project after a later
+            -- `reproject` lives in entity_meta instead, and can legitimately
+            -- differ), mimir_id the trailing import marker. Both nullable:
+            -- absent on the overwhelming majority of footers (no project
+            -- field at all is rare but legal; mimir_id only ever appears on
+            -- an imported fact).
+            CREATE TABLE IF NOT EXISTS fact_facets (
+                entity_id TEXT NOT NULL,
+                rev_hash TEXT NOT NULL,
+                fact_type TEXT NOT NULL,
+                tags TEXT NOT NULL,
+                triggers TEXT NOT NULL,
+                anchors TEXT NOT NULL,
+                expires TEXT,
+                provenance TEXT,
+                project TEXT,
+                mimir_id TEXT,
+                PRIMARY KEY (entity_id, rev_hash)
+            );
             ",
         )?;
         Ok(())
+    }
+
+    /// Write (or overwrite) one revision's facets row. Idempotent - the same
+    /// (entity_id, rev_hash) always maps to the same event body, so writing
+    /// it twice is a no-op in effect. Shared by the live write path
+    /// (apply_facets_delta, inside the append transaction) and the CLI
+    /// backfill (its own transaction, over already-existing events).
+    fn upsert_facets_row(
+        conn: &Connection,
+        entity_id: &str,
+        rev_hash: &str,
+        facets: &crate::footer::Facets,
+    ) -> SqlResult<()> {
+        conn.execute(
+            "INSERT INTO fact_facets
+                (entity_id, rev_hash, fact_type, tags, triggers, anchors, expires, provenance,
+                 project, mimir_id)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+             ON CONFLICT(entity_id, rev_hash) DO UPDATE SET
+                fact_type = excluded.fact_type,
+                tags = excluded.tags,
+                triggers = excluded.triggers,
+                anchors = excluded.anchors,
+                expires = excluded.expires,
+                provenance = excluded.provenance,
+                project = excluded.project,
+                mimir_id = excluded.mimir_id",
+            params![
+                entity_id,
+                rev_hash,
+                facets.fact_type,
+                serde_json::to_string(&facets.tags).unwrap_or_default(),
+                serde_json::to_string(&facets.triggers).unwrap_or_default(),
+                serde_json::to_string(&facets.anchors).unwrap_or_default(),
+                facets.expires,
+                facets.provenance,
+                facets.project,
+                facets.mimir_id,
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// The facets delta for one event: parse its body's footer and, when it
+    /// is a genuine memory footer, upsert the typed row - SAME transaction as
+    /// the append (called from insert_event), so the two can never go out of
+    /// sync. Unlike the heads/entity_meta projections this is NOT a fold: a
+    /// revision's facets are a pure function of that one event's own body, so
+    /// there is nothing to rebuild-from-scratch and no "tip_seq" to track -
+    /// it runs on every content-bearing event, in any order, unconditionally.
+    ///
+    /// Only FactCreated/FactRevised carry real content (a retract's body is a
+    /// tombstone, a supersede points elsewhere, resolve/reassert/echo/
+    /// reproject touch no body at all - same rule `footer::defects` applies).
+    /// Repo chunks carry their OWN footer shape (`[repo file | ...]`), which
+    /// `parse_facets` already fails to match, but the id is filtered first
+    /// too, for clarity and so a future chunk footer accidentally shaped like
+    /// `[memory/...]` still could not slip into this table.
+    fn apply_facets_delta(
+        conn: &Connection,
+        kind: EventKind,
+        entity_id: &str,
+        body: &str,
+        this_hash: &str,
+    ) -> SqlResult<()> {
+        if !matches!(kind, EventKind::FactCreated | EventKind::FactRevised) {
+            return Ok(());
+        }
+        if crate::repo::is_chunk_id(entity_id) {
+            return Ok(());
+        }
+        let Some(facets) = crate::footer::parse_facets(body) else { return Ok(()) };
+        Self::upsert_facets_row(conn, entity_id, this_hash, &facets)
+    }
+
+    /// Read a fact's typed metadata: the facets-table row for this EXACT
+    /// revision when one exists, else parsed fresh from `body` (an event
+    /// written before the facets table existed, or a store that has not been
+    /// backfilled yet). The one place a caller reads metadata through, so the
+    /// projection and the footer can never answer a caller differently.
+    /// Fails open to the footer parse on ANY read error (including "no such
+    /// table" on a store from before this feature, opened read-only) - a
+    /// broken facets read must cost nothing but the optimization.
+    pub fn read_facets(&self, entity_id: &str, rev_hash: &str, body: &str) -> crate::footer::Facets {
+        self.query_facets_row(entity_id, rev_hash)
+            .unwrap_or_else(|| crate::footer::parse_facets(body).unwrap_or_default())
+    }
+
+    fn query_facets_row(&self, entity_id: &str, rev_hash: &str) -> Option<crate::footer::Facets> {
+        self.conn
+            .query_row(
+                "SELECT fact_type, tags, triggers, anchors, expires, provenance, project, mimir_id
+                 FROM fact_facets WHERE entity_id = ? AND rev_hash = ?",
+                params![entity_id, rev_hash],
+                |r| {
+                    let tags: String = r.get(1)?;
+                    let triggers: String = r.get(2)?;
+                    let anchors: String = r.get(3)?;
+                    Ok(crate::footer::Facets {
+                        fact_type: r.get(0)?,
+                        tags: serde_json::from_str(&tags).unwrap_or_default(),
+                        triggers: serde_json::from_str(&triggers).unwrap_or_default(),
+                        anchors: serde_json::from_str(&anchors).unwrap_or_default(),
+                        expires: r.get(4)?,
+                        provenance: r.get(5)?,
+                        project: r.get(6)?,
+                        mimir_id: r.get(7)?,
+                    })
+                },
+            )
+            .ok()
+    }
+
+    /// The DISPLAY body a consumer receives for one exact revision: when the
+    /// STORED body is footer-free (the post-migration shape - see `thor
+    /// migrate-facets-store`), compose its footer back from the facets row
+    /// and append it; otherwise `body` already carries its own footer inline
+    /// (the pre-migration shape, and the permanent fallback for any event a
+    /// migration could not convert losslessly - see `thor
+    /// verify-footer-roundtrip`), so it is returned completely unchanged.
+    /// This is the ONE seam a reader should call instead of handing out
+    /// `body` raw, so a migrated store looks byte-for-byte like a
+    /// pre-migration one to every existing consumer - `get`/`history`/the
+    /// pinned brief all go through it (see `with_display_bodies`).
+    ///
+    /// Deliberately checked in THIS order (inline footer first): on the
+    /// CURRENT, un-migrated store every body still carries its footer
+    /// inline even though a facets row also exists (M3 writes both), so
+    /// composing unconditionally whenever a facets row is present would
+    /// double-append the footer. Checking `extract` first makes this
+    /// function a safe no-op on every store that has not been migrated,
+    /// with no flag or store-version marker required.
+    ///
+    /// Fails open on any facets-read error (including "no such table" on a
+    /// store from before M3): the safest output when nothing can be
+    /// composed is exactly what has always been returned - `body`, verbatim.
+    pub fn display_body(&self, entity_id: &str, rev_hash: &str, body: &str) -> String {
+        if crate::footer::extract(body).is_some() {
+            return body.to_string();
+        }
+        match self.query_facets_row(entity_id, rev_hash) {
+            Some(facets) if !facets.fact_type.is_empty() => {
+                crate::footer::compose_from_facets(body, &facets)
+            }
+            _ => body.to_string(),
+        }
+    }
+
+    /// Map every event's body through `display_body` - for callers that fetch
+    /// a batch of events purely to SHOW them to a consumer (the CLI/MCP
+    /// `get`, `history` and pinned-brief surfaces). Internal fold/integrity
+    /// code (cas, auditor, the backfill, the migration itself) must keep
+    /// reading `Event.body` raw and never route through this: it exists
+    /// only at the display boundary.
+    pub fn with_display_bodies(&self, events: Vec<Event>) -> Vec<Event> {
+        events
+            .into_iter()
+            .map(|mut e| {
+                e.body = self.display_body(&e.entity_id, &e.this_hash, &e.body);
+                e
+            })
+            .collect()
+    }
+
+    /// True when a facets row already exists for this exact revision (the
+    /// backfill's idempotence check: re-running it must not re-count or
+    /// re-write what an earlier run, or a live write, already filled in).
+    pub fn facets_row_exists(&self, entity_id: &str, rev_hash: &str) -> bool {
+        self.conn
+            .query_row(
+                "SELECT 1 FROM fact_facets WHERE entity_id = ? AND rev_hash = ?",
+                params![entity_id, rev_hash],
+                |_| Ok(()),
+            )
+            .is_ok()
+    }
+
+    /// Write one backfilled facets row (`thor backfill-facets`). Public
+    /// because the CLI backfill runs over already-existing events, outside
+    /// the append transaction that `apply_facets_delta` rides on live writes.
+    pub fn write_facets_row(
+        &self,
+        entity_id: &str,
+        rev_hash: &str,
+        facets: &crate::footer::Facets,
+    ) -> anyhow::Result<()> {
+        Self::upsert_facets_row(&self.conn, entity_id, rev_hash, facets)?;
+        Ok(())
+    }
+
+    /// Differential audit for the facets projection: where BOTH a facets row
+    /// and a parseable footer exist for the same (entity, revision), they
+    /// must describe the SAME metadata. An event's body is immutable once
+    /// written, so for a given revision this can only disagree because of a
+    /// write-time bug, a bad backfill, or direct tampering of the facets
+    /// table - never benign staleness. Returns the mismatches found; empty =
+    /// consistent.
+    ///
+    /// A MISSING row is deliberately not checked here at all: a store that
+    /// predates this feature, or has not run `thor backfill-facets` yet, must
+    /// stay green - only a row that CONTRADICTS its own event's footer is an
+    /// error. Tolerant of a store that does not even have the table yet (a
+    /// pre-facets store opened read-only, e.g. by `thor fsck`): that is the
+    /// same "nothing to check" case, not a failure.
+    ///
+    /// A body carrying NO footer at all is ALSO not checked here (M4): that
+    /// is the post-migration, footer-free storage shape (`thor
+    /// migrate-facets-store`), where the facets row IS the metadata - there
+    /// is no independent copy left in the body to compare it against. This
+    /// is an accepted, permanent loss of THIS PARTICULAR cross-check for a
+    /// migrated row (not an oversight): only a row whose body STILL carries
+    /// a footer, and disagrees with it, can mean a write-time bug, a bad
+    /// backfill, or tampering; a footer-free row's own tamper-evidence is
+    /// the hash chain elsewhere, not this differential.
+    pub fn verify_facets_projection(&self) -> anyhow::Result<Vec<String>> {
+        let table_exists: bool = self
+            .conn
+            .query_row(
+                "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'fact_facets'",
+                [],
+                |_| Ok(()),
+            )
+            .optional()?
+            .is_some();
+        if !table_exists {
+            return Ok(Vec::new());
+        }
+        let mut issues = Vec::new();
+        let mut stmt = self.conn.prepare(
+            "SELECT f.entity_id, f.rev_hash, f.fact_type, f.tags, f.triggers, f.anchors, \
+             f.expires, f.provenance, f.project, f.mimir_id, e.body
+             FROM fact_facets f
+             JOIN event e ON e.entity_id = f.entity_id AND e.this_hash = f.rev_hash",
+        )?;
+        let rows = stmt.query_map([], |r| {
+            let tags: String = r.get(3)?;
+            let triggers: String = r.get(4)?;
+            let anchors: String = r.get(5)?;
+            let stored = crate::footer::Facets {
+                fact_type: r.get(2)?,
+                tags: serde_json::from_str(&tags).unwrap_or_default(),
+                triggers: serde_json::from_str(&triggers).unwrap_or_default(),
+                anchors: serde_json::from_str(&anchors).unwrap_or_default(),
+                expires: r.get(6)?,
+                provenance: r.get(7)?,
+                project: r.get(8)?,
+                mimir_id: r.get(9)?,
+            };
+            Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?, stored, r.get::<_, String>(10)?))
+        })?;
+        for row in rows {
+            let (entity_id, rev_hash, stored, body) = row?;
+            let short = &rev_hash[..rev_hash.len().min(8)];
+            match crate::footer::parse_facets(&body) {
+                None if crate::footer::extract(&body).is_none() => {
+                    // Footer-free storage (M4): the row is the sole record,
+                    // nothing independent to cross-check it against.
+                }
+                None => issues.push(format!(
+                    "facets row for {entity_id} rev {short} but its current body carries no \
+                     parseable memory footer"
+                )),
+                Some(fresh) if fresh != stored => issues.push(format!(
+                    "facets/footer mismatch for {entity_id} rev {short}: stored {stored:?} vs \
+                     footer says {fresh:?}"
+                )),
+                Some(_) => {}
+            }
+        }
+        Ok(issues)
     }
 
     /// One event's delta on the heads projection - the incremental mirror of
@@ -2289,5 +2604,269 @@ mod tests {
             3,
             "the hole at seq 4 must still cap the frontier at 3, not jump to 5 via the seq-0 offset"
         );
+    }
+
+    /// The core M3 guarantee: a facets row appears for a typed fact in the
+    /// SAME call that appends it (no separate step, nothing to fall out of
+    /// step with), and it matches what the footer itself says.
+    #[test]
+    fn facets_row_is_written_in_the_same_transaction_as_the_append() {
+        let mut store = EventStore::in_memory().unwrap();
+        let footer = crate::footer::compose_full(
+            "gotcha",
+            &["deploy".into()],
+            "global",
+            &["scp".into()],
+            &["deploy/watcher.sh".into()],
+            Some("2027-01-15"),
+            Some("verified"),
+        );
+        let body = format!("never deploy on friday\n\n{}", footer);
+        let ev = store.append_event("s", "l", "a", EventKind::FactCreated, "e1", None, &body).unwrap();
+
+        let got = store.read_facets("e1", &ev.this_hash, &body);
+        assert_eq!(got, crate::footer::parse_facets(&body).unwrap(), "row matches the footer");
+        assert!(store.facets_row_exists("e1", &ev.this_hash), "the row exists right away");
+    }
+
+    /// A revise mints a NEW revision - and therefore a NEW facets row keyed on
+    /// the new rev_hash - while the OLD revision's row stays exactly as it
+    /// was (facets are per-revision, never mutated in place).
+    #[test]
+    fn revise_writes_a_new_facets_row_per_revision_and_keeps_the_old_one() {
+        let mut store = EventStore::in_memory().unwrap();
+        let v1_footer = crate::footer::compose("gotcha", &["a".into()], "global", &[], &[], None);
+        let v1_body = format!("v1 content\n\n{}", v1_footer);
+        let v1 = store.append_event("s", "l", "a", EventKind::FactCreated, "e1", None, &v1_body).unwrap();
+
+        let v2_footer = crate::footer::compose("decision", &["b".into()], "global", &[], &[], None);
+        let v2_body = format!("v2 content\n\n{}", v2_footer);
+        let v2 = store
+            .append_mutate_checked(
+                "s", "l", "a", EventKind::FactRevised, "e1", Some(&v1.this_hash), &v2_body,
+            )
+            .unwrap();
+
+        assert!(store.facets_row_exists("e1", &v1.this_hash), "v1's row is untouched");
+        assert!(store.facets_row_exists("e1", &v2.this_hash), "v2 got its own row");
+        let old = store.read_facets("e1", &v1.this_hash, &v1_body);
+        let new = store.read_facets("e1", &v2.this_hash, &v2_body);
+        assert_eq!(old.fact_type, "gotcha");
+        assert_eq!(new.fact_type, "decision");
+    }
+
+    /// A fact with no footer at all gets no facets row - and reading it must
+    /// still work, falling back to the (empty) footer parse. This is the
+    /// unconditional additive guarantee: a store that never backfills, or a
+    /// fact that was never typed, must behave exactly as before.
+    #[test]
+    fn a_fact_with_no_footer_gets_no_facets_row_and_reads_fall_back_cleanly() {
+        let mut store = EventStore::in_memory().unwrap();
+        let ev = store
+            .append_event("s", "l", "a", EventKind::FactCreated, "e1", None, "a plain untyped note")
+            .unwrap();
+        assert!(!store.facets_row_exists("e1", &ev.this_hash), "no footer, no row");
+        let got = store.read_facets("e1", &ev.this_hash, "a plain untyped note");
+        assert_eq!(got, crate::footer::Facets::default(), "falls back to an empty facets value");
+    }
+
+    /// A store that predates this table (or one opened before it was ever
+    /// created) must not error: `verify_facets_projection` treats a missing
+    /// table exactly like zero rows, not a failure.
+    #[test]
+    fn verify_facets_projection_tolerates_a_store_with_no_facets_table_at_all() {
+        let store = EventStore::in_memory().unwrap();
+        store.conn().execute("DROP TABLE fact_facets", []).unwrap();
+        let issues = store.verify_facets_projection().unwrap();
+        assert!(issues.is_empty(), "a missing table is not a contradiction: {issues:?}");
+    }
+
+    /// The check's whole job: a facets row that CONTRADICTS its own event's
+    /// (immutable) body is a real problem - direct tampering of the
+    /// derived table, or a bad backfill - and must be reported with the
+    /// mismatching entity/rev named, not silently accepted.
+    #[test]
+    fn verify_facets_projection_catches_a_tampered_row() {
+        let mut store = EventStore::in_memory().unwrap();
+        let footer = crate::footer::compose("gotcha", &["deploy".into()], "global", &[], &[], None);
+        let body = format!("never deploy on friday\n\n{}", footer);
+        let ev = store.append_event("s", "l", "a", EventKind::FactCreated, "e1", None, &body).unwrap();
+
+        assert!(store.verify_facets_projection().unwrap().is_empty(), "clean before tampering");
+
+        // Simulate tampering / a bad backfill: the row now claims a DIFFERENT
+        // fact_type than the event's own (immutable) body actually carries.
+        store
+            .conn()
+            .execute(
+                "UPDATE fact_facets SET fact_type = 'decision' WHERE entity_id = 'e1' AND rev_hash = ?",
+                params![ev.this_hash],
+            )
+            .unwrap();
+
+        let issues = store.verify_facets_projection().unwrap();
+        assert_eq!(issues.len(), 1, "{issues:?}");
+        assert!(issues[0].contains("e1"), "{issues:?}");
+        assert!(issues[0].contains("mismatch"), "{issues:?}");
+    }
+
+    /// A store with no facets rows YET (not backfilled) must stay green - the
+    /// exact non-negotiable from the fsck check's own doc: missing is not an
+    /// error, only a contradiction is.
+    #[test]
+    fn verify_facets_projection_is_clean_when_nothing_has_been_backfilled() {
+        let mut store = EventStore::in_memory().unwrap();
+        // An event whose body carries no footer at all never gets a row -
+        // this is the everyday "not backfilled / never typed" shape.
+        store.append_event("s", "l", "a", EventKind::FactCreated, "e1", None, "untyped").unwrap();
+        assert!(store.verify_facets_projection().unwrap().is_empty());
+    }
+
+    /// `write_facets_row` / `facets_row_exists` are the backfill's own
+    /// primitives (it runs outside the append transaction, over
+    /// already-existing events) - round-trip them directly.
+    #[test]
+    fn write_facets_row_is_idempotent_and_visible_to_facets_row_exists() {
+        let mut store = EventStore::in_memory().unwrap();
+        store.append_event("s", "l", "a", EventKind::FactCreated, "e1", None, "untyped").unwrap();
+        let facets = crate::footer::Facets {
+            fact_type: "gotcha".to_string(),
+            tags: vec!["x".to_string()],
+            ..Default::default()
+        };
+        assert!(!store.facets_row_exists("e1", "rev-a"));
+        store.write_facets_row("e1", "rev-a", &facets).unwrap();
+        assert!(store.facets_row_exists("e1", "rev-a"));
+        // Writing again (the idempotent backfill re-run case) must not error.
+        store.write_facets_row("e1", "rev-a", &facets).unwrap();
+        let got = store.read_facets("e1", "rev-a", "irrelevant when a row exists");
+        assert_eq!(got, facets);
+    }
+
+    /// THE CORE M4 SAFETY PROPERTY: on the CURRENT (un-migrated) storage
+    /// shape every body still carries its own footer inline even though a
+    /// facets row also exists (M3 writes both) - so `display_body` must
+    /// return it COMPLETELY UNCHANGED, never double-appending a second,
+    /// composed footer. Catches a regression that composes whenever a
+    /// facets row is present instead of checking the body first.
+    #[test]
+    fn display_body_never_double_appends_when_the_body_still_carries_its_own_footer() {
+        let mut store = EventStore::in_memory().unwrap();
+        let footer = crate::footer::compose("gotcha", &["deploy".into()], "global", &[], &[], None);
+        let body = format!("never deploy on friday\n\n{}", footer);
+        let ev = store.append_event("s", "l", "a", EventKind::FactCreated, "e1", None, &body).unwrap();
+        assert!(store.facets_row_exists("e1", &ev.this_hash), "M3 wrote a row alongside the footer");
+        assert_eq!(
+            store.display_body("e1", &ev.this_hash, &body),
+            body,
+            "a body that already carries its footer must never gain a second, composed one"
+        );
+    }
+
+    /// The post-migration shape: a footer-free stored body plus a matching
+    /// facets row must display EXACTLY the footer the row describes, glued
+    /// back onto the content - this is the whole point of `display_body`,
+    /// the read-side counterpart of `thor migrate-facets-store`.
+    #[test]
+    fn display_body_composes_the_footer_back_for_a_footer_free_body() {
+        let store = EventStore::in_memory().unwrap();
+        let facets = crate::footer::Facets {
+            fact_type: "gotcha".to_string(),
+            tags: vec!["deploy".to_string()],
+            project: Some("global".to_string()),
+            ..Default::default()
+        };
+        store.write_facets_row("e1", "rev-x", &facets).unwrap();
+        let footer_free_body = "never deploy on friday";
+        let displayed = store.display_body("e1", "rev-x", footer_free_body);
+        assert_eq!(
+            displayed,
+            "never deploy on friday\n\n[memory/gotcha | tags: deploy | project: global]"
+        );
+    }
+
+    /// A footer-free body with NO matching facets row (an event that was
+    /// never typed to begin with - there is nothing to compose) must pass
+    /// through unchanged, exactly like a pre-M3 store: `display_body` must
+    /// never invent a footer out of nothing.
+    #[test]
+    fn display_body_passes_a_footer_free_body_through_when_no_facets_row_exists() {
+        let store = EventStore::in_memory().unwrap();
+        assert_eq!(store.display_body("e1", "rev-missing", "just a note"), "just a note");
+    }
+
+    /// `with_display_bodies` is the batch form `get`/`history` actually call:
+    /// on a store that has never run `backfill-facets` (no facets rows for
+    /// anything written before M3 existed - the exact shape the real store
+    /// has TODAY) every event must come back byte-identical to what
+    /// `get_all_events` itself returned. This is the explicit "an old store
+    /// without facets just keeps working" guarantee.
+    #[test]
+    fn with_display_bodies_is_a_no_op_on_a_store_with_no_facets_rows_at_all() {
+        let mut store = EventStore::in_memory().unwrap();
+        store.append_event("s", "l", "a", EventKind::FactCreated, "e1", None, "a plain untyped note").unwrap();
+        let footer = crate::footer::compose("decision", &["x".into()], "global", &[], &[], None);
+        store
+            .append_event("s", "l", "a", EventKind::FactCreated, "e2", None, &format!("v1\n\n{footer}"))
+            .unwrap();
+        let raw = store.get_all_events().unwrap();
+        let displayed = store.with_display_bodies(raw.clone());
+        let raw_bodies: Vec<&str> = raw.iter().map(|e| e.body.as_str()).collect();
+        let displayed_bodies: Vec<&str> = displayed.iter().map(|e| e.body.as_str()).collect();
+        assert_eq!(displayed_bodies, raw_bodies, "every body already carries its own footer inline");
+    }
+
+    /// The READ side of the same guarantee, taken further: even a store that
+    /// has since LOST its facets table entirely (opened read-only after
+    /// external damage, or a binary older than M3 touching the file) must
+    /// not error or panic on `display_body` - it fails open to the body
+    /// verbatim, exactly like `read_facets` already documents for any facets
+    /// read error. Events are written FIRST, table dropped AFTER: dropping it
+    /// before writing a typed fact is a different, pre-existing gap in the
+    /// M3 write path (`apply_facets_delta` propagates a missing-table SQL
+    /// error on WRITE) that this task did not touch and is not what "an old
+    /// store keeps working" is about - reading is what must stay resilient.
+    #[test]
+    fn display_body_fails_open_when_the_facets_table_is_gone_entirely() {
+        let mut store = EventStore::in_memory().unwrap();
+        let footer = crate::footer::compose("decision", &["x".into()], "global", &[], &[], None);
+        let body = format!("v1\n\n{footer}");
+        let ev = store.append_event("s", "l", "a", EventKind::FactCreated, "e1", None, &body).unwrap();
+        store.conn().execute("DROP TABLE fact_facets", []).unwrap();
+        assert_eq!(store.display_body("e1", &ev.this_hash, &body), body, "the body already carries its footer");
+        assert_eq!(
+            store.display_body("e1", &ev.this_hash, "footer-free with no table to consult"),
+            "footer-free with no table to consult",
+            "no table to compose from - fails open to the body verbatim, never a panic"
+        );
+    }
+
+    /// Post-migration self-consistency (M4): a facets row whose event body
+    /// carries NO footer at all is the expected, everyday shape after
+    /// `thor migrate-facets-store` - not a contradiction. Before this fix
+    /// `verify_facets_projection` (and therefore `thor fsck`) would have
+    /// flagged EVERY successfully migrated fact as "carries no parseable
+    /// memory footer", which would have made fsck fail on every real
+    /// migrated store - exactly the opposite of task 4's requirement.
+    #[test]
+    fn verify_facets_projection_accepts_a_footer_free_body_with_a_matching_row() {
+        let mut store = EventStore::in_memory().unwrap();
+        // A migrated event: body has no inline footer, but a facets row
+        // exists for it (written by the migration, not by apply_facets_delta,
+        // which never fires here since a footer-free body has no footer for
+        // it to parse - insert the row directly to model that end state
+        // without depending on the migration command itself).
+        let ev = store
+            .append_event("s", "l", "a", EventKind::FactCreated, "e1", None, "never deploy on friday")
+            .unwrap();
+        assert!(!store.facets_row_exists("e1", &ev.this_hash), "no footer, so no row yet - by construction");
+        let facets = crate::footer::Facets {
+            fact_type: "gotcha".to_string(),
+            tags: vec!["deploy".to_string()],
+            ..Default::default()
+        };
+        store.write_facets_row("e1", &ev.this_hash, &facets).unwrap();
+        let issues = store.verify_facets_projection().unwrap();
+        assert!(issues.is_empty(), "a footer-free body with a matching row is not a contradiction: {issues:?}");
     }
 }

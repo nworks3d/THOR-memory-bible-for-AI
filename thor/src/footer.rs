@@ -1019,6 +1019,171 @@ pub fn anchors(body: &str) -> Vec<String> {
         .collect()
 }
 
+/// Parse the footer's `| tags: <t1 t2> |` field into its word list. Empty
+/// when absent, or present but blank (the format always writes the field,
+/// even with no tags - "tags: "). Same shape as `anchors()`, split on
+/// whitespace instead of comma since a tag never contains one.
+pub fn tags(body: &str) -> Vec<String> {
+    let Some(idx) = body.find("| tags: ") else { return Vec::new() };
+    let rest = &body[idx + "| tags: ".len()..];
+    let Some(field) = rest.split(" |").next() else { return Vec::new() };
+    field.trim().trim_end_matches(']').split_whitespace().map(|t| t.to_string()).collect()
+}
+
+/// Typed, structured mirror of everything a `[memory/...]` footer carries -
+/// the shape the facets table stores (event_store::fact_facets) and the
+/// write-gate (`dropped_fields`) compares. `fact_type` is the RAW string the
+/// footer names (e.g. "note", "gotcha", "insight") - unlike `fact_type()`
+/// above, which maps into the narrower `FactType` enum and returns None for
+/// "note" and anything outside that enum; the facets table holds whatever
+/// was actually written, not a lossy subset of it.
+///
+/// `project` and `mimir_id` are the two fields `dropped_fields` never
+/// touches (project is owned by `reproject`, mimir_id by the importer), but
+/// they are PART of the footer text for a GIVEN revision and must round-trip
+/// through `compose_from_facets` exactly like every other field - a facets
+/// row is only a faithful mirror of "what this revision's footer says" once
+/// it carries these too.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct Facets {
+    pub fact_type: String,
+    pub tags: Vec<String>,
+    pub triggers: Vec<String>,
+    pub anchors: Vec<String>,
+    pub expires: Option<String>,
+    pub provenance: Option<String>,
+    pub project: Option<String>,
+    pub mimir_id: Option<String>,
+}
+
+/// Parse a body's trailing `[memory/...]` footer into its typed fields. None
+/// when the body carries no footer at all (a legitimately untyped fact), or
+/// when the trailing bracketed line is some OTHER shape (a repo chunk's
+/// `[repo file | ...]`, or a bracketed remark that merely looks like a
+/// footer) - only a genuine memory footer parses. Every field goes through
+/// the SAME parser every other reader uses (tags/fires_when/anchors/expires/
+/// provenance/project/mimir_id above), so this can never drift from what
+/// strip()/fact_type() etc. already see - it is a second view of the same
+/// text, not a second opinion.
+pub fn parse_facets(body: &str) -> Option<Facets> {
+    let footer = extract(body)?;
+    let rest = footer.strip_prefix("[memory/")?;
+    let ty: String = rest.chars().take_while(|c| c.is_ascii_alphabetic() || *c == '-').collect();
+    if ty.is_empty() {
+        return None;
+    }
+    Some(Facets {
+        fact_type: ty,
+        tags: tags(body),
+        triggers: fires_when(body)
+            .map(|s| s.split_whitespace().map(String::from).collect())
+            .unwrap_or_default(),
+        anchors: anchors(body),
+        expires: expires(body),
+        provenance: provenance(body),
+        project: project(body),
+        mimir_id: mimir_id(body),
+    })
+}
+
+/// Compose the DISPLAY body for a footer-free stored body: rebuild the
+/// footer text from `facets` (canonical field order: tags, fires-when,
+/// anchors, expires, provenance, project, mimir) and append it after the
+/// standard blank-line separator. The inverse of `strip` + `parse_facets`
+/// for a revision whose footer round-trips losslessly - see
+/// `thor verify-footer-roundtrip` / `thor migrate-facets-store`, which are
+/// the only callers allowed to conclude that it does. Read callers
+/// (`EventStore::display_body`) use this only when `body` carries no inline
+/// footer of its own; a body that already has one is returned unchanged by
+/// the caller, never passed through here, so this never double-composes.
+pub fn compose_from_facets(footer_free_body: &str, facets: &Facets) -> String {
+    format!("{}\n\n{}", footer_free_body, footer_text(facets))
+}
+
+/// The footer LINE alone (`[memory/...]`), rebuilt from typed facets in the
+/// same field order `compose_full`/`edit_footer` write. `tags` is always
+/// emitted (even empty), matching the writer's own convention - a footer
+/// that never had a `tags:` field at all will therefore fail to round-trip
+/// through `compose_from_facets`, which is correct: that is a shape the
+/// gate must refuse to convert, not silently paper over.
+fn footer_text(facets: &Facets) -> String {
+    let mut out = format!("[memory/{}", facets.fact_type);
+    out.push_str(&format!(" | tags: {}", join_words(&facets.tags)));
+    if !facets.triggers.is_empty() {
+        out.push_str(&format!(" | fires-when: {}", join_words(&facets.triggers)));
+    }
+    if !facets.anchors.is_empty() {
+        out.push_str(&format!(" | anchors: {}", join_anchors(&facets.anchors)));
+    }
+    if let Some(exp) = &facets.expires {
+        out.push_str(&format!(" | expires: {}", exp));
+    }
+    if let Some(p) = &facets.provenance {
+        out.push_str(&format!(" | provenance: {}", p));
+    }
+    if let Some(proj) = &facets.project {
+        out.push_str(&format!(" | project: {}", proj));
+    }
+    if let Some(m) = &facets.mimir_id {
+        out.push_str(&format!(" | mimir:{}", m));
+    }
+    out.push(']');
+    out
+}
+
+/// Parse the footer's trailing `| mimir:<id>` field: the mimir-import
+/// identity marker (only ever present on an imported fact, appended after
+/// `project` - see importer.rs). None when absent.
+pub fn mimir_id(body: &str) -> Option<String> {
+    let idx = body.find("| mimir:")?;
+    let rest = &body[idx + "| mimir:".len()..];
+    let id = rest.trim_end_matches(']').trim();
+    (!id.is_empty()).then(|| id.to_string())
+}
+
+/// The write-gate: does `new` drop a metadata field that `old` carried,
+/// without `edits` saying so explicitly? Returns the first dropped field's
+/// name (a ReviseArgs parameter name), or None when nothing was lost.
+///
+/// A "drop" is a field going from PRESENT to ABSENT - changing a field's
+/// VALUE via an explicit new footer (a deliberate retype) is not a drop and
+/// stays legal; only vanishing is refused, and only when `edits` never named
+/// the field, so an explicit clear (tags: [], expires: "") always passes.
+///
+/// Why this exists, and why it is narrower than "any silent change": a body
+/// with NO footer of its own already inherits the previous one in full (see
+/// `carry_over`) - that path can never drop anything, by construction. And a
+/// caller who supplies ONLY a fresh `body` with its own complete footer and
+/// nothing else is, by this store's own shipped convention, retyping on
+/// purpose ("theirs wins" - see `carry_over_never_overrides_a_supplied_footer`
+/// and the revise doc: a re-typed footer clears a field silently, and that is
+/// the documented route). Neither of those needs a new gate. The gap is
+/// narrower and real: a revise that combines a raw `body` (bringing its own,
+/// possibly INCOMPLETE, retyped footer) WITH one or more explicit metadata
+/// parameters for OTHER fields. There, `edit_footer` faithfully edits only
+/// the named fields and preserves everything else in that already-incomplete
+/// footer - so a field the caller never mentioned at all (not in `body`'s
+/// retype, not in any parameter) can vanish as a side effect of touching a
+/// DIFFERENT field, and nothing about the call named that consequence.
+pub fn dropped_fields(old: &Facets, new: &Facets, edits: &FieldEdits) -> Option<String> {
+    if edits.tags.is_none() && !old.tags.is_empty() && new.tags.is_empty() {
+        return Some("tags".to_string());
+    }
+    if edits.triggers.is_none() && !old.triggers.is_empty() && new.triggers.is_empty() {
+        return Some("triggers".to_string());
+    }
+    if edits.anchors.is_none() && !old.anchors.is_empty() && new.anchors.is_empty() {
+        return Some("anchors".to_string());
+    }
+    if edits.expires.is_none() && old.expires.is_some() && new.expires.is_none() {
+        return Some("expires".to_string());
+    }
+    if edits.provenance.is_none() && old.provenance.is_some() && new.provenance.is_none() {
+        return Some("provenance".to_string());
+    }
+    None
+}
+
 /// True when the TRAILING footer carries a source-store reference (`mimir:<id>`):
 /// the fact is the import-synced copy of an external source of truth, so its
 /// lifecycle (revision, decay) is decided THERE and flows in via the importer.
@@ -1695,5 +1860,178 @@ mod tests {
         );
         assert_eq!(project("b\n\n[memory/note | tags: | project: global]").as_deref(), Some("global"));
         assert_eq!(project("no footer here"), None);
+    }
+
+    #[test]
+    fn tags_parses_the_word_list_like_anchors_does() {
+        assert_eq!(
+            tags("b\n\n[memory/gotcha | tags: deploy nas | project: P]"),
+            vec!["deploy".to_string(), "nas".to_string()]
+        );
+        // compose()/edit_footer emit a double space for an empty field ("tags:
+        // " itself ends in a space, then the next field's own leading " |"
+        // follows) - the real shape an empty-tags footer takes.
+        assert!(tags("b\n\n[memory/note | tags:  | project: global]").is_empty());
+        assert!(tags("no footer here").is_empty());
+    }
+
+    #[test]
+    fn parse_facets_round_trips_every_field_and_is_none_without_a_memory_footer() {
+        let footer = compose_full(
+            "gotcha",
+            &["deploy".into(), "nas".into()],
+            "P",
+            &["scp".into()],
+            &["deploy/watcher.sh".into()],
+            Some("2027-01-15"),
+            Some("verified"),
+        );
+        let body = format!("never deploy on friday\n\n{}", footer);
+        assert_eq!(
+            parse_facets(&body),
+            Some(Facets {
+                fact_type: "gotcha".to_string(),
+                tags: vec!["deploy".to_string(), "nas".to_string()],
+                triggers: vec!["scp".to_string()],
+                anchors: vec!["deploy/watcher.sh".to_string()],
+                expires: Some("2027-01-15".to_string()),
+                provenance: Some("verified".to_string()),
+                project: Some("P".to_string()),
+                mimir_id: None,
+            })
+        );
+        // Untyped: no footer at all - legitimately nothing to parse.
+        assert_eq!(parse_facets("a plain note with no footer"), None);
+        // A repo chunk's own footer shape must not be read as a memory footer.
+        assert_eq!(parse_facets("fn a() {}\n\n[repo file | P/src/a.rs | chunk 1/1]"), None);
+        // A bracketed remark that merely looks like a trailing footer.
+        assert_eq!(parse_facets("the plan\n\n[checked 2026-07-30]"), None);
+    }
+
+    #[test]
+    fn dropped_fields_catches_an_untouched_field_lost_to_a_partial_retype() {
+        let old = Facets {
+            fact_type: "gotcha".to_string(),
+            tags: vec!["deploy".to_string()],
+            triggers: vec![],
+            anchors: vec!["deploy/watcher.sh".to_string()],
+            expires: None,
+            provenance: None,
+            project: None,
+            mimir_id: None,
+        };
+        // The caller's own retyped footer keeps tags but drops anchors, and
+        // never mentioned anchors as a parameter (edits.anchors is None):
+        // this is exactly the class carry_over cannot see, because the
+        // caller DID supply their own complete-looking footer.
+        let new_missing_anchors = Facets { anchors: vec![], ..old.clone() };
+        let mut edits = FieldEdits::default();
+        edits.tags = Some(vec!["deploy".to_string()]); // tags WAS touched explicitly
+        assert_eq!(
+            dropped_fields(&old, &new_missing_anchors, &edits),
+            Some("anchors".to_string()),
+            "anchors vanished and nothing said that was intended"
+        );
+
+        // The same drop is legal the moment the caller explicitly clears it.
+        edits.anchors = Some(vec![]);
+        assert_eq!(
+            dropped_fields(&old, &new_missing_anchors, &edits),
+            None,
+            "an explicit clear is not a silent drop"
+        );
+    }
+
+    #[test]
+    fn dropped_fields_stays_silent_on_every_legitimate_shape() {
+        let old = Facets {
+            fact_type: "gotcha".to_string(),
+            tags: vec!["deploy".to_string()],
+            triggers: vec!["scp".to_string()],
+            anchors: vec!["a.rs".to_string()],
+            expires: Some("2027-01-15".to_string()),
+            provenance: Some("verified".to_string()),
+            project: Some("P".to_string()),
+            mimir_id: None,
+        };
+        let edits = FieldEdits::default();
+        // Identical: no drop.
+        assert_eq!(dropped_fields(&old, &old, &edits), None);
+        // A VALUE change (not a drop) is not refused - retyping is legal.
+        let changed = Facets { fact_type: "decision".to_string(), ..old.clone() };
+        assert_eq!(dropped_fields(&old, &changed, &edits), None);
+        // Nothing to lose in the first place.
+        assert_eq!(dropped_fields(&Facets::default(), &Facets::default(), &edits), None);
+    }
+
+    #[test]
+    fn mimir_id_parses_the_trailing_import_marker() {
+        assert_eq!(
+            mimir_id("b\n\n[memory/decision | tags: x | project: global | mimir:01KROUNDTRIP]"),
+            Some("01KROUNDTRIP".to_string())
+        );
+        assert_eq!(mimir_id("b\n\n[memory/note | tags: | project: global]"), None, "no marker at all");
+        assert_eq!(mimir_id("no footer here"), None);
+    }
+
+    /// THE CORE M4 GUARANTEE: composing the footer back from a revision's own
+    /// parsed facets, and gluing it onto the footer-free content, reproduces
+    /// the ORIGINAL body byte for byte - for every field a footer can carry,
+    /// including the two the M3 facets table did not originally store
+    /// (project, mimir). This is the exact property `thor
+    /// verify-footer-roundtrip` and `thor migrate-facets-store` gate on: a
+    /// regression here would silently widen what the migration is willing to
+    /// convert.
+    #[test]
+    fn compose_from_facets_round_trips_every_field_byte_for_byte() {
+        let footer = compose_full(
+            "gotcha",
+            &["deploy".into(), "nas".into()],
+            "P",
+            &["scp".into()],
+            &["deploy/watcher.sh".into()],
+            Some("2027-01-15"),
+            Some("verified"),
+        );
+        let original = format!("never deploy on friday\n\n{}", footer);
+        let facets = parse_facets(&original).expect("a genuine memory footer must parse");
+        let footer_free = strip(&original);
+        assert_eq!(
+            compose_from_facets(footer_free, &facets),
+            original,
+            "composed footer + footer-free body must equal the original body byte for byte"
+        );
+
+        // The mimir tail, present only on imported facts, must round-trip too.
+        let imported = "an imported rule\n\n[memory/decision | tags: x | project: global | mimir:01KROUNDTRIP]";
+        let imported_facets = parse_facets(imported).unwrap();
+        assert_eq!(compose_from_facets(strip(imported), &imported_facets), imported);
+
+        // The minimal shape (no tags, no optional fields, no project at all)
+        // must also round-trip: compose_full still always writes tags/project,
+        // so build this one directly to exercise a footer with NEITHER.
+        let minimal = "a bare note\n\n[memory/note | tags: ]";
+        let minimal_facets = parse_facets(minimal).unwrap();
+        assert_eq!(compose_from_facets(strip(minimal), &minimal_facets), minimal);
+    }
+
+    /// THE OTHER HALF OF THE GATE: a footer this module cannot faithfully
+    /// round-trip (here, a field the canonical writer never omits - `tags` -
+    /// is simply absent) must NOT be silently accepted. The migration's
+    /// whole safety argument rests on this staying true: composing back from
+    /// facets a hand-shaped or historical footer that skips a canonical
+    /// field must produce something DIFFERENT from the original, so the gate
+    /// refuses to convert it and it keeps its footer in the body.
+    #[test]
+    fn compose_from_facets_does_not_paper_over_a_non_canonical_footer() {
+        // No `tags:` field at all - not a shape compose_full/edit_footer ever
+        // produce, but a plausible hand-written or historical footer.
+        let non_canonical = "a rule\n\n[memory/gotcha | project: global]";
+        let facets = parse_facets(non_canonical).expect("fact_type alone is enough to parse");
+        let composed = compose_from_facets(strip(non_canonical), &facets);
+        assert_ne!(
+            composed, non_canonical,
+            "a footer missing the always-written tags field must NOT round-trip losslessly"
+        );
     }
 }

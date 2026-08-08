@@ -48,9 +48,21 @@
 //! one of them nine times. So decay now reads THAT, and only that.
 //!
 //! WHAT DECAY IS NOW. An item called noise at least `NOISE_MARKS_BEFORE_STALE`
-//! times, and never marked useful, stops reaching an injection surface. Never
-//! deleted, never hidden from `lookup::search`, and a single mark of
-//! usefulness overrides it permanently. A serving count decides nothing.
+//! times SINCE the last time anyone called it useful stops reaching an
+//! injection surface. Never deleted, never hidden from `lookup::search`, and
+//! a mark of usefulness still clears every noise mark recorded before it. A
+//! serving count decides nothing.
+//!
+//! WHAT THAT LAST SENTENCE USED TO SAY, AND THE DEFECT IT CARRIED. Until
+//! 2026-08-08 one mark of usefulness made an item immortal: `is_stale`
+//! returned false forever after it, and no operation anywhere undoes a
+//! verdict. The judgement debt asks first about the items served most often -
+//! the ones already winning every place they can - so the only maintenance
+//! loop in the system was quietly freezing exactly the items that dominate,
+//! and the cheap one-call answer was the one that did it. Retiring still
+//! takes two noise marks, so one stray verdict still decides nothing; what a
+//! useful mark no longer does is outrank a reader who changes their mind
+//! later, about an item that has since drifted.
 //! `status`/`doctor` still report "served N times, never marked" as something
 //! to look at, never as a filter.
 
@@ -65,8 +77,8 @@ use thor_core::event_store::EventStore;
 /// production.
 pub const STALE_AFTER_SERVINGS: usize = 5;
 
-/// Called noise this many times, and never marked useful, is where an item
-/// stops reaching an injection surface.
+/// Called noise this many times SINCE the last mark of usefulness is where
+/// an item stops reaching an injection surface.
 ///
 /// TWO, and not a number picked here: it is what 1.0 already did. Its own
 /// rule was that a second noise judgement is where a fact starts costing a
@@ -95,7 +107,7 @@ impl DecayContext {
         // be work done to reach a number nobody reads.
         DecayContext {
             ever_marked_useful: crate::usefulness::ever_marked_useful(store),
-            noise: crate::usefulness::noise_counts(store),
+            noise: crate::usefulness::noise_since_last_useful(store),
         }
     }
 
@@ -114,7 +126,8 @@ impl DecayContext {
     }
 
     /// Whether this item is currently stale: called noise at least
-    /// `NOISE_MARKS_BEFORE_STALE` times and never once marked useful. The one
+    /// `NOISE_MARKS_BEFORE_STALE` times SINCE the last time anyone called it
+    /// useful (never "and never once marked useful" - see below). The one
     /// comparison this whole module exists to make - see `serve/tests/
     /// decay_is_decided_in_exactly_one_place.rs`, which fails if this literal
     /// expression is ever duplicated elsewhere in this crate.
@@ -145,9 +158,11 @@ impl DecayContext {
         if item.bindings.iter().any(|b| matches!(b, Binding::Always)) {
             return false;
         }
-        if self.ever_marked_useful.contains(&item.id) {
-            return false;
-        }
+        // Deliberately NOT "was it ever marked useful". That form made one
+        // verdict permanent and let the maintenance loop freeze exactly the
+        // items that already dominate - see
+        // `usefulness::noise_since_last_useful`. A useful mark still
+        // protects: it resets the count below to zero.
         self.noise.get(&item.id).copied().unwrap_or(0) >= NOISE_MARKS_BEFORE_STALE
     }
 }
@@ -244,11 +259,42 @@ mod tests {
         );
     }
 
+    /// Built from real events, in order, because ORDER is now the whole
+    /// point: a mark of usefulness clears the noise recorded BEFORE it.
+    fn judged(id: &str, verdicts: &[bool]) -> DecayContext {
+        let mut store = EventStore::in_memory().unwrap();
+        for (n, useful) in verdicts.iter().enumerate() {
+            let at = format!("2026-08-{:02}T00:00:00Z", n + 1);
+            if *useful {
+                crate::mark::record_useful(&mut store, "s", "l", "a", &at, id).unwrap();
+            } else {
+                crate::mark::record_noise(&mut store, "s", "l", "a", &at, id).unwrap();
+            }
+        }
+        DecayContext::load(&store)
+    }
+
     #[test]
-    fn a_mark_of_usefulness_overrides_any_amount_of_noise() {
-        let mut decay = called_noise("i1", NOISE_MARKS_BEFORE_STALE * 20);
-        decay.ever_marked_useful.insert("i1".to_string());
-        assert!(!decay.is_stale(&bound("i1")), "one mark of usefulness wins outright");
+    fn a_mark_of_usefulness_clears_the_noise_recorded_before_it() {
+        let mut verdicts = vec![false; NOISE_MARKS_BEFORE_STALE * 20];
+        verdicts.push(true);
+        assert!(!judged("i1", &verdicts).is_stale(&bound("i1")), "a later verdict settles it");
+    }
+
+    /// THE DEFECT THIS PREVENTS, found independently by two reviews on
+    /// 2026-08-08. "Ever marked useful" made one verdict permanent, and the
+    /// judgement debt asks first about the items served most often - the ones
+    /// already winning every place. So the only maintenance loop in the
+    /// system quietly made the dominant items immortal, and the cheapest
+    /// answer was the one that did it. The latest verdict counts now.
+    #[test]
+    fn noise_after_a_mark_of_usefulness_still_retires_it() {
+        let mut verdicts = vec![true];
+        verdicts.extend(std::iter::repeat(false).take(NOISE_MARKS_BEFORE_STALE));
+        assert!(
+            judged("i1", &verdicts).is_stale(&bound("i1")),
+            "a verdict from before must not outrank one made later with better information"
+        );
     }
 
     #[test]
@@ -271,10 +317,9 @@ mod tests {
     /// yields a different answer with nothing to undo.
     #[test]
     fn decay_is_reversible_a_mark_after_the_fact_un_stales_it() {
-        let before = called_noise("i1", NOISE_MARKS_BEFORE_STALE);
-        assert!(before.is_stale(&bound("i1")), "fixture sanity: retired before any mark");
-        let mut after = called_noise("i1", NOISE_MARKS_BEFORE_STALE);
-        after.ever_marked_useful.insert("i1".to_string());
-        assert!(!after.is_stale(&bound("i1")));
+        let mut verdicts = vec![false; NOISE_MARKS_BEFORE_STALE];
+        assert!(judged("i1", &verdicts).is_stale(&bound("i1")), "fixture sanity: retired before any mark");
+        verdicts.push(true);
+        assert!(!judged("i1", &verdicts).is_stale(&bound("i1")));
     }
 }

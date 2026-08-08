@@ -22,7 +22,10 @@
 use crate::rank::RankedItem;
 use intent::Action;
 
-pub const MAX_ITEMS: usize = 4;
+/// Re-exported, not redeclared. The write gate has to ask "would this item
+/// ever be shown", which needs this number, and `model` cannot read it from
+/// here without inverting the dependency. Two names, one definition.
+pub use model::item::MAX_ITEMS;
 pub const MAX_BLOCK_CHARS: usize = 1200;
 
 /// The one line every injection surface opens with, verbatim - session start

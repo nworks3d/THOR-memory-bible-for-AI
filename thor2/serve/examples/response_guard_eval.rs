@@ -2,7 +2,11 @@
 //!
 //! Runs two eval sets written BEFORE the rulebook or matcher source was ever
 //! read (only the six plain-language rule intents were known at authoring
-//! time) through the REAL matcher (`serve::respond::block_reason`) against
+//! time) through the REAL matcher (`serve::respond::guard_verdict` - the one
+//! the Stop hook in `serve/src/bin/serve.rs` actually calls; this ran against
+//! `block_reason` until 2026-08-07, which ignores the `before` and `tier`
+//! keys the live rulebook carries, so every number it printed described a
+//! code path production does not use) against
 //! the REAL live rulebook (named by `RESPONSE_GUARD_EVAL_RULEBOOK`, read
 //! directly - never copied, never modified):
 //!
@@ -99,7 +103,7 @@ fn main() {
         let rule_key = case.rule.unwrap_or(0);
         let entry = by_rule.entry(rule_key).or_insert((0, 0));
         entry.1 += 1;
-        match respond::block_reason(Some(&rulebook_text), &case.reply) {
+        match respond::guard_verdict(Some(&rulebook_text), &case.reply).block_reason {
             Some(reason) => {
                 caught_total += 1;
                 entry.0 += 1;
@@ -142,7 +146,7 @@ fn main() {
     for case in &should_pass {
         let entry = by_class.entry(case.class.clone()).or_insert((0, 0));
         entry.1 += 1;
-        if let Some(reason) = respond::block_reason(Some(&rulebook_text), &case.reply) {
+        if let Some(reason) = respond::guard_verdict(Some(&rulebook_text), &case.reply).block_reason {
             false_block_total += 1;
             entry.0 += 1;
             false_block_examples.push((case.id.clone(), case.class.clone(), reason));

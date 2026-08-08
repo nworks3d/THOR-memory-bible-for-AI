@@ -12,8 +12,7 @@
 
 use crate::input::ServeInput;
 use crate::live::LiveItem;
-use model::item::{Binding, Item, Kind, Severity, TargetKind};
-use model::normalize::{last_segment, normalize_target};
+use model::item::{Binding, Item, Kind};
 use regex::Regex;
 use std::sync::OnceLock;
 
@@ -24,20 +23,10 @@ pub struct RankedItem {
     pub item: Item,
 }
 
-/// Severity, heaviest first, with a missing severity sinking below every
-/// declared one - never landing between costly and irreversible, and never
-/// silently acting as if it were between irreversible and costly either.
-/// (Ord's own default for `Option<Severity>` puts `None` FIRST, which would
-/// rank a severity-less item as if it outranked `Irreversible` - exactly the
-/// silent-middle-value failure this function exists to refuse.)
-fn severity_rank(severity: Option<Severity>) -> u8 {
-    match severity {
-        Some(Severity::Irreversible) => 0,
-        Some(Severity::Costly) => 1,
-        Some(Severity::HouseStyle) => 2,
-        None => 3,
-    }
-}
+/// Moved to `model::item` so the write gate can rank a candidate against its
+/// rivals without `model` depending on `serve`. Re-exported here because the
+/// ranking is still this module's business and every doc comment names it so.
+pub use model::item::severity_rank;
 
 /// A distinctive term: letters/digits plus the punctuation an identifier or a
 /// path realistically carries, at least 4 characters. Same shape as the
@@ -67,19 +56,11 @@ pub fn closeness(item_text: &str, context: &str) -> usize {
     ctx_terms.intersection(&item_terms).count()
 }
 
-/// Same target, decided in the ONE place normalisation lives
-/// (`model::normalize`): equal once normalised, or equal by their last path
-/// segment (an item bound to a full path still fires when the input names it
-/// by its bare file/command name, and vice versa - see `normalize::last_segment`'s
-/// own doc comment, which describes exactly this comparison).
-pub fn target_matches(item_kind: TargetKind, item_value: &str, in_kind: TargetKind, in_value: &str) -> bool {
-    if item_kind != in_kind {
-        return false;
-    }
-    let a = normalize_target(item_value);
-    let b = normalize_target(in_value);
-    a == b || last_segment(&a) == last_segment(&b)
-}
+/// Same target: moved to `model::normalize` so the write gate can ask the
+/// same question without `model` having to depend on `serve`. Re-exported
+/// here under its original name, because every caller and half the doc
+/// comments in this workspace name it `rank::target_matches`.
+pub use model::normalize::target_matches;
 
 /// `Always` never matches here - on purpose. The five injection surfaces
 /// (CONTRACT.md's "vijf oppervlakken die elkaars plaatsen nooit afnemen")

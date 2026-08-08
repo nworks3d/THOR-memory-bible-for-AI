@@ -5,11 +5,13 @@
 //! remember this, so a failure here is surfaced, never swallowed.
 //!
 //! This is the write half of the decay doctrine (`crate::decay`): an item
-//! served repeatedly and never marked useful eventually stops reaching an
+//! called noise twice since anyone last called it useful stops reaching an
 //! injection surface, and recording a mark here - at any point, even after
-//! decay has already taken hold - cancels that permanently, because decay is
-//! re-derived from the log fresh on every call (`crate::usefulness::
-//! ever_marked_useful`), never a persisted flag to flip back.
+//! decay has already taken hold - clears the noise recorded before it,
+//! because decay is re-derived from the log fresh on every call
+//! (`crate::usefulness::noise_since_last_useful`), never a persisted flag to
+//! flip back. It does NOT clear what comes after: the latest verdict is the
+//! one that counts, which is what makes a second opinion possible at all.
 
 use model::marked::{ItemMarkedNoise, ItemMarkedUseful};
 use thor_core::event_store::{Event, EventKind, EventStore};

@@ -82,3 +82,35 @@ mod tests {
         assert!(!marked.contains("x2"));
     }
 }
+
+/// Noise judgements recorded SINCE each item's most recent mark of
+/// usefulness, rather than over its whole life.
+///
+/// WHY THE "EVER" FORM WAS WRONG. `ever_marked_useful` made a single useful
+/// verdict permanent: no amount of later evidence could ever retire that
+/// item again, and there is no operation anywhere in this system that undoes
+/// one. Two independent reviews found the same consequence on 2026-08-08:
+/// the judgement debt asks first about the items served most often, which
+/// are exactly the ones already winning every place, so the only maintenance
+/// loop in the system was quietly making the dominant items immortal - and
+/// the cheap answer (plain `mark`, one call) was the one that did it, while
+/// the honest answer needs two.
+///
+/// The rule now is simply that the LATEST verdict counts. A useful mark
+/// still protects, and one stray noise still decides nothing, because
+/// retiring still needs two. What it no longer does is outrank a reader who
+/// changed their mind later, with better information.
+pub fn noise_since_last_useful(store: &EventStore) -> HashMap<String, usize> {
+    let Ok(events) = store.event_kinds() else { return HashMap::new() };
+    let mut counts: HashMap<String, usize> = HashMap::new();
+    for (kind, id) in events {
+        match kind {
+            EventKind::ItemMarkedUseful => {
+                counts.insert(id, 0);
+            }
+            EventKind::ItemMarkedNoise => *counts.entry(id).or_default() += 1,
+            _ => {}
+        }
+    }
+    counts
+}

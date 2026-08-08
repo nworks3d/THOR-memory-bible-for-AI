@@ -7,6 +7,120 @@
 use intent::Action;
 use model::item::TargetKind;
 
+/// One whitespace-separated argument, stripped of the shell punctuation that
+/// wraps or follows it, and of a leading `--flag=`.
+///
+/// Deliberately not a shell parser. It never resolves a variable, a glob or a
+/// pipeline; it only recovers the literal words a person typed, which is all
+/// an anchor match needs.
+fn shell_tokens(command: &str) -> Vec<String> {
+    command
+        .split_whitespace()
+        .map(|raw| {
+            let t = raw.trim_matches(|c| matches!(c, '"' | '\'' | '(' | ')' | ';' | ',' | '`' | '|' | '<' | '>'));
+            match t.split_once('=') {
+                // `--db=path` and `FOO=path` both hand over the right half.
+                Some((_, rhs)) if !rhs.is_empty() && t.starts_with(|c: char| c == '-' || c.is_ascii_uppercase()) => rhs,
+                _ => t,
+            }
+            .trim_end_matches(['.', ':', ';'])
+            .to_string()
+        })
+        .filter(|t| !t.is_empty())
+        .collect()
+}
+
+/// The last dot-suffix of a token, when it looks like a file extension:
+/// 1 to 8 characters, letters and digits only.
+fn extension_of(token: &str) -> Option<&str> {
+    let (_, ext) = token.rsplit_once('.')?;
+    let ok = !ext.is_empty()
+        && ext.len() <= 8
+        && ext.chars().all(|c| c.is_ascii_alphanumeric());
+    ok.then_some(ext)
+}
+
+/// Every file the command NAMES, as an anchor value.
+///
+/// THE DEFECT THIS CLOSES, measured on 2026-08-07 in two places. A fact
+/// anchored at a file fired when that file was opened with a file tool, and
+/// stayed silent when a shell command read the very same file. Reproduced
+/// here: three facts fired for `thor2/model/src/gate.rs` as a file and zero
+/// for `grep -n Refusal thor2/model/src/gate.rs`. Shell is how deploy and
+/// infrastructure work happens, so that is exactly where those facts were
+/// needed and exactly where they said nothing. A warning about a grep trap in
+/// a log file stayed quiet during that grep, and the mistake it named was
+/// made.
+///
+/// Not a widened trigger: the anchor is unchanged, and it still matches only
+/// the file it always named. What changes is that the file is now recognised
+/// through a second, equally real route.
+pub fn paths_in_command(command: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    for token in shell_tokens(command) {
+        if token.contains("://") || token.starts_with('-') || token.contains('*') || token.contains('?') {
+            continue;
+        }
+        let normalised = token.replace('\\', "/");
+        let has_separator = normalised.contains('/');
+        if !has_separator && extension_of(&normalised).is_none() {
+            continue;
+        }
+        if !out.contains(&normalised) {
+            out.push(normalised);
+        }
+    }
+    out
+}
+
+/// Every host the command NAMES, as an anchor value: the authority half of a
+/// URL, or a bare dotted name.
+///
+/// A filename is the hard case, because `gate.rs` has exactly the shape of a
+/// hostname. A bare token is therefore only read as a host when its last
+/// label is NOT a known source extension (`model::gate::FILE_EXTENSIONS`, the
+/// same list the write gate uses to tell `guard.rs:610` from `host:8080`).
+/// That trades a miss for a false fire on purpose: a real TLD that is also a
+/// source extension (`.md`, `.cc`) is skipped, which costs a hint, while the
+/// opposite error would put a fact about a server in front of somebody
+/// editing a file.
+pub fn hosts_in_command(command: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    for token in shell_tokens(command) {
+        let candidate = match token.split_once("://") {
+            // Strip scheme, then userinfo, then path, then port.
+            Some((_, rest)) => {
+                let authority = rest.split(['/', '?', '#']).next().unwrap_or("");
+                let authority = authority.rsplit('@').next().unwrap_or(authority);
+                authority.split(':').next().unwrap_or(authority).to_string()
+            }
+            None => {
+                if token.contains('/') || token.starts_with('-') {
+                    continue;
+                }
+                // `ssh admin@host` names a host as plainly as a URL does.
+                let token = token.rsplit('@').next().unwrap_or(&token).to_string();
+                match extension_of(&token) {
+                    // A dotted name whose tail is a source extension is a
+                    // file, not a host.
+                    Some(ext) if model::gate::FILE_EXTENSIONS.contains(&ext.to_lowercase().as_str()) => continue,
+                    Some(ext) if ext.chars().all(|c| c.is_ascii_alphabetic()) && ext.len() >= 2 => {
+                        token.split(':').next().unwrap_or(&token).to_string()
+                    }
+                    _ => continue,
+                }
+            }
+        };
+        if candidate.is_empty() || !candidate.contains('.') {
+            continue;
+        }
+        if !out.contains(&candidate) {
+            out.push(candidate);
+        }
+    }
+    out
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct ServeInput {
     pub moments: Vec<Action>,
@@ -38,14 +152,22 @@ impl ServeInput {
         self.context.push_str(text);
     }
 
-    /// A command about to run: derives moments via `intent::from_command` and
-    /// treats the command text itself as a possible `Target::Command` doel.
+    /// A command about to run: derives moments via `intent::from_command`,
+    /// treats the command text itself as a possible `Target::Command` doel,
+    /// and - see `paths_in_command`/`hosts_in_command` - every file and host
+    /// the command NAMES as a doel of its own.
     pub fn add_command(&mut self, command: &str) {
         if command.is_empty() {
             return;
         }
         self.moments.extend(intent::from_command(command).into_iter().map(|s| s.action));
         self.targets.push((TargetKind::Command, command.to_string()));
+        for path in paths_in_command(command) {
+            self.targets.push((TargetKind::Path, path));
+        }
+        for host in hosts_in_command(command) {
+            self.targets.push((TargetKind::Host, host));
+        }
         self.push_context(command);
     }
 
@@ -113,5 +235,91 @@ mod tests {
         input.add_moment(Action::Publish);
         input.add_moment(Action::Publish);
         assert_eq!(input.moments.len(), 1);
+    }
+
+    // ------------------------------------------ files and hosts in a command
+
+    /// The measured defect, in one line: the same file, once as a file and
+    /// once inside a command, has to reach the same anchor.
+    #[test]
+    fn a_command_that_reads_a_file_names_that_file_as_a_target() {
+        let paths = paths_in_command("grep -n Refusal thor2/model/src/gate.rs");
+        assert_eq!(paths, vec!["thor2/model/src/gate.rs"]);
+
+        let mut input = ServeInput::default();
+        input.add_command("grep -n Refusal thor2/model/src/gate.rs");
+        assert!(
+            input.targets.contains(&(TargetKind::Path, "thor2/model/src/gate.rs".to_string())),
+            "the file the command reads must be a Path doel: {:?}",
+            input.targets
+        );
+        assert!(
+            input.targets.iter().any(|(k, _)| *k == TargetKind::Command),
+            "and the command itself must still be one"
+        );
+    }
+
+    /// The exact case from the field report: a bare log filename, greped.
+    #[test]
+    fn a_bare_filename_with_an_extension_counts() {
+        assert_eq!(paths_in_command("Select-String UP_DONE rebuild-prod.log"), vec!["rebuild-prod.log"]);
+    }
+
+    #[test]
+    fn windows_and_unc_paths_are_normalised_not_dropped() {
+        assert_eq!(paths_in_command("type C:\\Users\\dev\\thor2\\thor.db"), vec!["C:/Users/dev/thor2/thor.db"]);
+        assert_eq!(paths_in_command("cat \\\\server\\share\\deploy.log"), vec!["//server/share/deploy.log"]);
+    }
+
+    #[test]
+    fn a_flag_hands_over_its_value() {
+        assert_eq!(paths_in_command("serve --db=/srv/thor/thor.db hook"), vec!["/srv/thor/thor.db"]);
+    }
+
+    #[test]
+    fn quotes_and_trailing_punctuation_come_off() {
+        assert_eq!(paths_in_command("cat 'docs/1.0/SETUP.md';"), vec!["docs/1.0/SETUP.md"]);
+    }
+
+    /// Not a widened trigger: a glob names no one file, and a flag is not a
+    /// path. Either one turned into a doel would fire facts on commands that
+    /// never touched the file they are about.
+    #[test]
+    fn globs_and_flags_are_not_paths() {
+        assert!(paths_in_command("rm -rf target/*.rs").iter().all(|p| !p.contains('*')));
+        assert_eq!(paths_in_command("cargo test --all-targets"), Vec::<String>::new());
+    }
+
+    #[test]
+    fn a_url_yields_its_host() {
+        assert_eq!(hosts_in_command("curl https://quote.example.com/orders?id=3"), vec!["quote.example.com"]);
+        // `ssh admin@host` names a host too; the user half is not part of it.
+        assert_eq!(hosts_in_command("ssh admin@files.example.com"), vec!["files.example.com"]);
+    }
+
+    #[test]
+    fn a_bare_hostname_yields_a_host() {
+        assert_eq!(hosts_in_command("nslookup shop.example.com"), vec!["shop.example.com"]);
+    }
+
+    /// The hard case, and the reason the source-extension list is consulted:
+    /// `gate.rs` has exactly the shape of a hostname. Reading it as one would
+    /// put facts about a server in front of somebody editing a file.
+    #[test]
+    fn a_filename_is_never_read_as_a_host() {
+        for cmd in ["grep foo model/src/gate.rs", "cat notes.md", "sh deploy.sh", "node build.js"] {
+            assert_eq!(hosts_in_command(cmd), Vec::<String>::new(), "{cmd} must name no host");
+        }
+    }
+
+    #[test]
+    fn a_command_naming_a_host_reaches_a_host_anchor() {
+        let mut input = ServeInput::default();
+        input.add_command("curl -I https://shop.example.com/");
+        assert!(
+            input.targets.contains(&(TargetKind::Host, "shop.example.com".to_string())),
+            "a host anchor must be reachable from a command: {:?}",
+            input.targets
+        );
     }
 }

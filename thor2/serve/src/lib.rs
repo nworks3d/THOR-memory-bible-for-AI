@@ -51,8 +51,8 @@
 //!
 //! `decay` sits AFTER `rank::select`/`session_start::select` on every one of
 //! the three injection surfaces (1, 2, 3), never as a fourth kind of
-//! candidate pool: an item served repeatedly and never marked useful
-//! (`mark::record_useful`) stops reaching them, while `lookup` (surface 4)
+//! candidate pool: an item called noise twice since anyone last called it
+//! useful (`mark::record_useful`) stops reaching them, while `lookup` (surface 4)
 //! never applies it at all, so nothing decay excludes ever stops being
 //! findable - see `decay`'s own doc comment for the full doctrine.
 //!

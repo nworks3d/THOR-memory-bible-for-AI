@@ -19,7 +19,7 @@
 //!
 //! Judgements are events, not a flag: they land in the same hash-chained log
 //! as everything else, `history` walks them, and a later mark of usefulness
-//! overrides them permanently without anything to undo.
+//! clears the ones recorded before it without anything to undo.
 //!
 //! NOT RUN, AND HERE IS WHY - the measurement that stopped it (2026-08-03).
 //! A dry run said 599 items, 998 judgements, 194 taken past the retirement

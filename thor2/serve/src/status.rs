@@ -89,8 +89,9 @@ pub struct StoreStatus {
     /// same count `serve audit`'s own "declared, never delivered" line
     /// reports, exposed here as a number rather than a table.
     pub declared_never_fired: usize,
-    /// Of the fireable items, how many are currently decayed (served at
-    /// least `decay::STALE_AFTER_SERVINGS` times and never marked useful) -
+    /// Of the fireable items, how many are currently decayed (called noise
+    /// at least `decay::NOISE_MARKS_BEFORE_STALE` times since the last mark
+    /// of usefulness) -
     /// excluded from every injection surface right now, but still fully
     /// live and still fully findable via `lookup::search`.
     pub decayed: usize,
@@ -224,6 +225,11 @@ mod tests {
     /// be asserting against the exemption rather than against the threshold.
     fn bound_rule(id: &str) -> Item {
         let mut it = item(id, Kind::Rule);
+        // A project, because ground 19 refuses a GLOBAL item anchored at a
+        // source file: it would fire in every repository that happens to have
+        // one by that name. These fixtures are about serving counts, not about
+        // that ground, so they name a project the way a real caller does.
+        it.project = Some("some-project".to_string());
         it.bindings = vec![Binding::Target {
             kind: model::item::TargetKind::Path,
             value: format!("src/{id}.rs"),

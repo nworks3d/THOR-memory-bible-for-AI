@@ -299,6 +299,9 @@ mod tests {
     fn a_target_binding_round_trips() {
         let mut db = EventStore::in_memory().unwrap();
         let mut it = item("x7", Kind::Orientation);
+        // Named project: ground 19 refuses a global item anchored at a source
+        // file, and this test is about the binding round-tripping.
+        it.project = Some("some-project".to_string());
         it.bindings = vec![Binding::Target { kind: TargetKind::Path, value: "a/b.rs".to_string() }];
         store::declare(&mut db, "s", "l", "a", &it).unwrap();
         let live = live_items(&db);

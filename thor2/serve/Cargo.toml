@@ -1,6 +1,6 @@
 [package]
 name = "serve"
-version = "0.1.0"
+version.workspace = true
 edition = "2021"
 license = "GPL-3.0-or-later"
 description = "The one serving path: select, rank, cap and render items for every channel (hook/check/why/audit)"

@@ -1,6 +1,6 @@
 [package]
 name = "model"
-version = "0.1.0"
+version.workspace = true
 edition = "2021"
 license = "GPL-3.0-or-later"
 description = "The four item kinds, their typed bindings, and the write gate that refuses what cannot be honoured"

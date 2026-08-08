@@ -1,6 +1,6 @@
 [package]
 name = "mcp"
-version = "0.1.0"
+version.workspace = true
 edition = "2021"
 license = "GPL-3.0-or-later"
 description = "The agent-facing MCP surface: remember/revise/pin/unpin/get/lookup/mark/status through the model write gate and serve's lookup/status - never a tool onto session_start, the moment surface, or the prompt surface"

@@ -1,14 +1,20 @@
 # Release: tag -> build on clean runners -> attach binaries.
 #
 # Triggered ONLY by a version tag, so a release always corresponds to an exact
-# commit, and the binary is built by CI on a clean machine - never uploaded from
-# a maintainer's laptop, where "works here" proves nothing.
+# commit, and the binaries are built by CI on a clean machine - never uploaded
+# from a maintainer's laptop, where "works here" proves nothing.
 #
-# Three assets, because THOR ships in two shapes that are not interchangeable and
-# the client shape is built for two platforms:
-#   thor-<ver>-windows-x86_64.zip  - semantic (dense recall). The client build.
-#   thor-<ver>-linux-x86_64.tar.gz - semantic (dense recall). The client build.
-#   thor-<ver>-linux-x86_64-bm25.tar.gz - default. No ONNX: the server/NAS build.
+# THIS BUILDS VERSION 2, which is a SET of programs rather than one command with
+# subcommands, so every asset is a bundle. Version 1 shipped a single `thor`
+# binary and its release (tag v1.0.0) stays downloadable from GitHub as it is;
+# this workflow no longer builds that shape. Re-cutting a 1.x patch means
+# restoring the old job from git history first.
+#
+# Three assets, because the recall shape is not interchangeable and the client
+# shape is built for two platforms:
+#   thor2-<ver>-windows-x86_64.zip      - meaning search included. The client build.
+#   thor2-<ver>-linux-x86_64.tar.gz     - meaning search included. The client build.
+#   thor2-<ver>-linux-x86_64-plain.tar.gz - no meaning search: the server/NAS build.
 #
 name: Release
 
@@ -26,6 +32,11 @@ permissions:
 
 env:
   CARGO_TERM_COLOR: always
+  # The programs a user actually needs. The rest of the tree is maintenance and
+  # measurement tooling that only makes sense inside a checkout, so it is
+  # deliberately NOT shipped: apply_pins, fake_judge, footer_read, import_noise,
+  # repair_project, restore_attribution, verify.
+  SHIPPED_BINS: install doctor serve mcp codeindex backup sync migrate
 
 jobs:
   # A tag that does not build or does not pass its tests must never become a
@@ -42,13 +53,16 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
         with:
-          workspaces: thor
-      - name: Test (semantic)
-        working-directory: thor
+          workspaces: thor2
+      - name: Test (whole workspace, every target)
+        working-directory: thor2
+        run: cargo test --release --workspace --all-targets
+      - name: Test (meaning search compiled in)
+        working-directory: thor2
         run: cargo test --release --features semantic --lib
-      - name: Build (default / bm25 - the server shape must keep compiling)
-        working-directory: thor
-        run: cargo build --release
+      - name: Build (plain - the server shape must keep compiling)
+        working-directory: thor2
+        run: cargo build --release --workspace
 
   build:
     name: ${{ matrix.asset }}
@@ -60,46 +74,49 @@ jobs:
         include:
           - os: windows-latest
             features: "--features semantic"
-            bin: thor.exe
-            asset: thor-windows-x86_64.zip
+            ext: ".exe"
+            asset: thor2-windows-x86_64.zip
           - os: ubuntu-latest
             features: "--features semantic"
-            bin: thor
-            asset: thor-linux-x86_64.tar.gz
+            ext: ""
+            asset: thor2-linux-x86_64.tar.gz
           - os: ubuntu-latest
             features: ""
-            bin: thor
-            asset: thor-linux-x86_64-bm25.tar.gz
+            ext: ""
+            asset: thor2-linux-x86_64-plain.tar.gz
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
         with:
-          workspaces: thor
+          workspaces: thor2
 
       - name: Build
-        working-directory: thor
-        run: cargo build --release ${{ matrix.features }}
+        working-directory: thor2
+        run: cargo build --release --workspace ${{ matrix.features }}
 
-      # Stage into dist/ rather than the repo root: the crate lives in a
-      # directory called `thor` and the linux binary is also called `thor`, so
-      # copying it to `.` collides with that directory and the package step dies.
+      # Stage into dist/ rather than the repo root: several binary names are
+      # also directory names in this tree, and copying to `.` collides.
       - name: Package (windows)
         if: runner.os == 'Windows'
-        shell: pwsh
+        shell: bash
         run: |
-          New-Item -ItemType Directory -Force -Path dist | Out-Null
-          Copy-Item thor/target/release/${{ matrix.bin }} dist/
-          Copy-Item LICENSE dist/
-          Compress-Archive -Path dist/* -DestinationPath ${{ matrix.asset }}
+          mkdir -p dist
+          for b in $SHIPPED_BINS; do
+            cp "thor2/target/release/$b${{ matrix.ext }}" dist/
+          done
+          cp LICENSE dist/
+          cd dist && 7z a -tzip "../${{ matrix.asset }}" ./*
 
       - name: Package (linux)
         if: runner.os == 'Linux'
         run: |
           mkdir -p dist
-          cp thor/target/release/${{ matrix.bin }} dist/
+          for b in $SHIPPED_BINS; do
+            cp "thor2/target/release/$b" dist/
+          done
           cp LICENSE dist/
-          tar czf ${{ matrix.asset }} -C dist ${{ matrix.bin }} LICENSE
+          tar czf ${{ matrix.asset }} -C dist .
 
       # Anyone should be able to verify the download matches what CI produced.
       - name: Checksum
@@ -130,9 +147,9 @@ jobs:
       - name: List what will be published
         run: ls -la dist
 
-      # The notes state what the binary does NOT include, because that is what
+      # The notes state what the download does NOT include, because that is what
       # generates issues otherwise: no embedding model ships with it, and the
-      # semantic build needs the MSVC runtime on Windows.
+      # meaning-search build needs the MSVC runtime on Windows.
       - name: Publish
         uses: softprops/action-gh-release@v2
         with:
@@ -142,38 +159,46 @@ jobs:
           body: |
             Built by CI from this tag on clean runners. Verify with the `.sha256` next to each asset.
 
-            **Which asset**
+            **Which download**
 
-            | asset | recall | for |
+            | asset | meaning search | for |
             |---|---|---|
-            | `thor-windows-x86_64.zip` | semantic + bm25 | Windows client (the agent machine) |
-            | `thor-linux-x86_64.tar.gz` | semantic + bm25 | Linux client |
-            | `thor-linux-x86_64-bm25.tar.gz` | bm25 only | servers / NAS / containers - no ONNX |
+            | `thor2-windows-x86_64.zip` | yes | Windows, the machine your assistant runs on |
+            | `thor2-linux-x86_64.tar.gz` | yes | Linux, same |
+            | `thor2-linux-x86_64-plain.tar.gz` | no | servers, a NAS, a container |
+
+            Each one is a bundle, not a single program. Version 2 is several small
+            programs that work together: `install` sets everything up, `doctor` tells you
+            whether it is healthy, and the rest run in the background once installed.
 
             **What is NOT in the box**
 
-            - **No embedding model.** Semantic recall needs a local ONNX sentence-embedding
-              model (~235 MB) that you supply; nothing auto-downloads. Without it THOR runs
-              pure bm25 and degrades cleanly - it does not break. See README ("Semantic mode").
-            - **Windows: needs the Microsoft Visual C++ Redistributable** (`MSVCP140.dll`,
-              `VCRUNTIME140.dll`) and `DirectML.dll` (present on Windows 10 1903+). If the
-              binary refuses to start, install the VC++ redistributable first.
+            - **No language model of any kind.** Nothing calls out to an API, nothing needs
+              a key. Meaning search needs a local model file (about 235 MB) that you supply;
+              nothing downloads itself. Without it, search falls back to matching words and
+              keeps working - it does not break.
+            - **Windows: you need the Microsoft Visual C++ Redistributable**
+              (`MSVCP140.dll`, `VCRUNTIME140.dll`) and `DirectML.dll`, which is already on
+              Windows 10 1903 and later. If a program refuses to start, install the VC++
+              redistributable first.
 
             **Install**
 
-            Unpack, put the binary where it will stay, then `thor install --with-courier` to
-            wire the hooks into your agent (it backs up settings.json first and only adds
-            THOR's own entries; it writes the binary's current path, so move it before you
-            install). Run `thor doctor` if anything looks off - it reports the store, model,
-            sidecars and daemon, which is what recall behaviour depends on.
+            Unpack everything into a folder where it can stay - the setup writes down where
+            it put things, so moving the folder afterwards breaks it. Then run `install`,
+            pointing it at your assistant's settings file. It backs that file up first and
+            only ever adds its own entries. Restart your assistant afterwards: it reads its
+            settings once, at startup, so until you restart nothing you installed is
+            running. Then run `doctor` to see whether it is actually healthy.
 
-            New here? docs/1.0/FEATURES.md explains in plain words what each part does and whether it
-            is worth turning on. Full walkthrough: docs/1.0/SETUP.md. Exact costs and undo steps for
-            every optional piece: docs/1.0/OPTIONAL-FEATURES.md.
+            New here? The README walks through it step by step. Coming from version 1?
+            Your old notes are not lost - see the README's own note on that; and version 1's
+            documentation is still in `docs/1.0/`.
 
             **What has actually been run**
 
-            Every asset is built and tested by CI on a clean runner - build plus the full
-            library suite, on both shapes THOR ships in. Beyond that, the platform the
-            maintainer uses is started by hand before publishing; the others are CI-built.
-            If one does not start for you, say so - that is the report worth having.
+            Every asset is built and tested by CI on a clean runner: the whole test suite,
+            plus a separate run with meaning search compiled in, plus the plain server
+            shape. Beyond that, the maintainer starts the Windows build by hand before
+            publishing; the Linux ones are CI-built only. If one does not start for you,
+            say so - that is the report worth having.

@@ -1,6 +1,6 @@
 [package]
 name = "intent"
-version = "0.1.0"
+version.workspace = true
 edition = "2021"
 license = "GPL-3.0-or-later"
 description = "The closed action vocabulary and its detection - one house for every surface form of the same meaning"

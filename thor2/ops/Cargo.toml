@@ -1,6 +1,6 @@
 [package]
 name = "ops"
-version = "0.1.0"
+version.workspace = true
 edition = "2021"
 license = "GPL-3.0-or-later"
 description = "The operational layer: replica sync over HTTP, agent-settings hook installer, and the plain-language health check"

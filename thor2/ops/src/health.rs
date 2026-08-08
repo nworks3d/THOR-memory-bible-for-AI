@@ -538,7 +538,7 @@ pub fn gate_line(db: &Path) -> String {
         return "gate: has never refused a write, and has never stood aside from one".to_string();
     }
     format!(
-        "gate: {refused} refusals by {} distinct rules, {stood_aside} stand-asides (the stale-rule nudge holding off for the rest of a session - no prohibition ever stands aside any more)",
+        "gate: {refused} refusals by {} distinct rules, {stood_aside} stand-asides, lifetime (a stand-aside is the stale-rule nudge holding off for the rest of a session; no prohibition stands aside SINCE 2026-08-08, so older ones in this total are real prohibitions that did)",
         rules.len()
     )
 }

@@ -520,9 +520,10 @@ pub enum Capacity {
 /// and this note exists because the opposite was tried for a few hours on
 /// 2026-08-08 and was wrong.
 ///
-/// The reasoning that failed: "every serving surface adds a Path target AND a
-/// Dir target for the same touch, so a directory anchor is in the pool every
-/// time a file under it is touched". It does not. `ServeInput::add_file` adds
+/// The reasoning that failed held that a file touch offers its parent
+/// directory as a second target beside the path, putting a directory anchor in
+/// the pool every time a file under it is touched. It does not.
+/// `ServeInput::add_file` adds
 /// a Path target only, and `normalize::target_matches` refuses a kind
 /// mismatch, so that pool is never assembled anywhere.
 ///
@@ -615,9 +616,13 @@ pub fn capacity(store: &EventStore, item: &Item) -> anyhow::Result<Capacity> {
     // legitimate thing for a rule to be. But it has to be SAID, because this
     // is exactly the case the crowding count below cannot see: a directory
     // pool holding three items reads as roomy while being unreachable.
-    let all_dir = bindings
-        .iter()
-        .all(|b| matches!(b, Binding::Target { kind: crate::item::TargetKind::Dir, .. }));
+    // `bindings` above already dropped every Always, so this has to ask the
+    // ITEM, not the filtered list. A pinned item is served in full at every
+    // session start, so "never shown as advice" would be a flat lie about an
+    // [Always, Dir] pair - and both reviews caught exactly that wording.
+    let pinned = item.bindings.iter().any(|b| matches!(b, Binding::Always));
+    let all_dir = !pinned
+        && bindings.iter().all(|b| matches!(b, Binding::Target { kind: crate::item::TargetKind::Dir, .. }));
     if all_dir {
         return Ok(Capacity::Crowded(
             "every binding on this item is a DIRECTORY, which no automatic serving surface can \

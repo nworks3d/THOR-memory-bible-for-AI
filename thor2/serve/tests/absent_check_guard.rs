@@ -148,7 +148,7 @@ fn the_same_write_sent_again_in_the_same_session_is_refused_again_and_says_so() 
     assert_eq!(v["decision"], "block", "the forbidden write must not land on the second try: {second}");
     let second_reason = v["reason"].as_str().unwrap();
     assert!(second_reason.starts_with(&first_reason), "the original reason must survive: {second_reason}");
-    assert!(second_reason.contains("SECOND time"), "a repeat must say it is one: {second_reason}");
+    assert!(second_reason.contains("ALREADY been refused"), "a repeat must say it is one: {second_reason}");
 }
 
 /// THE DEFECT THIS PREVENTS, and this test exists because the one above used

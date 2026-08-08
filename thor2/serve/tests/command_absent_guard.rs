@@ -170,7 +170,7 @@ fn a_second_different_command_tripping_the_same_rule_is_refused_again() {
         serde_json::from_str(&second).unwrap_or_else(|e| panic!("a fresh violation must still be judged: {e}: {second}"));
     assert_eq!(v2["decision"], "block", "a second, different violation must not ride in free: {second}");
     assert!(
-        !v2["reason"].as_str().unwrap().contains("SECOND time"),
+        !v2["reason"].as_str().unwrap().contains("ALREADY been refused"),
         "a DIFFERENT command is not a repeat and must not be told it is: {second}"
     );
 }
@@ -198,7 +198,7 @@ fn the_same_command_sent_again_is_refused_again_and_says_so() {
     assert_eq!(v2["decision"], "block", "{second}");
     let again = v2["reason"].as_str().unwrap();
     assert!(again.starts_with(&first_reason), "the original reason must survive: {again}");
-    assert!(again.contains("SECOND time"), "{again}");
+    assert!(again.contains("ALREADY been refused"), "{again}");
 }
 
 /// A DIFFERENT session gets its own say: the once-per-session marker must

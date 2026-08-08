@@ -1479,16 +1479,14 @@ fn stale_guard_stop_check(db_path: &Path, session_id: &str) -> Option<HookOutput
     let marker_path = stale_guard::default_marker_path(db_path);
     let marker_text = std::fs::read_to_string(&marker_path).ok();
     let blocked = marker_text.as_deref().map(stale_guard::read_blocked).unwrap_or_default();
-    if stale_guard::already_blocked(&blocked, session_id) {
-        // The one place left in this binary that has something to say and
-        // chooses not to say it. That is correct here - a maintenance nudge
-        // that blocked every turn would be routed around within a day - but
-        // it is the exact shape that hid a broken gate for the whole of 2.0,
-        // so it is counted. Filed under the guard's own name rather than a
-        // rule id, because what stood aside is the guard, not one rule.
-        record_gate(db_path, session_id, false, "stale-guard", "stop");
-        return None;
-    }
+    // The marker is READ here and acted on at the bottom, after the debt is
+    // known. It used to return right here, recording a stand-aside before
+    // anything had established there was something to withhold - so every
+    // Stop after the first nudge logged one, including turns with an empty
+    // sidecar and nothing to say, plus a store write per turn. Both reviews
+    // caught it: a number that measures silence must not count silence about
+    // nothing.
+    let already_nudged = stale_guard::already_blocked(&blocked, session_id);
 
     let stale_text = std::fs::read_to_string(absent_guard::default_stale_path(db_path)).ok()?;
     let stale = absent_guard::read_stale(&stale_text);
@@ -1509,6 +1507,18 @@ fn stale_guard_stop_check(db_path: &Path, session_id: &str) -> Option<HookOutput
 
     let remaining = stale_guard::outstanding(&stale, &settled_ids);
     if remaining.is_empty() {
+        return None;
+    }
+
+    // NOW it is true: there is outstanding rot, and this session has already
+    // been told once. This is the one place left in the binary that has
+    // something to say and chooses not to say it, which is correct for a
+    // maintenance nudge - one that blocked every turn would be routed around
+    // within a day - and it is the exact shape that hid a broken gate for the
+    // whole of 2.0, so it is counted. Filed under the guard's own name rather
+    // than a rule id, because what stands aside is the guard, not one rule.
+    if already_nudged {
+        record_gate(db_path, session_id, false, "stale-guard", "stop");
         return None;
     }
 

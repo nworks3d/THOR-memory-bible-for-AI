@@ -173,7 +173,7 @@ fn an_identical_repeat_write_into_a_frozen_directory_is_still_refused() {
     let v: serde_json::Value = serde_json::from_str(&second)
         .unwrap_or_else(|e| panic!("a frozen path must not open up on the second try: {e}: {second}"));
     assert_eq!(v["decision"], "block", "{second}");
-    assert!(v["reason"].as_str().unwrap().contains("SECOND time"), "{second}");
+    assert!(v["reason"].as_str().unwrap().contains("ALREADY been refused"), "{second}");
 }
 
 /// THE DEFECT THIS PREVENTS, and it was pinned by the test above asserting

@@ -81,7 +81,14 @@ fn no_comment_claims_a_touch_adds_a_directory_target() {
     }
     assert!(!files.is_empty(), "the workspace crates must be readable");
 
-    // Both spellings the false claim actually took, normalised for case.
+    // NORMALISED FIRST, and that is the whole difference between a guard and a
+    // decoration. The first version of this test searched raw source and so
+    // missed the very comment it was built from: this codebase wraps at about
+    // 76 columns, and the claim was broken across two lines with a doc marker
+    // in between. A contiguous substring cannot see prose split that way, so
+    // any real reintroduction would have been invisible. Both reviews found the
+    // test toothless the same evening it was written. Strip the markers,
+    // collapse the whitespace, then look.
     let banned = ["a path target and a dir target", "path target and a dir target for the same touch"];
     let mut offenders = Vec::new();
     for file in &files {
@@ -90,9 +97,15 @@ fn no_comment_claims_a_touch_adds_a_directory_target() {
         if file.file_name().is_some_and(|n| n == "a_comment_never_claims_what_the_code_does_not_do.rs") {
             continue;
         }
-        let lower = src.to_lowercase();
+        let flat = src
+            .lines()
+            .map(|l| l.trim().trim_start_matches("///").trim_start_matches("//!").trim_start_matches("//").trim())
+            .collect::<Vec<_>>()
+            .join(" ")
+            .to_lowercase();
+        let flat = flat.split_whitespace().collect::<Vec<_>>().join(" ");
         for phrase in banned {
-            if lower.contains(phrase) {
+            if flat.contains(phrase) {
                 offenders.push(format!("{} claims: {phrase}", file.display()));
             }
         }

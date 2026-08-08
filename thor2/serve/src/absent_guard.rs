@@ -160,15 +160,18 @@
 //! below: that space is keyed on the TOUCHED FILE, a stable identity the
 //! caller already holds before any matching ever runs. A raw command string
 //! has no such identity - two commands that trip the SAME rule rarely share
-//! the same text at all (a commit message differs on every retry by design),
-//! so keying on it would suppress almost nothing and "at most one block per
-//! session" would be true in name only. The matched item's own ANCHOR value
-//! ("git commit") is the closest available stand-in for "the same file":
-//! stable for the rest of the session, shared by every real invocation of
-//! that subcommand - so that is the key, read off the WINNING candidate only
-//! after matching already found it (this guard cannot know its own marker
-//! key up front the way the file arm can, which is handed its key - the file
-//! path - directly by the caller before any matching runs at all). The
+//! the same text at all (a commit message differs on every retry by design).
+//!
+//! That observation used to be the reason this arm keyed on the matched ANCHOR
+//! ("git commit") ALONE, and stood aside once per session per anchor. Both
+//! halves are gone as of 2026-08-08. Nothing is suppressed any more: a repeat
+//! is refused too, and the key decides only whether the wording says so. Which
+//! is exactly why the key can now carry the command's own fingerprint beside
+//! the anchor - the objection above was about suppression, and there is none
+//! left to get wrong. The anchor is still read off the WINNING candidate after
+//! matching, because this guard cannot know its key up front the way the file
+//! arm can, which is handed the file path by the caller before any matching
+//! runs. The
 //! staleness ledger needs no new sidecar, by contrast: `StaleRecord`/
 //! `StaleFinding` are already keyed by item id regardless of what "file"
 //! happens to name, so `stale_in_command` folds into the SAME
@@ -314,10 +317,14 @@ pub fn attempt_key(target: &str, carried: Option<&str>) -> String {
 /// the first refusal, so a caller that reads its input at all has new
 /// information, and the new information is "stop resending this one".
 pub fn escalated(reason: &str) -> String {
+    // "already been refused", not "the SECOND time": this fires on the third
+    // attempt and every one after it too, and the file arm is not the only
+    // caller - the command arm shares it, where "write" would be wrong. Both
+    // reviews flagged the old wording as cosmetically false.
     format!(
         "{reason}
 
-This is the SECOND time this exact write was refused in this session. Resending it again will be refused again. Change what the write carries, or ask the user whether the rule itself is wrong - and if it is, correct the rule (revise or retract it, with a reason) rather than working around it."
+This exact attempt has ALREADY been refused in this session, and resending it will be refused again. Change what it carries, or ask the user whether the rule itself is wrong - and if it is, correct the rule (revise or retract it, with a reason) rather than working around it."
     )
 }
 
@@ -571,10 +578,32 @@ fn first_violation<'a>(
         // So a moment-only match must additionally land inside the file the
         // check itself names. An `Absent` check names a file; refusing a write
         // to a different file is not the rule doing its job.
-        let target_matched = candidate.item.bindings.iter().any(|b| {
-            matches!(b, model::item::Binding::Target { .. })
+        // "Reached through a target" is not "carries a target". A first pass
+        // asked the second question and got the first one wrong: an item bound
+        // [Moment(ProdData), Target{Dir,"config"}] reaches this pool ONLY
+        // through the moment, because a Dir or Command binding cannot match
+        // the Path target `add_file` builds - yet it carries a target, so the
+        // scope test was skipped and the defect survived for exactly the
+        // shapes most likely to have it.
+        //
+        // `RankedItem` does not record WHY it matched, so the honest question
+        // is asked directly: does a PATH binding on this item actually name
+        // the file being written? That is the only binding kind a file touch
+        // can match, and `rank::select` used the same comparison to let this
+        // item in.
+        let reached_by_path = candidate.item.bindings.iter().any(|b| {
+            matches!(
+                b,
+                model::item::Binding::Target { kind: model::item::TargetKind::Path, value }
+                    if model::normalize::target_matches(
+                        model::item::TargetKind::Path,
+                        value,
+                        model::item::TargetKind::Path,
+                        file_path,
+                    )
+            )
         });
-        if !target_matched && !path_is_or_contains(&root.join(check_path), Path::new(file_path)) {
+        if !reached_by_path && !path_is_or_contains(&root.join(check_path), &root.join(file_path)) {
             continue;
         }
         if let Some(literal) = first_present_literal(literals, content) {
@@ -695,6 +724,23 @@ fn forbidden_literals(check: &Check) -> Option<&[String]> {
 pub fn find_forbidden_violation(items: &[LiveItem], content: &str) -> Option<String> {
     for candidate in items {
         if !candidate.item.kind.can_fire() {
+            continue;
+        }
+        // The Always requirement lives HERE, not in the caller's choice of
+        // pool, and that is the whole point of this line. A `Forbidden` check
+        // carries no path, so its reach is its BINDING: Always means every
+        // write to every file, and anything narrower means the rule was
+        // written about a place this arm cannot honour.
+        //
+        // It used to rest on the caller passing `live::always_candidates`.
+        // That function falls back to `live_items` - the entire store - on
+        // three separate paths (a stale binding projection, or either
+        // projected read failing), so in that state a target-bound
+        // `Forbidden` check would refuse EVERY write, while `doctor` filed it
+        // under "blocks nothing at all". A guarantee that holds only while an
+        // unrelated projection is warm is not a guarantee; found by a review
+        // reading this function instead of the comment that described it.
+        if !candidate.item.bindings.iter().any(|b| matches!(b, model::item::Binding::Always)) {
             continue;
         }
         let Some(check) = &candidate.item.check else { continue };
@@ -1472,12 +1518,29 @@ mod tests {
             "the file the check actually names must still be protected"
         );
 
-        // And a TARGET-bound item keeps blocking wherever the pool put it:
-        // its binding is what scoped it, and the ranking already matched.
-        let anchored = item_with_check("t1", "NOTES.md", "forbidden");
-        assert!(
-            find_violation(&[anchored], &other, content, Some(dir.path())).is_some(),
-            "an anchored rule is scoped by its binding, not by the check path"
+        // THE MIXED-BINDING HOLE, which the first version of this test
+        // cemented as intended behaviour. An item can carry a Target binding
+        // AND reach this pool through a Moment - because a Dir or Command
+        // target, or a Path target naming a DIFFERENT file, cannot match the
+        // Path target a file touch builds. Asking "does it carry a target"
+        // therefore let exactly those shapes skip the scope check. The question
+        // now asked is whether a Path binding actually names THIS file.
+        let anchored_elsewhere = item_with_check("t1", "NOTES.md", "forbidden");
+        assert_eq!(
+            find_violation(&[anchored_elsewhere], &other, content, Some(dir.path())),
+            None,
+            "a rule anchored at NOTES.md must not refuse a write to OTHER.md, however it got into the pool"
+        );
+
+        let mut moment_and_dir = item_with_check("t2", "NOTES.md", "forbidden");
+        moment_and_dir.item.bindings = vec![
+            Binding::Moment(intent::Action::ProdData),
+            Binding::Target { kind: TargetKind::Dir, value: "config".to_string() },
+        ];
+        assert_eq!(
+            find_violation(&[moment_and_dir], &other, content, Some(dir.path())),
+            None,
+            "carrying a Dir target does not scope a moment-reached rule to an unrelated file"
         );
     }
 
@@ -1624,7 +1687,7 @@ mod tests {
             vec![item_with_absent_all_check("r10", "STYLE.md", &["forbidden-one", "forbidden-two", "forbidden-three"])];
         let content = "this text carries forbidden-one right here";
 
-        let reason = find_violation(&ranked, "NOTES.md", content, Some(dir.path())).expect("must block");
+        let reason = find_violation(&ranked, "STYLE.md", content, Some(dir.path())).expect("must block");
         assert!(reason.contains("forbidden-one"), "{reason}");
         assert!(!reason.contains("forbidden-two"), "{reason}");
         assert!(!reason.contains("forbidden-three"), "{reason}");
@@ -1640,7 +1703,7 @@ mod tests {
             vec![item_with_absent_all_check("r11", "STYLE.md", &["forbidden-one", "forbidden-two", "forbidden-three"])];
         let content = "this text carries forbidden-two right here";
 
-        let reason = find_violation(&ranked, "NOTES.md", content, Some(dir.path())).expect("must block");
+        let reason = find_violation(&ranked, "STYLE.md", content, Some(dir.path())).expect("must block");
         assert!(reason.contains("forbidden-two"), "{reason}");
         assert!(!reason.contains("forbidden-one"), "{reason}");
         assert!(!reason.contains("forbidden-three"), "{reason}");
@@ -1658,7 +1721,7 @@ mod tests {
             vec![item_with_absent_all_check("r12", "STYLE.md", &["forbidden-one", "forbidden-two", "forbidden-three"])];
         let content = "this text carries forbidden-three right here";
 
-        let reason = find_violation(&ranked, "NOTES.md", content, Some(dir.path())).expect("must block");
+        let reason = find_violation(&ranked, "STYLE.md", content, Some(dir.path())).expect("must block");
         assert!(reason.contains("forbidden-three"), "{reason}");
         assert!(!reason.contains("forbidden-one"), "{reason}");
         assert!(!reason.contains("forbidden-two"), "{reason}");
@@ -1845,7 +1908,7 @@ mod tests {
         let first = block_message("a-1", "no dashes", "a - b", "-");
         let again = escalated(&first);
         assert!(again.starts_with(&first), "the original reason must survive verbatim: {again}");
-        assert!(again.contains("SECOND time"), "{again}");
+        assert!(again.contains("ALREADY been refused"), "{again}");
         assert_ne!(again, first, "a repeat that reads identically teaches the caller nothing new");
     }
 
@@ -2211,6 +2274,40 @@ mod tests {
     fn a_path_anchored_check_is_invisible_to_the_self_contained_arm() {
         let anchored = dir_item_with_check("anchored", "docs", "\u{2014}");
         assert!(find_forbidden_violation(&[anchored], "text with \u{2014} in it").is_none());
+    }
+
+    /// THE DEFECT THIS PREVENTS, and it is the one a review called worse than
+    /// what it replaced. A `Forbidden` check carries no path, so its reach IS
+    /// its binding: Always means every write to every file, and anything
+    /// narrower is a rule written about a place this arm cannot honour.
+    ///
+    /// That requirement used to live only in the CALLER, which passes
+    /// `live::always_candidates`. That function falls back to `live_items` -
+    /// the whole store - on three separate paths, so with a cold binding
+    /// projection a target-bound `Forbidden` check would refuse EVERY write,
+    /// while `doctor` classified it as blocking nothing. The requirement is
+    /// now local, so no pool can hand this arm something it must not act on.
+    #[test]
+    fn a_forbidden_check_without_an_always_binding_can_never_block_whatever_pool_it_arrives_in() {
+        let mut pinned = always_item_with_forbidden_check("pinned", &["\u{2014}"]);
+        pinned.item.bindings = vec![Binding::Always];
+        assert!(
+            find_forbidden_violation(&[pinned], "text with \u{2014} in it").is_some(),
+            "an Always-bound Forbidden check is exactly what this arm exists for"
+        );
+
+        for bindings in [
+            vec![Binding::Moment(intent::Action::Commit)],
+            vec![Binding::Target { kind: TargetKind::Path, value: "NOTES.md".to_string() }],
+            vec![Binding::Target { kind: TargetKind::Command, value: "git commit".to_string() }],
+        ] {
+            let mut narrower = always_item_with_forbidden_check("narrower", &["\u{2014}"]);
+            narrower.item.bindings = bindings.clone();
+            assert!(
+                find_forbidden_violation(&[narrower], "text with \u{2014} in it").is_none(),
+                "a Forbidden check on {bindings:?} must never block, even handed straight to this arm"
+            );
+        }
     }
 
     /// The set-form counterpart to `dir_item_with_check` above, mirroring how

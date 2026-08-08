@@ -39,7 +39,12 @@ pub fn record_delivery(
 }
 
 /// Record what the write guard actually DID: refused a call, or stood aside
-/// on a call it had already refused once.
+/// with something outstanding it chose not to raise again this session.
+///
+/// The stand-aside used to mean "a call it had already refused once", which is
+/// what the file and command arms did until 2026-08-08. Neither does any more -
+/// no prohibition stands aside at all. What is left is the stale-rule nudge at
+/// Stop, which holds off for the rest of a session after it has been paid once.
 ///
 /// WHY BOTH, AND WHY THE SECOND ONE MATTERS MORE. A refusal is visible to the
 /// person it refused. A gate that quietly declines to look is visible to

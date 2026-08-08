@@ -3,11 +3,18 @@
 //! design note: write and declare is the failure policy that must never be
 //! quiet). Every refusal ground below has a test named after the defect it
 //! prevents; a refusal ground with no test does not exist.
+//!
+//! Alongside the refusal grounds, this file also produces `Warning`s - a
+//! smell worth a second look, never a reason to stop a write. See
+//! `Warning`'s own doc comment for the line this file draws between the two,
+//! and the section banner near the end of this file, above `warnings`, for
+//! both classes it currently covers.
 
 use crate::anchor_shape::{self, UnmatchableAnchor};
 use crate::item::{Binding, Check, Item, Kind, TargetKind};
-use crate::normalize::normalize_target;
+use crate::normalize::{last_segment, normalize_target};
 use intent::Action;
+use std::collections::HashSet;
 use std::fmt;
 
 /// A rule/orientation whose text is unreadable at a glance is not readable
@@ -385,9 +392,9 @@ const LINE_NUMBER_WORDS: &[&str] = &["line", "regel"];
 /// A conservative set of source/text file extensions, used to recognise a
 /// "file.ext:93" line-number suffix (e.g. "guard.rs:610"). Deliberately
 /// narrow and letters-only: a wider match would also catch a host:port like
-/// "quote.nworks3d.be:8080" or an IP:port like "127.0.0.1:8080" - a missed
+/// "quote.example.com:8080" or an IP:port like "127.0.0.1:8080" - a missed
 /// case is acceptable here, a false refusal is not.
-const FILE_EXTENSIONS: &[&str] = &[
+pub const FILE_EXTENSIONS: &[&str] = &[
     "rs", "ts", "tsx", "js", "jsx", "mjs", "cjs", "py", "go", "java", "rb", "php", "c", "h",
     "cpp", "hpp", "cc", "cs", "swift", "kt", "scala", "sh", "ps1", "psm1", "md", "txt", "json",
     "toml", "yaml", "yml", "html", "htm", "css", "scss", "sql", "vue", "lua",
@@ -414,7 +421,7 @@ fn is_capital_l_line_token(token: &str) -> bool {
 /// Whether `token` ends in ":<digits>" directly attached to a filename-
 /// looking stem (a '.' followed by a known extension): "guard.rs:610"
 /// matches, "127.0.0.1:8080" does not (the "extension" "1" is not a
-/// letter), and "quote.nworks3d.be:8080" does not ("be" is not a known
+/// letter), and "quote.example.com:8080" does not ("com" is not a known
 /// source/text extension).
 fn looks_like_file_line_suffix(token: &str) -> bool {
     let colon_idx = match token.rfind(':') {
@@ -618,6 +625,25 @@ pub fn declare(item: &Item) -> Result<(), Refusal> {
                 ),
                 "give it the project that file belongs to; if the fact really is true everywhere, say what it means without naming one repository's source",
             ));
+        }
+        // The ANCHOR, not only the text. Found on 2026-08-07, the same day
+        // this ground shipped: a global rule about `revise` carried no
+        // filename in its words but was anchored at `model/src/store.rs`, and
+        // sailed straight through. An anchor is worse than a mention, because
+        // it is the thing that decides WHERE the item fires - a global item
+        // anchored at `src/main.rs` fires in every project that happens to
+        // have one. Measured the same day: 27 live global items were anchored
+        // this way, against 2 the text half caught.
+        for binding in &item.bindings {
+            let Binding::Target { kind: TargetKind::Path, value } = binding else { continue };
+            if let Some(named) = source_file_in_token(value) {
+                return Err(Refusal::new(
+                    format!(
+                        "this item has no project, so it is served in every project, but it is anchored at the source file '{named}', which exists in only one"
+                    ),
+                    "give it the project that file belongs to; an anchor decides where an item fires, so a global one fires in every repository that happens to have a file by that name",
+                ));
+            }
         }
     }
     // GROUND 10: a Rule/Orientation never expires by design (ground 2), which
@@ -959,6 +985,310 @@ pub fn build_check(
             "'{other}' is not a known check_kind; valid: path_exists, contains, absent, absent_all, forbidden"
         )),
     }
+}
+
+// ---------------------------------------------------------------------------
+// Write-time WARNINGS: a smell worth a second look, never a reason to stop a
+// write. Everything above this banner can refuse a declaration; nothing
+// below it can. Two classes, both measured on a real store, neither provable
+// from an item's own fields the certain way a refusal ground must be (see
+// `Warning`'s own doc comment for why that line matters):
+//
+//   1. A falsifier that is ALREADY TRUE the moment it is written is a
+//      guaranteed false alarm later, and nothing today checks a falsifier
+//      against the text it is meant to guard - only that one exists at all
+//      (ground 10, above). Whether a falsifier truly contradicts or restates
+//      the text is a judgement call free text cannot settle mechanically.
+//      What CAN be settled mechanically, and is settled below, is the
+//      degenerate case: a falsifier built entirely out of words the text
+//      itself already uses cannot be naming an observation distinct from
+//      what the text already claims, so it cannot do a falsifier's one job.
+//      General contradiction detection (text now reading "without a space"
+//      against a falsifier still reading "wrong as soon as a format other
+//      than with a space appears") is deliberately NOT attempted here - see
+//      `falsifier_restates_text_warning`'s own doc comment for why, and
+//      ground 7's removal note earlier in this file for the precedent: a
+//      plausible-sounding rule with no corpus behind it is exactly how a
+//      false-positive rate nobody measured gets shipped.
+//
+//   2. A check that cannot fail is worse than no check at all (ground 18's
+//      own doc comment already makes this case for a refusal; the same
+//      reasoning applies one notch down, to a check that is merely weak
+//      rather than provably useless). Two of the four sub-cases measured on
+//      a real 127-check corpus are decidable from the check's own fields,
+//      with no file to read: a literal pulled from its own check path's
+//      filename (`filename_overlap_warning`), and a literal under 8
+//      characters (`short_literal_warning`). The other two - a literal with
+//      25 or more occurrences in the file, and a literal that only ever
+//      appears inside a comment - need the file's actual content, which
+//      this gate never reads (see `check.rs`'s own module doc comment: that
+//      runner ends at the model boundary, and this file sits above even
+//      that). Those two belong beside `crate::check::run`, in a tool that
+//      already opens the file - `serve/examples/check_census.rs` is the
+//      natural home; this file does not grow a filesystem dependency to
+//      reach them.
+// ---------------------------------------------------------------------------
+
+/// A write-time observation that never blocks. Unlike `Refusal`, nothing
+/// returns a `Warning` as an `Err`, and `declare`/`revise` above never
+/// produce one - a caller that wants both calls `declare`/`revise` for the
+/// hard gate and `warnings` (below) for this, separately, and a write that
+/// passes the first must never be stopped by anything the second reports.
+///
+/// The line this file draws between the two kinds of signal: a `Refusal`
+/// requires the SHAPE alone to settle the question, with no real case going
+/// the other way (see ground 18's own doc comment: "shorter than three
+/// characters AND entirely ASCII alphanumeric" refuses only what can never,
+/// in any real case, prove anything). A `Warning` is for exactly the cases
+/// that doctrine rules out of a refusal: real, measured, but not certain - a
+/// smell that is often right and sometimes wrong. Promoting one of these to
+/// a refusal on the strength of the same evidence is the mistake ground 7
+/// already made once, reasoned rather than measured, refusing 19% of a real
+/// corpus to catch a 0.7% defect; its removal note earlier in this file is
+/// the reason that mistake is not repeated here.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Warning {
+    pub problem: String,
+    pub advice: String,
+}
+
+impl Warning {
+    fn new(problem: impl Into<String>, advice: impl Into<String>) -> Self {
+        Self { problem: problem.into(), advice: advice.into() }
+    }
+}
+
+impl fmt::Display for Warning {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{} - {}", self.problem, self.advice)
+    }
+}
+
+/// A word significant enough to compare a falsifier against its own item's
+/// text: alphanumeric only, split on everything else, at least this many
+/// characters long. Not measured - there is no corpus of falsifier/text
+/// pairs to measure against yet, so this is reasoned the same way
+/// `MAX_CHECK_FILE_BYTES` is (see that constant's own doc comment): short
+/// enough to keep real content words ("format", "config", "space"), long
+/// enough to drop most English AND Dutch stopwords ("the", "een", "dat",
+/// "van") without building or maintaining a stopword list for either
+/// language.
+const MIN_SIGNIFICANT_WORD_CHARS: usize = 4;
+
+/// How many significant words a falsifier must contain before "every one of
+/// them already appears in the text" counts as a real signal. Below it, one
+/// coincidentally shared word (a project name, a shared noun) would fire the
+/// warning on almost no evidence at all. Not measured, reasoned the same way.
+const MIN_SIGNIFICANT_FALSIFIER_WORDS: usize = 3;
+
+/// The lowercased, alphanumeric-only words of `text` that are at least
+/// `MIN_SIGNIFICANT_WORD_CHARS` long, as a set - order and repetition both
+/// thrown away on purpose, since only "does this word appear at all" matters
+/// to the comparison this feeds.
+fn significant_words(text: &str) -> HashSet<String> {
+    text.split(|c: char| !c.is_alphanumeric())
+        .filter(|word| word.chars().count() >= MIN_SIGNIFICANT_WORD_CHARS)
+        .map(str::to_lowercase)
+        .collect()
+}
+
+/// WARNING - a falsifier that uses no word beyond what the text already
+/// uses cannot be naming an observation the text does not already make, so
+/// it cannot do the one thing a falsifier exists to do: name what would
+/// prove the fact wrong.
+///
+/// THE DEFECT THIS NARROWS, never fully closes (see this section's own
+/// banner comment above): a falsifier left stale after the text it guards
+/// was corrected, measured twice on a real store - text corrected to read
+/// "without a space" while the falsifier still read "wrong as soon as a
+/// format other than with a space appears", and a fact about a config file
+/// that had already stopped pointing at the system its falsifier named.
+/// Neither example is a literal duplicate, and this function does not claim
+/// to catch either one directly - general contradiction detection needs real
+/// language understanding, not a word-overlap count, and this file has
+/// already learned once (ground 7's removal note, above) what shipping a
+/// plausible-sounding, unmeasured rule like that costs. What IS safe to
+/// catch mechanically is the narrower, degenerate case this same failure
+/// class also produces: a falsifier that was never rewritten at all, and
+/// just echoes the text's own words back - which can never be true only
+/// sometimes, the way a genuine contradiction can, so flagging it costs
+/// nothing when it turns out fine.
+fn falsifier_restates_text_warning(text: &str, falsifier: &str) -> Option<Warning> {
+    let falsifier_words = significant_words(falsifier);
+    if falsifier_words.len() < MIN_SIGNIFICANT_FALSIFIER_WORDS {
+        return None;
+    }
+    let text_words = significant_words(text);
+    if falsifier_words.iter().all(|word| text_words.contains(word)) {
+        return Some(Warning::new(
+            format!("the falsifier uses no word the text does not already use ('{falsifier}')"),
+            "name an observation the text does not already assert, and confirm it is not already true right now - a falsifier that is already true when it is written is a guaranteed false alarm later",
+        ));
+    }
+    None
+}
+
+/// The write-time warning half of ground 10 (a falsifier is required for a
+/// Rule/Orientation): gated on `Kind::can_fire` for the identical reason
+/// ground 10 itself is - a Report/Lookup/Chunk's falsifier, if it carries
+/// one at all, is never the thing standing between a stale claim and a
+/// reader, so this has nothing useful to say about one. Safe to call on an
+/// item `declare` would also refuse for an unrelated reason (a missing
+/// falsifier, say): this only ever looks at the two fields it names.
+pub fn falsifier_warnings(item: &Item) -> Vec<Warning> {
+    if !item.kind.can_fire() {
+        return Vec::new();
+    }
+    let Some(falsifier) = item.falsifier.as_deref().map(str::trim).filter(|f| !f.is_empty()) else {
+        return Vec::new();
+    };
+    falsifier_restates_text_warning(&item.text, falsifier).into_iter().collect()
+}
+
+/// A filename or check literal boiled down to its bare letters and digits,
+/// lowercased - "RELEASE-CHECKLIST", "Release Checklist" and
+/// "release_checklist" all collapse to the same value, since none of that
+/// punctuation is what makes two names "the same word" to a reader.
+fn alnum_lowercase(s: &str) -> String {
+    s.to_lowercase().chars().filter(|c| c.is_alphanumeric()).collect()
+}
+
+/// Below this many characters, a match between a literal and a filename
+/// token is as likely to be coincidence as content - reuses ground 18's own
+/// three-character boundary (`proves_something`) rather than a second,
+/// independently chosen number.
+const MIN_FILENAME_OVERLAP_CHARS: usize = 3;
+
+/// The check path's own file name, boiled down two ways: as one
+/// punctuation-free blob (`.0`, so "ReleaseChecklist" can match a
+/// multi-word stem in one go), and as the individual words the stem's own
+/// separators mark out (`.1`, so "RELEASE" alone can match one word of a
+/// longer stem). The extension is dropped first - a `.md`/`.rs`/`.json`
+/// suffix is a file TYPE, shared by thousands of files, never a name. Only
+/// the file's own base name counts, never a directory it sits in:
+/// `normalize::last_segment` (the same helper `check_target_binding` already
+/// trusts for "the part a sentence realistically names") drops every
+/// directory component before either shape below is built.
+fn filename_stem_shapes(path: &str) -> (String, Vec<String>) {
+    let normalized = normalize_target(path);
+    let file_name = last_segment(&normalized);
+    let stem = match file_name.rfind('.') {
+        Some(0) | None => file_name,
+        Some(idx) => &file_name[..idx],
+    };
+    let whole = alnum_lowercase(stem);
+    let tokens = stem.split(|c: char| !c.is_alphanumeric()).filter(|t| !t.is_empty()).map(alnum_lowercase).collect();
+    (whole, tokens)
+}
+
+/// WARNING - a literal that is itself (a word of) its own check path's
+/// filename is a `PathExists` check wearing a disguise: a file's own name
+/// tends to appear somewhere in that file - a title, a heading, a module doc
+/// comment - regardless of whatever the check is actually meant to guard.
+///
+/// THE DEFECT THIS FLAGS: measured on a real 127-check corpus, 11 checks
+/// searched a file for a literal that was a word straight out of that same
+/// file's own name - "RELEASE" checked for inside RELEASE-CHECKLIST.md.
+///
+/// Never a refusal: plenty of real symbols and constants legitimately share
+/// a word with the file that defines them (a check for "Config" inside
+/// config.rs is not automatically weak) - the shape proves a smell, not a
+/// defect, exactly `Warning`'s own line between the two kinds of signal.
+fn filename_overlap_warning(path: &str, literal: &str) -> Option<Warning> {
+    let literal_norm = alnum_lowercase(literal);
+    if literal_norm.chars().count() < MIN_FILENAME_OVERLAP_CHARS {
+        return None;
+    }
+    let (stem_whole, stem_tokens) = filename_stem_shapes(path);
+    let matches = literal_norm == stem_whole || stem_tokens.iter().any(|token| *token == literal_norm);
+    if matches {
+        return Some(Warning::new(
+            format!("the check literal '{literal}' is also a word in its own check path's filename ('{path}')"),
+            "a word pulled from a file's own name tends to appear in that file no matter what it says - confirm this really proves the fact, or name a phrase the file's content alone would prove",
+        ));
+    }
+    None
+}
+
+/// Below this length, an ordinary (letters-and-digits-only) literal is a
+/// smell worth a second look - not a hard cutoff the way ground 18's
+/// stricter, sub-three-character boundary is (`proves_something`), and
+/// deliberately given, not derived: measured on a real 127-check corpus, 5
+/// checks used a literal of 6 characters or fewer, none of them provably
+/// empty of meaning the way ground 18's own boundary requires, all of them
+/// weak enough that a reviewer would want a second look.
+pub const SHORT_LITERAL_WARNING_CHARS: usize = 8;
+
+/// WARNING - ground 18's REFUSAL above only fires on proof: shorter than
+/// three characters AND entirely ordinary. This is the same shape, widened
+/// to a warning band up to `SHORT_LITERAL_WARNING_CHARS`, and the "entirely
+/// ordinary" half of the condition is kept for the identical reason ground
+/// 18 keeps it: a single punctuation character (an em dash, a curly quote)
+/// is exactly as distinctive at length one as this whole system's own
+/// typography rule already proves, and pure whitespace can be a deliberate
+/// thing to search for (`check_single_literal`'s own doc comment) - neither
+/// is a smell just because it is short.
+fn short_literal_warning(literal: &str) -> Option<Warning> {
+    if literal.is_empty() {
+        // Ground 13 already refuses this outright, with a clearer message
+        // than a length smell would give.
+        return None;
+    }
+    let len = literal.chars().count();
+    let ordinary = literal.chars().all(|c| c.is_ascii_alphanumeric());
+    if ordinary && len < SHORT_LITERAL_WARNING_CHARS {
+        return Some(Warning::new(
+            format!(
+                "the check literal '{literal}' is {len} characters, under the {SHORT_LITERAL_WARNING_CHARS}-character smell threshold"
+            ),
+            "a short, ordinary literal is more likely to occur by coincidence than to prove the one thing this check is meant to guard - a longer, more specific phrase proves the same fact more safely, if one exists",
+        ));
+    }
+    None
+}
+
+/// The write-time warning half of a `Check`: every literal a check carries,
+/// run through both smells above. `PathExists` carries no literal at all, so
+/// it never has anything to say here. `Forbidden` carries no path (see
+/// `Check::Forbidden`'s own doc comment) - `filename_overlap_warning` never
+/// runs for it, by construction, since there is no path to compare a literal
+/// against, not because of an extra condition written here to skip it.
+pub fn check_warnings(check: &Check) -> Vec<Warning> {
+    let mut out = Vec::new();
+    match check {
+        Check::PathExists { .. } => {}
+        Check::Contains { path, literal } | Check::Absent { path, literal } => {
+            out.extend(short_literal_warning(literal));
+            out.extend(filename_overlap_warning(path, literal));
+        }
+        Check::AbsentAll { path, literals } => {
+            for literal in literals {
+                out.extend(short_literal_warning(literal));
+                out.extend(filename_overlap_warning(path, literal));
+            }
+        }
+        Check::Forbidden { literals } => {
+            for literal in literals {
+                out.extend(short_literal_warning(literal));
+            }
+        }
+    }
+    out
+}
+
+/// Every write-time warning `item` produces - the one function a caller
+/// needs, mirroring `declare` as the one function a caller needs for the
+/// hard gate. Advisory only: nothing here is wired into `store::declare` or
+/// `store::revise` (see this crate's `store` module) - a `Warning` is meant
+/// to be shown alongside a successful write, never to change whether one
+/// happens, and wiring that display in is a decision for whatever sits above
+/// this crate, not for the gate itself to force.
+pub fn warnings(item: &Item) -> Vec<Warning> {
+    let mut out = falsifier_warnings(item);
+    if let Some(check) = &item.check {
+        out.extend(check_warnings(check));
+    }
+    out
 }
 
 #[cfg(test)]
@@ -1331,8 +1661,8 @@ mod tests {
     #[test]
     fn a_qualified_hostname_target_is_accepted() {
         let mut item = base(Kind::Orientation);
-        item.text = "quote.nworks3d.be serves the quote portal".to_string();
-        item.bindings = vec![Binding::Target { kind: TargetKind::Host, value: "quote.nworks3d.be".to_string() }];
+        item.text = "quote.example.com serves the quote portal".to_string();
+        item.bindings = vec![Binding::Target { kind: TargetKind::Host, value: "quote.example.com".to_string() }];
         assert!(declare(&item).is_ok());
     }
 
@@ -1480,7 +1810,7 @@ mod tests {
     #[test]
     fn a_hostname_and_port_is_accepted() {
         let mut item = base(Kind::Orientation);
-        item.text = "quote.nworks3d.be:8080 serves the quote portal".to_string();
+        item.text = "quote.example.com:8080 serves the quote portal".to_string();
         assert!(declare(&item).is_ok());
     }
 
@@ -1558,7 +1888,7 @@ mod tests {
         item.text = "the quote portal listens here".to_string();
         item.bindings = vec![Binding::Target {
             kind: TargetKind::Host,
-            value: "quote.nworks3d.be:8080".to_string(),
+            value: "quote.example.com:8080".to_string(),
         }];
         assert!(declare(&item).is_ok());
     }
@@ -2075,6 +2405,49 @@ mod tests {
         let mut item = global(Kind::Orientation, "serve/src/lookup.rs MIN_SIMILARITY is 0.50, raised from 0.45.");
         item.project = Some("The-AI-memory-bible".to_string());
         assert!(declare(&item).is_ok());
+    }
+
+    /// The half this ground was missing on the day it shipped. An anchor
+    /// decides WHERE an item fires, so a global item anchored at a source
+    /// file fires in every repository that happens to have a file by that
+    /// name - worse than merely mentioning one, and it slips past a check
+    /// that only reads the text.
+    #[test]
+    fn a_global_rule_anchored_at_a_source_file_is_refused() {
+        let mut item = base(Kind::Rule);
+        item.project = None;
+        item.text = "this operation replaces the whole body, there is no partial update".to_string();
+        item.bindings = vec![Binding::Target { kind: TargetKind::Path, value: "model/src/store.rs".to_string() }];
+
+        let err = declare(&item).expect_err("a global item anchored at one repository's source must be refused");
+        assert!(err.problem.contains("anchored at the source file"), "the refusal must say what it saw: {err:?}");
+        assert!(err.problem.contains("store.rs"), "and name it: {err:?}");
+    }
+
+    #[test]
+    fn the_same_rule_with_a_project_is_accepted() {
+        let mut item = base(Kind::Rule);
+        item.project = Some("some-project".to_string());
+        item.text = "this operation replaces the whole body, there is no partial update".to_string();
+        item.bindings = vec![Binding::Target { kind: TargetKind::Path, value: "model/src/store.rs".to_string() }];
+        declare(&item).expect("naming the project the file belongs to is the way out, and it must work");
+    }
+
+    /// A config or documentation anchor is genuinely about the machine or
+    /// about every repository at once, so it must stay allowed globally -
+    /// otherwise this ground would refuse the very facts that belong global.
+    #[test]
+    fn a_global_rule_anchored_at_config_is_still_accepted() {
+        // Each one carries a directory or an extension: a bare `.gitignore`
+        // is refused by the anchor-shape ground long before this one, which
+        // is a separate rule and stays that way.
+        for path in ["settings.json", ".claude/settings.json", "README.md", "Cargo.toml"] {
+            let mut item = base(Kind::Rule);
+            item.project = None;
+            item.text = "back this file up before touching it".to_string();
+            item.bindings = vec![Binding::Target { kind: TargetKind::Path, value: path.to_string() }];
+            declare(&item).unwrap_or_else(|e| panic!("a global anchor on {path} must stay allowed: {e:?}"));
+        }
     }
 
     #[test]
@@ -2649,5 +3022,318 @@ mod tests {
             build_check(Some("absent_all"), Some("docs/STYLE.md".to_string()), None, vec!["TODO".to_string()]),
             Ok(Some(Check::AbsentAll { path: "docs/STYLE.md".to_string(), literals: vec!["TODO".to_string()] }))
         );
+    }
+
+    // ------------------------------------------------------ write-time warnings
+    //
+    // Everything below tests `warnings`/`falsifier_warnings`/`check_warnings`,
+    // never the private helpers directly - the same convention every test
+    // above this section already follows for `declare`/`revise`/`build_check`.
+    // No test here needs `declare` to also pass first: `warnings` is meant to
+    // stand on its own, and several cases below deliberately build an item
+    // `declare` would refuse for an unrelated reason, to prove this never
+    // panics or gives a confusing answer on one.
+
+    // --------------------------------------------- falsifier restates the text
+
+    /// THE DEFECT THIS NARROWS: the degenerate case of a falsifier left
+    /// stale after the text it guards changed - here, never rewritten at
+    /// all. A falsifier that is word-for-word the text can never be false
+    /// while the text is true, so it can never do a falsifier's one job.
+    #[test]
+    fn a_falsifier_identical_to_the_text_is_warned() {
+        let mut item = base(Kind::Rule);
+        item.bindings = vec![Binding::Always];
+        item.text = "the release checklist lives in RELEASE.md".to_string();
+        item.falsifier = Some("the release checklist lives in RELEASE.md".to_string());
+        let warnings = falsifier_warnings(&item);
+        assert_eq!(warnings.len(), 1);
+        assert!(warnings[0].problem.contains("RELEASE.md"), "names the falsifier: {:?}", warnings[0]);
+    }
+
+    /// The realistic shape of the same defect: a falsifier reordered around
+    /// the text's own words rather than left byte-identical, which is what a
+    /// falsifier that was never really rewritten actually looks like in
+    /// practice.
+    #[test]
+    fn a_falsifier_that_only_reorders_the_texts_own_words_is_warned() {
+        let mut item = base(Kind::Orientation);
+        item.text = "the release checklist lives in RELEASE.md".to_string();
+        item.falsifier = Some("the release checklist RELEASE.md lives".to_string());
+        assert_eq!(falsifier_warnings(&item).len(), 1);
+    }
+
+    /// THE CASE THIS MUST NEVER MISFIRE ON: the default falsifier/text pair
+    /// (`base`, above) that every other test in this file builds on. If this
+    /// warning ever fired on it, it would be noise on the single most common
+    /// fixture in this whole suite - exactly the "cries wolf" failure mode
+    /// the task that built this warning was told to avoid above all else.
+    #[test]
+    fn a_falsifier_that_names_something_the_text_does_not_is_not_warned() {
+        let mut item = base(Kind::Rule);
+        item.bindings = vec![Binding::Always];
+        assert_eq!(item.text, "do the thing");
+        assert_eq!(item.falsifier.as_deref(), Some("the thing turns out to have already been done"));
+        assert!(falsifier_warnings(&item).is_empty());
+    }
+
+    /// A handful of the real falsifiers already used elsewhere in this test
+    /// file, none of which may ever be flagged - a second, broader proof
+    /// that a genuine contrastive falsifier (the only kind ground 10 wants)
+    /// passes clean.
+    #[test]
+    fn other_real_falsifiers_already_used_in_this_file_are_never_warned() {
+        for falsifier in [
+            "the next force-push to main lands clean with nobody reverting it",
+            "this incident happens again within a week",
+        ] {
+            let mut item = base(Kind::Rule);
+            item.bindings = vec![Binding::Always];
+            item.falsifier = Some(falsifier.to_string());
+            assert!(falsifier_warnings(&item).is_empty(), "must not warn on: {falsifier}");
+        }
+    }
+
+    /// THE DEFECT THIS PREVENTS: firing on a single coincidentally shared
+    /// word. "changes" appears in both, and would be a 100% overlap if the
+    /// evidence threshold did not first require at least three significant
+    /// words in the falsifier itself.
+    #[test]
+    fn a_short_falsifier_below_the_evidence_threshold_is_not_warned() {
+        let mut item = base(Kind::Orientation);
+        item.text = "the value changes daily".to_string();
+        item.falsifier = Some("it changes".to_string());
+        assert!(falsifier_warnings(&item).is_empty());
+    }
+
+    /// Only a Rule/Orientation is ever served at a gate where a stale
+    /// falsifier matters (`Kind::can_fire`) - the same gating ground 10
+    /// itself uses. A Report may carry a falsifier-shaped field but it is
+    /// never what stands between a stale claim and a reader.
+    #[test]
+    fn a_report_with_a_duplicate_falsifier_is_not_warned_only_rule_and_orientation_are() {
+        let mut item = base(Kind::Report);
+        item.text = "do the thing".to_string();
+        item.falsifier = Some("do the thing".to_string());
+        item.expires = Some("2027-01-01".to_string());
+        assert!(falsifier_warnings(&item).is_empty());
+    }
+
+    /// Defensive: `warnings`/`falsifier_warnings` must stay safe to call on
+    /// an item `declare` would separately refuse for missing a falsifier
+    /// (ground 10) - never panic, just report nothing about a field that
+    /// is not there.
+    #[test]
+    fn an_item_with_no_falsifier_produces_no_falsifier_warning() {
+        let mut item = base(Kind::Rule);
+        item.bindings = vec![Binding::Always];
+        item.falsifier = None;
+        assert!(falsifier_warnings(&item).is_empty());
+    }
+
+    // ------------------------------------------------------- short check literal
+
+    #[test]
+    fn a_short_ordinary_literal_is_warned() {
+        let check = Check::Contains { path: "README.md".to_string(), literal: "index".to_string() };
+        let warnings = check_warnings(&check);
+        assert_eq!(warnings.len(), 1);
+        assert!(warnings[0].problem.contains("index"), "names the literal: {:?}", warnings[0]);
+    }
+
+    #[test]
+    fn a_seven_character_ordinary_literal_is_warned() {
+        let check = Check::Contains { path: "README.md".to_string(), literal: "lookups".to_string() };
+        assert_eq!(check_warnings(&check).len(), 1);
+    }
+
+    /// THE BOUNDARY: the task's own threshold is "shorter than 8 characters"
+    /// - exactly 8 must already be on the safe side of it.
+    #[test]
+    fn an_eight_character_ordinary_literal_is_not_warned() {
+        let check = Check::Contains { path: "README.md".to_string(), literal: "function".to_string() };
+        assert!(check_warnings(&check).is_empty());
+    }
+
+    /// THE DEFECT THIS PREVENTS: warning on the single most valuable literal
+    /// this system has. Mirrors `a_single_punctuation_character_is_accepted`
+    /// (ground 18) - a typography rule is a set of one-character literals,
+    /// and this warning must never treat the shortest of them as a smell.
+    #[test]
+    fn a_single_punctuation_character_literal_is_never_warned_for_length() {
+        let check = Check::Absent { path: "docs/STYLE.md".to_string(), literal: "\u{2014}".to_string() };
+        assert!(check_warnings(&check).is_empty());
+    }
+
+    /// Mirrors `a_whitespace_literal_is_still_accepted` (ground 13): a
+    /// trailing-space or exact-indent check is deliberate content, never a
+    /// smell just because it is short.
+    #[test]
+    fn a_whitespace_literal_is_never_warned_for_length() {
+        let check = Check::Absent { path: "docs/STYLE.md".to_string(), literal: " \n".to_string() };
+        assert!(check_warnings(&check).is_empty());
+    }
+
+    #[test]
+    fn a_long_distinctive_literal_is_not_warned() {
+        let check = Check::Contains { path: "guard.rs".to_string(), literal: "additionalContext".to_string() };
+        assert!(check_warnings(&check).is_empty());
+    }
+
+    // --------------------------------------------------- filename/literal overlap
+
+    /// THE CONCRETE REAL EXAMPLE: "RELEASE" checked for inside
+    /// RELEASE-CHECKLIST.md. Also short enough (7 characters) to trip the
+    /// length smell above at the same time - both fire, independently and
+    /// correctly, on the one literal that is weak both ways.
+    #[test]
+    fn a_literal_matching_a_filename_token_is_warned() {
+        let check =
+            Check::Contains { path: "docs/RELEASE-CHECKLIST.md".to_string(), literal: "RELEASE".to_string() };
+        let warnings = check_warnings(&check);
+        assert_eq!(warnings.len(), 2, "{warnings:?}");
+        assert!(warnings.iter().any(|w| w.problem.contains("filename")), "{warnings:?}");
+        assert!(
+            warnings.iter().any(|w| w.problem.contains("characters")),
+            "the same literal is also short: {warnings:?}"
+        );
+    }
+
+    /// The filename smell in isolation, on a literal long enough (12
+    /// characters) that the length smell stays silent - proves the two
+    /// warnings are independent signals, not one disguised as two.
+    #[test]
+    fn a_literal_matching_a_filename_token_alone_is_warned_once() {
+        let check = Check::Contains {
+            path: "docs/CONTRIBUTING-CHECKLIST.md".to_string(),
+            literal: "CONTRIBUTING".to_string(),
+        };
+        let warnings = check_warnings(&check);
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        assert!(warnings[0].problem.contains("filename"), "{:?}", warnings[0]);
+    }
+
+    /// The whole-stem shape: no single filename token equals the literal,
+    /// but the literal, punctuation stripped, equals the whole stem.
+    #[test]
+    fn a_literal_matching_the_whole_filename_stem_is_warned() {
+        let check = Check::Contains {
+            path: "docs/RELEASE-CHECKLIST.md".to_string(),
+            literal: "ReleaseChecklist".to_string(),
+        };
+        let warnings = check_warnings(&check);
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        assert!(warnings[0].problem.contains("filename"), "{:?}", warnings[0]);
+    }
+
+    /// THE DEFECT THIS PREVENTS: reading a DIRECTORY segment as if it were
+    /// the filename. Only the file's own base name counts - "settings.md"
+    /// here, never the "configuration" directory it sits in.
+    #[test]
+    fn a_literal_matching_only_a_directory_segment_is_not_warned() {
+        let check =
+            Check::Contains { path: "configuration/settings.md".to_string(), literal: "configuration".to_string() };
+        assert!(check_warnings(&check).is_empty());
+    }
+
+    /// Sanity: an unrelated, long, ordinary literal trips neither smell.
+    #[test]
+    fn a_literal_unrelated_to_the_filename_is_not_warned() {
+        let check = Check::Contains { path: "LICENSE.md".to_string(), literal: "copyleft".to_string() };
+        assert!(check_warnings(&check).is_empty());
+    }
+
+    #[test]
+    fn a_check_with_no_smell_produces_no_warnings() {
+        let check = Check::Contains {
+            path: "docs/ARCHITECTURE.md".to_string(),
+            literal: "must never accept a partial write".to_string(),
+        };
+        assert!(check_warnings(&check).is_empty());
+    }
+
+    // ------------------------------------------------- warnings by check variant
+
+    #[test]
+    fn path_exists_never_produces_a_literal_warning() {
+        let check = Check::PathExists { path: "RELEASE-CHECKLIST.md".to_string() };
+        assert!(check_warnings(&check).is_empty());
+    }
+
+    /// `Absent` shares its match arm with `Contains` in `check_warnings` -
+    /// proven separately so a future split of that arm cannot silently drop
+    /// coverage for this variant.
+    #[test]
+    fn absent_gets_the_same_warnings_as_contains() {
+        let check = Check::Absent { path: "README.md".to_string(), literal: "index".to_string() };
+        assert_eq!(check_warnings(&check).len(), 1);
+    }
+
+    /// `Forbidden` carries no path at all (see `Check::Forbidden`'s own doc
+    /// comment) - proves the short-literal warning still fires, and that
+    /// nothing here panics for lack of a path to compare against.
+    #[test]
+    fn forbidden_gets_the_short_literal_warning_but_never_a_filename_warning() {
+        let check = Check::Forbidden { literals: vec!["bad".to_string()] };
+        let warnings = check_warnings(&check);
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        assert!(warnings[0].problem.contains("characters"), "{:?}", warnings[0]);
+    }
+
+    /// THE DEFECT THIS PREVENTS: one weak literal in a set hiding behind
+    /// stronger ones. Every offending entry must be named, not just the
+    /// first - mirrors `one_useless_entry_refuses_the_whole_set` (ground 18)
+    /// for the refusal side.
+    #[test]
+    fn absent_all_warns_once_per_offending_literal() {
+        let check = Check::AbsentAll {
+            path: "docs/STYLE.md".to_string(),
+            literals: vec!["bad".to_string(), "wrong".to_string(), "a genuinely distinctive phrase".to_string()],
+        };
+        let warnings = check_warnings(&check);
+        assert_eq!(warnings.len(), 2, "{warnings:?}");
+        assert!(warnings.iter().any(|w| w.problem.contains("bad")), "{warnings:?}");
+        assert!(warnings.iter().any(|w| w.problem.contains("wrong")), "{warnings:?}");
+    }
+
+    // ---------------------------------------------------------- warnings(item)
+
+    /// The one entry point a caller needs, combining both classes - proves
+    /// `warnings` actually calls both halves rather than just one of them.
+    #[test]
+    fn warnings_combines_falsifier_and_check_warnings() {
+        let mut item = base(Kind::Rule);
+        item.bindings = vec![Binding::Always];
+        item.text = "the release checklist lives in RELEASE.md".to_string();
+        item.falsifier = Some("the release checklist RELEASE.md lives".to_string());
+        item.check = Some(Check::Contains { path: "README.md".to_string(), literal: "index".to_string() });
+
+        let warnings = warnings(&item);
+        assert_eq!(warnings.len(), 2, "{warnings:?}");
+        assert!(warnings.iter().any(|w| w.problem.contains("falsifier")), "{warnings:?}");
+        assert!(warnings.iter().any(|w| w.problem.contains("check literal")), "{warnings:?}");
+    }
+
+    #[test]
+    fn warnings_is_empty_for_a_clean_item() {
+        let mut item = base(Kind::Rule);
+        item.bindings = vec![Binding::Always];
+        item.check = Some(Check::Contains {
+            path: "docs/ARCHITECTURE.md".to_string(),
+            literal: "must never accept a partial write".to_string(),
+        });
+        assert!(warnings(&item).is_empty());
+    }
+
+    /// THE CORE DESIGN PROPERTY: a warning never blocks. An item that trips
+    /// a warning must still pass `declare` cleanly - if this ever failed, a
+    /// `Warning` would have quietly become a second `Refusal`.
+    #[test]
+    fn declare_still_succeeds_on_an_item_that_produces_warnings() {
+        let mut item = base(Kind::Orientation);
+        item.check = Some(Check::Contains { path: "README.md".to_string(), literal: "index".to_string() });
+
+        assert!(declare(&item).is_ok(), "a warning must never turn into a refusal");
+        assert!(!check_warnings(item.check.as_ref().unwrap()).is_empty(), "the fixture must actually warn");
     }
 }

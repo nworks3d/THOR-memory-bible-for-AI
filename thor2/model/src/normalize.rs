@@ -77,3 +77,17 @@ mod tests {
         assert_eq!(once, twice);
     }
 }
+
+/// Same target, decided in the ONE place normalisation lives
+/// (`model::normalize`): equal once normalised, or equal by their last path
+/// segment (an item bound to a full path still fires when the input names it
+/// by its bare file/command name, and vice versa - see `normalize::last_segment`'s
+/// own doc comment, which describes exactly this comparison).
+pub fn target_matches(item_kind: crate::item::TargetKind, item_value: &str, in_kind: crate::item::TargetKind, in_value: &str) -> bool {
+    if item_kind != in_kind {
+        return false;
+    }
+    let a = normalize_target(item_value);
+    let b = normalize_target(in_value);
+    a == b || last_segment(&a) == last_segment(&b)
+}

@@ -18,5 +18,5 @@ pub mod normalize;
 pub mod served;
 pub mod store;
 
-pub use gate::Refusal;
+pub use gate::{Refusal, Warning};
 pub use item::{Binding, Check, Item, Kind, Severity, TargetKind};

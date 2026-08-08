@@ -8,7 +8,7 @@
 //! the caller, never swallowed.
 
 use crate::gate::{self, Refusal};
-use crate::item::{Binding, Item};
+use crate::item::{Binding, Item, Kind};
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use thor_core::cas::compute_head_sets;
@@ -112,7 +112,11 @@ fn normalized(item: &Item) -> Item {
 /// that two sentences sharing a topic but making a different point should
 /// still pass, while two close paraphrases of the same fact (the defect this
 /// check exists for) should not.
-const NEAR_DUPLICATE_JACCARD_THRESHOLD: f64 = 0.8;
+/// Made public so a census can ask "which pairs ALREADY in the store would
+/// this rule have refused" using the one definition, rather than a second
+/// one that drifts from it. The write gate refuses a near-duplicate on the
+/// way in; nothing ever looked at the pairs that were already there.
+pub const NEAR_DUPLICATE_JACCARD_THRESHOLD: f64 = 0.8;
 
 /// Normalise item text for the near-duplicate comparison in `declare`:
 /// lowercase, then keep only maximal runs of letters/digits as words, joined
@@ -124,7 +128,7 @@ const NEAR_DUPLICATE_JACCARD_THRESHOLD: f64 = 0.8;
 /// nothing. This is a content-comparison normalisation, a different job from
 /// `normalize::normalize_target` (which normalises a TARGET VALUE for
 /// path/host/route identity) - it does not reuse or replace that function.
-fn normalize_for_comparison(text: &str) -> String {
+pub fn normalize_for_comparison(text: &str) -> String {
     text.to_lowercase()
         .split(|c: char| !c.is_alphanumeric())
         .filter(|word| !word.is_empty())
@@ -135,7 +139,7 @@ fn normalize_for_comparison(text: &str) -> String {
 /// The set of words in an already-normalised text, for a Jaccard comparison.
 /// Splits on the single spaces `normalize_for_comparison` already collapsed
 /// every gap down to.
-fn word_set(normalized_text: &str) -> HashSet<&str> {
+pub fn word_set(normalized_text: &str) -> HashSet<&str> {
     normalized_text.split(' ').filter(|word| !word.is_empty()).collect()
 }
 
@@ -143,7 +147,7 @@ fn word_set(normalized_text: &str) -> HashSet<&str> {
 /// sets (two texts with no comparable word at all) count as identical rather
 /// than as "no overlap" - an empty text is not a wildcard that matches
 /// nothing.
-fn jaccard_similarity(a: &HashSet<&str>, b: &HashSet<&str>) -> f64 {
+pub fn jaccard_similarity(a: &HashSet<&str>, b: &HashSet<&str>) -> f64 {
     if a.is_empty() && b.is_empty() {
         return 1.0;
     }
@@ -245,6 +249,29 @@ fn find_near_duplicate(store: &EventStore, item: &Item) -> anyhow::Result<Option
     for (id, existing) in candidates {
         if existing.kind != item.kind {
             continue; // only a live item of the SAME kind can be a near-duplicate
+        }
+        // Two items scoped to DIFFERENT projects are not copies of each other,
+        // however alike they read. Two repositories can genuinely carry the
+        // same constraint - the same licence wording, the same release step -
+        // and each needs its own, because a fact serves the project it is
+        // scoped to and no other.
+        //
+        // THE DEFECT THIS CLOSES, and it is the exact opposite of what this
+        // function is for. Comparing across every project meant the second
+        // project could not have the rule at all, and the only shape that
+        // satisfied both was ONE GLOBAL fact - which then fires in every
+        // project on the machine, asserting something true of two of them and
+        // false everywhere else. Observed 2026-08-07 with a licence rule: it
+        // was global, so it fired on a GPLv3 repository claiming that
+        // repository was non-commercial.
+        //
+        // Global against scoped is still compared, and must be: a global item
+        // already fires inside every project, so a scoped copy of it really is
+        // a second copy of something already being served there.
+        if let (Some(existing_project), Some(new_project)) = (&existing.project, &item.project) {
+            if existing_project != new_project {
+                continue;
+            }
         }
         let existing_normalized = normalize_for_comparison(&existing.text);
         if existing_normalized == new_normalized {
@@ -416,6 +443,13 @@ pub fn declare(
             ),
         }));
     }
+    // CONTRACT R1's own refusal class, unpaid until 2026-08-08: an item that
+    // cannot reach a block is cover that looks real and never fires. Only the
+    // provable half refuses here; the rest comes back as a note on the write
+    // (see `capacity`).
+    if let Capacity::DeadOnArrival(refusal) = capacity(store, &item).map_err(WriteError::Store)? {
+        return Err(WriteError::Refused(refusal));
+    }
     let body = canonical_body(&item).map_err(WriteError::Serialize)?;
     store
         .append_event(session_id, lineage_id, actor, EventKind::FactCreated, &item.id, None, &body)
@@ -443,6 +477,363 @@ pub fn revise(
     let existing = normalized(existing);
     let updated = normalized(updated);
     gate::revise(&existing, &updated).map_err(WriteError::Refused)?;
+    // The same capacity refusal `declare` makes. Without this the gate was
+    // one door wide: declare refused an item that could never be shown, and
+    // revise walked the identical binding in through the back.
+    if let Capacity::DeadOnArrival(refusal) = capacity(store, &updated).map_err(WriteError::Store)? {
+        return Err(WriteError::Refused(refusal));
+    }
+    let body = canonical_body(&updated).map_err(WriteError::Serialize)?;
+    store
+        .append_mutate_checked(session_id, lineage_id, actor, EventKind::FactRevised, &updated.id, None, &body)
+        .map_err(WriteError::Store)
+}
+
+/// What the capacity check concluded about a new item's chances of ever
+/// being shown.
+#[derive(Debug)]
+pub enum Capacity {
+    /// At least one of its bindings has room, or it outranks enough rivals.
+    Fine,
+    /// Every binding is already full of rivals it can never outrank. The item
+    /// would be stored, fire nowhere, and nothing would say so.
+    DeadOnArrival(Refusal),
+    /// A binding is full of rivals at the same weight or heavier. Whether
+    /// this item is seen then depends on closeness at some future moment,
+    /// which nobody can decide now - so it is said, not enforced.
+    Crowded(String),
+}
+
+/// Which live items would compete with `item` at the moment `binding` stands
+/// for.
+///
+/// `Always` is deliberately not a pool: session start serves every pinned
+/// item in full and caps nothing, so a pin never takes another pin's place
+/// (CONTRACT: the five surfaces never share a candidate pool).
+///
+/// Scope follows what actually gets served: a project item competes with its
+/// own project and with the global tier that reaches every project. A GLOBAL
+/// item is compared only against other globals, because the projects it will
+/// land in are not knowable at write time and guessing them would refuse
+/// writes for crowding that may never happen.
+/// Does a rival bound to a DIRECTORY compete with an item bound to a FILE
+/// inside it? Yes, and `target_matches` alone cannot say so, because it
+/// requires the two kinds to be equal.
+///
+/// WHY THIS MATTERS AND WHY IT IS ONE-WAY. Every serving surface builds its
+/// input with `ServeInput::add_file`, which adds a Path target AND a Dir
+/// target for the same touch, so a directory anchor is in the pool every
+/// single time a file under it is touched. Missing that made the crowding
+/// count a lower bound rather than the pool - and the count decides a
+/// REFUSAL, so undercounting is the only direction that is merely wrong
+/// rather than harmful.
+///
+/// One-way on purpose. The mirror case - my item is bound to the directory,
+/// a rival to one file inside it - is NOT a rival: that file's anchor fires
+/// only when that particular file is touched, and my directory anchor fires
+/// for every file under it. Counting all of them would call a directory
+/// anchor crowded by rivals it will usually never meet, which is exactly the
+/// kind of bought catch CONTRACT R9 forbids.
+fn covering_dir(
+    rival_kind: crate::item::TargetKind,
+    rival_value: &str,
+    my_kind: crate::item::TargetKind,
+    my_value: &str,
+) -> bool {
+    use crate::item::TargetKind;
+    if rival_kind != TargetKind::Dir || my_kind != TargetKind::Path {
+        return false;
+    }
+    let mine = crate::normalize::normalize_target(my_value);
+    let Some((parent, _)) = mine.rsplit_once('/') else { return false };
+    crate::normalize::target_matches(TargetKind::Dir, rival_value, TargetKind::Dir, parent)
+}
+
+fn pool_rivals<'a>(
+    candidates: &'a [(String, Item)],
+    item: &Item,
+    binding: &Binding,
+) -> Vec<&'a (String, Item)> {
+    let Some(kind_match): Option<&dyn Fn(&Binding) -> bool> = (match binding {
+        Binding::Always => None,
+        Binding::Moment(_) => Some(&|b: &Binding| matches!((b, binding), (Binding::Moment(x), Binding::Moment(y)) if x == y)),
+        Binding::Target { .. } => Some(&|b: &Binding| match (b, binding) {
+            (Binding::Target { kind: bk, value: bv }, Binding::Target { kind, value }) => {
+                crate::normalize::target_matches(*bk, bv, *kind, value) || covering_dir(*bk, bv, *kind, value)
+            }
+            _ => false,
+        }),
+    }) else {
+        return Vec::new();
+    };
+
+    candidates
+        .iter()
+        .filter(|(id, other)| {
+            if *id == item.id || !other.kind.can_fire() {
+                return false;
+            }
+            match (item.project.as_deref(), other.project.as_deref()) {
+                (None, None) => true,
+                (None, Some(_)) => false,
+                (Some(_), None) => true,
+                (Some(mine), Some(theirs)) => mine == theirs,
+            }
+        })
+        .filter(|(_, other)| other.bindings.iter().any(|b| kind_match(b)))
+        .collect()
+}
+
+/// Would this item ever reach a block, and if not, is that provable?
+///
+/// WHY THIS EXISTS AND WHY IT IS NOT A KNOB. CONTRACT R1 names "anchors on a
+/// full target" as a refusal class and nothing ever implemented it, so by
+/// R1's own last line that refusal did not exist. Version 1 had one, counted
+/// per anchor; that unit is wrong here. Measured 2026-08-08: of the 38 items
+/// competing at the worst target, only 5 were anchored there and 33 were
+/// bound to a MOMENT, so a per-anchor gate would have let every one of them
+/// through. The unit that competes is the pool `rank::select` assembles.
+///
+/// TWO ANSWERS, ALONG THE LINE THE DOCTRINE ALREADY DRAWS. A refusal has to
+/// be provable, so it fires only when EVERY binding the item carries is
+/// already full of rivals of STRICTLY heavier severity. Severity is compared
+/// before closeness, so no context at any future moment can lift this item
+/// into the block: it is dead on arrival, and storing it would be cover that
+/// looks real and never fires. Anything less is a warning, because whether a
+/// same-weight rival wins depends on closeness to something that has not
+/// happened yet, and refusing on a guess is how a gate teaches people to
+/// route around it.
+///
+/// No new constant: the line is `item::MAX_ITEMS`, the number of places a
+/// block actually has. A configurable capacity would be exactly the
+/// compensating knob CONTRACT R9 calls a reported design failure.
+pub fn capacity(store: &EventStore, item: &Item) -> anyhow::Result<Capacity> {
+    let bindings: Vec<&Binding> =
+        item.bindings.iter().filter(|b| !matches!(b, Binding::Always)).collect();
+    if bindings.is_empty() || !item.kind.can_fire() {
+        return Ok(Capacity::Fine);
+    }
+    let candidates = if store.heads_projection_current() {
+        live_items_from_projection(store)?
+    } else {
+        live_items_from_fold(store)?
+    };
+
+    let mine = crate::item::severity_rank(item.severity);
+    let mut every_binding_is_hopeless = true;
+    let mut crowded: Option<String> = None;
+
+    for binding in &bindings {
+        let rivals = pool_rivals(&candidates, item, binding);
+        let heavier = rivals.iter().filter(|(_, o)| crate::item::severity_rank(o.severity) < mine).count();
+        let at_least_equal =
+            rivals.iter().filter(|(_, o)| crate::item::severity_rank(o.severity) <= mine).count();
+
+        if heavier < crate::item::MAX_ITEMS {
+            every_binding_is_hopeless = false;
+        }
+        if crowded.is_none() && at_least_equal >= crate::item::MAX_ITEMS {
+            crowded = Some(format!(
+                "{} already holds {at_least_equal} item(s) of the same weight or heavier, for {} \
+                 place(s) in a block - this one may well never be shown there. Bind it to the exact \
+                 file or command it is about instead of the broad moment, or fold it into whichever \
+                 item already carries that ground.",
+                describe(binding),
+                crate::item::MAX_ITEMS
+            ));
+        }
+    }
+
+    if every_binding_is_hopeless {
+        let worst = bindings
+            .iter()
+            .map(|b| (describe(b), pool_rivals(&candidates, item, b)))
+            .max_by_key(|(_, r)| r.len())
+            .map(|(d, r)| {
+                let ids: Vec<&str> = r.iter().take(3).map(|(id, _)| id.as_str()).collect();
+                format!("{d} is held by {} heavier item(s), among them {}", r.len(), ids.join(", "))
+            })
+            .unwrap_or_default();
+        return Ok(Capacity::DeadOnArrival(Refusal {
+            problem: format!(
+                "every binding on this item is already full of heavier rivals, so it can never \
+                 reach a block: {worst}"
+            ),
+            fix: "give it a binding that is actually free - the exact file or command it is about \
+                  rather than a broad moment - or raise its severity if that is honestly what it \
+                  is, or fold the constraint into the item that already holds that ground. Storing \
+                  it as it stands would be cover that looks real and never fires."
+                .to_string(),
+        }));
+    }
+    Ok(match crowded {
+        Some(note) => Capacity::Crowded(note),
+        None => Capacity::Fine,
+    })
+}
+
+/// One binding, in the words a refusal can use.
+fn describe(binding: &Binding) -> String {
+    match binding {
+        Binding::Always => "the pinned layer".to_string(),
+        Binding::Moment(a) => format!("the moment '{}'", a.as_str()),
+        Binding::Target { kind, value } => format!("the target {kind:?}:{value}"),
+    }
+}
+
+/// The longest reason `archive` will carry. It becomes a tag, and a tag is
+/// something search matches on: a paragraph in there would match everything.
+pub const ARCHIVE_REASON_LIMIT: usize = 120;
+
+/// Marks an anchor that points at something DELIBERATELY absent, so it must
+/// never be read as decay.
+///
+/// THE DEFECT THIS CLOSES, and it was found the hard way on 2026-08-07. A
+/// sweep archived six rules anchored at `firmware/src/secrets.h` - a file
+/// that is gitignored and is SUPPOSED not to exist in a checkout. The anchor
+/// was never stale: it was there precisely so the rules fire the moment
+/// anybody creates or touches that file. One of the six said so in its own
+/// text, in capitals. Prose could not stop the sweep, because a sweep reads
+/// paths and not sentences, and that rule was scoped to a project the sweep
+/// was not even running in.
+///
+/// So the distinction has to be something a machine can see. An item carrying
+/// this tag is skipped by the decay count and refused by `archive`.
+pub const DELIBERATE_ANCHOR_TAG: &str = "deliberate-anchor";
+
+/// Turn a fireable item into archive material: same id, same text, same
+/// history, still fully findable by `lookup` - but it stops claiming to fire.
+///
+/// WHY THIS IS NOT A `revise`. A Report may carry no bindings (gate ground 6)
+/// and `gate::revise` refuses dropping bindings unconditionally, on purpose.
+/// Those two rules are both right and they meet head on here, which is the
+/// signal that archiving is not a correction at all. A correction says the
+/// fact was wrong. This says the fact is still true and no longer has a place
+/// to fire - a different act, so it gets its own door, the same way `retract`
+/// does.
+///
+/// THE DEFECT THIS CLOSES. A store fills up with items anchored to things
+/// that stopped existing: the one-off script that produced a measurement, the
+/// experiment directory, the log file. The knowledge in them is often still
+/// true and worth finding. But they are counted as live rules, they answer
+/// "how many rules do you have" with a yes, and every one of them fires
+/// nowhere while nothing says so. Retracting would take the knowledge out of
+/// `lookup` as well, which is too blunt. This keeps the words and drops only
+/// the claim that they fire.
+///
+/// A rule carrying a runnable check is REFUSED. That is exactly the kind that
+/// can still block a wrong write, so archiving one would be throwing away the
+/// only enforcement this memory has. Settle or remove the check first if that
+/// is really what you mean.
+pub fn archive(
+    store: &mut EventStore,
+    session_id: &str,
+    lineage_id: &str,
+    actor: &str,
+    entity_id: &str,
+    reason: &str,
+) -> Result<Event, WriteError> {
+    let reason = reason.trim();
+    if reason.is_empty() {
+        return Err(WriteError::Refused(Refusal {
+            problem: "an archive with no reason".to_string(),
+            fix: "say why this item can no longer fire - six weeks later nobody can tell a \
+                  deliberate archive from an accident without it"
+                .to_string(),
+        }));
+    }
+    if reason.chars().count() > ARCHIVE_REASON_LIMIT {
+        return Err(WriteError::Refused(Refusal {
+            problem: format!("the reason is {} characters", reason.chars().count()),
+            fix: format!("keep it under {ARCHIVE_REASON_LIMIT}: it becomes a tag, and search matches on tags"),
+        }));
+    }
+    if reason.contains(',') || reason.contains('\n') || reason.contains('\r') {
+        return Err(WriteError::Refused(Refusal {
+            problem: "the reason contains a comma or a line break".to_string(),
+            fix: "write it as one plain phrase - it becomes a single tag".to_string(),
+        }));
+    }
+
+    let existing = show(store, entity_id).map_err(|e| WriteError::Store(anyhow::anyhow!("{e}")))?;
+    if !existing.kind.can_fire() {
+        return Err(WriteError::Refused(Refusal {
+            problem: format!("'{entity_id}' is already archive material ({:?})", existing.kind),
+            fix: "nothing to do - it does not claim to fire".to_string(),
+        }));
+    }
+    if existing.check.is_some() {
+        return Err(WriteError::Refused(Refusal {
+            problem: format!("'{entity_id}' carries a runnable check"),
+            fix: "a rule that can prove itself is the only kind that can ever block a wrong \
+                  write; settle or clear the check first if archiving it is really the intent"
+                .to_string(),
+        }));
+    }
+    if existing.tags.iter().any(|t| t == DELIBERATE_ANCHOR_TAG) {
+        return Err(WriteError::Refused(Refusal {
+            problem: format!("'{entity_id}' anchors at something deliberately absent"),
+            fix: "its anchor is not decay - it is there so the rule fires the moment that file \
+                  appears or is touched; drop the deliberate-anchor tag first if that has really \
+                  stopped being true"
+                .to_string(),
+        }));
+    }
+
+    let mut updated = existing.clone();
+    updated.kind = Kind::Report;
+    updated.bindings = Vec::new(); // a Report may carry none, and must not
+    updated.severity = None; // meaningless once it cannot fire
+    updated.tags.push(format!("archived:{reason}"));
+
+    gate::declare(&updated).map_err(WriteError::Refused)?;
+    let body = canonical_body(&updated).map_err(WriteError::Serialize)?;
+    store
+        .append_mutate_checked(session_id, lineage_id, actor, EventKind::FactRevised, &updated.id, None, &body)
+        .map_err(WriteError::Store)
+}
+
+/// Bring an item back out of the archive: restore the kind and the anchor it
+/// had, and mark that anchor deliberate so no later sweep takes it again.
+///
+/// The counterpart to `archive`, and it exists because that operation was
+/// used wrongly once. It is deliberately narrow - it takes the kind and the
+/// one anchor explicitly rather than digging them out of history - because
+/// undoing a mistake should be an act someone states in full, not a magic
+/// rewind that might restore something nobody looked at.
+pub fn restore_deliberate_anchor(
+    store: &mut EventStore,
+    session_id: &str,
+    lineage_id: &str,
+    actor: &str,
+    entity_id: &str,
+    kind: Kind,
+    anchor: &str,
+) -> Result<Event, WriteError> {
+    let existing = show(store, entity_id).map_err(|e| WriteError::Store(anyhow::anyhow!("{e}")))?;
+    if existing.kind.can_fire() {
+        return Err(WriteError::Refused(Refusal {
+            problem: format!("'{entity_id}' is not archived ({:?})", existing.kind),
+            fix: "nothing to restore - it already fires".to_string(),
+        }));
+    }
+    if !kind.can_fire() {
+        return Err(WriteError::Refused(Refusal {
+            problem: format!("{kind:?} is not a kind that fires"),
+            fix: "restore it as a Rule or an Orientation, or leave it archived".to_string(),
+        }));
+    }
+
+    let mut updated = existing.clone();
+    updated.kind = kind;
+    updated.bindings =
+        vec![Binding::Target { kind: crate::item::TargetKind::Path, value: anchor.to_string() }];
+    updated.tags.retain(|t| !t.starts_with("archived:"));
+    if !updated.tags.iter().any(|t| t == DELIBERATE_ANCHOR_TAG) {
+        updated.tags.push(DELIBERATE_ANCHOR_TAG.to_string());
+    }
+
+    gate::declare(&updated).map_err(WriteError::Refused)?;
     let body = canonical_body(&updated).map_err(WriteError::Serialize)?;
     store
         .append_mutate_checked(session_id, lineage_id, actor, EventKind::FactRevised, &updated.id, None, &body)
@@ -585,7 +976,7 @@ pub fn history(store: &EventStore, entity_id: &str) -> Result<Vec<Revision>, Rea
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::item::{Binding, Kind, Severity, TargetKind};
+    use crate::item::{Binding, Check, Kind, Severity, TargetKind};
     use intent::Action;
 
     fn sample() -> Item {
@@ -822,6 +1213,62 @@ mod tests {
             .expect("a genuinely different fact of the same kind must not be refused");
     }
 
+    /// The defect this guards against, and it is this check working against
+    /// its own purpose. Two repositories can genuinely need the same rule -
+    /// the same licence wording, the same release step. Comparing across every
+    /// project meant the second one could not have it, and the only shape that
+    /// satisfied both was ONE GLOBAL fact, which then fires in every project on
+    /// the machine. Observed 2026-08-07 with a licence rule that was global and
+    /// therefore fired on a GPLv3 repository claiming it was non-commercial.
+    #[test]
+    fn the_same_rule_is_accepted_in_a_different_project() {
+        let mut store = EventStore::in_memory().unwrap();
+        let mut first = sample_with("licence-a", "never call this project free and open-source");
+        first.project = Some("project-a".to_string());
+        declare(&mut store, "s1", "l1", "test", &first).unwrap();
+
+        let mut second = sample_with("licence-b", "never call this project free and open-source");
+        second.project = Some("project-b".to_string());
+        declare(&mut store, "s1", "l1", "test", &second).expect(
+            "the same constraint in a DIFFERENT project is not a second copy - refusing it \
+             leaves one global fact as the only option, which is the defect",
+        );
+    }
+
+    #[test]
+    fn the_same_rule_twice_in_one_project_is_still_refused() {
+        let mut store = EventStore::in_memory().unwrap();
+        let mut first = sample_with("licence-a", "never call this project free and open-source");
+        first.project = Some("project-a".to_string());
+        declare(&mut store, "s1", "l1", "test", &first).unwrap();
+
+        let mut second = sample_with("licence-b", "never call this project free and open-source");
+        second.project = Some("project-a".to_string());
+        assert!(
+            matches!(declare(&mut store, "s1", "l1", "test", &second), Err(WriteError::Refused(_))),
+            "within ONE project the duplicate check must still bite"
+        );
+    }
+
+    /// A global item already fires inside every project, so a scoped copy of
+    /// it really is a second copy of something already being served there.
+    /// Skipping this pairing would let the store fill with per-project echoes
+    /// of one global rule.
+    #[test]
+    fn a_scoped_copy_of_a_global_rule_is_still_refused() {
+        let mut store = EventStore::in_memory().unwrap();
+        let mut global = sample_with("global-rule", "never call this project free and open-source");
+        global.project = None;
+        declare(&mut store, "s1", "l1", "test", &global).unwrap();
+
+        let mut scoped = sample_with("scoped-rule", "never call this project free and open-source");
+        scoped.project = Some("project-a".to_string());
+        assert!(
+            matches!(declare(&mut store, "s1", "l1", "test", &scoped), Err(WriteError::Refused(_))),
+            "a global rule already fires here, so a scoped copy is a second copy"
+        );
+    }
+
     #[test]
     fn the_same_text_under_a_different_kind_is_accepted() {
         let mut store = EventStore::in_memory().unwrap();
@@ -834,6 +1281,309 @@ mod tests {
         second.falsifier = None; // only Rule/Orientation require one (gate ground 10)
         declare(&mut store, "s1", "l1", "test", &second)
             .expect("identical text under a DIFFERENT kind must not be refused as a near-duplicate");
+    }
+
+    /// Wildly different sentences on purpose: the near-duplicate check runs
+    /// before the capacity check, and near-identical fixtures would be
+    /// refused for the wrong reason and quietly test nothing.
+    const DISTINCT: [&str; 9] = [
+        "the changelog belongs at the repository root and nowhere else",
+        "database migrations run forward only, never in reverse",
+        "every uploaded image is stripped of its location metadata",
+        "the nightly job writes its report before it deletes anything",
+        "a released version number is never reused for a different build",
+        "connection pools close on shutdown, in the opposite order they opened",
+        "the search index rebuilds from source, never from its own output",
+        "temporary credentials expire within the hour they were issued",
+        "a queue consumer acknowledges only after the work has landed",
+    ];
+
+    fn bound_to(id: &str, nth: usize, moment: intent::Action, severity: Option<Severity>) -> Item {
+        let mut item = sample_with(id, DISTINCT[nth % DISTINCT.len()]);
+        item.bindings = vec![Binding::Moment(moment)];
+        item.severity = severity;
+        item
+    }
+
+    /// THE DEFECT THIS PREVENTS, and CONTRACT R1 named it long before anything
+    /// implemented it: an item every one of whose bindings is already full of
+    /// heavier rivals is stored, fires nowhere, and nothing says so. Severity
+    /// is compared before closeness, so no future moment can lift it in - it
+    /// is not unlucky, it is unreachable.
+    #[test]
+    fn an_item_that_can_never_reach_a_block_is_refused() {
+        let mut store = EventStore::in_memory().unwrap();
+        for i in 0..crate::item::MAX_ITEMS {
+            let heavy = bound_to(&format!("heavy-{i}"), i, intent::Action::Commit, Some(Severity::Irreversible));
+            declare(&mut store, "s", "l", "t", &heavy).expect("fixture must store");
+        }
+        let light = bound_to("light-one", 8, intent::Action::Commit, Some(Severity::HouseStyle));
+        let err = declare(&mut store, "s", "l", "t", &light).expect_err("it can never be shown");
+        let msg = format!("{err}");
+        assert!(msg.contains("never reach a block"), "the refusal must say why: {msg}");
+        assert!(msg.contains("heavy-"), "and name what holds the places: {msg}");
+    }
+
+    /// The other half, and the reason the refusal is narrow: a rival of the
+    /// SAME weight might still lose to this item on closeness at some future
+    /// moment. Refusing on that would be refusing on a guess, which is how a
+    /// gate teaches people to route around it.
+    #[test]
+    fn a_full_pool_of_equals_is_a_note_and_never_a_refusal() {
+        let mut store = EventStore::in_memory().unwrap();
+        for i in 0..crate::item::MAX_ITEMS + 2 {
+            let peer = bound_to(&format!("peer-{i}"), i, intent::Action::Commit, Some(Severity::Costly));
+            declare(&mut store, "s", "l", "t", &peer).expect("fixture must store");
+        }
+        let another = bound_to("another-peer", 8, intent::Action::Commit, Some(Severity::Costly));
+        declare(&mut store, "s", "l", "t", &another).expect("an equal must still be storable");
+
+        match capacity(&store, &another).unwrap() {
+            Capacity::Crowded(note) => assert!(note.contains("same weight or heavier"), "{note}"),
+            other => panic!("a full pool of equals must be reported, got {other:?}"),
+        }
+    }
+
+    /// A second binding that is free saves the item: it is only dead when
+    /// EVERY door is shut. Refusing while one is open would delete a fact that
+    /// works perfectly well somewhere else.
+    #[test]
+    fn one_free_binding_is_enough_to_be_storable() {
+        let mut store = EventStore::in_memory().unwrap();
+        for i in 0..crate::item::MAX_ITEMS {
+            let heavy = bound_to(&format!("h-{i}"), i, intent::Action::Commit, Some(Severity::Irreversible));
+            declare(&mut store, "s", "l", "t", &heavy).expect("fixture must store");
+        }
+        let mut light = bound_to("two-doors", 8, intent::Action::Commit, Some(Severity::HouseStyle));
+        light.bindings.push(Binding::Target { kind: TargetKind::Path, value: "src/lonely.rs".to_string() });
+        declare(&mut store, "s", "l", "t", &light).expect("the free target binding must save it");
+    }
+
+    /// THE DEFECT THIS PREVENTS: counting the wrong pool. Every serving
+    /// surface builds its input with `ServeInput::add_file`, which adds a
+    /// Path target AND a Dir target for the same touch, so a directory
+    /// anchor is in the pool every time a file under it is touched. The
+    /// crowding count compared bindings by kind, so it never saw them, and a
+    /// file whose directory was already full of heavier rules read as an
+    /// empty target.
+    #[test]
+    fn a_directory_full_of_heavier_rules_crowds_a_file_inside_it() {
+        let mut store = EventStore::in_memory().unwrap();
+        for i in 0..crate::item::MAX_ITEMS {
+            let mut heavy = sample_with(&format!("dir-{i}"), DISTINCT[i % DISTINCT.len()]);
+            heavy.bindings = vec![Binding::Target { kind: TargetKind::Dir, value: "src/deep".to_string() }];
+            heavy.severity = Some(Severity::Irreversible);
+            declare(&mut store, "s", "l", "t", &heavy).expect("fixture must store");
+        }
+        let mut light = sample_with("newcomer", "a webhook retry backs off before it gives up entirely");
+        light.bindings = vec![Binding::Target { kind: TargetKind::Path, value: "src/deep/mod.rs".to_string() }];
+        light.severity = Some(Severity::HouseStyle);
+        let refusal = declare(&mut store, "s", "l", "t", &light)
+            .expect_err("a file under a full directory can never reach a block");
+        assert!(format!("{refusal}").contains("dir-0"), "the refusal must name a holder: {refusal}");
+    }
+
+    /// The mirror case, and it must NOT refuse. A rule bound to one file
+    /// inside my directory fires only when that file is touched; my
+    /// directory anchor fires for every file under it. Counting all of them
+    /// would call a directory anchor crowded by rivals it will usually never
+    /// meet - a catch bought by widening, which CONTRACT R9 forbids.
+    #[test]
+    fn files_inside_a_directory_do_not_crowd_the_directory_itself() {
+        let mut store = EventStore::in_memory().unwrap();
+        for i in 0..crate::item::MAX_ITEMS + 2 {
+            let mut heavy = sample_with(&format!("file-{i}"), DISTINCT[i % DISTINCT.len()]);
+            heavy.bindings = vec![Binding::Target { kind: TargetKind::Path, value: format!("src/deep/f{i}.rs") }];
+            heavy.severity = Some(Severity::Irreversible);
+            declare(&mut store, "s", "l", "t", &heavy).expect("fixture must store");
+        }
+        let mut dir_rule = sample_with("the-dir-rule", "a webhook retry backs off before it gives up entirely");
+        dir_rule.bindings = vec![Binding::Target { kind: TargetKind::Dir, value: "src/deep".to_string() }];
+        dir_rule.severity = Some(Severity::HouseStyle);
+        declare(&mut store, "s", "l", "t", &dir_rule).expect("a directory anchor is not crowded by its own files");
+    }
+
+    /// A pinned item is never in a pool: session start serves every pin in
+    /// full and caps nothing, so a pin cannot take another pin's place.
+    /// Counting them would refuse writes for crowding that does not exist.
+    #[test]
+    fn a_pinned_item_is_never_refused_for_crowding() {
+        let mut store = EventStore::in_memory().unwrap();
+        for i in 0..crate::item::MAX_ITEMS + 3 {
+            let mut pin = sample_with(&format!("pin-{i}"), DISTINCT[i % DISTINCT.len()]);
+            pin.bindings = vec![Binding::Always];
+            pin.severity = Some(Severity::Irreversible);
+            declare(&mut store, "s", "l", "t", &pin).expect("fixture must store");
+        }
+        let mut another = sample_with("pin-more", "a webhook retry backs off before it gives up entirely");
+        another.bindings = vec![Binding::Always];
+        another.severity = Some(Severity::HouseStyle);
+        declare(&mut store, "s", "l", "t", &another).expect("a pin never competes for a place");
+    }
+
+    /// The promise archiving makes: the words survive, the claim to fire does
+    /// not. If this ever stops holding, archiving has quietly become a
+    /// retraction with extra steps.
+    #[test]
+    fn archiving_keeps_the_words_and_drops_only_the_claim_to_fire() {
+        let mut store = EventStore::in_memory().unwrap();
+        let mut item = sample_with("measured-thing", "that reranker failed both gates");
+        item.project = Some("some-project".to_string());
+        declare(&mut store, "s1", "l1", "test", &item).unwrap();
+
+        archive(&mut store, "s1", "l1", "test", "measured-thing", "the script it measured is gone").unwrap();
+
+        let after = show(&store, "measured-thing").unwrap();
+        assert_eq!(after.kind, Kind::Report, "it must stop being a kind that claims to fire");
+        assert!(!after.kind.can_fire());
+        assert_eq!(after.text, "that reranker failed both gates", "the words must survive untouched");
+        assert_eq!(after.project.as_deref(), Some("some-project"), "the scope must survive");
+        assert!(after.bindings.is_empty(), "a Report may carry no bindings");
+        assert!(
+            after.tags.iter().any(|t| t == "archived:the script it measured is gone"),
+            "the reason must survive as a tag, or nobody can tell this from an accident: {:?}",
+            after.tags
+        );
+    }
+
+    /// An archived item stays in the live set. That is the whole difference
+    /// from retracting: `lookup` must still find it.
+    #[test]
+    fn an_archived_item_is_still_live_and_findable() {
+        let mut store = EventStore::in_memory().unwrap();
+        let item = sample_with("measured-thing", "that reranker failed both gates");
+        declare(&mut store, "s1", "l1", "test", &item).unwrap();
+        archive(&mut store, "s1", "l1", "test", "measured-thing", "anchor gone").unwrap();
+
+        assert!(
+            show(&store, "measured-thing").is_ok(),
+            "archiving must not remove the item - that is what retract is for"
+        );
+    }
+
+    #[test]
+    fn archiving_refuses_without_a_reason() {
+        let mut store = EventStore::in_memory().unwrap();
+        let item = sample_with("thing", "some fact");
+        declare(&mut store, "s1", "l1", "test", &item).unwrap();
+
+        assert!(matches!(
+            archive(&mut store, "s1", "l1", "test", "thing", "   "),
+            Err(WriteError::Refused(_))
+        ));
+        assert_eq!(show(&store, "thing").unwrap().kind, Kind::Orientation, "a refused archive changes nothing");
+    }
+
+    /// The defect this guards against: archiving a rule that can prove itself
+    /// would throw away the only enforcement this memory actually has. A rule
+    /// with a runnable check is the one kind that can block a wrong write.
+    #[test]
+    fn archiving_refuses_a_rule_that_can_still_prove_itself() {
+        let mut store = EventStore::in_memory().unwrap();
+        let mut item = sample_with("provable", "the config lives in config/app.toml");
+        item.check = Some(Check::PathExists { path: "config/app.toml".to_string() });
+        declare(&mut store, "s1", "l1", "test", &item).unwrap();
+
+        let err = archive(&mut store, "s1", "l1", "test", "provable", "anchor gone")
+            .expect_err("a provable rule must not be archivable in one step");
+        assert!(format!("{err:?}").contains("check"), "the refusal must name why: {err:?}");
+        assert_eq!(show(&store, "provable").unwrap().kind, Kind::Orientation);
+    }
+
+    #[test]
+    fn archiving_something_already_archived_is_refused_rather_than_repeated() {
+        let mut store = EventStore::in_memory().unwrap();
+        let item = sample_with("thing", "some fact");
+        declare(&mut store, "s1", "l1", "test", &item).unwrap();
+        archive(&mut store, "s1", "l1", "test", "thing", "anchor gone").unwrap();
+
+        assert!(matches!(
+            archive(&mut store, "s1", "l1", "test", "thing", "anchor gone"),
+            Err(WriteError::Refused(_))
+        ));
+        let after = show(&store, "thing").unwrap();
+        assert_eq!(
+            after.tags.iter().filter(|t| t.starts_with("archived:")).count(),
+            1,
+            "a second archive must not stack a second reason tag"
+        );
+    }
+
+    /// The defect this guards against, and it is the one that actually
+    /// happened. Six rules anchored at a gitignored secrets file were swept
+    /// into the archive as "dead anchors". They were not dead: the anchor was
+    /// there so they fire the moment anybody touches that file. One of them
+    /// said so in its own text and the sweep read paths, not sentences.
+    #[test]
+    fn archiving_refuses_an_anchor_that_is_absent_on_purpose() {
+        let mut store = EventStore::in_memory().unwrap();
+        let mut item = sample_with("guards-secrets", "this file is gitignored and must never be committed");
+        item.tags = vec![DELIBERATE_ANCHOR_TAG.to_string()];
+        declare(&mut store, "s1", "l1", "test", &item).unwrap();
+
+        let err = archive(&mut store, "s1", "l1", "test", "guards-secrets", "anchor resolves to nothing")
+            .expect_err("an anchor marked deliberate must survive any sweep");
+        assert!(format!("{err:?}").contains("deliberately absent"), "the refusal must say why: {err:?}");
+        assert!(show(&store, "guards-secrets").unwrap().kind.can_fire(), "it must still fire");
+    }
+
+    #[test]
+    fn restoring_brings_back_the_kind_and_the_anchor_and_marks_it_deliberate() {
+        let mut store = EventStore::in_memory().unwrap();
+        let item = sample_with("guards-secrets", "this file is gitignored and must never be committed");
+        declare(&mut store, "s1", "l1", "test", &item).unwrap();
+        archive(&mut store, "s1", "l1", "test", "guards-secrets", "swept by mistake").unwrap();
+
+        restore_deliberate_anchor(
+            &mut store,
+            "s1",
+            "l1",
+            "test",
+            "guards-secrets",
+            Kind::Rule,
+            "firmware/src/secrets.h",
+        )
+        .unwrap();
+
+        let after = show(&store, "guards-secrets").unwrap();
+        assert_eq!(after.kind, Kind::Rule);
+        assert_eq!(
+            after.bindings,
+            vec![Binding::Target { kind: TargetKind::Path, value: "firmware/src/secrets.h".to_string() }]
+        );
+        assert!(after.tags.iter().any(|t| t == DELIBERATE_ANCHOR_TAG), "it must be marked: {:?}", after.tags);
+        assert!(!after.tags.iter().any(|t| t.starts_with("archived:")), "the archive reason must go: {:?}", after.tags);
+
+        // And now it is immune to the same mistake.
+        assert!(matches!(
+            archive(&mut store, "s1", "l1", "test", "guards-secrets", "anchor resolves to nothing"),
+            Err(WriteError::Refused(_))
+        ));
+    }
+
+    #[test]
+    fn restoring_something_that_was_never_archived_is_refused() {
+        let mut store = EventStore::in_memory().unwrap();
+        let item = sample_with("thing", "some fact");
+        declare(&mut store, "s1", "l1", "test", &item).unwrap();
+        assert!(matches!(
+            restore_deliberate_anchor(&mut store, "s1", "l1", "test", "thing", Kind::Rule, "a/b.rs"),
+            Err(WriteError::Refused(_))
+        ));
+    }
+
+    #[test]
+    fn archiving_refuses_a_reason_that_would_pollute_search() {
+        let mut store = EventStore::in_memory().unwrap();
+        let item = sample_with("thing", "some fact");
+        declare(&mut store, "s1", "l1", "test", &item).unwrap();
+
+        let long = "x".repeat(ARCHIVE_REASON_LIMIT + 1);
+        assert!(matches!(archive(&mut store, "s1", "l1", "test", "thing", &long), Err(WriteError::Refused(_))));
+        assert!(matches!(
+            archive(&mut store, "s1", "l1", "test", "thing", "two, reasons"),
+            Err(WriteError::Refused(_))
+        ));
     }
 
     #[test]

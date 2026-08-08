@@ -96,6 +96,193 @@ const SESSION_ID: &str = "mcp";
 const LINEAGE_ID: &str = "mcp";
 const ACTOR: &str = "mcp";
 
+/// What the body becomes: replaced wholesale, added to, or patched in one
+/// place. Exactly one of the three, or none at all.
+///
+/// WHY THE SMALL EDITS EXIST. Replacing the whole body was the only way to
+/// correct anything, so fixing one word in a 290-character rule meant
+/// retyping all 290 and only then finding out whether the result still fit
+/// the limit. That is friction on precisely the act this memory most needs
+/// to be easy, and it is why corrections got skipped in favour of storing a
+/// second copy - the exact defect `correct-instead-of-duplicating` exists to
+/// prevent.
+///
+/// Nothing here bypasses anything: the result is handed to the same gate,
+/// so the length limit, the typography rules and every other ground still
+/// apply to what comes out.
+fn edited_text(current: &str, args: &ReviseArgs) -> Result<String, String> {
+    let modes = [args.text.is_some(), args.append.is_some(), args.replace_from.is_some()];
+    if modes.iter().filter(|m| **m).count() > 1 {
+        return Err(
+            "give exactly one of text, append or replace_from - say what the body IS, or say what \
+             to change about it, never both"
+                .to_string(),
+        );
+    }
+    if let Some(t) = &args.text {
+        return Ok(t.clone());
+    }
+    if let Some(extra) = &args.append {
+        let extra = extra.trim();
+        if extra.is_empty() {
+            return Err("append with nothing to add - omit it, or pass the words".to_string());
+        }
+        return Ok(format!("{} {extra}", current.trim_end()));
+    }
+    if let Some(from) = &args.replace_from {
+        let Some(to) = &args.replace_to else {
+            return Err("replace_from needs replace_to - pass an empty string to delete".to_string());
+        };
+        if from.is_empty() {
+            return Err("replace_from cannot be empty - it would match at every position".to_string());
+        }
+        // A substring that is not there would make this a silent no-op that
+        // still reports success, which is the worst kind of edit: the caller
+        // believes the correction landed.
+        if !current.contains(from.as_str()) {
+            return Err(format!(
+                "{from:?} is not in this item's text, so there is nothing to replace - read it \
+                 with get first"
+            ));
+        }
+        return Ok(current.replacen(from.as_str(), to, 1));
+    }
+    Ok(current.to_string())
+}
+
+/// Append `model::gate::warnings` to a write that already SUCCEEDED.
+///
+/// A warning is not a refusal and must never read like one: the item is
+/// stored, and the note is about how well it will work, not about whether it
+/// was allowed. Hence the wording, and hence the placement after the success
+/// line rather than instead of it.
+///
+/// WHY IT HAS TO BE APPENDED, not prepended. `apply_captured` classifies a
+/// drained write by the SUCCESS PREFIX of this very string ("stored ",
+/// "revised ", "retracted ") - see its own note on why refusals share no
+/// prefix to key on. Putting anything in front of that prefix would silently
+/// reclassify every warned write as not-applied, and the queue would then
+/// replay writes that had already landed.
+///
+/// Without this, `warnings` was a complete tested function that nothing ever
+/// called, which is the same as not having built it.
+fn with_warnings(
+    success: String,
+    item: &model::item::Item,
+    root: Option<&std::path::Path>,
+    store: Option<&thor_core::event_store::EventStore>,
+) -> String {
+    let mut notes: Vec<String> = model::gate::warnings(item).iter().map(|w| w.to_string()).collect();
+    // The half of the capacity check that is a note rather than a refusal.
+    // Without this call it was dead code: constructed in `model::store` and
+    // read by nothing but its own unit test, so a writer filling a pool that
+    // is already full of equals was told nothing at all.
+    if let Some(store) = store {
+        if let Ok(model::store::Capacity::Crowded(note)) = model::store::capacity(store, item) {
+            notes.push(note);
+        }
+    }
+    if let Some(root) = root {
+        notes.extend(file_aware_warnings(item, root));
+        notes.extend(suggested_check(item, root));
+    }
+    if notes.is_empty() {
+        return success;
+    }
+    let notes: Vec<String> = notes.iter().map(|n| format!("  note: {n}")).collect();
+    format!("{success}\n{}", notes.join("\n"))
+}
+
+/// Whether `line` is a comment, judged narrowly and on purpose.
+///
+/// The census that first counted hollow checks read a leading `#` as a
+/// comment marker everywhere, which made a Markdown heading and a C
+/// `#define` look like commentary: it reported 28 comment-only checks where
+/// hand-checking found 6. This is the corrected rule, and it is deliberately
+/// conservative - it would rather miss a real comment than call working code
+/// one, because the warning it feeds is about weakening a proof.
+fn looks_like_comment(line: &str, extension: &str) -> bool {
+    let s = line.trim_start();
+    match extension {
+        // A heading is content, not commentary.
+        "md" | "markdown" => false,
+        _ if s.starts_with("#define") || s.starts_with("#include") => false,
+        "sh" | "py" | "yml" | "yaml" | "toml" | "ps1" if s.starts_with('#') => true,
+        _ => s.starts_with("//") || s.starts_with("<!--") || s.starts_with("/*") || s.starts_with('*'),
+    }
+}
+
+/// The half of the hollow-check problem the write gate cannot see, because it
+/// never reads a file: a literal that occurs everywhere, and one that only
+/// ever sits in a comment.
+///
+/// The second is the dangerous one. A check on a function name matched a
+/// passing remark in a comment while the real implementation lived in another
+/// file, so the rule looked enforced and reached nobody who touched the code
+/// it was about. Measured in a live repository, three checks failed that way.
+///
+/// A warning, never a refusal: a literal in a doc comment IS sometimes the
+/// only place a file states what it does, and that is a weaker proof rather
+/// than a wrong one.
+fn file_aware_warnings(item: &model::item::Item, root: &std::path::Path) -> Vec<String> {
+    let Some(model::item::Check::Contains { path, literal }) = item.check.as_ref() else {
+        return Vec::new();
+    };
+    let Ok(body) = std::fs::read_to_string(root.join(path.replace('\\', "/"))) else {
+        return Vec::new();
+    };
+    let extension = std::path::Path::new(path).extension().and_then(|e| e.to_str()).unwrap_or("");
+
+    let mut out = Vec::new();
+    let hits: Vec<&str> = body.lines().filter(|l| l.contains(literal.as_str())).collect();
+    if hits.len() >= 25 {
+        out.push(format!(
+            "{literal:?} occurs {} times in {path}, so this check cannot tell you much - a whole \
+             phrase or a signature would prove more",
+            hits.len()
+        ));
+    }
+    if !hits.is_empty() && hits.iter().all(|l| looks_like_comment(l, extension)) {
+        out.push(format!(
+            "{literal:?} appears only inside comments in {path}. That passes while the behaviour \
+             it guards may live in another file entirely - check the anchor points at the code, \
+             not at a remark about it"
+        ));
+    }
+    out
+}
+
+/// The other half: a rule with NO check whose own falsifier names a real
+/// file. That falsifier is already saying what would prove the rule wrong,
+/// and half the time the file it names is right there - so the check writes
+/// itself and nobody thought to ask for one.
+///
+/// A suggestion and nothing more. It never guesses a literal, because a
+/// guessed proof is worse than none: it would put a rule back among the ones
+/// allowed to block, on the strength of something nobody chose.
+fn suggested_check(item: &model::item::Item, root: &std::path::Path) -> Vec<String> {
+    if item.check.is_some() || !item.kind.can_fire() {
+        return Vec::new();
+    }
+    let Some(falsifier) = item.falsifier.as_deref() else { return Vec::new() };
+    for raw in falsifier.split_whitespace() {
+        let token = raw.trim_matches(|c: char| !c.is_alphanumeric() && c != '/' && c != '.' && c != '_' && c != '-');
+        if token.len() < 5 || !token.contains('/') || token.contains("://") {
+            continue;
+        }
+        if root.join(token).is_file() {
+            return vec![format!(
+                "this rule has no check, and its falsifier names {token}, which is really there. \
+                 A contains check on a distinctive line of that file would prove this rule is still \
+                 about something real, and would refuse a write to {token} that REMOVES that line. \
+                 It does NOT refuse a write that introduces something forbidden - only absent, \
+                 absent_all and forbidden do that, and only where a literal can honestly be named"
+            )];
+        }
+    }
+    Vec::new()
+}
+
 const INSTRUCTIONS: &str = "THOR 2.0's agent surface: fourteen tools, no more. retract removes an item \
 that is simply WRONG (a reason is required; nothing is deleted, history still walks it), resolve \
 settles an id that get reports as DIVERGED, history walks one id's whole life oldest first, and \
@@ -292,14 +479,42 @@ pub struct RememberArgs {
     pub always: bool,
 }
 
-#[derive(Deserialize, Serialize, schemars::JsonSchema)]
+/// `Default` is derived on purpose. Every field added here used to break
+/// every exhaustive struct literal in the crate's own tests at once - eleven
+/// of them the last time - which makes a small extension look expensive and
+/// pushes it into never happening. A literal that spells out only what it
+/// cares about and ends in `..Default::default()` does not care what is
+/// added later.
+#[derive(Deserialize, Serialize, schemars::JsonSchema, Default)]
 #[serde(deny_unknown_fields)]
 pub struct ReviseArgs {
     /// The id of the existing item to correct.
     pub id: String,
-    /// New text. Omit to keep the current text unchanged.
+    /// New text, replacing the whole body. Omit to keep the current text
+    /// unchanged. For a SMALL correction to a long item, prefer `append` or
+    /// `replace_from`/`replace_to` below - retyping a 290-character rule to
+    /// fix one word is friction on exactly the maintenance this memory needs
+    /// most, and it is the reason corrections get skipped.
     #[serde(default)]
     pub text: Option<String>,
+    /// Add this to the END of the current text, with one space between.
+    /// Refused together with `text` (say what the body is, or say what to add
+    /// to it, never both). The result still goes through the whole gate, so a
+    /// 300-character limit is enforced on what comes out, not on what you
+    /// typed.
+    #[serde(default)]
+    pub append: Option<String>,
+    /// Replace the FIRST occurrence of this substring in the current text
+    /// with `replace_to`. Refused unless `replace_to` is given too, refused
+    /// together with `text`, and refused when the substring is not actually
+    /// in the current text - a silent no-op would report success while
+    /// changing nothing.
+    #[serde(default)]
+    pub replace_from: Option<String>,
+    /// What `replace_from` becomes. Pass an empty string to delete the
+    /// substring.
+    #[serde(default)]
+    pub replace_to: Option<String>,
     /// One of: irreversible, costly, house_style. Omit to keep the current
     /// value; pass "" to clear it.
     #[serde(default)]
@@ -712,7 +927,12 @@ impl ThorMcpServer {
                 check,
             };
             match model::store::declare_in(s, SESSION_ID, LINEAGE_ID, ACTOR, &item, root.as_deref().map(|p| p.as_path())) {
-                Ok(event) => Ok(format!("stored '{}' ({:?}, event seq {})", item.id, item.kind, event.seq)),
+                Ok(event) => Ok(with_warnings(
+                    format!("stored '{}' ({:?}, event seq {})", item.id, item.kind, event.seq),
+                    &item,
+                    root.as_deref().map(|p| p.as_path()),
+                    Some(s),
+                )),
                 Err(e) => Err(format!("REFUSED: {e}")),
             }
         })
@@ -724,6 +944,10 @@ impl ThorMcpServer {
         if let Some(queued) = self.capture("revise", &args) {
             return queued;
         }
+        // The checkout, for the notes that need to read a file (see
+        // `file_aware_warnings`). Cloned out here because the closure below
+        // cannot borrow self.
+        let revise_root = self.root.clone();
         self.blocking(move |s| {
             let existing = model::store::show(s, &args.id).map_err(|e| format!("cannot revise: {e}"))?;
             let bindings = if args.moments.is_some() || args.targets.is_some() || args.always.is_some() {
@@ -834,10 +1058,14 @@ impl ThorMcpServer {
                 .map_err(|e| format!("invalid check: {e}"))?
             };
             let check_cleared = args.check_kind.as_deref() == Some("");
+            // Prefixed like every other refusal on this surface: a caller
+            // that keys on "REFUSED" must not have to learn a second shape
+            // just because the reason came from the edit modes.
+            let text = edited_text(&existing.text, &args).map_err(|e| format!("REFUSED: {e}"))?;
             let updated = Item {
                 id: existing.id.clone(),
                 kind: existing.kind,
-                text: args.text.clone().unwrap_or_else(|| existing.text.clone()),
+                text,
                 bindings,
                 severity,
                 project,
@@ -866,7 +1094,14 @@ impl ThorMcpServer {
             };
             let gate_existing = cleared.baseline(&existing);
             match model::store::revise(s, SESSION_ID, LINEAGE_ID, ACTOR, &gate_existing, &updated) {
-                Ok(event) => Ok(format!("revised '{}' (event seq {})", updated.id, event.seq)),
+                Ok(event) => {
+                    Ok(with_warnings(
+                        format!("revised '{}' (event seq {})", updated.id, event.seq),
+                        &updated,
+                        revise_root.as_deref().map(|p| p.as_path()),
+                        Some(s),
+                    ))
+                }
                 Err(e) => Err(format!("REFUSED: {e}")),
             }
         })
@@ -992,7 +1227,7 @@ impl ThorMcpServer {
         .await
     }
 
-    #[tool(description = "Judge an item you were served or looked up. Default records that it HELPED (serve::mark::record_useful), which overrides any amount of noise permanently. Pass noise:true for the opposite - this did not belong where it fired - and two of those, with no mark of usefulness, retire it from the injection surfaces while leaving it fully findable via lookup. The noise side is the ONLY thing that retires anything: a serving count decides nothing, because firing often is what relevance looks like (see serve::decay for the day that was measured). Judging as you go is where this is done best.")]
+    #[tool(description = "Judge an item you were served or looked up. Default records that it HELPED (serve::mark::record_useful), which clears the noise recorded BEFORE it - not the noise recorded after: the latest verdict is the one that counts, because a reader is allowed to change their mind about an item that has drifted. Pass noise:true for the opposite - this did not belong where it fired - and two of those SINCE the last mark of usefulness retire it from the injection surfaces while leaving it fully findable via lookup. The noise side is the ONLY thing that retires anything: a serving count decides nothing, because firing often is what relevance looks like (see serve::decay for the day that was measured). Judging as you go is where this is done best.")]
     async fn mark(&self, Parameters(args): Parameters<MarkArgs>) -> String {
         self.blocking(move |s| {
             let now = serve::time::now_iso8601();
@@ -1007,7 +1242,7 @@ impl ThorMcpServer {
                     args.id,
                     serve::decay::NOISE_MARKS_BEFORE_STALE
                 )),
-                Ok(_) => Ok(format!("marked useful: {} (overrides any amount of noise, permanently)", args.id)),
+                Ok(_) => Ok(format!("marked useful: {} (clears the noise recorded before it; a later noise mark still counts)", args.id)),
                 Err(e) => Err(format!("could not record the mark: {e}")),
             }
         })
@@ -1437,6 +1672,9 @@ mod tests {
         assert!(stored.starts_with("stored"), "fixture setup must succeed: {stored}");
 
         let revise_args = ReviseArgs {
+            append: None,
+            replace_from: None,
+            replace_to: None,
             id: "drop-tags-1".to_string(),
             text: None,
             severity: None,
@@ -1459,6 +1697,263 @@ mod tests {
 
         let events = srv.store.lock().unwrap().get_all_events().unwrap();
         assert_eq!(events.len(), 1, "a refused revise must append nothing beyond the original declare");
+    }
+
+    // ------------------------------------------------- notes that read a file
+
+    fn item_with_contains(path: &str, literal: &str) -> Item {
+        let mut item = model::item::Item {
+            id: "probe".to_string(),
+            kind: model::item::Kind::Rule,
+            text: "some rule about this file".to_string(),
+            bindings: vec![model::item::Binding::Always],
+            severity: None,
+            project: None,
+            tags: vec![],
+            expires: None,
+            key: None,
+            falsifier: Some("the file stops saying it".to_string()),
+            check: None,
+        };
+        item.check =
+            Some(model::item::Check::Contains { path: path.to_string(), literal: literal.to_string() });
+        item
+    }
+
+    /// The measured defect: a check matched a passing remark in a comment
+    /// while the behaviour it claimed to guard lived in another file, so the
+    /// rule looked enforced and reached nobody editing the real code.
+    #[test]
+    fn a_literal_only_in_a_comment_is_flagged() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("a.rs"), "fn real() {}\n// mentions handleCreated in passing\n").unwrap();
+        let notes = file_aware_warnings(&item_with_contains("a.rs", "handleCreated"), dir.path());
+        assert!(notes.iter().any(|n| n.contains("only inside comments")), "{notes:?}");
+    }
+
+    /// The blind spot that had to be corrected by hand: reading a leading
+    /// hash as a comment marker turns a Markdown heading and a C `#define`
+    /// into commentary. That over-reported 28 hollow checks where 6 were
+    /// real.
+    #[test]
+    fn a_markdown_heading_and_a_define_are_content_not_commentary() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("README.md"), "# How it works\nplain text\n").unwrap();
+        std::fs::write(dir.path().join("pins.h"), "#define PANEL_R0 8\n").unwrap();
+
+        let heading = file_aware_warnings(&item_with_contains("README.md", "# How it works"), dir.path());
+        assert!(heading.is_empty(), "a heading is content: {heading:?}");
+        let define = file_aware_warnings(&item_with_contains("pins.h", "#define PANEL_R0"), dir.path());
+        assert!(define.is_empty(), "a preprocessor directive is code: {define:?}");
+    }
+
+    #[test]
+    fn a_literal_that_is_everywhere_is_flagged() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("a.js"), "setTimeout();\n".repeat(30)).unwrap();
+        let notes = file_aware_warnings(&item_with_contains("a.js", "setTimeout"), dir.path());
+        assert!(notes.iter().any(|n| n.contains("occurs 30 times")), "{notes:?}");
+    }
+
+    #[test]
+    fn a_file_that_is_not_there_produces_no_note_rather_than_a_guess() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(file_aware_warnings(&item_with_contains("gone.rs", "anything"), dir.path()).is_empty());
+    }
+
+    /// A rule with no check whose own falsifier names a real file: the check
+    /// nearly writes itself, and nobody thought to ask for one.
+    #[test]
+    fn a_falsifier_naming_a_real_file_suggests_a_check() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("src")).unwrap();
+        std::fs::write(dir.path().join("src/gate.rs"), "fn gate() {}\n").unwrap();
+
+        let mut item = item_with_contains("x", "y");
+        item.check = None;
+        item.falsifier = Some("src/gate.rs stops refusing an unbound rule".to_string());
+        let notes = suggested_check(&item, dir.path());
+        assert!(notes.iter().any(|n| n.contains("src/gate.rs")), "{notes:?}");
+    }
+
+    #[test]
+    fn nothing_is_suggested_when_a_check_is_already_there() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("src")).unwrap();
+        std::fs::write(dir.path().join("src/gate.rs"), "fn gate() {}\n").unwrap();
+
+        let mut item = item_with_contains("src/gate.rs", "fn gate");
+        item.falsifier = Some("src/gate.rs stops refusing an unbound rule".to_string());
+        assert!(suggested_check(&item, dir.path()).is_empty());
+    }
+
+    /// It never guesses: a falsifier naming a file that is not there says
+    /// nothing at all, because a suggested proof nobody can verify is worse
+    /// than no suggestion.
+    #[test]
+    fn a_falsifier_naming_a_missing_file_suggests_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut item = item_with_contains("x", "y");
+        item.check = None;
+        item.falsifier = Some("src/never-existed.rs changes".to_string());
+        assert!(suggested_check(&item, dir.path()).is_empty());
+    }
+
+    // ------------------------------------------------------- small edits
+
+    async fn stored(srv: &ThorMcpServer, id: &str, text: &str) {
+        let mut args = base_remember(id);
+        args.text = text.to_string();
+        let reply = srv.remember(Parameters(args)).await;
+        assert!(reply.starts_with("stored "), "{reply}");
+    }
+
+    async fn body(srv: &ThorMcpServer, id: &str) -> String {
+        let raw = srv.get(Parameters(GetArgs { id: id.to_string() })).await;
+        serde_json::from_str::<Item>(&raw).expect(&format!("get must return JSON: {raw}")).text
+    }
+
+    #[tokio::test]
+    async fn append_adds_to_the_end_without_retyping_the_body() {
+        let srv = server();
+        stored(&srv, "app-1", "the changelog lives in CHANGELOG.md at the repo root").await;
+        let reply = srv
+            .revise(Parameters(ReviseArgs {
+                id: "app-1".to_string(),
+                append: Some("and nowhere else".to_string()),
+                ..Default::default()
+            }))
+            .await;
+        assert!(reply.starts_with("revised "), "{reply}");
+        assert_eq!(body(&srv, "app-1").await, "the changelog lives in CHANGELOG.md at the repo root and nowhere else");
+    }
+
+    #[tokio::test]
+    async fn replace_patches_one_place_and_leaves_the_rest() {
+        let srv = server();
+        stored(&srv, "rep-1", "the changelog lives in CHANGELOG.md at the repo root").await;
+        srv.revise(Parameters(ReviseArgs {
+            id: "rep-1".to_string(),
+            replace_from: Some("the repo root".to_string()),
+            replace_to: Some("docs/".to_string()),
+            ..Default::default()
+        }))
+        .await;
+        assert_eq!(body(&srv, "rep-1").await, "the changelog lives in CHANGELOG.md at docs/");
+    }
+
+    /// The defect this prevents, and it is the quiet one: a substring that is
+    /// not in the body would replace nothing and still report success, so the
+    /// caller walks away believing the correction landed.
+    #[tokio::test]
+    async fn replacing_something_that_is_not_there_is_refused_not_silently_ignored() {
+        let srv = server();
+        stored(&srv, "rep-2", "the changelog lives in CHANGELOG.md at the repo root").await;
+        let reply = srv
+            .revise(Parameters(ReviseArgs {
+                id: "rep-2".to_string(),
+                replace_from: Some("never written".to_string()),
+                replace_to: Some("x".to_string()),
+                ..Default::default()
+            }))
+            .await;
+        assert!(reply.contains("REFUSED"), "{reply}");
+        assert!(reply.contains("nothing to replace"), "the refusal must say why: {reply}");
+        assert_eq!(
+            body(&srv, "rep-2").await,
+            "the changelog lives in CHANGELOG.md at the repo root",
+            "a refused edit must change nothing"
+        );
+    }
+
+    #[tokio::test]
+    async fn two_edit_modes_at_once_are_refused() {
+        let srv = server();
+        stored(&srv, "rep-3", "the changelog lives in CHANGELOG.md at the repo root").await;
+        let reply = srv
+            .revise(Parameters(ReviseArgs {
+                id: "rep-3".to_string(),
+                text: Some("a whole new body that says something else entirely".to_string()),
+                append: Some("and more".to_string()),
+                ..Default::default()
+            }))
+            .await;
+        assert!(reply.contains("REFUSED"), "{reply}");
+    }
+
+    #[tokio::test]
+    async fn replace_from_without_replace_to_is_refused() {
+        let srv = server();
+        stored(&srv, "rep-4", "the changelog lives in CHANGELOG.md at the repo root").await;
+        let reply = srv
+            .revise(Parameters(ReviseArgs {
+                id: "rep-4".to_string(),
+                replace_from: Some("CHANGELOG.md".to_string()),
+                ..Default::default()
+            }))
+            .await;
+        assert!(reply.contains("REFUSED"), "{reply}");
+    }
+
+    /// The property that makes the small edits safe: they are a convenience
+    /// for TYPING, never a way past the gate. An append whose result breaks a
+    /// rule is refused exactly as if the whole body had been retyped.
+    #[tokio::test]
+    async fn a_small_edit_still_faces_the_whole_gate() {
+        let srv = server();
+        stored(&srv, "rep-5", "the changelog lives in CHANGELOG.md at the repo root").await;
+        let reply = srv
+            .revise(Parameters(ReviseArgs {
+                id: "rep-5".to_string(),
+                append: Some("x".repeat(400)),
+                ..Default::default()
+            }))
+            .await;
+        assert!(reply.contains("REFUSED"), "an over-long result must be refused: {reply}");
+        assert_eq!(
+            body(&srv, "rep-5").await,
+            "the changelog lives in CHANGELOG.md at the repo root",
+            "and nothing may have been written"
+        );
+    }
+
+    // ------------------------------------------------------- write-time notes
+
+    /// The invariant that makes appending safe, and the reason a warning is
+    /// never prepended: `apply_captured` decides whether a drained write
+    /// LANDED by looking at this string's leading "stored "/"revised ". Put a
+    /// note in front of that and every warned write reads as not-applied, so
+    /// the queue replays writes that already succeeded.
+    #[tokio::test]
+    async fn a_warning_is_appended_and_never_disturbs_the_success_prefix() {
+        let srv = server();
+        let mut args = base_remember("warned-item");
+        // Six characters: past the length the gate refuses outright, still
+        // short enough to be the smell `check_warnings` reports. This is the
+        // measured example - a check on "INSERT" that claimed to guard admin
+        // settings and matched seven times, including inside "INSERT OR
+        // REPLACE".
+        args.check_kind = Some("contains".to_string());
+        args.check_path = Some("src/main.rs".to_string());
+        args.check_literal = Some("INSERT".to_string());
+
+        let reply = srv.remember(Parameters(args)).await;
+        assert!(reply.starts_with("stored "), "the success prefix must survive: {reply}");
+        assert!(reply.contains("note:"), "the warning must actually reach the caller: {reply}");
+        assert!(!reply.contains("REFUSED"), "a warning must never read as a refusal: {reply}");
+
+        let events = srv.store.lock().unwrap().get_all_events().unwrap();
+        assert_eq!(events.len(), 1, "a warned write is still a write: it must have landed");
+    }
+
+    /// A clean item must stay clean: no note, no trailing whitespace, nothing
+    /// for a reader to wonder about.
+    #[tokio::test]
+    async fn a_clean_write_gets_no_note_at_all() {
+        let srv = server();
+        let reply = srv.remember(Parameters(base_remember("clean-item"))).await;
+        assert!(reply.starts_with("stored "), "{reply}");
+        assert!(!reply.contains("note:"), "nothing to warn about, so nothing may be said: {reply}");
     }
 
     // ------------------------------------------------- remember/get round trip
@@ -1492,6 +1987,9 @@ mod tests {
         srv.remember(Parameters(base_remember("revise-1"))).await;
 
         let revise_args = ReviseArgs {
+            append: None,
+            replace_from: None,
+            replace_to: None,
             id: "revise-1".to_string(),
             text: Some("never force-push to main, ever".to_string()),
             severity: None,
@@ -1658,6 +2156,9 @@ mod tests {
         assert!(srv.remember(Parameters(args)).await.starts_with("stored"));
 
         let revise_args = ReviseArgs {
+            append: None,
+            replace_from: None,
+            replace_to: None,
             id: "check-keep-1".to_string(),
             text: None,
             severity: Some("costly".to_string()), // change an unrelated field
@@ -1697,6 +2198,9 @@ mod tests {
         assert!(srv.remember(Parameters(args)).await.starts_with("stored"));
 
         let revise_args = ReviseArgs {
+            append: None,
+            replace_from: None,
+            replace_to: None,
             id: "check-keep-2".to_string(),
             text: Some("the roadmap lives in ROADMAP.md, updated every quarter".to_string()),
             severity: None,
@@ -1741,6 +2245,9 @@ mod tests {
         assert!(srv.remember(Parameters(base_remember("check-clear-noop-1"))).await.starts_with("stored"));
 
         let revise_args = ReviseArgs {
+            append: None,
+            replace_from: None,
+            replace_to: None,
             id: "check-clear-noop-1".to_string(),
             text: None,
             severity: None,
@@ -1775,6 +2282,9 @@ mod tests {
         assert!(srv.remember(Parameters(args)).await.starts_with("stored"));
 
         let revise_args = ReviseArgs {
+            append: None,
+            replace_from: None,
+            replace_to: None,
             id: "check-clear-refuse-1".to_string(),
             text: None,
             severity: None,
@@ -1829,6 +2339,9 @@ mod tests {
         assert!(srv.remember(Parameters(args)).await.starts_with("stored"));
 
         let revise_args = ReviseArgs {
+            append: None,
+            replace_from: None,
+            replace_to: None,
             id: "check-clear-populated-1".to_string(),
             text: None,
             severity: None,
@@ -1951,6 +2464,9 @@ mod tests {
         assert!(srv.remember(Parameters(args)).await.starts_with("stored"));
 
         let revise_args = ReviseArgs {
+            append: None,
+            replace_from: None,
+            replace_to: None,
             id: "check-keep-absent-all-1".to_string(),
             text: None,
             severity: Some("costly".to_string()), // change an unrelated field
@@ -1998,6 +2514,9 @@ mod tests {
         assert!(srv.remember(Parameters(args)).await.starts_with("stored"));
 
         let revise_args = ReviseArgs {
+            append: None,
+            replace_from: None,
+            replace_to: None,
             id: "check-upgrade-to-set-1".to_string(),
             text: Some("docs/STYLE.md never carries an em dash, en dash or ellipsis".to_string()),
             severity: None,
@@ -2115,6 +2634,9 @@ mod tests {
         assert!(srv.remember(Parameters(args)).await.starts_with("stored"));
 
         let revise_args = ReviseArgs {
+            append: None,
+            replace_from: None,
+            replace_to: None,
             id: "check-keep-forbidden-1".to_string(),
             text: None,
             severity: Some("costly".to_string()), // change an unrelated field
@@ -2164,6 +2686,9 @@ mod tests {
         assert!(srv.remember(Parameters(args)).await.starts_with("stored"));
 
         let revise_args = ReviseArgs {
+            append: None,
+            replace_from: None,
+            replace_to: None,
             id: "check-downgrade-to-forbidden-1".to_string(),
             text: Some("never write an em dash, anywhere".to_string()),
             severity: None,
@@ -2202,6 +2727,9 @@ mod tests {
         assert!(srv.remember(Parameters(args)).await.starts_with("stored"));
 
         let revise_args = ReviseArgs {
+            append: None,
+            replace_from: None,
+            replace_to: None,
             id: "check-clear-populated-forbidden-1".to_string(),
             text: None,
             severity: None,
@@ -2250,6 +2778,9 @@ mod tests {
         assert!(srv.remember(Parameters(args)).await.starts_with("stored"));
 
         let revise_args = ReviseArgs {
+            append: None,
+            replace_from: None,
+            replace_to: None,
             id: "clear-severity-1".to_string(),
             text: None,
             severity: Some("".to_string()), // deliberate clear, per the documented convention
@@ -2290,6 +2821,9 @@ mod tests {
         assert!(srv.remember(Parameters(args)).await.starts_with("stored"));
 
         let revise_args = ReviseArgs {
+            append: None,
+            replace_from: None,
+            replace_to: None,
             id: "clear-project-1".to_string(),
             text: None,
             severity: None,
@@ -2330,6 +2864,9 @@ mod tests {
         assert!(srv.remember(Parameters(args)).await.starts_with("stored"));
 
         let revise_args = ReviseArgs {
+            append: None,
+            replace_from: None,
+            replace_to: None,
             id: "clear-project-ws".to_string(),
             text: None,
             severity: None,
@@ -2362,6 +2899,9 @@ mod tests {
         assert!(srv.remember(Parameters(blank_report("clear-expires-1"))).await.starts_with("stored"));
 
         let revise_args = ReviseArgs {
+            append: None,
+            replace_from: None,
+            replace_to: None,
             id: "clear-expires-1".to_string(),
             text: None,
             severity: None,
@@ -2400,6 +2940,9 @@ mod tests {
         assert!(srv.remember(Parameters(args)).await.starts_with("stored"));
 
         let revise_args = ReviseArgs {
+            append: None,
+            replace_from: None,
+            replace_to: None,
             id: "clear-key-1".to_string(),
             text: None,
             severity: None,
@@ -2437,6 +2980,9 @@ mod tests {
         assert!(srv.remember(Parameters(args)).await.starts_with("stored"));
 
         let revise_args = ReviseArgs {
+            append: None,
+            replace_from: None,
+            replace_to: None,
             id: "clear-falsifier-1".to_string(),
             text: None,
             severity: None,
@@ -2484,6 +3030,9 @@ mod tests {
         assert!(srv.remember(Parameters(args)).await.starts_with("stored"));
 
         let revise_args = ReviseArgs {
+            append: None,
+            replace_from: None,
+            replace_to: None,
             id: "clear-severity-keep-tags-refusal-1".to_string(),
             text: None,
             severity: Some("".to_string()), // deliberate, legitimate clear
@@ -2517,6 +3066,10 @@ mod tests {
         let srv = server();
         let mut args = base_remember("pin-1");
         args.always = false;
+        // A project, because a source-file anchor on a GLOBAL item is refused
+        // by ground 19: it would fire in every repository that has a file by
+        // that name. Real callers name the project; so does this fixture.
+        args.project = Some("some-project".to_string());
         args.targets = vec![TargetArg { kind: "path".to_string(), value: "src/pin_test.rs".to_string() }];
         assert!(srv.remember(Parameters(args)).await.starts_with("stored"));
 
@@ -2537,6 +3090,7 @@ mod tests {
         let srv = server();
         let mut args = base_remember("unpin-1");
         args.always = true;
+        args.project = Some("some-project".to_string()); // see the note in the pin test
         args.targets = vec![TargetArg { kind: "path".to_string(), value: "src/unpin_test.rs".to_string() }];
         assert!(srv.remember(Parameters(args)).await.starts_with("stored"));
 
@@ -2721,6 +3275,7 @@ mod tests {
         // rather than against the noise signal.
         let mut args = base_remember("noisy-1");
         args.always = false;
+        args.project = Some("some-project".to_string()); // see the note in the pin test
         args.targets = vec![TargetArg { kind: "path".to_string(), value: "src/noisy.rs".to_string() }];
         srv.remember(Parameters(args)).await;
         for _ in 0..serve::decay::NOISE_MARKS_BEFORE_STALE {

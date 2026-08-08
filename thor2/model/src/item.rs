@@ -823,3 +823,28 @@ mod tests {
         assert!(TargetKind::from_str("bogus").is_err());
     }
 }
+
+/// How many items one served block ever holds.
+///
+/// WHY A DELIVERY NUMBER LIVES IN THE ITEM MODEL. The write gate has to be
+/// able to ask "would this item ever be shown", and the answer depends on how
+/// many places a block has. `serve` already depends on `model`, so the
+/// constant cannot live there and be read here without inverting that. It is
+/// re-exported as `serve::render::MAX_ITEMS`, which stays the name every
+/// existing caller uses: one definition, two doors.
+pub const MAX_ITEMS: usize = 4;
+
+/// Severity, heaviest first, with a missing severity sinking below every
+/// declared one - never landing between costly and irreversible, and never
+/// silently acting as if it were between irreversible and costly either.
+/// (Ord's own default for `Option<Severity>` puts `None` FIRST, which would
+/// rank a severity-less item as if it outranked `Irreversible` - exactly the
+/// silent-middle-value failure this function exists to refuse.)
+pub fn severity_rank(severity: Option<Severity>) -> u8 {
+    match severity {
+        Some(Severity::Irreversible) => 0,
+        Some(Severity::Costly) => 1,
+        Some(Severity::HouseStyle) => 2,
+        None => 3,
+    }
+}

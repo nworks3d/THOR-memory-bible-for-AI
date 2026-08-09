@@ -599,6 +599,16 @@ pub fn pinned_line(db: &Path) -> String {
         return "pinned: nothing is pinned".to_string();
     }
     let never_judged = pinned.iter().filter(|li| !judged.contains(&li.id)).count();
+    // A share of nothing is not a share. On a fresh store this line said "0% of
+    // every serving" beside "4 never examined", which reads as an alarm about a
+    // memory that has simply not been used yet - the first thing a new user
+    // sees, and wrong.
+    if served.values().sum::<usize>() == 0 {
+        return format!(
+            "pinned: {} item(s), served at every session start - nothing has been served yet, so there is nothing to weigh them against",
+            pinned.len()
+        );
+    }
     let their_servings: usize = pinned.iter().map(|li| served.get(&li.id).copied().unwrap_or(0)).sum();
     let all: usize = served.values().sum();
     format!(

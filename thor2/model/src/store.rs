@@ -648,10 +648,12 @@ pub fn capacity(store: &EventStore, item: &Item) -> anyhow::Result<Capacity> {
         }
         if crowded.is_none() && at_least_equal >= crate::item::MAX_ITEMS {
             crowded = Some(format!(
-                "{} already holds {at_least_equal} item(s) of the same weight or heavier, for {} \
-                 place(s) in a block - this one may well never be shown there. Bind it to the exact \
-                 file or command it is about instead of the broad moment, or fold it into whichever \
-                 item already carries that ground.",
+                "{} already holds AT LEAST {at_least_equal} item(s) of the same weight or heavier, \
+                 for {} place(s) in a block - this one may well never be shown there. At least, \
+                 because this count sees only the rivals sharing this one binding; the real crowd \
+                 also includes everything reaching that place through a moment, which only doctor's \
+                 crowding line can count. Bind it to the exact file or command it is about instead \
+                 of the broad moment, or fold it into whichever item already carries that ground.",
                 describe(binding),
                 crate::item::MAX_ITEMS
             ));

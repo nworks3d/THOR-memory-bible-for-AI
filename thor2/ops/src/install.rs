@@ -394,13 +394,27 @@ pub fn working_contract() -> Vec<model::item::Item> {
             "A report omits a step that produced nothing and the reader turns out not to be misled \
              by the omission.",
         ),
+        // The sixth, added 2026-08-09, and the only one a newcomer meets as a
+        // REFUSAL before they meet it as advice. Without it the very first
+        // serious rule someone writes is turned away by a question they have
+        // never been asked, which is the worst possible first impression of a
+        // gate that is doing exactly the right thing.
+        rule(
+            "answer-whether-a-rule-can-refuse",
+            "A rule you call expensive, or that names a command, flag or path, is asked one \
+             question before it is stored: is there a text whose presence MEANS the mistake is \
+             happening? If yes, add a check with that literal. If no, tag it no-literal. Both \
+             answers are fine; silence is not.",
+            "A rule marked irreversible or costly is stored without ever being asked whether it \
+             can refuse anything.",
+        ),
     ]
 }
 
 /// Write the starting notes into a store that has just been created.
 ///
 /// Only ever called for a store this run created. Seeding an existing memory
-/// would push four items into someone's real notes on an upgrade, which is
+/// would push the whole contract into someone's real notes on an upgrade, which is
 /// exactly the kind of uninvited write this whole project argues against.
 ///
 /// Every note goes through `model::store::declare` - the same gate the agent's
@@ -1029,7 +1043,7 @@ mod tests {
     }
 
     /// The defect this guards against: seeding on every run, which would push
-    /// four notes into a real memory on an upgrade. The CLI only calls this
+    /// the starting notes into a real memory on an upgrade. The CLI only calls this
     /// for a store it just created; this proves the second call is refused
     /// rather than quietly doubling everything up.
     #[test]

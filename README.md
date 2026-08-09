@@ -2,6 +2,35 @@
 
 # THOR - a memory for your AI coding assistant
 
+**In one line:** your AI assistant forgets everything between sessions. THOR
+remembers for it, and reminds it at the exact moment it is about to get
+something wrong.
+
+Picture a new colleague who is brilliant, fast, and has no memory at all. Every
+morning you explain the project from scratch. You tell them on Monday never to
+touch the live server; on Thursday they touch the live server, because Monday
+never happened for them.
+
+You cannot fix that by writing a document. Nobody opens a document at the second
+they are about to make the mistake. THOR does the opening for you: you say a
+thing once, and it comes back on its own when it matters - when that file is
+opened, when that command is about to run.
+
+Three things change for you:
+
+- **You stop repeating yourself.** The same explanation, the same warning, the
+  same preference: said once.
+- **Some mistakes become impossible, not just discouraged.** A note can be given
+  a proof. A note that can prove it still applies is allowed to refuse the
+  change outright instead of merely warning about it.
+- **You can see what it is actually doing.** It prints how much of your memory
+  can stop a mistake, and how often it really has. No dashboard-flattery.
+
+It runs entirely on your own machine. No account, no key, no data leaving your
+computer, nothing sent anywhere.
+
+---
+
 THOR is free and GPLv3. If it earns its keep, you can support the work:
 **[buy me a Ko-fi](https://ko-fi.com/noizieworks)** or
 **[become a YouTube member](https://www.youtube.com/channel/UCrEZc_oJR9mywNjqY115mRg/join)** -
@@ -14,25 +43,7 @@ no pressure, no paywall, everything stays open either way.
 
 *Prefer watching? The video above walks through what THOR is and why it exists.*
 
-## The problem
-
-AI coding assistants forget everything. Close the window, and it is gone. Even
-in one long conversation, the older parts get squeezed out to make room.
-
-You know the feeling if you have worked with one for more than a day:
-
-- You explain your project again. And again.
-- You say "never do that on the live server" - and three days later it does it,
-  because that sentence lived in a chat that no longer exists.
-- It makes a mistake you already caught and fixed weeks ago.
-
-Writing it all down in a notes file does not fix it, because nobody opens the
-notes file at the moment it would have helped.
-
-## What THOR does about it
-
-THOR keeps what you tell it, and hands the right piece back to your assistant at
-the moment it needs it - without you asking.
+## What that looks like in practice
 
 Say you once told it: *"the database must never be opened over the network
 drive, it corrupts."* Weeks later, in a brand new conversation, your assistant
@@ -41,6 +52,11 @@ it types anything, that sentence appears in front of it.
 
 That is the whole idea. Not a search box you remember to use. A memory that
 shows up on time.
+
+It is worth being clear about why a notes file is not the same thing. A notes
+file is only as good as someone remembering to open it, and nobody opens one at
+the second they are about to get something wrong. Being on time is the entire
+feature.
 
 Three things make that work, and they all live in one file on your machine:
 
@@ -104,6 +120,30 @@ judgement about that one note.
 
 That number being printed at all is the point: a safety net nothing is attached
 to looks exactly like a safety net that works.
+
+### THOR asks, so you do not have to remember to
+
+Leaving that to whoever thinks of it means it never happens. So THOR asks, by
+itself, in two places.
+
+**When a note is written.** A note you call expensive, or one that spells out a
+command, a flag or a filename, is not stored until one question is answered: is
+there a text whose presence *means* the mistake is happening? If there is, the
+note gets a proof built on exactly that text. If there is not - and often there
+is not, because "check with me first" has nothing to catch - you say so and the
+note goes in unchanged. Both are real answers. Only saying nothing is not.
+
+**For the notes you already had.** Once per session, THOR picks one note that
+names something concrete, has never been asked, and holds the turn until it is.
+One at a time, forever, so a memory written before any of this existed still
+gets worked through instead of being declared hopeless.
+
+A caution worth stating plainly: THOR can prove that a note is *wired* so a
+matching change would be stopped. It cannot know whether the text you typed is
+the text the real command uses. A misspelled fragment is wired perfectly and
+guards nothing. That is why the health check reports two different numbers - how
+many notes could refuse something, and how many ever actually did. Trust the
+second one.
 
 ## Getting started
 
@@ -200,19 +240,22 @@ one has talked itself into a corner - not because it is getting long.
 Worth knowing before you start, because the beginning is the least impressive
 part and it is easy to conclude too early that nothing is happening.
 
-**Day one, it stops nothing.** A fresh memory holds four starting notes and
-nothing else. The part of THOR that can refuse a wrong change only works on
-notes that carry a proof, and you have not written any yet. So on the first day
-you get four notes at the start of a conversation and a nudge at the end, and no
-refusals at all. That is not a fault; there is simply nothing yet to refuse
-with.
+**Day one, it stops nothing.** A fresh memory holds a handful of starting notes
+about how to write notes, and nothing else. The part of THOR that can refuse a
+wrong change only works on notes that carry a proof, and you have not written
+any yet. So on the first day you get those notes at the start of a conversation
+and a nudge at the end, and no refusals at all. That is not a fault; there is
+simply nothing yet to refuse with.
 
 **Your first note will probably be turned down.** It asks for two things most
 people leave out: when the note should come back to you, and what would show it
-had gone wrong. The refusal names everything that is missing at once and says
-what to write instead, so the second attempt usually lands. It is strict on
-purpose - a note nobody can ever prove wrong is a note that quietly stops being
-true.
+had gone wrong. If the note is about something expensive, or names a command or
+a filename, it asks a third: is there a text whose presence means the mistake is
+happening? Answering "no, there is nothing to catch here" is enough, and often
+it is the truthful answer. The refusal names everything that is missing at once
+and says what to write instead, so the second attempt usually lands. It is
+strict on purpose - a note nobody can ever prove wrong is a note that quietly
+stops being true.
 
 **The value arrives once you have notes about real places.** A note tied to a
 file, a folder or a command comes back exactly when you touch that thing. A

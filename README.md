@@ -2,32 +2,23 @@
 
 # THOR - a memory for your AI coding assistant
 
-**In one line:** your AI assistant forgets everything between sessions. THOR
-remembers for it, and reminds it at the exact moment it is about to get
-something wrong.
+**Your assistant forgets you the second you close the window. THOR does not.**
 
-Picture a new colleague who is brilliant, fast, and has no memory at all. Every
-morning you explain the project from scratch. You tell them on Monday never to
-touch the live server; on Thursday they touch the live server, because Monday
-never happened for them.
+Tell it once:
 
-You cannot fix that by writing a document. Nobody opens a document at the second
-they are about to make the mistake. THOR does the opening for you: you say a
-thing once, and it comes back on its own when it matters - when that file is
-opened, when that command is about to run.
+- *never deploy on a Friday*
+- *the invoice number goes in the payment reference, never in the description*
+- *the dough is 65% water and rests overnight, not two hours*
 
-Three things change for you:
+Weeks later, in a conversation that has never heard of any of it, the right one
+comes back on its own - while you are deploying, while you are invoicing, while
+you are making dough. You did not search for it. You did not remind anyone.
 
-- **You stop repeating yourself.** The same explanation, the same warning, the
-  same preference: said once.
-- **Some mistakes become impossible, not just discouraged.** A note can be given
-  a proof. A note that can prove it still applies is allowed to refuse the
-  change outright instead of merely warning about it.
-- **You can see what it is actually doing.** It prints how much of your memory
-  can stop a mistake, and how often it really has. No dashboard-flattery.
+It was built for code and it turned out not to care what the subject is. The
+same memory holds your deploy rules, how your company does its billing, and what
+you learned the last time you made pizza.
 
-It runs entirely on your own machine. No account, no key, no data leaving your
-computer, nothing sent anywhere.
+Runs on your own machine. No account, no key, nothing sent anywhere.
 
 ---
 
@@ -45,18 +36,40 @@ no pressure, no paywall, everything stays open either way.
 
 ## What that looks like in practice
 
-Say you once told it: *"the database must never be opened over the network
-drive, it corrupts."* Weeks later, in a brand new conversation, your assistant
-starts editing the config file that points at that database. Right then, before
-it types anything, that sentence appears in front of it.
+Months ago you found out the hard way that this project is pinned to an older
+Node, and anything newer breaks the build. You said so once, and moved on.
+
+Today a fresh conversation opens `package.json` to add a dependency, sees an
+engine range that looks out of date, and is one helpful edit away from bumping
+it. Right then, before it types, your own sentence is in front of it.
 
 That is the whole idea. Not a search box you remember to use. A memory that
 shows up on time.
 
-It is worth being clear about why a notes file is not the same thing. A notes
-file is only as good as someone remembering to open it, and nobody opens one at
-the second they are about to get something wrong. Being on time is the entire
-feature.
+### "I already have a CLAUDE.md for that"
+
+Most assistants read a rules file at startup - `CLAUDE.md`, `AGENTS.md`,
+`.cursorrules`. It helps, and it runs out of road quickly.
+
+Past a certain size it becomes a phone book, and nobody reads a phone book front
+to back. Your assistant skims it, takes the gist and moves on. The rule was in
+there. It got skipped. Nothing looks wrong afterwards, because the line is still
+sitting in the file, so you go on believing you are covered.
+
+Here is the part that is genuinely different. Picture a fresh agent, no history,
+no idea what this project has already cost you, one keystroke away from the
+exact write that broke production last spring. A rules file would have mentioned
+it somewhere on page four. THOR stops the keystroke. The write does not happen -
+and what stops it is the note *you* wrote, the day it broke.
+
+That is the whole promise: not better advice, but a wrong change that does not
+land.
+
+Getting there is not free, and it is worth knowing before you start. A note only
+earns that power if it is written to earn it: tied to a real file or command,
+carrying something checkable that shows it still applies. THOR ships with a
+handful of starting notes that teach exactly that, and refuses the ones that
+cannot work. [AGENTS.md](AGENTS.md) spells out the rules of the game in full.
 
 Three things make that work, and they all live in one file on your machine:
 
@@ -85,7 +98,51 @@ Everything stays on your machine. No cloud, no account, no subscription, and
 nothing to sign up for. If some optional piece is missing, THOR quietly falls
 back to a simpler way of working instead of breaking.
 
-## What version 2 adds: a note that can actually stop you
+## What changed in version 2
+
+Version 1 remembered well and never argued. It would hand your assistant a note
+at the right moment and hope. Version 2 is the same memory with a spine.
+
+- **A note can refuse.** The headline, and the rest of this section is about it.
+  Version 1 could only speak.
+- **Bad notes no longer get in.** A note that cannot ever fire, has nothing that
+  would prove it wrong, runs on for a page, or simply repeats one you already
+  have: turned away at the door, with the reason and the fix. Version 1 stored
+  whatever it was given, and you found out months later that half of it was
+  unreachable.
+- **It counts what it actually did.** How many notes can refuse something, how
+  many ever have, how much of your memory nothing re-reads. Version 1 had no
+  number for the one thing it was built to do, which is how a safety net stays
+  broken for a year.
+- **Maintenance is no longer optional.** At the end of a turn it asks for one
+  thing: judge a note that keeps firing, fix one you just filed where it will
+  never be seen, answer whether an expensive note can refuse anything. One at a
+  time, and it will not be waved off with a promise to do it later.
+- **It costs almost nothing to carry.** A note is capped at 300 characters and a
+  block at four notes and 1200 characters, so what lands in the conversation is
+  a few hundred tokens, not a whole rules file re-read on every turn. A memory
+  of ten thousand notes costs the same per turn as one of fifty. Nothing calls
+  out to a model to decide what to send - it is a local program reading a local
+  file, so there is no network round trip in front of your keystroke. The one
+  exception is the handful you deliberately pin: those are read out in full at
+  the start of a conversation, so pin sparingly and the cap does the rest.
+  Measured on the author's own machine and memory: about 110 ms per call and
+  around 1500 characters delivered when something applies, against roughly 660
+  ms for version 1. One machine, one memory - treat it as an order of magnitude,
+  not a specification.
+- **Stale notes are hunted, not left to rot.** A note whose proof comes out
+  false is reported instead of quietly going on being wrong. A note that keeps
+  firing without anyone ever saying whether it belonged gets asked about, and
+  two verdicts of "this did not belong" retire it from every channel while
+  leaving it findable. In version 1 a note that went wrong simply stayed.
+- **Crowding is visible and refused.** Only a few notes fit in a block, so notes
+  compete. Version 2 counts that competition, tells you when you have just
+  stored something onto a spot too crowded to ever show it, names what is
+  holding the place, and refuses the write outright when every spot the note
+  could take is already full of heavier ones. Version 1 accepted it and said
+  nothing, which is how a memory fills up with advice nobody will ever see.
+
+### A note that can actually stop you
 
 Showing a warning at the right moment is worth a lot, and for a long time that
 was all THOR could do. A note could speak. It could not refuse.
@@ -111,14 +168,13 @@ for reasons that stopped being true months ago. So THOR only hands that power to
 notes that can prove, at that exact second, that they still describe your
 project.
 
-There is an honest consequence: **most of your notes will never be able to block
-anything, and that is by design.** The health check prints the number, and you
-should look at it. On the author's own memory, when this was first measured, 2
-notes out of 2999 could prove themselves. A day of deliberate work took that to
-256. It moves by hand and only by hand, because deciding what proves a note is a
-judgement about that one note.
+Which is why, as the top of this page already said, most of your notes will
+never block anything. The health check prints how many can, and you should look
+at it. On the author's own memory, when this was first measured, 2 notes out of
+2999 could prove themselves; a day of deliberate work took that to 256. It moves
+by hand, because deciding what proves a note is a judgement about that one note.
 
-That number being printed at all is the point: a safety net nothing is attached
+That the number is printed at all is the point: a safety net nothing is attached
 to looks exactly like a safety net that works.
 
 ### THOR asks, so you do not have to remember to

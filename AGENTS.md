@@ -58,8 +58,8 @@ is the one step you cannot do for them.
 thor2/target/release/doctor.exe --db "<their store>"
 ```
 
-Nine plain lines, one per part. A missing language model is not a problem: THOR
-works without it, just with simpler matching.
+One plain line per part. A missing language model is not a problem: THOR works
+without it, just with simpler matching.
 
 **5. Give the project its own memory.** From the project folder:
 
@@ -76,6 +76,38 @@ the old one.
 **6. Prove it works before you say it works.** Store one real note, then start a
 fresh conversation and check that it comes back. Only then tell them setup is
 done.
+
+Use something they actually said, not a test string - a note worth keeping is a
+better proof than "hello world", and they get to keep it:
+
+```
+remember(
+  id:        "dev-server-needs-the-vpn",
+  kind:      "rule",
+  text:      "The staging server only answers over the VPN; without it every request just times out.",
+  targets:   [{ kind: "host", value: "staging.example.internal" }],
+  falsifier: "A request to staging succeeds with the VPN off."
+)
+```
+
+Then open a new conversation and touch that host. If the note comes back, setup
+is done. If it does not, do not tell them it worked - the usual cause is step 3,
+the restart.
+
+## The tools you have
+
+After the restart you get fourteen. These are the ones setup needs; the rest
+announce themselves.
+
+- `remember` - store a new note. `revise` - correct one that exists. Prefer
+  revise: a second copy of a note is worse than no note.
+- `lookup` - search everything, any project, before you store. `get` - read one
+  note by its id. `history` - walk one note's whole life.
+- `status` - what is in the memory right now.
+- `retract` - remove a note that is simply wrong, with a reason. `mark` - record
+  that a note helped, or that it did not belong where it fired.
+- `search_code`, `where_used`, `outline` - the three code questions: find text,
+  find who uses a symbol, see what one file declares.
 
 ---
 

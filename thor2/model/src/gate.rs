@@ -651,7 +651,7 @@ fn shape_problems(item: &Item) -> Vec<Refusal> {
                 "answer one question: is there a text whose presence MEANS the mistake is happening? \
                  If yes, add a check with that literal - forbidden for a command or for any file, \
                  absent for one named file. If no (an authorised action looks identical to an \
-                 unauthorised one), tag it '{}' and it goes in as it is.",
+                 unauthorised one), put '{}' in its tags and it goes in as it is.",
                 crate::store::NO_LITERAL_TAG
             ),
         ));

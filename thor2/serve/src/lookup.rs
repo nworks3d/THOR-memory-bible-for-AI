@@ -838,6 +838,9 @@ mod tests {
         let mut rule = item("rule1", Kind::Rule, "never force-push to main", None);
         rule.bindings = vec![Binding::Always];
         rule.severity = Some(Severity::Irreversible);
+        // Gate ground 11: bound Always there is no literal to forbid, so the
+        // tag is the honest answer. This test is about search, not teeth.
+        rule.tags = vec![store::NO_LITERAL_TAG.to_string()];
         store::declare(&mut db, "s", "l", "a", &rule).unwrap();
         let hits = search(&db, "force-push");
         assert_eq!(hits.len(), 1);
@@ -1137,6 +1140,7 @@ mod semantic_search_tests {
             expires: Some("2027-01-01".to_string()),
             key: None,
             falsifier: None,
+            check: None,
         }
     }
 
@@ -1249,11 +1253,18 @@ mod semantic_search_tests {
 
     // -------------------------------------------------------------- expiry
 
-    fn report_expiring(id: &str, expires: &str) -> Item {
+    /// `subject` is not decoration. Two of these live in one store in the
+    /// expiry test, and under `--features semantic` the write gate's
+    /// near-duplicate check compares MEANING, not the id woven into the
+    /// sentence - "a settled report about stale-1" and "... about fresh-1"
+    /// read as the same fact and the second declare is refused. Each caller
+    /// says what its report is actually about; "settled report" stays in the
+    /// text so one query still reaches them all.
+    fn report_expiring(id: &str, expires: &str, subject: &str) -> Item {
         Item {
             id: id.to_string(),
             kind: Kind::Report,
-            text: format!("a settled report about {id} and its outcome"),
+            text: format!("a settled report: {subject}"),
             bindings: vec![],
             severity: None,
             project: None,
@@ -1261,6 +1272,7 @@ mod semantic_search_tests {
             expires: Some(expires.to_string()),
             key: None,
             falsifier: None,
+            check: None,
         }
     }
 
@@ -1273,8 +1285,8 @@ mod semantic_search_tests {
     #[test]
     fn an_expired_report_is_held_back_from_search() {
         let mut db = EventStore::in_memory().unwrap();
-        model::store::declare(&mut db, "s", "l", "a", &report_expiring("stale-1", "2020-01-01")).unwrap();
-        model::store::declare(&mut db, "s", "l", "a", &report_expiring("fresh-1", "2099-01-01")).unwrap();
+        model::store::declare(&mut db, "s", "l", "a", &report_expiring("stale-1", "2020-01-01", "the courier rollout and why it was rolled back")).unwrap();
+        model::store::declare(&mut db, "s", "l", "a", &report_expiring("fresh-1", "2099-01-01", "how the NAS replica was sized for the estimator")).unwrap();
 
         let (hits, withheld) = search_with_expired(&db, "settled report");
         let ids: Vec<&str> = hits.iter().map(|h| h.id.as_str()).collect();
@@ -1287,7 +1299,7 @@ mod semantic_search_tests {
     #[test]
     fn an_expired_item_is_still_readable_by_id() {
         let mut db = EventStore::in_memory().unwrap();
-        model::store::declare(&mut db, "s", "l", "a", &report_expiring("stale-2", "2020-01-01")).unwrap();
+        model::store::declare(&mut db, "s", "l", "a", &report_expiring("stale-2", "2020-01-01", "the abandoned quote-number scheme of last spring")).unwrap();
         let shown = model::store::show(&db, "stale-2").expect("still readable whole");
         assert_eq!(shown.id, "stale-2");
         assert_eq!(shown.expires.as_deref(), Some("2020-01-01"), "and it still says when it expired");
@@ -1298,7 +1310,7 @@ mod semantic_search_tests {
     #[test]
     fn a_malformed_expiry_expires_nothing() {
         let mut db = EventStore::in_memory().unwrap();
-        let mut odd = report_expiring("odd-1", "2020-01-01");
+        let mut odd = report_expiring("odd-1", "2020-01-01", "an expiry string nobody can parse");
         odd.expires = Some("soon".to_string());
         // Straight into the log, bypassing the gate's own date validation.
         let body = model::store::canonical_body(&odd).unwrap();

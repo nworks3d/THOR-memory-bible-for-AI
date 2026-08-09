@@ -552,8 +552,33 @@ pub fn teeth_line(db: &Path) -> String {
     if heavy == 0 {
         return "teeth: no rule is marked irreversible or costly yet".to_string();
     }
+    // Armed is a claim about shape. Having refused something is a fact about
+    // the world, and it is the only one of the two that cannot be wrong.
+    //
+    // WHY BOTH NUMBERS, and the owner put it exactly right on 2026-08-09: the
+    // agent writes these rules, not him, so "a human will spot a bad literal"
+    // is not a safeguard - the human never sees it. Nothing here can check
+    // that a forbidden fragment is spelled the way the real command spells it
+    // (measured the same day: requiring the fragment to appear in the rule's
+    // own text would have refused 17 of 29 literals, including every one of
+    // the typography rule's, which cannot quote what it forbids). What CAN be
+    // known is whether a rule has ever actually stopped anything. A rule that
+    // has is proven in the field; one that has not may be perfect and merely
+    // untested, or may be a typo nobody will ever notice, and this line
+    // refuses to blur those two.
+    let proven = store
+        .get_all_events()
+        .map(|events| {
+            events
+                .iter()
+                .filter(|e| e.kind == thor_core::event_store::EventKind::GateRefused)
+                .map(|e| e.entity_id.clone())
+                .collect::<std::collections::HashSet<_>>()
+                .len()
+        })
+        .unwrap_or(0);
     format!(
-        "teeth: {heavy_with_teeth} of {heavy} rule(s) marked irreversible or costly can actually refuse something - the other {} can only inform, and they are the ones where being wrong was already called expensive",
+        "teeth: {heavy_with_teeth} of {heavy} rule(s) marked irreversible or costly can actually refuse something - the other {} can only inform, and they are the ones where being wrong was already called expensive; {proven} rule(s) of any weight have ever actually refused a write, which is the only count here that is proven rather than claimed",
         heavy - heavy_with_teeth
     )
 }
@@ -1027,6 +1052,9 @@ mod tests {
 
             let mut heavy_prose = rule("heavy-but-toothless");
             heavy_prose.severity = Some(model::item::Severity::Irreversible);
+            // Since gate ground 11 this is the only way a heavy rule carries no
+            // check: asked, and the answer was that there is nothing to catch.
+            heavy_prose.tags = vec![store::NO_LITERAL_TAG.to_string()];
             store::declare(&mut s, "s", "l", "a", &heavy_prose).unwrap();
 
             let mut heavy_armed = rule("heavy-and-armed");

@@ -257,6 +257,7 @@ mod tests {
             expires: if kind == Kind::Report { Some("2027-01-01".to_string()) } else { None },
             key: if kind == Kind::Lookup { Some(format!("{id}-key")) } else { None },
             falsifier: None,
+            check: None,
         }
     }
 

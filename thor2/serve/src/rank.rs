@@ -12,7 +12,7 @@
 
 use crate::input::ServeInput;
 use crate::live::LiveItem;
-use model::item::{Binding, Item, Kind};
+use model::item::{Binding, Item, Kind, Severity, TargetKind};
 use regex::Regex;
 use std::sync::OnceLock;
 
@@ -118,8 +118,22 @@ pub fn select(candidates: &[LiveItem], input: &ServeInput) -> Vec<RankedItem> {
         .collect();
 
     hits.sort_by(|a, b| {
-        severity_rank(a.item.severity)
-            .cmp(&severity_rank(b.item.severity))
+        // 1. IRREVERSIBLE KEEPS THE TOP BAND, always. Nothing lighter may
+        //    displace a warning about something that cannot be undone, whatever
+        //    else is true of it. This band is what makes the rest of this
+        //    ordering safe to change at all.
+        irreversible(&a.item)
+            .cmp(&irreversible(&b.item))
+            // 2. THEN THE ONE ANCHORED AT WHAT YOU ARE TOUCHING. Measured on
+            //    the owner's store, 2026-08-09: opening the busiest file in it
+            //    showed four general warnings about deploying and none of the
+            //    twelve facts about that very file, because severity decided
+            //    everything and closeness was never consulted across bands. A
+            //    general rule still reaches you at the moment it is about; the
+            //    specific one has only this one chance.
+            .then_with(|| anchored_at_a_place(&b.item).cmp(&anchored_at_a_place(&a.item)))
+            // 3. Then weight, as before, among items equally close.
+            .then_with(|| severity_rank(a.item.severity).cmp(&severity_rank(b.item.severity)))
             .then_with(|| {
                 let ca = closeness(&a.item.text, &input.context);
                 let cb = closeness(&b.item.text, &input.context);
@@ -128,6 +142,22 @@ pub fn select(candidates: &[LiveItem], input: &ServeInput) -> Vec<RankedItem> {
             .then_with(|| a.id.cmp(&b.id)) // deterministic, never length
     });
     hits
+}
+
+/// A warning about something that cannot be undone. Its own key in the
+/// ordering, so nothing lighter can ever take its place - see `select`.
+fn irreversible(item: &Item) -> bool {
+    item.severity != Some(Severity::Irreversible)
+}
+
+/// Is this item bound to a PLACE - a file or a directory - rather than
+/// reaching the pool through a broad moment? A place-bound item gets one
+/// chance, at that place; a moment-bound one reaches you wherever that moment
+/// is detected, so it has others.
+fn anchored_at_a_place(item: &Item) -> bool {
+    item.bindings
+        .iter()
+        .any(|b| matches!(b, Binding::Target { kind: TargetKind::Path | TargetKind::Dir, .. }))
 }
 
 #[cfg(test)]
@@ -396,6 +426,57 @@ mod tests {
         };
         let hits = select(&[generic, specific], &input);
         assert_eq!(hits[0].id, "s", "the item naming the real command/path must rank first");
+    }
+
+    /// THE INVERSION THIS FIXES, measured on the owner's real store
+    /// (2026-08-09): opening the busiest file in it showed four general
+    /// warnings about deploying and NONE of the twelve facts about that very
+    /// file. Severity decided everything and closeness was never consulted
+    /// across bands, so a rule bound to a broad moment always beat one
+    /// anchored at the file in your hands. The general rule still reaches you
+    /// at the moment it is about; the specific one had only that one chance.
+    #[test]
+    fn a_fact_anchored_at_this_file_beats_a_general_one_of_the_same_weight() {
+        let mut anchored = base("anchored", Kind::Rule);
+        anchored.item.severity = Some(Severity::Costly);
+        anchored.item.bindings =
+            vec![Binding::Target { kind: TargetKind::Path, value: "deploy/compose.yml".to_string() }];
+
+        let mut general = base("general", Kind::Rule);
+        general.item.severity = Some(Severity::Costly);
+        general.item.bindings = vec![Binding::Moment(Action::Deploy)];
+
+        let mut input = ServeInput::default();
+        input.add_file("deploy/compose.yml");
+        input.moments.push(Action::Deploy);
+
+        let hits = select(&[general, anchored], &input);
+        assert_eq!(hits[0].id, "anchored", "the fact about this very file must come first");
+    }
+
+    /// AND THE LINE THAT MAKES THAT SAFE. An irreversible warning keeps the top
+    /// band whatever else is true: measured before shipping the rule above,
+    /// plain closeness-first would have pushed six irreversible warnings out of
+    /// their place on this store. A memory that shows the handy note instead of
+    /// the one that stops you wrecking production is worse than one that shows
+    /// neither.
+    #[test]
+    fn an_irreversible_warning_is_never_displaced_by_a_closer_lighter_one() {
+        let mut anchored = base("anchored-light", Kind::Rule);
+        anchored.item.severity = Some(Severity::HouseStyle);
+        anchored.item.bindings =
+            vec![Binding::Target { kind: TargetKind::Path, value: "deploy/compose.yml".to_string() }];
+
+        let mut hard = base("hard-general", Kind::Rule);
+        hard.item.severity = Some(Severity::Irreversible);
+        hard.item.bindings = vec![Binding::Moment(Action::Deploy)];
+
+        let mut input = ServeInput::default();
+        input.add_file("deploy/compose.yml");
+        input.moments.push(Action::Deploy);
+
+        let hits = select(&[anchored, hard], &input);
+        assert_eq!(hits[0].id, "hard-general", "nothing lighter may take an irreversible warning's place");
     }
 
     #[test]

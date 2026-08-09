@@ -565,6 +565,18 @@ fn hook_once(db_path: &Path) -> Option<HookOutput> {
             return Some(output);
         }
 
+        // THE MESS YOU MADE THIS SESSION, before the older debt below it.
+        // Asked first because it is the only one whose answer decays: the
+        // person who wrote the fact still knows what it was for, and tomorrow
+        // nobody does.
+        if let Some(reason) =
+            EventStore::open_existing(db_path).ok().and_then(|s| crowding_debt(&s, &session_id))
+        {
+            return Some(HookOutput::Decision(
+                serde_json::json!({ "decision": "block", "reason": reason }),
+            ));
+        }
+
         // The one debt nobody ever pays voluntarily. Independent of the
         // capture guard above it - that one can be switched off and usually
         // is, and this must not go quiet with it.
@@ -917,6 +929,70 @@ fn capture_stop_check(db_path: &Path, session_id: &str) -> Option<HookOutput> {
             "reason": reason,
         }))),
     }
+}
+
+/// The crowded facts THIS session wrote and has not dealt with.
+///
+/// WHY THIS IS FORCED AND THE EVALUATION IS NOT. The write response already
+/// says "this may well never be shown there" the moment somebody stores a fact
+/// onto a full pool. Saying it was not enough: measured across two real
+/// sessions, the note was reported and then left alone, and the fact stayed
+/// invisible. A maintenance step that depends on somebody remembering is the
+/// same shape as the useful-mark was before it was fixed - it works exactly as
+/// often as people feel like it.
+///
+/// So this holds the turn, like the judgement debt does, and for the same
+/// reason: it is the only thing that ever produced maintenance. It is asked
+/// BEFORE that older debt because this answer decays - the person who wrote
+/// the fact still knows what it was for, and tomorrow nobody does.
+///
+/// IT CARRIES NO STATE OF ITS OWN, and that is deliberate. The log already
+/// knows which items this session wrote, and `capacity` is a pure function of
+/// the store as it stands now. So the debt clears by construction the moment
+/// the fact is folded away, re-anchored somewhere with room, or retracted -
+/// there is no marker to go stale and no sidecar to drift.
+///
+/// It only ever asks about what YOU made. A session that stores nothing never
+/// sees it, and it never turns into a backlog nag about somebody else's mess.
+fn crowding_debt(store: &EventStore, session_id: &str) -> Option<String> {
+    use thor_core::event_store::EventKind;
+    let events = store.get_all_events().ok()?;
+
+    // Written here, in this session: a declare or a revise. Retractions are
+    // read too, because retracting IS one of the three ways out.
+    let mut written: Vec<String> = Vec::new();
+    let mut settled: std::collections::HashSet<String> = Default::default();
+    for e in &events {
+        if e.session_id != session_id {
+            continue;
+        }
+        match e.kind {
+            EventKind::FactCreated | EventKind::FactRevised => {
+                if !written.contains(&e.entity_id) {
+                    written.push(e.entity_id.clone());
+                }
+            }
+            EventKind::FactRetracted => {
+                settled.insert(e.entity_id.clone());
+            }
+            _ => {}
+        }
+    }
+
+    for id in written {
+        if settled.contains(&id) {
+            continue;
+        }
+        let Ok(item) = model::store::show(store, &id) else { continue };
+        let Ok(model::store::Capacity::Crowded(note)) = model::store::capacity(store, &item) else {
+            continue;
+        };
+        return Some(format!(
+            "[THOR] '{id}' was stored this session onto a place that is already full, so it will              probably never be read there. The memory said so when you wrote it. Deal with it              before ending the turn, in this order: (1) FOLD it - if an existing item almost says              the same thing, revise that one to carry your point and retract yours; (2) RE-ANCHOR              it - if it is really about a narrower file or command than the one it hangs on, move              it there with revise; (3) LEAVE IT and say why - sometimes the place is honestly full              of heavier things, and then that is the answer, but say which ones hold it. What you              never do is raise its severity to make it visible: that pushes a heavier warning out              to show a lighter one. The note said: {note} The item says: {}",
+            item.text
+        ));
+    }
+    None
 }
 
 /// How many times an item must have fired SINCE its last verdict before the
@@ -1650,6 +1726,114 @@ mod decay_notice_tests {
 mod judgement_debt_tests {
     use super::*;
     use model::item::{Binding, Item, Kind};
+
+    /// A crowded pool to write into: MAX_ITEMS items of equal weight already
+    /// claiming one moment, so the next arrival gets the note rather than a
+    /// refusal (a refusal needs HEAVIER rivals - see `model::store::capacity`).
+    fn crowd_a_moment(store: &mut EventStore, project: &str) {
+        const DISTINCT: [&str; 5] = [
+            "a webhook retry backs off before it gives up entirely",
+            "the estimator rounds a quote up to whole cents",
+            "a spool label carries the batch it came from",
+            "the scheduler skips a printer that is on hold",
+            "an invoice number never restarts inside a year",
+        ];
+        for i in 0..model::item::MAX_ITEMS {
+            let item = Item {
+                id: format!("holder-{i}"),
+                kind: Kind::Rule,
+                text: DISTINCT[i % DISTINCT.len()].to_string(),
+                bindings: vec![Binding::Moment(intent::Action::Deploy)],
+                severity: None,
+                project: Some(project.to_string()),
+                tags: vec![],
+                expires: None,
+                key: None,
+                falsifier: Some(format!("holder {i} turns out not to matter")),
+                check: None,
+            };
+            model::store::declare(store, "earlier", "earlier", "t", &item).expect("fixture must store");
+        }
+    }
+
+    fn crowded_newcomer(id: &str, project: &str) -> Item {
+        Item {
+            id: id.to_string(),
+            kind: Kind::Rule,
+            text: "a shipment label is printed once and never reprinted silently".to_string(),
+            bindings: vec![Binding::Moment(intent::Action::Deploy)],
+            severity: None,
+            project: Some(project.to_string()),
+            tags: vec![],
+            expires: None,
+            key: None,
+            falsifier: Some("a label is reprinted without anyone noticing".to_string()),
+            check: None,
+        }
+    }
+
+    /// THE LAZINESS THIS REMOVES. The write response already said "this may
+    /// well never be shown there". Across two real sessions that note was
+    /// reported and then left alone, and the fact stayed invisible. A
+    /// maintenance step that depends on remembering works exactly as often as
+    /// people feel like it, which is the same defect the useful-mark had.
+    #[test]
+    fn a_fact_written_onto_a_full_place_holds_the_turn() {
+        let mut store = EventStore::in_memory().unwrap();
+        crowd_a_moment(&mut store, "p");
+        model::store::declare(&mut store, "now", "now", "t", &crowded_newcomer("mine", "p")).unwrap();
+
+        let asked = crowding_debt(&store, "now").expect("a crowded write must hold the turn");
+        assert!(asked.contains("mine"), "{asked}");
+        assert!(asked.contains("FOLD"), "it must say what to do, not just that something is wrong: {asked}");
+        assert!(asked.contains("never do is raise its severity"), "{asked}");
+    }
+
+    /// It asks about what YOU made, never about somebody else's backlog. A
+    /// session that wrote nothing crowded ends silently.
+    #[test]
+    fn an_earlier_sessions_crowded_fact_is_never_this_sessions_debt() {
+        let mut store = EventStore::in_memory().unwrap();
+        crowd_a_moment(&mut store, "p");
+        model::store::declare(&mut store, "yesterday", "yesterday", "t", &crowded_newcomer("theirs", "p")).unwrap();
+
+        assert!(crowding_debt(&store, "today").is_none(), "a fresh session inherits no debt");
+        assert!(crowding_debt(&store, "yesterday").is_some(), "fixture sanity: the writer does owe it");
+    }
+
+    /// IT CARRIES NO STATE, so it clears by construction. Retracting the fact
+    /// is one of the three ways out, and nothing has to be told about it.
+    #[test]
+    fn retracting_the_crowded_fact_clears_the_debt_with_nothing_to_update() {
+        let mut store = EventStore::in_memory().unwrap();
+        crowd_a_moment(&mut store, "p");
+        model::store::declare(&mut store, "now", "now", "t", &crowded_newcomer("mine", "p")).unwrap();
+        assert!(crowding_debt(&store, "now").is_some(), "fixture sanity");
+
+        model::store::retract(&mut store, "now", "now", "t", "mine", "folded into the item that already said it")
+            .unwrap();
+        assert!(crowding_debt(&store, "now").is_none(), "folding it away settles it, with no marker to update");
+    }
+
+    /// The other way out: move it somewhere with room. Same story - the debt
+    /// is derived from the store as it stands, so re-anchoring settles it.
+    #[test]
+    fn re_anchoring_it_somewhere_with_room_clears_the_debt() {
+        let mut store = EventStore::in_memory().unwrap();
+        crowd_a_moment(&mut store, "p");
+        let mine = crowded_newcomer("mine", "p");
+        model::store::declare(&mut store, "now", "now", "t", &mine).unwrap();
+        assert!(crowding_debt(&store, "now").is_some(), "fixture sanity");
+
+        let mut moved = mine.clone();
+        moved.bindings = vec![Binding::Target {
+            kind: model::item::TargetKind::Path,
+            value: "server/lib/labels.js".to_string(),
+        }];
+        model::store::revise(&mut store, "now", "now", "t", &mine, &moved).unwrap();
+        assert!(crowding_debt(&store, "now").is_none(), "a place with room settles it");
+    }
+
 
     fn declare(store: &mut EventStore, id: &str, pinned: bool) {
         let item = Item {

@@ -378,6 +378,22 @@ pub fn working_contract() -> Vec<model::item::Item> {
              rules carry none, by design.",
             "A rule carrying no runnable check is found blocking a write.",
         ),
+        // The fifth, and the only one here that is not about WRITING a fact.
+        // It earned its place from the field, 2026-08-09: a session told to
+        // report literally what it got, including when nothing happened, did
+        // markedly better work than one left to summarise. Everything else in
+        // this contract keeps the memory honest; this one keeps the report
+        // honest, and a memory read through a flattering report is no better
+        // than a wrong one.
+        rule(
+            "say-what-actually-happened",
+            "Say what actually happened, including when nothing did. A step that fired nothing, a \
+             check that found nothing, a number you could not get: that is a result and it belongs \
+             in the report. Leaving it out reads as success, and the reader cannot tell the \
+             difference.",
+            "A report omits a step that produced nothing and the reader turns out not to be misled \
+             by the omission.",
+        ),
     ]
 }
 

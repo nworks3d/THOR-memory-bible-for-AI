@@ -85,7 +85,26 @@ fn a_guard_that_already_fired_this_turn_never_re_blocks() {
     let dir = fixture();
     let msg = format!("the commit fsck run is done, all gepusht. {}", "detail ".repeat(120));
     let out = run_hook(&dir.path().join("thor.db"), &stop_payload(&msg, true));
-    assert!(out.trim().is_empty(), "stop_hook_active=true must suppress the block: {out}");
+    assert!(!out.contains("\"decision\":\"block\""), "a second pass must never hold the turn: {out}");
+}
+
+/// ...but it must not go BLIND either, which is what "never re-block" had
+/// quietly become. Reported 2026-08-09: the owner's TLDR rule "worked an hour
+/// ago and is now gone". It had not changed. A debt had simply started firing
+/// every turn, so every follow-up reply arrived with stop_hook_active set,
+/// and the whole hook returned early - the guard never read one of them.
+/// Those are the replies most likely to need it: they come right after a
+/// nudge. A warning cannot hold the turn, so saying it costs no loop safety.
+#[test]
+fn a_second_pass_still_says_what_it_found_as_a_warning() {
+    let dir = fixture();
+    let msg = format!("the commit fsck run is done, all gepusht. {}", "detail ".repeat(120));
+    let out = run_hook(&dir.path().join("thor.db"), &stop_payload(&msg, true));
+    assert!(!out.trim().is_empty(), "the second pass must not stay silent about a reply it faults");
+    assert!(
+        out.to_lowercase().contains("tldr"),
+        "and it must name what is missing, not just make a noise: {out}"
+    );
 }
 
 /// Capability amnesia is caught too - the class that had me ask the owner to

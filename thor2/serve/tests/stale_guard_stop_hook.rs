@@ -344,9 +344,12 @@ fn the_response_guards_own_behavior_at_stop_is_unchanged() {
     assert!(v["reason"].as_str().unwrap().contains("TLDR"), "the Response Guard's own reason must still win: {out}");
 }
 
-/// Loop safety must also be unchanged: `stop_hook_active: true` still
-/// suppresses the Response Guard (and, transitively, everything after it,
-/// this guard included) exactly as before.
+/// Loop safety: `stop_hook_active: true` must still suppress every check
+/// that can HOLD the turn, this guard included. Since 2026-08-09 the Response
+/// Guard is the one exception, and only in its warning form - see
+/// `a_second_pass_still_says_what_it_found_as_a_warning` for why going fully
+/// blind on a second pass was a defect. A warning holds nothing, so the loop
+/// safety this test exists for is unaffected.
 #[test]
 fn a_guard_that_already_fired_this_turn_still_suppresses_everything_after_it() {
     let dir = tempfile::tempdir().unwrap();
@@ -365,7 +368,8 @@ fn a_guard_that_already_fired_this_turn_still_suppresses_everything_after_it() {
     .to_string();
 
     let out = run_hook(&db, &payload);
-    assert!(out.trim().is_empty(), "stop_hook_active=true must suppress everything, this guard included: {out}");
+    assert!(!out.contains("\"decision\":\"block\""), "a second pass must hold nothing: {out}");
+    assert!(!out.contains("r1"), "and the stale-rule guard must stay silent, exactly as before: {out}");
 }
 
 const CAPTURE_RULEBOOK: &str = r#"[

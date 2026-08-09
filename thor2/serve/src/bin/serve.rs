@@ -527,10 +527,31 @@ fn hook_once(db_path: &Path) -> Option<HookOutput> {
     // event name, past this whole block.
     if event_name == "Stop" {
         let already_fired = payload.get("stop_hook_active").and_then(|v| v.as_bool()).unwrap_or(false);
-        if already_fired {
-            return None;
-        }
         let msg = payload.get("last_assistant_message").and_then(|v| v.as_str()).unwrap_or("");
+        // THE DEFECT THIS CLOSES, reported by the owner on 2026-08-09: "my
+        // TLDR rules worked an hour ago and now they are gone."
+        //
+        // `stop_hook_active` means a Stop hook already held this turn once.
+        // Returning None on it was loop safety, and it was too wide: it
+        // switched off the Response Guard as well as the debts. That went
+        // unnoticed while blocks were rare. The moment one debt started
+        // firing every turn, EVERY follow-up reply landed in an already-fired
+        // turn, and the guard silently stopped watching any of them - exactly
+        // the replies most likely to need it, since they come after a nudge.
+        //
+        // So the second pass still reads the reply and still says what it
+        // found, as a WARN. A warning cannot hold the turn, so it cannot
+        // loop; the loop safety that matters is keeping BLOCK to one pass,
+        // not going blind.
+        if already_fired {
+            if msg.trim().is_empty() {
+                return None;
+            }
+            let rulebook_text = std::fs::read_to_string(respond::default_rulebook_path(db_path)).ok();
+            let verdict = respond::guard_verdict(rulebook_text.as_deref(), msg);
+            let text = verdict.block_reason.or(verdict.warn_reason)?;
+            return Some(HookOutput::Warn { event_name, text });
+        }
         let warn_text: Option<String> = if msg.trim().is_empty() {
             None
         } else {
@@ -581,6 +602,21 @@ fn hook_once(db_path: &Path) -> Option<HookOutput> {
         // capture guard above it - that one can be switched off and usually
         // is, and this must not go quiet with it.
         if let Some(reason) = EventStore::open_existing(db_path).ok().and_then(|s| judgement_debt(&s, &session_id)) {
+            return Some(HookOutput::Decision(
+                serde_json::json!({ "decision": "block", "reason": reason }),
+            ));
+        }
+
+        // The backlog burn: one fact per turn that LOOKS armable and has
+        // never been asked. Last of the debts on purpose - it is the only one
+        // with no urgency, and it must never speak over a mess made this
+        // session or a verdict that is owed.
+        if let Some(reason) = EventStore::open_existing(db_path)
+            .ok()
+            .filter(|_| teeth_not_yet_asked_this_session(db_path, &session_id))
+            .and_then(|s| teeth_debt(&s))
+        {
+            record_teeth_asked(db_path, &session_id);
             return Some(HookOutput::Decision(
                 serde_json::json!({ "decision": "block", "reason": reason }),
             ));
@@ -1010,6 +1046,76 @@ fn session_watermark(db_path: &Path, session_id: &str) -> Option<i64> {
 ///
 /// It only ever asks about what THIS session made. A session that stores
 /// nothing never sees it, and it never becomes a backlog nag about older mess.
+/// THE THING THE OWNER ASKED FOR THREE DAYS RUNNING, and did not have until
+/// 2026-08-09: the system finding, by itself, which facts deserve to reach the
+/// gate.
+///
+/// The write gate asks its question of every heavy rule at the door. That
+/// covers what is written from now on, and it covered the backlog exactly once
+/// - in a sweep somebody had to decide to run. Everything else in the store
+/// stayed as it was, and nothing was ever going to look at it again. "Ask when
+/// somebody happens to touch it" is not a mechanism; it is a hope.
+///
+/// So this walks the whole store, every turn, and holds the turn on ONE rule
+/// that names something concrete in its own text and has never been asked. It
+/// does not decide the answer - that needs judgement, and the answer "there is
+/// nothing to catch here" is a real answer. It decides WHO GETS ASKED, which
+/// was the part that depended on somebody remembering.
+///
+/// Deliberately last among the debts and deliberately one at a time: this is a
+/// backlog with hundreds in it, and a burn that never stops beats a sweep that
+/// happens once.
+/// Where the backlog burn remembers whose turn it already took.
+fn teeth_asked_path(db: &Path) -> std::path::PathBuf {
+    db.parent().unwrap_or_else(|| Path::new(".")).join("teeth-asked.json")
+}
+
+/// ONCE per session, never once per turn.
+///
+/// THE DEFECT THIS PREVENTS, caught the same evening it was built: with 348
+/// unanswered rules in the store, a per-turn debt is not a slow burn, it is a
+/// wall - every single turn ends held, forever, and the only way to work is to
+/// stop believing the debts. A maintenance nudge that makes the tool unusable
+/// gets switched off, and then it protects nothing at all.
+fn teeth_not_yet_asked_this_session(db: &Path, session_id: &str) -> bool {
+    let Ok(text) = std::fs::read_to_string(teeth_asked_path(db)) else { return true };
+    !text.lines().any(|line| line.trim() == session_id)
+}
+
+/// Best effort, like every sidecar here: a sidecar that cannot be written
+/// means the burn asks again next turn, never that a turn breaks.
+fn record_teeth_asked(db: &Path, session_id: &str) {
+    let path = teeth_asked_path(db);
+    let mut text = std::fs::read_to_string(&path).unwrap_or_default();
+    text.push_str(session_id);
+    text.push('\n');
+    // Keep the tail only: this file is a set of recent sessions, not history.
+    let kept: Vec<&str> = text.lines().rev().take(200).collect();
+    let trimmed: String = kept.into_iter().rev().collect::<Vec<_>>().join("\n");
+    let _ = std::fs::write(&path, format!("{trimmed}\n"));
+}
+
+fn teeth_debt(store: &EventStore) -> Option<String> {
+    let mut candidates: Vec<(String, String, String)> = serve::live::live_items(store)
+        .into_iter()
+        .filter(|li| li.item.kind.can_fire())
+        .filter(|li| li.item.check.is_none())
+        .filter(|li| !li.item.tags.iter().any(|t| t == model::store::NO_LITERAL_TAG))
+        .filter_map(|li| model::gate::candidate_literal(&li.item.text).map(|lit| (li.id.clone(), li.item.text.clone(), lit)))
+        .collect();
+    // Lowest id first: a stable order, so the same fact is asked until it is
+    // answered rather than a different one every turn.
+    candidates.sort_by(|a, b| a.0.cmp(&b.0));
+    let (id, text, literal) = candidates.first()?;
+    let left = candidates.len().saturating_sub(1);
+    Some(format!(
+        "[THOR] '{id}' has never been asked whether it can refuse anything, and its own text names something a guard could look for: \"{literal}\". Answer it before ending the turn, and {left} other rule(s) are waiting behind it. \
+         Is there a text whose presence MEANS the mistake is happening? If YES, give this rule a check with that literal - forbidden for a command or for any file, absent for one named file - and re-anchor it if the check needs a command it does not have. If NO (an authorised action looks identical to an unauthorised one, or the rule is about something forgotten rather than something typed), tag it '{}' and it stays exactly as it is. \
+         Both answers settle it for good; only leaving it unanswered brings it back. The rule says: {text}",
+        model::store::NO_LITERAL_TAG
+    ))
+}
+
 fn crowding_debt(store: &EventStore, db_path: &Path, session_id: &str) -> Option<String> {
     use thor_core::event_store::EventKind;
     let since = session_watermark(db_path, session_id)?;
@@ -1041,12 +1147,18 @@ fn crowding_debt(store: &EventStore, db_path: &Path, session_id: &str) -> Option
             continue;
         }
         let Ok(item) = model::store::show(store, &id) else { continue };
+        // Exit 3 taken: the crowd was judged deserved. See the tag's own doc
+        // comment for the day this exit existed in the message but nowhere in
+        // the code, and the item kept coming back every turn.
+        if item.tags.iter().any(|t| t == model::store::CROWDED_ON_PURPOSE_TAG) {
+            continue;
+        }
         let Ok(model::store::Capacity::Crowded(note)) = model::store::capacity(store, &item) else {
             continue;
         };
         return Some(format!(
-            "[THOR] '{id}' was stored this session onto a place that is already full, so it will probably never be read there. The memory said so when you wrote it. Deal with it before ending the turn, in this order: (1) FOLD it - if an existing item almost says the same thing, revise that one to carry your point and retract yours; (2) RE-ANCHOR it - if it is really about a narrower file or command than the one it hangs on, move it there with revise; (3) LEAVE IT and say why - sometimes the place is honestly full of heavier things, and then that is the answer, but say which ones hold it. What you never do is raise its severity to make it visible: that pushes a heavier warning out to show a lighter one. The note said: {note} The item says: {}",
- item.text
+            "[THOR] '{id}' was stored this session onto a place that is already full, so it will probably never be read there. The memory said so when you wrote it. Deal with it before ending the turn, in this order: (1) FOLD it - if an existing item almost says the same thing, revise that one to carry your point and retract yours; (2) RE-ANCHOR it - if it is really about a narrower file or command than the one it hangs on, move it there with revise; (3) LEAVE IT - sometimes the place is honestly full of heavier things, and then that is the answer: say in your reply which items hold it, and tag this one '{}' so it is recorded as a decision rather than an oversight. Saying it only in prose settles nothing and this will ask again next turn. What you never do is raise its severity to make it visible: that pushes a heavier warning out to show a lighter one. The note said: {note} The item says: {}",
+ model::store::CROWDED_ON_PURPOSE_TAG, item.text
         ));
     }
     None
@@ -1906,6 +2018,137 @@ mod judgement_debt_tests {
         }];
         model::store::revise(&mut store, "mcp", "mcp", "t", &mine, &moved).unwrap();
         assert!(crowding_debt(&store, &db, "now").is_none(), "a place with room settles it");
+    }
+
+    /// A rule as it exists in a store written BEFORE the gate started asking:
+    /// it names something concrete and carries no check. The gate refuses to
+    /// create one now, which is the point of the gate - so the only honest way
+    /// to test the backlog burn is to put a legacy row in directly, exactly as
+    /// the migration did.
+    fn legacy_unanswered(store: &mut EventStore, id: &str, text: &str) {
+        let mut item = crowded_newcomer(id, "p");
+        item.text = text.to_string();
+        let body = serde_json::to_string(&item).unwrap();
+        store
+            .append_event("legacy", id, "migration", thor_core::event_store::EventKind::FactCreated, id, None, &body)
+            .unwrap();
+    }
+
+    #[test]
+    fn the_burn_takes_one_turn_per_session_not_every_turn() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("t.db");
+        assert!(teeth_not_yet_asked_this_session(&db, "s1"), "a fresh session has not been asked");
+        record_teeth_asked(&db, "s1");
+        assert!(!teeth_not_yet_asked_this_session(&db, "s1"), "the same session must not be held again");
+        assert!(teeth_not_yet_asked_this_session(&db, "s2"), "a different session gets its own turn");
+    }
+
+    #[test]
+    fn a_rule_naming_a_command_is_found_without_anybody_pointing_at_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("t.db");
+        let mut store = EventStore::new(&db).unwrap();
+        legacy_unanswered(&mut store, "names-a-flag", "Draai npm audit fix --force nooit op deze repo");
+
+        let asked = teeth_debt(&store).expect("a rule naming a flag must be found by the sweep itself");
+        assert!(asked.contains("names-a-flag"), "it must name which rule: {asked}");
+        assert!(asked.contains("--force"), "and quote what it spotted: {asked}");
+    }
+
+    #[test]
+    fn either_answer_settles_it_and_only_silence_brings_it_back() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("t.db");
+        let mut store = EventStore::new(&db).unwrap();
+        legacy_unanswered(&mut store, "answer-me", "Draai npm audit fix --force nooit op deze repo");
+        assert!(teeth_debt(&store).is_some(), "fixture sanity");
+
+        let item = model::store::show(&store, "answer-me").unwrap();
+        let mut answered_no = item.clone();
+        answered_no.tags.push(model::store::NO_LITERAL_TAG.to_string());
+        model::store::revise(&mut store, "s", "l", "a", &item, &answered_no).unwrap();
+        assert!(teeth_debt(&store).is_none(), "answering 'nothing to catch' must settle it for good");
+    }
+
+    /// The ground must not become noise. A rule that names nothing concrete
+    /// has no question to answer, and asking anyway would teach the reader to
+    /// dismiss this debt on sight.
+    #[test]
+    fn a_rule_that_names_nothing_concrete_is_never_asked() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("t.db");
+        let mut store = EventStore::new(&db).unwrap();
+        let mut item = crowded_newcomer("pure-judgement", "p");
+        item.text = "Vraag eerst toestemming voor je iets onomkeerbaars doet".to_string();
+        model::store::declare(&mut store, "s", "l", "a", &item).unwrap();
+        assert!(teeth_debt(&store).is_none(), "there is nothing here a guard could look for");
+    }
+
+    #[test]
+    fn prose_that_merely_contains_a_slash_or_a_dot_is_not_a_path() {
+        assert_eq!(model::gate::candidate_literal("werk dev->prod bij en/of herstart"), None);
+        assert_eq!(model::gate::candidate_literal("dat kost 15-20 min. in totaal"), None);
+        assert_eq!(
+            model::gate::candidate_literal("wijzig files/deploy-watcher.sh en push"),
+            Some("files/deploy-watcher.sh".to_string())
+        );
+    }
+
+    /// A rule that already carries a check has been armed; asking again would
+    /// be asking a settled question.
+    #[test]
+    fn a_rule_that_already_has_teeth_is_left_alone() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("t.db");
+        let mut store = EventStore::new(&db).unwrap();
+        let mut item = crowded_newcomer("already-armed", "p");
+        item.text = "Draai npm audit fix --force nooit op deze repo".to_string();
+        item.check = Some(model::item::Check::Forbidden { literals: vec!["--force".to_string()] });
+        model::store::declare(&mut store, "s", "l", "a", &item).unwrap();
+        assert!(teeth_debt(&store).is_none());
+    }
+
+    /// The THIRD way out, and until 2026-08-09 the only one the message
+    /// promised without the code honouring it. Saying "it belongs here" in a
+    /// reply settled nothing, so the debt re-fired every turn and the only
+    /// escape left was deleting a true fact.
+    #[test]
+    fn judging_the_crowd_deserved_settles_the_debt_without_moving_anything() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("t.db");
+        let mut store = EventStore::new(&db).unwrap();
+        crowd_a_moment(&mut store, "p");
+        record_session_watermark(&db, "now");
+        let mine = crowded_newcomer("mine", "p");
+        model::store::declare(&mut store, "mcp", "mcp", "t", &mine).unwrap();
+        assert!(crowding_debt(&store, &db, "now").is_some(), "fixture sanity");
+
+        let mut judged = mine.clone();
+        judged.tags.push(model::store::CROWDED_ON_PURPOSE_TAG.to_string());
+        model::store::revise(&mut store, "mcp", "mcp", "t", &mine, &judged).unwrap();
+        assert!(
+            crowding_debt(&store, &db, "now").is_none(),
+            "a recorded decision settles it, with the item exactly as crowded as before"
+        );
+    }
+
+    /// The tag settles the DEBT, not the crowding. An item that took exit 3 is
+    /// still crowded out, and every count that measures reach must still say so
+    /// - otherwise the escape hatch would quietly improve the numbers.
+    #[test]
+    fn taking_the_third_exit_does_not_pretend_the_place_has_room() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("t.db");
+        let mut store = EventStore::new(&db).unwrap();
+        crowd_a_moment(&mut store, "p");
+        let mut mine = crowded_newcomer("mine", "p");
+        mine.tags.push(model::store::CROWDED_ON_PURPOSE_TAG.to_string());
+        model::store::declare(&mut store, "mcp", "mcp", "t", &mine).unwrap();
+        assert!(
+            matches!(model::store::capacity(&store, &mine), Ok(model::store::Capacity::Crowded(_))),
+            "the tag is a decision about the debt, never a claim that the place is free"
+        );
     }
 
 

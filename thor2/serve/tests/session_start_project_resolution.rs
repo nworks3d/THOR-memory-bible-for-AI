@@ -20,7 +20,9 @@ fn rule_always_for_project(id: &str, project: &str) -> Item {
         bindings: vec![Binding::Always],
         severity: Some(Severity::Irreversible),
         project: Some(project.to_string()),
-        tags: vec![],
+        // Gate ground 11: this file tests project scoping, and a generic
+        // standing rule has no literal to catch.
+        tags: vec![model::store::NO_LITERAL_TAG.to_string()],
         expires: None,
         key: None,
         falsifier: Some(format!("the standing rule for {project} turns out to be wrong")),

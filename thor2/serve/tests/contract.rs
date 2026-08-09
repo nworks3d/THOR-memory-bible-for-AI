@@ -29,7 +29,10 @@ fn rule_always(id: &str, project: Option<&str>) -> Item {
         bindings: vec![Binding::Always],
         severity: Some(Severity::Irreversible),
         project: project.map(str::to_string),
-        tags: vec![],
+        // Gate ground 11 asks every heavy rule whether it can refuse. These
+        // fixtures exist to test DELIVERY, and a generic "standing rule N" has
+        // no literal to catch, so the tag is the truthful answer.
+        tags: vec![model::store::NO_LITERAL_TAG.to_string()],
         expires: None,
         key: None,
         falsifier: Some(format!("standing rule {id} turns out to be wrong")),
@@ -45,7 +48,8 @@ fn rule_moment(id: &str, action: Action) -> Item {
         bindings: vec![Binding::Moment(action)],
         severity: Some(Severity::Irreversible),
         project: None,
-        tags: vec![],
+        // Same as rule_always: asked, and there is nothing literal to catch.
+        tags: vec![model::store::NO_LITERAL_TAG.to_string()],
         expires: None,
         key: None,
         falsifier: Some(format!("{id} turns out to be safe without checking first")),

@@ -96,6 +96,7 @@ pub mod migrate;
 pub mod pins;
 pub mod project;
 pub mod prompt;
+pub mod prove;
 pub mod rank;
 pub mod reentry;
 pub mod render;
@@ -180,7 +181,9 @@ mod tests {
                 bindings: vec![Binding::Moment(Action::Configure)],
                 severity: Some(Severity::Irreversible),
                 project: None,
-                tags: vec![],
+                // Gate ground 11: filler rules for a crowding test have nothing
+                // literal to catch, and saying so is what lets them in.
+                tags: vec![store::NO_LITERAL_TAG.to_string()],
                 expires: None,
                 key: None,
                 falsifier: Some(format!("rule number {i} turns out to be wrong")),

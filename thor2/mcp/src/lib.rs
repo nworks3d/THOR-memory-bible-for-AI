@@ -348,6 +348,32 @@ pub struct TargetArg {
 /// `Binding` list `model::item::Item` actually stores. The one place both
 /// `remember` and `revise` build a binding list, so the two tools can never
 /// disagree about what a moment/target name means.
+/// A check that claims to refuse must be shown to refuse, here, before the
+/// write lands. See `serve::prove` for the defect this closes; the short
+/// version is that "important" was a word anybody could write, and the store
+/// counted it as protection without ever trying it.
+///
+/// Only a check that is TRIED and stays SILENT is refused. A check that cannot
+/// be tried without a working copy passes - reporting it as unproven belongs
+/// to `doctor`, not to a door that would otherwise refuse every file-reading
+/// proof this store has.
+fn refuse_an_unproven_check(item: &model::item::Item) -> Result<(), String> {
+    match serve::prove::prove(&item.id, item) {
+        serve::prove::Proof::Silent(attempt) => Err(format!(
+            "REFUSED: this check does not actually refuse anything. The attempt it should have stopped - {attempt} - \
+             went straight through the guard. A rule that looks armed and fires nothing is worse than one with no \
+             check at all, because it is counted as protection. Fix the literal so it appears verbatim in the \
+             command or content that makes the mistake, or anchor the rule to the command it is really about."
+        )),
+        serve::prove::Proof::NotProvable(why)
+            if why.starts_with("a forbidden check reaches only") =>
+        {
+            Err(format!("REFUSED: {why}. As written it can never fire, whatever it looks like."))
+        }
+        _ => Ok(()),
+    }
+}
+
 fn build_bindings(moments: &[String], targets: &[TargetArg], always: bool) -> Result<Vec<Binding>, String> {
     let mut bindings = Vec::new();
     for name in moments {
@@ -926,6 +952,9 @@ impl ThorMcpServer {
                 falsifier: args.falsifier.clone(),
                 check,
             };
+            if let Err(why) = refuse_an_unproven_check(&item) {
+                return Err(why);
+            }
             match model::store::declare_in(s, SESSION_ID, LINEAGE_ID, ACTOR, &item, root.as_deref().map(|p| p.as_path())) {
                 Ok(event) => Ok(with_warnings(
                     format!("stored '{}' ({:?}, event seq {})", item.id, item.kind, event.seq),
@@ -1093,6 +1122,11 @@ impl ThorMcpServer {
                 check: check_cleared,
             };
             let gate_existing = cleared.baseline(&existing);
+            // Same door as remember: a correction must not be able to swap a
+            // working lock for one that fires nothing.
+            if let Err(why) = refuse_an_unproven_check(&updated) {
+                return Err(why);
+            }
             match model::store::revise(s, SESSION_ID, LINEAGE_ID, ACTOR, &gate_existing, &updated) {
                 Ok(event) => {
                     Ok(with_warnings(
@@ -1650,7 +1684,11 @@ mod tests {
             text: "never force-push to main".to_string(),
             severity: Some("irreversible".to_string()),
             project: None,
-            tags: vec![],
+            // Gate ground 11 asks every heavy rule whether it can refuse. This
+            // one is bound Always, so there is no literal to forbid: banning
+            // "--force" everywhere would refuse the sentence that documents the
+            // rule. The tag is the honest answer, not a way around the gate.
+            tags: vec![model::store::NO_LITERAL_TAG.to_string()],
             expires: None,
             key: None,
             falsifier: Some("a force-push to main lands clean, nobody reverts it".to_string()),
@@ -1686,6 +1724,10 @@ mod tests {
     async fn a_refused_revise_that_drops_a_field_is_loud_and_writes_nothing() {
         let srv = server();
         let mut args = base_remember("drop-tags-1");
+        // Ground 9 is what this test is about, so keep ground 11 out of it: a
+        // heavy rule that loses its no-literal tag is refused for the teeth
+        // question first, and the tags message never gets a turn.
+        args.severity = Some("house_style".to_string());
         args.tags = vec!["safety".to_string()];
         let stored = srv.remember(Parameters(args)).await;
         assert!(stored.starts_with("stored"), "fixture setup must succeed: {stored}");
@@ -3045,6 +3087,8 @@ mod tests {
     async fn clearing_severity_in_the_same_revise_that_drops_tags_still_refuses_the_tags_drop() {
         let srv = server();
         let mut args = base_remember("clear-severity-keep-tags-refusal-1");
+        // Same reason as the sibling test above: a light rule isolates ground 9.
+        args.severity = Some("house_style".to_string());
         args.tags = vec!["safety".to_string()];
         assert!(srv.remember(Parameters(args)).await.starts_with("stored"));
 
@@ -3075,7 +3119,7 @@ mod tests {
         let get_reply = srv.get(Parameters(GetArgs { id: "clear-severity-keep-tags-refusal-1".to_string() })).await;
         let item: Item = serde_json::from_str(&get_reply).unwrap();
         assert_eq!(item.tags, vec!["safety".to_string()], "a refused revise must change nothing, severity included");
-        assert_eq!(item.severity, Some(ItemSeverity::Irreversible), "a refused revise must change nothing");
+        assert_eq!(item.severity, Some(ItemSeverity::HouseStyle), "a refused revise must change nothing");
     }
 
     // ----------------------------------------------------------- pin/unpin

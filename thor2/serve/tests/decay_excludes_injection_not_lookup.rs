@@ -25,7 +25,9 @@ fn moment_rule(id: &str) -> Item {
         bindings: vec![Binding::Moment(Action::Push)],
         severity: Some(Severity::Irreversible),
         project: None,
-        tags: vec![],
+        // Gate ground 11: these fixtures test decay, not teeth, and a generic
+        // "never <id> without checking first" has no literal to catch.
+        tags: vec![model::store::NO_LITERAL_TAG.to_string()],
         expires: None,
         key: None,
         falsifier: Some(format!("{id} turns out to be safe without checking first")),
@@ -41,7 +43,8 @@ fn always_rule(id: &str) -> Item {
         bindings: vec![Binding::Always],
         severity: Some(Severity::Irreversible),
         project: None,
-        tags: vec![],
+        // Same as moment_rule above.
+        tags: vec![model::store::NO_LITERAL_TAG.to_string()],
         expires: None,
         key: None,
         falsifier: Some(format!("standing rule {id} turns out to be wrong")),

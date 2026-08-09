@@ -717,6 +717,50 @@ pub const ARCHIVE_REASON_LIMIT: usize = 120;
 /// this tag is skipped by the decay count and refused by `archive`.
 pub const DELIBERATE_ANCHOR_TAG: &str = "deliberate-anchor";
 
+/// A heavy rule that carries no check informs and never refuses. Sometimes
+/// that is correct - "ask before pushing to main" has no text whose presence
+/// means the mistake, because an authorised push looks exactly like an
+/// unauthorised one. Sometimes it is an oversight nobody ever revisits.
+///
+/// Prose cannot tell those apart, and nothing else can either: a rule that
+/// merely informs is indistinguishable, from the outside, from a rule someone
+/// forgot to give teeth. Measured 2026-08-09 on the real store: 2757 rules,
+/// 331 carrying any check at all, and 17 able to refuse an introduction. Not
+/// one thing in the system had ever asked the question.
+///
+/// So the distinction has to be something a machine can see. An item carrying
+/// this tag has been through the question and the answer was no. Without it, a
+/// heavy rule with no check is refused by `gate::declare` - not because it must
+/// have teeth, but because it must have been ASKED.
+pub const NO_LITERAL_TAG: &str = "no-literal";
+
+/// Sometimes a fact belongs exactly where it is and the place is honestly full
+/// of heavier things. The crowding debt has always SAID so - "leave it and say
+/// why" is the third of the three ways out it offers - but saying why happened
+/// in prose, and prose settles nothing. Measured 2026-08-09, on this codebase:
+/// the debt re-fired on the same item every turn, because folding and
+/// re-anchoring were the only exits that actually closed it. The one honest
+/// answer left was to delete a true fact to stop the nagging, which is the
+/// wrong incentive to build into a memory.
+///
+/// So the third exit gets the same shape as the other two: something a machine
+/// can see. An item carrying this tag has been through the question and the
+/// answer was that the crowd is deserved. The debt skips it; nothing else
+/// changes, and it stays as findable and as crowded as it was.
+pub const CROWDED_ON_PURPOSE_TAG: &str = "crowded-on-purpose";
+
+/// A rule about what gets SAID rather than written can never carry a check:
+/// a check reaches file writes and commands, and an answer is neither. Its
+/// enforcement lives in the response guard's own rulebook, a file this store
+/// knows nothing about - so a tag naming the entry is the link between the
+/// two, and it is a BETTER answer to the teeth question than "nothing to
+/// catch here", because it says where the catching actually happens.
+///
+/// Added 2026-08-09, the same evening ground 11 started asking: the first
+/// rule to deserve this answer was refused for not having one, which is the
+/// gate being right about the question and wrong about the vocabulary.
+pub const ANSWER_GUARD_TAG_PREFIX: &str = "answer-guard:";
+
 /// Turn a fireable item into archive material: same id, same text, same
 /// history, still fully findable by `lookup` - but it stops claiming to fire.
 ///

@@ -34,7 +34,9 @@ fn always_rule(id: &str) -> Item {
         bindings: vec![Binding::Always],
         severity: Some(Severity::Irreversible),
         project: None,
-        tags: vec![],
+        // Gate ground 11: this file tests subagent hook behaviour, and a
+        // generic "standing rule N" has no literal to catch.
+        tags: vec![model::store::NO_LITERAL_TAG.to_string()],
         expires: None,
         key: None,
         falsifier: Some(format!("standing rule {id} turns out to be wrong")),
@@ -50,7 +52,8 @@ fn moment_rule(id: &str, action: intent::Action) -> Item {
         bindings: vec![Binding::Moment(action)],
         severity: Some(Severity::Irreversible),
         project: None,
-        tags: vec![],
+        // Same as always_rule above.
+        tags: vec![model::store::NO_LITERAL_TAG.to_string()],
         expires: None,
         key: None,
         falsifier: Some(format!("{id} turns out to be safe without checking first")),

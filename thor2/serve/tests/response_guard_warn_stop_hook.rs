@@ -329,7 +329,9 @@ fn a_context_surface_still_renders_with_no_system_message() {
             bindings: vec![model::item::Binding::Moment(intent::Action::Push)],
             severity: Some(model::item::Severity::Irreversible),
             project: None,
-            tags: vec![],
+            // Gate ground 11: this file tests the response guard, and the rule
+            // is bound to a moment with no literal to catch.
+            tags: vec![model::store::NO_LITERAL_TAG.to_string()],
             expires: None,
             key: None,
             falsifier: Some("a force-push to main lands clean with nobody reverting it".to_string()),

@@ -11,7 +11,7 @@
 //! both classes it currently covers.
 
 use crate::anchor_shape::{self, UnmatchableAnchor};
-use crate::item::{Binding, Check, Item, Kind, TargetKind};
+use crate::item::{Binding, Check, Item, Kind, Severity, TargetKind};
 use crate::normalize::{last_segment, normalize_target};
 use intent::Action;
 use std::collections::HashSet;
@@ -565,6 +565,44 @@ fn find_line_number_reference(text: &str) -> Option<String> {
 ///
 /// A single problem returns byte-identical to what it always did. The wording
 /// only changes when there really are several.
+/// The concrete thing a rule's own text names, if it names one: something a
+/// guard could actually be told to look for.
+///
+/// Deliberately narrow, and it stays narrow. Three shapes only - a span in
+/// backticks, a long flag, and a token that looks like a path. Widening it to
+/// catch more would trade a real question for a stream of pointless ones, and
+/// a debt nobody believes is a debt nobody pays.
+pub fn candidate_literal(text: &str) -> Option<String> {
+    if let Some(rest) = text.split_once('`').map(|(_, r)| r) {
+        if let Some((inside, _)) = rest.split_once('`') {
+            let inside = inside.trim();
+            if !inside.is_empty() && inside.len() <= 60 {
+                return Some(inside.to_string());
+            }
+        }
+    }
+    for word in text.split_whitespace() {
+        let w = word.trim_matches(|c: char| !c.is_ascii_graphic() || c == ',' || c == ';' || c == '.');
+        if w.len() < 4 || w.len() > 60 {
+            continue;
+        }
+        if w.starts_with("--") {
+            return Some(w.to_string());
+        }
+        // A path, not prose: a separator AND an extension, so "en/of" and
+        // "dev->prod" never qualify.
+        let has_sep = w.contains('/') || w.contains('\\');
+        let has_ext = w.rsplit('.').next().map(|e| e.len() >= 2 && e.chars().all(|c| c.is_ascii_alphanumeric()))
+            == Some(true)
+            && w.contains('.');
+        if has_sep && has_ext {
+            return Some(w.to_string());
+        }
+    }
+    None
+}
+
+
 fn shape_problems(item: &Item) -> Vec<Refusal> {
     let mut problems = Vec::new();
     if item.kind == Kind::Rule && item.bindings.is_empty() {
@@ -577,6 +615,45 @@ fn shape_problems(item: &Item) -> Vec<Refusal> {
         problems.push(Refusal::new(
             format!("a {:?} has no falsifier - nothing says what observation would prove it wrong", item.kind),
             "add a falsifier: one sentence naming the observation that would make this fact false, or write it as a Report instead if it never goes stale",
+        ));
+    }
+    // Ground 11: a heavy rule must have been ASKED whether it can refuse.
+    //
+    // Not "must have teeth" - plenty of real rules have nothing literal to
+    // catch, and forcing a check on those would be the compensating knob R9
+    // forbids. The refusal is about the QUESTION being answered, and the
+    // answer "no" is a one-word tag. See `store::NO_LITERAL_TAG` for the
+    // measurement that showed nothing in the system ever asked.
+    //
+    // This fires on revise as well as declare, and that is the point: it is
+    // the only path by which rules written before the question existed ever
+    // get asked it. A rule nobody touches is never asked, which is the honest
+    // limit - a fact you never revisit is a fact you never learn anything new
+    // about.
+    // Severity OR a literal in its own text. Severity alone was too narrow,
+    // and the owner named the case on 2026-08-09: a new project's deploy rule
+    // that nobody thought to mark expensive gets no question at all, and then
+    // waits its turn behind every older rule in the backlog burn. A rule that
+    // spells out a command, a flag or a path is asked at the door instead,
+    // while the session that wrote it still knows what it meant.
+    let names_something = candidate_literal(&item.text).is_some();
+    if item.kind == Kind::Rule
+        && (matches!(item.severity, Some(Severity::Irreversible) | Some(Severity::Costly)) || names_something)
+        && item.check.is_none()
+        && !item.tags.iter().any(|t| {
+            t == crate::store::NO_LITERAL_TAG || t.starts_with(crate::store::ANSWER_GUARD_TAG_PREFIX)
+        })
+    {
+        problems.push(Refusal::new(
+            "this rule carries no check, so it can only inform while the mistake happens - and it is \
+             either marked expensive or names something concrete in its own text",
+            format!(
+                "answer one question: is there a text whose presence MEANS the mistake is happening? \
+                 If yes, add a check with that literal - forbidden for a command or for any file, \
+                 absent for one named file. If no (an authorised action looks identical to an \
+                 unauthorised one), tag it '{}' and it goes in as it is.",
+                crate::store::NO_LITERAL_TAG
+            ),
         ));
     }
     if item.kind.can_fire() {
@@ -1613,6 +1690,110 @@ mod tests {
         assert!(declare(&item).is_ok());
     }
 
+    /// Ground 11. The defect: a rule about something irreversible goes in
+    /// carrying nothing that can stop it, and nothing ever says a word. On the
+    /// real store that was 209 heavy rules and zero of them could refuse.
+    #[test]
+    fn a_heavy_rule_with_no_check_is_refused_until_the_question_is_answered() {
+        let mut item = base(Kind::Rule);
+        item.bindings = vec![Binding::Always];
+        item.severity = Some(Severity::Irreversible);
+        item.check = None;
+        let err = declare(&item).unwrap_err();
+        assert!(err.problem.contains("no check"), "names what is missing: {}", err.problem);
+        assert!(err.fix.contains(crate::store::NO_LITERAL_TAG), "names the way out: {}", err.fix);
+    }
+
+    #[test]
+    fn a_costly_rule_is_asked_the_same_question_as_an_irreversible_one() {
+        let mut item = base(Kind::Rule);
+        item.bindings = vec![Binding::Always];
+        item.severity = Some(Severity::Costly);
+        assert!(declare(&item).is_err());
+    }
+
+    #[test]
+    fn answering_no_lets_a_heavy_rule_in_exactly_as_it_is() {
+        let mut item = base(Kind::Rule);
+        item.bindings = vec![Binding::Always];
+        item.severity = Some(Severity::Irreversible);
+        item.tags = vec![crate::store::NO_LITERAL_TAG.to_string()];
+        assert!(
+            declare(&item).is_ok(),
+            "a rule with nothing literal to catch is legitimate - the tag records that it was asked"
+        );
+    }
+
+    /// The third honest answer, and the one the owner's own reporting rule
+    /// needed: a rule about what gets SAID is enforced by the response guard,
+    /// not by a check. Naming the guard entry says more than "nothing to catch
+    /// here" - it says where the catching happens, and it goes stale loudly if
+    /// that entry is ever removed.
+    #[test]
+    fn naming_the_answer_guard_entry_is_also_an_answer() {
+        let mut item = base(Kind::Rule);
+        item.bindings = vec![Binding::Always];
+        item.severity = Some(Severity::Costly);
+        item.tags = vec!["answer-guard:no-percentage-points".to_string()];
+        assert!(declare(&item).is_ok(), "enforced elsewhere is an answer, not a missing one");
+    }
+
+    #[test]
+    fn answering_yes_lets_a_heavy_rule_in_with_its_teeth() {
+        let mut item = base(Kind::Rule);
+        item.bindings = vec![Binding::Always];
+        item.severity = Some(Severity::Irreversible);
+        item.check = Some(Check::Forbidden { literals: vec!["--force".to_string()] });
+        assert!(declare(&item).is_ok());
+    }
+
+    /// The ground must stay narrow. A house-style rule and an unrated rule are
+    /// not what this is for, and widening it to them would be the compensating
+    /// knob R9 forbids.
+    #[test]
+    fn a_light_or_unrated_rule_is_never_asked() {
+        let mut light = base(Kind::Rule);
+        light.bindings = vec![Binding::Always];
+        light.severity = Some(Severity::HouseStyle);
+        assert!(declare(&light).is_ok(), "house style is not what this ground is about");
+
+        let mut unrated = base(Kind::Rule);
+        unrated.bindings = vec![Binding::Always];
+        unrated.severity = None;
+        assert!(declare(&unrated).is_ok(), "an unrated rule claims nothing about cost");
+    }
+
+    /// The one automatic route from the light majority into this ground, and
+    /// the owner asked for it by name on 2026-08-09: "how do I know that a
+    /// fact which later deserves the gate actually gets there?"
+    ///
+    /// It gets there the moment somebody calls it expensive. Nothing in this
+    /// system decides that FOR them - a light fact nobody re-rates stays light
+    /// and silent forever, which is the honest limit - but the instant the
+    /// re-rating is written, the question is asked before the write lands.
+    /// Without this test that guarantee rests on `revise` happening to call
+    /// `declare` first, which is an implementation detail, not a promise.
+    #[test]
+    fn raising_an_existing_light_rule_to_heavy_asks_the_question_before_it_lands() {
+        let mut light = base(Kind::Rule);
+        light.bindings = vec![Binding::Always];
+        light.severity = Some(Severity::HouseStyle);
+        assert!(declare(&light).is_ok(), "fixture sanity: it goes in as it stands");
+
+        let mut now_heavy = light.clone();
+        now_heavy.severity = Some(Severity::Costly);
+        let err = revise(&light, &now_heavy).unwrap_err();
+        assert!(
+            err.problem.contains("no check"),
+            "calling a fact expensive must trigger the teeth question: {}",
+            err.problem
+        );
+
+        let mut answered = now_heavy.clone();
+        answered.tags = vec![crate::store::NO_LITERAL_TAG.to_string()];
+        assert!(revise(&light, &answered).is_ok(), "and answering it lets the re-rating through");
+    }
+
     #[test]
     fn a_report_needs_no_falsifier_it_already_has_an_expiry() {
         let mut item = base(Kind::Report);
@@ -2566,7 +2747,14 @@ mod tests {
             "Verifieer voor elke publicatie met scripts/check-private-data.sh plus een strikte grep die 0 geeft.",
             "Bindt een service op een LAN-IP, voeg dan een extra binding toe in docker-compose.yml.",
         ] {
-            assert!(declare(&global(Kind::Rule, text)).is_ok(), "must stay writable: {text}");
+            // Ground 11 asks any rule that names something concrete whether it
+            // can refuse. All three of these name a file and none of them can:
+            // "run this script" and "add this binding" are omissions, and an
+            // omission has no text whose presence betrays it. The tag is that
+            // answer, and it keeps this test about scope, which is its subject.
+            let mut item = global(Kind::Rule, text);
+            item.tags = vec![crate::store::NO_LITERAL_TAG.to_string()];
+            assert!(declare(&item).is_ok(), "must stay writable: {text}");
         }
     }
 

@@ -91,7 +91,9 @@ fn the_same_binary_does_print_a_block_when_nothing_is_wrong() {
             bindings: vec![model::item::Binding::Moment(intent::Action::Push)],
             severity: Some(model::item::Severity::Irreversible),
             project: None,
-            tags: vec![],
+            // Gate ground 11: this test is about the hook failing open, and the
+            // rule is bound to a moment with no literal to catch.
+            tags: vec![model::store::NO_LITERAL_TAG.to_string()],
             expires: None,
             key: None,
             falsifier: Some("a force-push to main lands clean with nobody reverting it".to_string()),

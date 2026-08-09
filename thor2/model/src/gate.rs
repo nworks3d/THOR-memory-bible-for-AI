@@ -548,12 +548,76 @@ fn find_line_number_reference(text: &str) -> Option<String> {
 /// anything is appended to the log; `store::revise` calls this too (a
 /// revise must still satisfy every ground a fresh declaration would) and
 /// then layers the field-preservation check on top (ground 9).
-pub fn declare(item: &Item) -> Result<(), Refusal> {
+/// Every SHAPE problem an item has, not just the first.
+///
+/// WHY THIS COLLECTS INSTEAD OF RETURNING EARLY. Measured on a throwaway
+/// install, 2026-08-09: a newcomer's very first fact took four attempts,
+/// because each refusal named one missing thing at a time - no binding, then
+/// still no binding, then no falsifier. Every message was clear and the
+/// sequence was still discouraging, and this is the first thing anyone
+/// experiences of the gate.
+///
+/// Only grounds that are INDEPENDENT of each other live here: fixing any one
+/// of them cannot change the verdict on another, so listing them together is
+/// honest. The grounds that interact - a target binding's own validity, a
+/// check's shape, the project/anchor pair - keep first-wins, because there a
+/// combined list could name a problem that disappears once the first is fixed.
+///
+/// A single problem returns byte-identical to what it always did. The wording
+/// only changes when there really are several.
+fn shape_problems(item: &Item) -> Vec<Refusal> {
+    let mut problems = Vec::new();
     if item.kind == Kind::Rule && item.bindings.is_empty() {
-        return Err(Refusal::new(
+        problems.push(Refusal::new(
             "a Rule with no binding can never fire",
             "give it at least one binding: Moment(<action>), a Target, or Always",
         ));
+    }
+    if item.kind.can_fire() && item.falsifier.as_deref().map(str::trim).unwrap_or("").is_empty() {
+        problems.push(Refusal::new(
+            format!("a {:?} has no falsifier - nothing says what observation would prove it wrong", item.kind),
+            "add a falsifier: one sentence naming the observation that would make this fact false, or write it as a Report instead if it never goes stale",
+        ));
+    }
+    if item.kind.can_fire() {
+        let len = item.text.chars().count();
+        if len > MAX_TEXT_CHARS {
+            problems.push(Refusal::new(
+                format!("the text is {len} characters, over the {MAX_TEXT_CHARS}-character limit for a {:?}", item.kind),
+                format!("shorten the text to at most {MAX_TEXT_CHARS} characters; move the reasoning into a Report instead"),
+            ));
+        }
+    }
+    problems
+}
+
+/// Several shape problems as one refusal, numbered, so a writer fixes them in
+/// a single pass instead of discovering them one attempt at a time.
+fn combined(problems: Vec<Refusal>) -> Refusal {
+    let count = problems.len();
+    // Both halves carry every entry, and the PROBLEM half carries the original
+    // problem sentences verbatim. That is load-bearing:
+    // `serve::migrate::classify_refusal` labels a refusal by matching fixed
+    // template wording in `problem`, so hiding the sentences in `fix` would
+    // silently reclassify every multi-problem item as unrecognised. Only the
+    // three independent shape grounds reach here, and none of them interpolates
+    // a user-supplied value, so this cannot leak a path or a host into a label.
+    let problems_text: Vec<String> =
+        problems.iter().enumerate().map(|(i, r)| format!("({}) {}", i + 1, r.problem)).collect();
+    let fixes_text: Vec<String> =
+        problems.iter().enumerate().map(|(i, r)| format!("({}) {}", i + 1, r.fix)).collect();
+    Refusal::new(
+        format!("this item has {count} problems, all fixable in one pass: {}", problems_text.join("; ")),
+        fixes_text.join("; "),
+    )
+}
+
+pub fn declare(item: &Item) -> Result<(), Refusal> {
+    let problems = shape_problems(item);
+    match problems.len() {
+        0 => {}
+        1 => return Err(problems.into_iter().next().expect("length checked")),
+        _ => return Err(combined(problems)),
     }
     if item.kind != Kind::Report && item.expires.is_some() {
         // Only a Report has a short operational life. The other three last until
@@ -580,15 +644,6 @@ pub fn declare(item: &Item) -> Result<(), Refusal> {
     // action" (see MAX_TEXT_CHARS's own doc comment) - which is exactly
     // Kind::can_fire's definition of "reaches a gate", so this reuses it
     // rather than re-listing Rule/Orientation itself.
-    if item.kind.can_fire() {
-        let len = item.text.chars().count();
-        if len > MAX_TEXT_CHARS {
-            return Err(Refusal::new(
-                format!("the text is {len} characters, over the {MAX_TEXT_CHARS}-character limit for a {:?}", item.kind),
-                format!("shorten the text to at most {MAX_TEXT_CHARS} characters; move the reasoning into a Report instead"),
-            ));
-        }
-    }
     // GROUND 11: a line number is a snapshot of the file's shape at write
     // time, and the file keeps moving. Measured on 3 real cases, all 3 were
     // wrong within a week (a fact named line 93; the truth was line 95; a
@@ -658,12 +713,6 @@ pub fn declare(item: &Item) -> Result<(), Refusal> {
     // carry one (see `revise`'s field-preservation check below) but is never
     // required to: a Report already has its own expiry, and a Lookup/Chunk is
     // an archive fact answered by an explicit request, not a standing claim.
-    if item.kind.can_fire() && item.falsifier.as_deref().map(str::trim).unwrap_or("").is_empty() {
-        return Err(Refusal::new(
-            format!("a {:?} has no falsifier - nothing says what observation would prove it wrong", item.kind),
-            "add a falsifier: one sentence naming the observation that would make this fact false, or write it as a Report instead if it never goes stale",
-        ));
-    }
     // GROUND 12: a check is a claim that an item can be proven CURRENT right
     // now, and only a Rule or Orientation is ever served at a gate where
     // "is this still current" matters - the same reason ground 3 refuses a
@@ -1324,6 +1373,43 @@ mod tests {
     }
 
     // --------------------------------------------------------- ground 1
+
+    /// THE EXPERIENCE THIS FIXES. Measured on a throwaway install,
+    /// 2026-08-09: a newcomer's first fact took four attempts, because the
+    /// gate named one missing thing per attempt. No binding, fix that, still
+    /// no binding, fix that, no falsifier. Every message was clear and the
+    /// sequence still taught someone that this tool is hostile.
+    ///
+    /// Independent problems are now listed together. A SINGLE problem must
+    /// still read exactly as it always did, which the rest of this module's
+    /// tests already pin.
+    #[test]
+    fn several_independent_problems_are_named_in_one_refusal() {
+        let mut item = base(Kind::Rule);
+        item.bindings = vec![];
+        item.falsifier = None;
+        item.text = "x".repeat(MAX_TEXT_CHARS + 1);
+
+        let refusal = declare(&item).expect_err("three problems must refuse");
+        let whole = format!("{refusal}");
+        assert!(whole.contains("3 problems"), "{whole}");
+        assert!(whole.contains("no binding"), "{whole}");
+        assert!(whole.contains("no falsifier"), "{whole}");
+        assert!(whole.contains("over the"), "the length problem must be named too: {whole}");
+    }
+
+    /// One problem is still one message, word for word. The combined form is
+    /// only for when there really are several - otherwise every existing
+    /// caller and every reader would have to learn a new shape for nothing.
+    #[test]
+    fn a_single_problem_is_reported_exactly_as_before() {
+        let mut item = base(Kind::Rule);
+        item.bindings = vec![];
+
+        let refusal = declare(&item).expect_err("one problem must refuse");
+        assert_eq!(refusal.problem, "a Rule with no binding can never fire");
+        assert!(!format!("{refusal}").contains("problems"), "no list wording for a single problem");
+    }
 
     #[test]
     fn a_rule_with_no_binding_is_refused() {

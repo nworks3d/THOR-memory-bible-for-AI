@@ -195,6 +195,35 @@ So stay in one conversation while you are on one piece of work. Start a fresh
 one on purpose - because you have moved on to something else, or because this
 one has talked itself into a corner - not because it is getting long.
 
+## What the first week actually looks like
+
+Worth knowing before you start, because the beginning is the least impressive
+part and it is easy to conclude too early that nothing is happening.
+
+**Day one, it stops nothing.** A fresh memory holds four starting notes and
+nothing else. The part of THOR that can refuse a wrong change only works on
+notes that carry a proof, and you have not written any yet. So on the first day
+you get four notes at the start of a conversation and a nudge at the end, and no
+refusals at all. That is not a fault; there is simply nothing yet to refuse
+with.
+
+**Your first note will probably be turned down.** It asks for two things most
+people leave out: when the note should come back to you, and what would show it
+had gone wrong. The refusal names everything that is missing at once and says
+what to write instead, so the second attempt usually lands. It is strict on
+purpose - a note nobody can ever prove wrong is a note that quietly stops being
+true.
+
+**The value arrives once you have notes about real places.** A note tied to a
+file, a folder or a command comes back exactly when you touch that thing. A
+handful of those is worth more than fifty general ones, and after a week or two
+of writing them down as you go, your assistant stops asking you the same
+questions.
+
+Then check what you have built with `doctor`. It tells you plainly how much of
+your memory can actually stop a wrong change, how often it has, and which parts
+nothing ever re-reads.
+
 ## Does it work?
 
 Use it for a week and see whether your assistant stops asking you the same

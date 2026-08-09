@@ -1214,8 +1214,27 @@ impl ThorMcpServer {
             if hits.is_empty() {
                 out.push_str(&format!("no matches for '{query}'\n"));
             }
-            for hit in &hits {
+            // A CAP, AND IT SAYS SO. Reported from a real session and
+            // reproduced: a single common word returned 270,000 characters
+            // across 797 items, which the caller's own transport then cut off
+            // at an arbitrary point. An answer that has to be truncated by
+            // something downstream is not an answer, and a silent truncation
+            // reads as "that is all there is".
+            //
+            // The whole set is still reachable - narrow the query, or ask for
+            // one by id with get - and the line below says exactly how much is
+            // not shown, because a cap nobody is told about is the same defect
+            // in a politer form.
+            const MAX_HITS: usize = 25;
+            for hit in hits.iter().take(MAX_HITS) {
                 out.push_str(&format!("{} ({:?}): {}\n", hit.id, hit.item.kind, hit.item.text));
+            }
+            if hits.len() > MAX_HITS {
+                out.push_str(&format!(
+                    "({} more match(es) not shown, of {} in total. Add a word to narrow it, or ask for one by id with get.)\n",
+                    hits.len() - MAX_HITS,
+                    hits.len()
+                ));
             }
             if withheld > 0 {
                 out.push_str(&format!(

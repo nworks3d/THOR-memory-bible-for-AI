@@ -69,13 +69,40 @@ fn is_expired(item: &Item, today: &str) -> bool {
 pub fn search_with_expired(store: &EventStore, query: &str) -> (Vec<LookupHit>, usize) {
     let q = query.to_lowercase();
     let today = today();
-    let matched: Vec<LookupHit> = live_items(store)
+    let words: Vec<String> = q.split_whitespace().map(str::to_string).collect();
+
+    let candidates: Vec<LookupHit> = live_items(store)
         .into_iter()
         .filter(|li| li.item.kind != Kind::Lookup)
-        .filter(|li| {
-            li.item.text.to_lowercase().contains(&q) || li.item.tags.iter().any(|t| t.to_lowercase().contains(&q))
-        })
         .map(|li| LookupHit { id: li.id, item: li.item })
+        .collect();
+
+    let phrase_hit: Vec<bool> = candidates.iter().map(|h| haystack_contains(h, &q)).collect();
+    let any_phrase = phrase_hit.iter().any(|hit| *hit);
+
+    // THE DEFECT THIS CLOSES, reported from a real session and reproduced
+    // here: the whole query was matched as ONE substring, so a natural
+    // multi-word search found nothing at all. "release checklist launch"
+    // returned zero while every word appeared in the store, and the only
+    // queries that worked were single distinctive words - which then returned
+    // hundreds. Search was all or nothing.
+    //
+    // The fallback requires EVERY word the caller typed, in any order. That is
+    // an AND, not an OR: it can never return an item missing one of their
+    // words, and it only runs when the phrase match already found nothing, so
+    // it can never change or reorder a result that already worked.
+    let use_all_words = !any_phrase && words.len() > 1;
+    let matched: Vec<LookupHit> = candidates
+        .into_iter()
+        .zip(phrase_hit)
+        .filter(|(h, on_phrase)| {
+            if use_all_words {
+                words.iter().all(|w| haystack_contains(h, w))
+            } else {
+                *on_phrase
+            }
+        })
+        .map(|(h, _)| h)
         .collect();
 
     let total = matched.len();
@@ -83,6 +110,14 @@ pub fn search_with_expired(store: &EventStore, query: &str) -> (Vec<LookupHit>, 
     let withheld = total - hits.len();
     hits.sort_by(|a, b| a.id.cmp(&b.id));
     (hits, withheld)
+}
+
+/// Does this item's text or any of its tags contain `needle`, already
+/// lowercased by the caller? The one place the haystack is defined, so the
+/// phrase pass and the all-words fallback can never search different fields.
+fn haystack_contains(hit: &LookupHit, needle: &str) -> bool {
+    hit.item.text.to_lowercase().contains(needle)
+        || hit.item.tags.iter().any(|t| t.to_lowercase().contains(needle))
 }
 
 /// The other door: an explicit request for exactly one `Lookup`'s key, from
@@ -685,6 +720,49 @@ mod tests {
             },
             check: None,
         }
+    }
+
+    /// THE DEFECT THIS CLOSES, reported from a real session and reproduced:
+    /// the whole query was matched as one substring, so a natural multi-word
+    /// search found nothing while every word appeared in the store. Search was
+    /// all or nothing - a phrase gave zero, a single common word gave hundreds.
+    #[test]
+    fn a_multi_word_query_finds_an_item_carrying_all_the_words() {
+        let mut store = EventStore::in_memory().unwrap();
+        let item = item("release-note", Kind::Report, "Werk de checklist bij voor je een release doet, en pas dan de launch", None);
+        store::declare(&mut store, "s", "l", "t", &item).unwrap();
+
+        // The words are all there, in a different order, never as this phrase.
+        let hits = search(&store, "release checklist launch");
+        assert_eq!(hits.len(), 1, "every word is present, so it must be found");
+        assert_eq!(hits[0].id, "release-note");
+    }
+
+    /// It is an AND, never an OR: an item missing one of the caller's words is
+    /// not a match. Widening to "any word" would turn every search into a
+    /// dump, which is the other half of the defect above.
+    #[test]
+    fn a_multi_word_query_never_matches_an_item_missing_one_of_the_words() {
+        let mut store = EventStore::in_memory().unwrap();
+        let item = item("partial", Kind::Report, "Werk de checklist bij voor je een release doet", None);
+        store::declare(&mut store, "s", "l", "t", &item).unwrap();
+
+        assert!(search(&store, "release checklist launch").is_empty(), "launch is missing, so this is not a match");
+    }
+
+    /// The fallback runs ONLY when the phrase found nothing, so it can never
+    /// change or widen a search that already worked.
+    #[test]
+    fn an_exact_phrase_match_is_never_widened_by_the_fallback() {
+        let mut store = EventStore::in_memory().unwrap();
+        let exact = item("exact", Kind::Report, "de release checklist hangt aan de launch", None);
+        store::declare(&mut store, "s", "l", "t", &exact).unwrap();
+        let scattered = item("scattered", Kind::Report, "checklist eerst, launch later, release ergens", None);
+        store::declare(&mut store, "s", "l", "t", &scattered).unwrap();
+
+        let hits = search(&store, "release checklist");
+        assert_eq!(hits.len(), 1, "the phrase matched, so the all-words pass must not run");
+        assert_eq!(hits[0].id, "exact");
     }
 
     #[test]

@@ -570,7 +570,7 @@ fn hook_once(db_path: &Path) -> Option<HookOutput> {
         // person who wrote the fact still knows what it was for, and tomorrow
         // nobody does.
         if let Some(reason) =
-            EventStore::open_existing(db_path).ok().and_then(|s| crowding_debt(&s, &session_id))
+            EventStore::open_existing(db_path).ok().and_then(|s| crowding_debt(&s, db_path, &session_id))
         {
             return Some(HookOutput::Decision(
                 serde_json::json!({ "decision": "block", "reason": reason }),
@@ -641,6 +641,13 @@ fn hook_once(db_path: &Path) -> Option<HookOutput> {
             // `INJECTION-FRAMING.md`'s own addendum and
             // `payload_is_from_a_subagent`'s doc comment, which now gates the
             // three surfaces that actually DO fire inside a subagent).
+            // Where the log stands right now, so the crowding debt at Stop can
+            // tell what THIS session wrote from what was already there. It
+            // cannot use the session id for that: every write through the tool
+            // server is stamped with a constant, never the caller's own
+            // session - see `crowding_debt`.
+            record_session_watermark(db_path, &session_id);
+
             let candidates = serve::live::always_candidates(&store);
             let decay = DecayContext::load(&store);
             let items = serve::decay::retain_live(
@@ -931,6 +938,44 @@ fn capture_stop_check(db_path: &Path, session_id: &str) -> Option<HookOutput> {
     }
 }
 
+/// Where this session's watermark lives: the store's tip as it stood when the
+/// session began, keyed by session id, in a sidecar beside the store - the
+/// same shape and the same place as every other per-session marker this
+/// binary keeps.
+fn watermark_path(db: &Path) -> std::path::PathBuf {
+    db.parent().unwrap_or_else(|| Path::new(".")).join("session-watermark.json")
+}
+
+/// Record where the log stood when this session started, once. Called from the
+/// SessionStart arm; best effort, like every sidecar here - a watermark that
+/// cannot be written means the crowding debt stays quiet, never that a turn
+/// breaks.
+fn record_session_watermark(db_path: &Path, session_id: &str) {
+    let Ok(store) = EventStore::open_existing(db_path) else { return };
+    let Ok((tip, _)) = store.contiguous_tip() else { return };
+    let path = watermark_path(db_path);
+    let mut marks: std::collections::BTreeMap<String, i64> = std::fs::read_to_string(&path)
+        .ok()
+        .and_then(|t| serde_json::from_str(&t).ok())
+        .unwrap_or_default();
+    // Never move a watermark that already exists: a session start that fires
+    // twice (a resume, a compact) must not forgive what was written between.
+    marks.entry(session_id.to_string()).or_insert(tip);
+    if let Ok(text) = serde_json::to_string(&marks) {
+        let _ = std::fs::write(&path, text);
+    }
+}
+
+/// Where the log stood when this session started, or `None` when no watermark
+/// was ever recorded for it. `None` means silence, deliberately: a session
+/// whose start was never seen (an older install, a hook that failed to write)
+/// must not be handed every crowded fact in the store as though it made them.
+fn session_watermark(db_path: &Path, session_id: &str) -> Option<i64> {
+    let text = std::fs::read_to_string(watermark_path(db_path)).ok()?;
+    let marks: std::collections::BTreeMap<String, i64> = serde_json::from_str(&text).ok()?;
+    marks.get(session_id).copied()
+}
+
 /// The crowded facts THIS session wrote and has not dealt with.
 ///
 /// WHY THIS IS FORCED AND THE EVALUATION IS NOT. The write response already
@@ -946,24 +991,36 @@ fn capture_stop_check(db_path: &Path, session_id: &str) -> Option<HookOutput> {
 /// BEFORE that older debt because this answer decays - the person who wrote
 /// the fact still knows what it was for, and tomorrow nobody does.
 ///
-/// IT CARRIES NO STATE OF ITS OWN, and that is deliberate. The log already
-/// knows which items this session wrote, and `capacity` is a pure function of
-/// the store as it stands now. So the debt clears by construction the moment
-/// the fact is folded away, re-anchored somewhere with room, or retracted -
-/// there is no marker to go stale and no sidecar to drift.
+/// WHAT "THIS SESSION" MEANS HERE, AND WHY IT IS NOT THE SESSION ID. A first
+/// version filtered events on `session_id` and was UNREACHABLE in real use:
+/// every write through the tool server is stamped with the constant "mcp"
+/// (`mcp::SESSION_ID`), never the caller's own session, so the Stop hook -
+/// which does know the real one - matched nothing and the debt never fired.
+/// Its unit tests passed because they handed the same id to both sides. Found
+/// by a real session running the test end to end and reporting that step 2
+/// simply did not block.
 ///
-/// It only ever asks about what YOU made. A session that stores nothing never
-/// sees it, and it never turns into a backlog nag about somebody else's mess.
-fn crowding_debt(store: &EventStore, session_id: &str) -> Option<String> {
+/// So the boundary is a WATERMARK: the store's tip as it stood when this
+/// session started (`session_watermark`). Anything written above it was
+/// written during this session, whoever stamped it.
+///
+/// Beyond that watermark it holds no state. `capacity` is a pure function of
+/// the store as it stands now, so the debt clears by construction the moment
+/// the fact is folded away, re-anchored somewhere with room, or retracted.
+///
+/// It only ever asks about what THIS session made. A session that stores
+/// nothing never sees it, and it never becomes a backlog nag about older mess.
+fn crowding_debt(store: &EventStore, db_path: &Path, session_id: &str) -> Option<String> {
     use thor_core::event_store::EventKind;
+    let since = session_watermark(db_path, session_id)?;
     let events = store.get_all_events().ok()?;
 
-    // Written here, in this session: a declare or a revise. Retractions are
-    // read too, because retracting IS one of the three ways out.
+    // Written during this session: a declare or a revise above the watermark.
+    // Retractions are read too, because retracting IS one of the three ways out.
     let mut written: Vec<String> = Vec::new();
     let mut settled: std::collections::HashSet<String> = Default::default();
     for e in &events {
-        if e.session_id != session_id {
+        if e.seq <= since {
             continue;
         }
         match e.kind {
@@ -988,8 +1045,8 @@ fn crowding_debt(store: &EventStore, session_id: &str) -> Option<String> {
             continue;
         };
         return Some(format!(
-            "[THOR] '{id}' was stored this session onto a place that is already full, so it will              probably never be read there. The memory said so when you wrote it. Deal with it              before ending the turn, in this order: (1) FOLD it - if an existing item almost says              the same thing, revise that one to carry your point and retract yours; (2) RE-ANCHOR              it - if it is really about a narrower file or command than the one it hangs on, move              it there with revise; (3) LEAVE IT and say why - sometimes the place is honestly full              of heavier things, and then that is the answer, but say which ones hold it. What you              never do is raise its severity to make it visible: that pushes a heavier warning out              to show a lighter one. The note said: {note} The item says: {}",
-            item.text
+            "[THOR] '{id}' was stored this session onto a place that is already full, so it will probably never be read there. The memory said so when you wrote it. Deal with it before ending the turn, in this order: (1) FOLD it - if an existing item almost says the same thing, revise that one to carry your point and retract yours; (2) RE-ANCHOR it - if it is really about a narrower file or command than the one it hangs on, move it there with revise; (3) LEAVE IT and say why - sometimes the place is honestly full of heavier things, and then that is the answer, but say which ones hold it. What you never do is raise its severity to make it visible: that pushes a heavier warning out to show a lighter one. The note said: {note} The item says: {}",
+ item.text
         ));
     }
     None
@@ -1779,11 +1836,15 @@ mod judgement_debt_tests {
     /// people feel like it, which is the same defect the useful-mark had.
     #[test]
     fn a_fact_written_onto_a_full_place_holds_the_turn() {
-        let mut store = EventStore::in_memory().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("t.db");
+        let mut store = EventStore::new(&db).unwrap();
         crowd_a_moment(&mut store, "p");
-        model::store::declare(&mut store, "now", "now", "t", &crowded_newcomer("mine", "p")).unwrap();
+        // What SessionStart does: mark where the log stood when we began.
+        record_session_watermark(&db, "now");
+        model::store::declare(&mut store, "mcp", "mcp", "t", &crowded_newcomer("mine", "p")).unwrap();
 
-        let asked = crowding_debt(&store, "now").expect("a crowded write must hold the turn");
+        let asked = crowding_debt(&store, &db, "now").expect("a crowded write must hold the turn");
         assert!(asked.contains("mine"), "{asked}");
         assert!(asked.contains("FOLD"), "it must say what to do, not just that something is wrong: {asked}");
         assert!(asked.contains("never do is raise its severity"), "{asked}");
@@ -1793,45 +1854,58 @@ mod judgement_debt_tests {
     /// session that wrote nothing crowded ends silently.
     #[test]
     fn an_earlier_sessions_crowded_fact_is_never_this_sessions_debt() {
-        let mut store = EventStore::in_memory().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("t.db");
+        let mut store = EventStore::new(&db).unwrap();
         crowd_a_moment(&mut store, "p");
-        model::store::declare(&mut store, "yesterday", "yesterday", "t", &crowded_newcomer("theirs", "p")).unwrap();
+        // Written BEFORE this session began - the watermark is taken after it.
+        model::store::declare(&mut store, "mcp", "mcp", "t", &crowded_newcomer("theirs", "p")).unwrap();
+        record_session_watermark(&db, "today");
 
-        assert!(crowding_debt(&store, "today").is_none(), "a fresh session inherits no debt");
-        assert!(crowding_debt(&store, "yesterday").is_some(), "fixture sanity: the writer does owe it");
+        assert!(crowding_debt(&store, &db, "today").is_none(), "a fresh session inherits no older mess");
+        assert!(
+            crowding_debt(&store, &db, "never-started").is_none(),
+            "a session whose start was never seen must stay silent, never inherit everything"
+        );
     }
 
     /// IT CARRIES NO STATE, so it clears by construction. Retracting the fact
     /// is one of the three ways out, and nothing has to be told about it.
     #[test]
     fn retracting_the_crowded_fact_clears_the_debt_with_nothing_to_update() {
-        let mut store = EventStore::in_memory().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("t.db");
+        let mut store = EventStore::new(&db).unwrap();
         crowd_a_moment(&mut store, "p");
-        model::store::declare(&mut store, "now", "now", "t", &crowded_newcomer("mine", "p")).unwrap();
-        assert!(crowding_debt(&store, "now").is_some(), "fixture sanity");
+        record_session_watermark(&db, "now");
+        model::store::declare(&mut store, "mcp", "mcp", "t", &crowded_newcomer("mine", "p")).unwrap();
+        assert!(crowding_debt(&store, &db, "now").is_some(), "fixture sanity");
 
-        model::store::retract(&mut store, "now", "now", "t", "mine", "folded into the item that already said it")
+        model::store::retract(&mut store, "mcp", "mcp", "t", "mine", "folded into the item that already said it")
             .unwrap();
-        assert!(crowding_debt(&store, "now").is_none(), "folding it away settles it, with no marker to update");
+        assert!(crowding_debt(&store, &db, "now").is_none(), "folding it away settles it, with no marker to update");
     }
 
     /// The other way out: move it somewhere with room. Same story - the debt
     /// is derived from the store as it stands, so re-anchoring settles it.
     #[test]
     fn re_anchoring_it_somewhere_with_room_clears_the_debt() {
-        let mut store = EventStore::in_memory().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("t.db");
+        let mut store = EventStore::new(&db).unwrap();
         crowd_a_moment(&mut store, "p");
+        record_session_watermark(&db, "now");
         let mine = crowded_newcomer("mine", "p");
-        model::store::declare(&mut store, "now", "now", "t", &mine).unwrap();
-        assert!(crowding_debt(&store, "now").is_some(), "fixture sanity");
+        model::store::declare(&mut store, "mcp", "mcp", "t", &mine).unwrap();
+        assert!(crowding_debt(&store, &db, "now").is_some(), "fixture sanity");
 
         let mut moved = mine.clone();
         moved.bindings = vec![Binding::Target {
             kind: model::item::TargetKind::Path,
             value: "server/lib/labels.js".to_string(),
         }];
-        model::store::revise(&mut store, "now", "now", "t", &mine, &moved).unwrap();
-        assert!(crowding_debt(&store, "now").is_none(), "a place with room settles it");
+        model::store::revise(&mut store, "mcp", "mcp", "t", &mine, &moved).unwrap();
+        assert!(crowding_debt(&store, &db, "now").is_none(), "a place with room settles it");
     }
 
 

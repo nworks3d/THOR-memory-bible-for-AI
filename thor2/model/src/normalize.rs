@@ -70,6 +70,65 @@ mod tests {
         assert_eq!(normalize_target("src/Main.RS"), "src/main.rs");
     }
 
+    /// THE DEFECT THIS PREVENTS, measured on the owner's real store: a fact
+    /// describing an offline backup folder had fired 51 times against the
+    /// local git checkout that happened to end in the same directory name.
+    /// Comparing only the final segment collapsed every path to its filename.
+    #[test]
+    fn a_backup_folder_does_not_match_a_checkout_of_the_same_name() {
+        use crate::item::TargetKind::Path;
+        assert!(!target_matches(
+            Path,
+            r"\server\homes\owner\projects\Some-Repo",
+            Path,
+            "C:/Users/someone/dev/Some-Repo"
+        ));
+        // Two different files that merely share a filename: also no longer a
+        // match, which is the same collapse one level down.
+        assert!(!target_matches(Path, "a/orders.js", Path, "b/orders.js"));
+        assert!(!target_matches(Path, "server/lib/orders.js", Path, "worker/lib/orders.js"));
+    }
+
+    /// THE LIMIT, pinned rather than hidden. A repo-relative anchor means
+    /// "<root>/server/lib/orders.js", but this function never sees the root,
+    /// so it cannot tell that apart from a nested copy at
+    /// "<root>/worker/server/lib/orders.js" - the nested one genuinely ends
+    /// with the anchor. Deciding it would mean threading the project root into
+    /// every comparison, which is a real change and not a tidy-up.
+    ///
+    /// It is strictly better than what it replaced, which matched on the
+    /// filename alone. If this ever starts returning false, someone taught the
+    /// matcher about roots - update this test on purpose.
+    #[test]
+    fn a_nested_copy_of_the_same_relative_path_still_matches() {
+        use crate::item::TargetKind::Path;
+        assert!(target_matches(Path, "server/lib/orders.js", Path, "worker/server/lib/orders.js"));
+    }
+
+    /// What must keep working, and why the comparison cannot simply be
+    /// equality: an item is anchored at a repo-relative path while the input
+    /// carries the absolute one.
+    #[test]
+    fn a_relative_anchor_still_matches_the_absolute_path_it_names() {
+        use crate::item::TargetKind::Path;
+        assert!(target_matches(Path, "server/lib/orders.js", Path, "C:/Users/x/dev/repo/server/lib/orders.js"));
+        assert!(target_matches(Path, r"server\lib\orders.js", Path, "C:/USERS/x/Server/Lib/Orders.js"));
+        // Either direction, since which side is longer is not fixed.
+        assert!(target_matches(Path, "C:/x/y/server/lib/orders.js", Path, "server/lib/orders.js"));
+        // A single-segment anchor keeps its old reach; the write gate is what
+        // refuses new items anchored on a bare role name.
+        assert!(target_matches(Path, "orders.js", Path, "C:/x/server/lib/orders.js"));
+    }
+
+    /// The separator requirement, which is what stops "ends with this path"
+    /// from quietly becoming "shares these last letters".
+    #[test]
+    fn a_shared_filename_ending_is_not_a_path_suffix() {
+        use crate::item::TargetKind::Path;
+        assert!(!target_matches(Path, "orders.js", Path, "C:/x/my-orders.js"));
+        assert!(!target_matches(Path, "lib/orders.js", Path, "C:/x/sublib/orders.js"));
+    }
+
     #[test]
     fn is_idempotent() {
         let once = normalize_target(r"  C:\Repo\Foo.rs  ");
@@ -79,15 +138,43 @@ mod tests {
 }
 
 /// Same target, decided in the ONE place normalisation lives
-/// (`model::normalize`): equal once normalised, or equal by their last path
-/// segment (an item bound to a full path still fires when the input names it
-/// by its bare file/command name, and vice versa - see `normalize::last_segment`'s
-/// own doc comment, which describes exactly this comparison).
+/// (`model::normalize`): equal once normalised, or one is a SUFFIX of the
+/// other on a path-segment boundary.
+///
+/// WHY A SUFFIX AND NOT THE LAST SEGMENT ALONE. An item is normally anchored
+/// at a repo-relative path while the input carries the absolute one, so the
+/// comparison has to survive a prefix it has never seen. Comparing only the
+/// final segment did that, and far more besides: it collapsed every path to
+/// its filename, so `a/orders.js` matched `b/orders.js`, and an anchor on a
+/// backup folder matched any checkout ending in the same directory name.
+///
+/// Measured on the owner's store, 2026-08-09: a fact describing an offline
+/// backup folder had fired 51 times against the local git checkout of the same
+/// name. The fact was true, the anchor looked reasonable, and the matcher put
+/// it somewhere it had no business being. Nothing reported it - it took a
+/// person reading one judgement request.
+///
+/// This is a NARROWING, which is the safe direction for a rule that decides
+/// where a fact appears: everything it still matches, it matched before. A
+/// single-segment anchor keeps matching any path ending in it; that looseness
+/// is real, and the write gate already refuses new items anchored on a bare
+/// role name.
 pub fn target_matches(item_kind: crate::item::TargetKind, item_value: &str, in_kind: crate::item::TargetKind, in_value: &str) -> bool {
     if item_kind != in_kind {
         return false;
     }
     let a = normalize_target(item_value);
     let b = normalize_target(in_value);
-    a == b || last_segment(&a) == last_segment(&b)
+    a == b || ends_on_segment_boundary(&a, &b) || ends_on_segment_boundary(&b, &a)
+}
+
+/// Does `longer` end with `shorter`, with a path separator immediately before
+/// it? The separator requirement is what stops `.../my-orders.js` from reading
+/// as though it ended with `orders.js`: a bare `ends_with` on the two strings
+/// would silently turn "ends with this path" into "shares these last letters".
+fn ends_on_segment_boundary(longer: &str, shorter: &str) -> bool {
+    if shorter.is_empty() || longer.len() <= shorter.len() {
+        return false;
+    }
+    longer.ends_with(shorter) && longer.as_bytes()[longer.len() - shorter.len() - 1] == b'/'
 }

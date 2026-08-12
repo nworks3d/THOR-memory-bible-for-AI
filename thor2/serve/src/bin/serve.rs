@@ -311,6 +311,10 @@ fn decay_notice(store: &EventStore, db: &Path, cwd: Option<&Path>) -> Option<Str
 
     let (mut dead, mut failing) = (0usize, 0usize);
     let mut found: Vec<absent_guard::StaleFinding> = Vec::new();
+    // Every item whose check this pass actually RAN. That is the set whose
+    // recovery this scan is entitled to record - see `record_stale_text` for
+    // the day a healed proof went on being reported as broken.
+    let mut scanned_ids: Vec<String> = Vec::new();
     for li in serve::live::live_items(store).iter().filter(|li| li.item.kind.can_fire()) {
         if li.item.project.as_deref() != Some(project.as_str()) {
             continue;
@@ -326,7 +330,11 @@ fn decay_notice(store: &EventStore, db: &Path, cwd: Option<&Path>) -> Option<Str
             }
         }
         if let Some(check) = li.item.check.as_ref() {
-            if model::check::run(check, &root) == model::check::Outcome::Fails {
+            let outcome = model::check::run(check, &root);
+            if outcome != model::check::Outcome::CannotRun {
+                scanned_ids.push(li.id.clone());
+            }
+            if outcome == model::check::Outcome::Fails {
                 failing += 1;
                 // A proof that RAN and came out false is the strongest thing
                 // this system can say about a stored fact: it is provably out
@@ -339,6 +347,20 @@ fn decay_notice(store: &EventStore, db: &Path, cwd: Option<&Path>) -> Option<Str
                     file: root.display().to_string(),
                 });
             }
+        }
+    }
+    // Clear first, and BEFORE the early return below: a scan that finds
+    // everything healthy is exactly the scan that has something to retract.
+    if let Ok(next_seq) = store.get_next_seq() {
+        let stale_path = absent_guard::default_stale_path(db);
+        let existing = std::fs::read_to_string(&stale_path).ok();
+        if let Some(text) = absent_guard::record_stale_text(
+            existing.as_deref(),
+            &found,
+            &scanned_ids,
+            next_seq.saturating_sub(1),
+        ) {
+            let _ = std::fs::write(&stale_path, text);
         }
     }
     if dead == 0 && failing == 0 {
@@ -360,17 +382,6 @@ fn decay_notice(store: &EventStore, db: &Path, cwd: Option<&Path>) -> Option<Str
     // as settled once it has been revised or retracted. Only FAILING proofs
     // go in - a dead anchor means a fact fires nowhere, which is bad but is
     // not evidence that it is wrong, and some of them are dead on purpose.
-    if !found.is_empty() {
-        if let Ok(next_seq) = store.get_next_seq() {
-            let stale_path = absent_guard::default_stale_path(db);
-            let existing = std::fs::read_to_string(&stale_path).ok();
-            if let Some(text) =
-                absent_guard::record_stale_text(existing.as_deref(), &found, next_seq.saturating_sub(1))
-            {
-                let _ = std::fs::write(&stale_path, text);
-            }
-        }
-    }
 
     let _ = std::fs::write(&stamp, &today);
     Some(format!(
@@ -1558,14 +1569,15 @@ fn record_absent_guard_staleness(
     let mut findings = absent_guard::stale_in_location(location_candidates, file_path, root);
     findings.extend(absent_guard::stale_in_content(ranked, file_path, root));
     findings.extend(absent_guard::stale_in_dir_content(location_candidates, file_path, root));
-    if findings.is_empty() {
-        return;
-    }
+    // Every id this pass looked at, so one that has recovered is dropped
+    // instead of being reported for the rest of its life.
+    let scanned: Vec<String> =
+        location_candidates.iter().map(|li| li.id.clone()).chain(ranked.iter().map(|r| r.id.clone())).collect();
     let Ok(next_seq) = store.get_next_seq() else { return };
     let now_seq = next_seq.saturating_sub(1);
     let stale_path = absent_guard::default_stale_path(db_path);
     let existing = std::fs::read_to_string(&stale_path).ok();
-    if let Some(text) = absent_guard::record_stale_text(existing.as_deref(), &findings, now_seq) {
+    if let Some(text) = absent_guard::record_stale_text(existing.as_deref(), &findings, &scanned, now_seq) {
         let _ = std::fs::write(&stale_path, text);
     }
 }
@@ -1673,14 +1685,12 @@ fn record_command_guard_staleness(
     root: Option<&Path>,
 ) {
     let findings = absent_guard::stale_in_command(command_candidates, command, root);
-    if findings.is_empty() {
-        return;
-    }
+    let scanned: Vec<String> = command_candidates.iter().map(|li| li.id.clone()).collect();
     let Ok(next_seq) = store.get_next_seq() else { return };
     let now_seq = next_seq.saturating_sub(1);
     let stale_path = absent_guard::default_stale_path(db_path);
     let existing = std::fs::read_to_string(&stale_path).ok();
-    if let Some(text) = absent_guard::record_stale_text(existing.as_deref(), &findings, now_seq) {
+    if let Some(text) = absent_guard::record_stale_text(existing.as_deref(), &findings, &scanned, now_seq) {
         let _ = std::fs::write(&stale_path, text);
     }
 }

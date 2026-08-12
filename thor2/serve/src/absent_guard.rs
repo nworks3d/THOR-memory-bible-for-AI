@@ -1451,11 +1451,78 @@ pub fn stale_in_command(items: &[LiveItem], command: &str, root: Option<&Path>) 
 /// nothing new to fold in at all (`findings` is empty), so a caller with
 /// nothing to record never has to reason about "write back what I just
 /// read, unchanged".
-pub fn record_stale_text(existing_text: Option<&str>, findings: &[StaleFinding], now_seq: i64) -> Option<String> {
-    if findings.is_empty() {
+/// `scanned` is every id this pass actually looked at. An id that was looked at
+/// and is NOT among the findings has recovered, and its record is dropped.
+///
+/// THE DEFECT THIS CLOSES, reported from a fresh session on 2026-08-10. This
+/// function used to return early on an empty finding list and never removed
+/// anything, so a proof that once came out false stayed on file forever. The
+/// owner's own AGENTS.md rule was reported as broken for hours after the word
+/// it forbids had already been taken out - the daily scan agreed it was fine,
+/// and the sidecar went on saying otherwise. A guard that cries wolf about a
+/// healthy rule is worse than one that says nothing: the next real finding
+/// arrives to a reader who has learned to dismiss it.
+///
+/// Only ids in `scanned` are dropped. A record for an item this pass never
+/// examined is left exactly as it was, because "not looked at" and "looked at
+/// and healthy" are different answers and this file must not confuse them.
+
+#[cfg(test)]
+mod recovery_tests {
+    use super::*;
+
+    fn finding(id: &str) -> StaleFinding {
+        StaleFinding {
+            id: id.to_string(),
+            outcome: StaleOutcome::Failed,
+            check: "Absent { path: \"NOTES.md\", literal: \"TODO\" }".to_string(),
+            file: "NOTES.md".to_string(),
+        }
+    }
+
+    /// THE DEFECT, reported from a fresh session on 2026-08-10: a proof that
+    /// once came out false was reported for hours after it had been fixed,
+    /// because nothing ever took the record back out.
+    #[test]
+    fn a_proof_that_healed_is_dropped_when_the_scan_sees_it_pass() {
+        let seen = vec!["r1".to_string()];
+        let recorded = record_stale_text(None, &[finding("r1")], &seen, 5).unwrap();
+        assert!(recorded.contains("r1"), "fixture sanity");
+
+        let cleared = record_stale_text(Some(&recorded), &[], &seen, 9)
+            .expect("a scan that clears something must write the file");
+        assert!(!cleared.contains("r1"), "a healed proof must not stay on file: {cleared}");
+    }
+
+    /// "Not looked at" is not "healthy". A pass that never examined an item
+    /// leaves its record alone, or a narrow scan would erase what a broad one
+    /// found.
+    #[test]
+    fn an_item_this_pass_never_looked_at_keeps_its_record() {
+        let recorded = record_stale_text(None, &[finding("r1")], &["r1".to_string()], 5).unwrap();
+        let after = record_stale_text(Some(&recorded), &[], &["other".to_string()], 9);
+        assert!(after.is_none(), "nothing to add and nothing to drop means nothing to write");
+    }
+
+    #[test]
+    fn a_clean_scan_with_an_empty_file_still_writes_nothing() {
+        assert!(record_stale_text(None, &[], &["r1".to_string()], 5).is_none());
+    }
+}
+
+pub fn record_stale_text(
+    existing_text: Option<&str>,
+    findings: &[StaleFinding],
+    scanned: &[String],
+    now_seq: i64,
+) -> Option<String> {
+    let mut records = existing_text.map(read_stale).unwrap_or_default();
+    let before = records.len();
+    records.retain(|id, _| !scanned.contains(id) || findings.iter().any(|f| &f.id == id));
+    let dropped = before - records.len();
+    if findings.is_empty() && dropped == 0 {
         return None;
     }
-    let mut records = existing_text.map(read_stale).unwrap_or_default();
     for finding in findings {
         match records.get_mut(&finding.id) {
             Some(existing) => {
@@ -3315,8 +3382,9 @@ mod tests {
             check: "Absent { path: \"NOTES.md\", literal: \"forbidden\" }".to_string(),
             file: "NOTES.md".to_string(),
         };
-        let text1 = record_stale_text(None, std::slice::from_ref(&finding), 5).unwrap();
-        let text2 = record_stale_text(Some(&text1), std::slice::from_ref(&finding), 9).unwrap();
+        let seen = vec![finding.id.clone()];
+        let text1 = record_stale_text(None, std::slice::from_ref(&finding), &seen, 5).unwrap();
+        let text2 = record_stale_text(Some(&text1), std::slice::from_ref(&finding), &seen, 9).unwrap();
 
         let records = read_stale(&text2);
         assert_eq!(records.len(), 1, "must stay one row, never a duplicate");

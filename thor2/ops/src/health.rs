@@ -286,14 +286,55 @@ pub fn proof_line(db: &Path) -> String {
 /// Needs `--checkouts`, for the same reason `orphan_projects_line` does: an
 /// anchor is relative to a project's own working copy, and this refuses to
 /// guess where that is.
+/// One rotted item, NAMED.
+///
+/// THE DEFECT THIS CLOSES, reported by an agent on 2026-08-14 after it went
+/// looking. This check knew exactly which item was broken - it holds the id
+/// in its own loop - and returned a number. The line then said "run doctor to
+/// see them", and doctor said "8". Nothing anywhere could turn that 8 into a
+/// list: not `audit` (counts), not `anchorprobe` (wants the file you are
+/// trying to find), not the MCP tools (they work per id, and the id is what
+/// you do not have). The only route left was reading the SQLite store by
+/// hand, around the whole tool. A number that names a problem and hides the
+/// subject is not a report, it is a rumour.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Rot {
+    pub id: String,
+    pub project: String,
+    /// The anchor that points at nothing, or the proof that came out false.
+    pub what: String,
+}
+
 /// The result of trying to check decay: either it could not be checked at
-/// all (and why), or it was, with counts. The one place that computes decay
-/// - shared by `decay_line` (prose, every project under `checkouts`) and
-/// `gate_verdict` (pass/fail, optionally narrowed to one project).
+/// all (and why), or it was, and every rotted item is named. The one place
+/// that computes decay - shared by `decay_line` (prose, every project under
+/// `checkouts`) and `gate_verdict` (pass/fail, optionally narrowed to one
+/// project).
 enum DecayCheck {
     StoreUnreadable,
     NoCheckouts,
-    Counted { dead: usize, failing: usize, judged: usize },
+    Counted { dead: Vec<Rot>, failing: Vec<Rot>, judged: usize },
+}
+
+/// How many rotted items the decay line names before it stops. Enough that a
+/// normal repair session needs no second surface, small enough that a sweep
+/// of 128 does not bury every other line in the report - and whatever it
+/// holds back, it says so out loud rather than reading as the whole list.
+const DECAY_NAMES_AT_MOST: usize = 20;
+
+/// The rotted items as text, one per line, indented under their own line.
+fn name_rot(label: &str, rot: &[Rot]) -> Vec<String> {
+    let mut out = Vec::new();
+    for r in rot.iter().take(DECAY_NAMES_AT_MOST) {
+        out.push(format!("  {label}: {} [{}] {}", r.id, r.project, r.what));
+    }
+    if rot.len() > DECAY_NAMES_AT_MOST {
+        out.push(format!(
+            "  {label}: and {} more, not named here",
+            rot.len() - DECAY_NAMES_AT_MOST
+        ));
+    }
+    out
 }
 
 /// For every live, fireable item whose project resolves to a checkout under
@@ -326,7 +367,7 @@ fn decay_check(db: &Path, checkouts: Option<&Path>, project_filter: Option<&str>
     }
 
     let items = serve::live::live_items(&store);
-    let (mut dead, mut failing, mut judged) = (0usize, 0usize, 0usize);
+    let (mut dead, mut failing, mut judged) = (Vec::new(), Vec::new(), 0usize);
     for li in items.iter().filter(|li| li.item.kind.can_fire()) {
         let Some(project) = li.item.project.as_deref() else { continue };
         if let Some(only) = project_filter {
@@ -351,13 +392,25 @@ fn decay_check(db: &Path, checkouts: Option<&Path>, project_filter: Option<&str>
                     continue;
                 }
                 if !base.join(value.replace('\\', "/")).exists() {
-                    dead += 1;
+                    dead.push(Rot {
+                        id: li.id.clone(),
+                        project: project.to_string(),
+                        what: value.clone(),
+                    });
                 }
             }
         }
         if let Some(check) = li.item.check.as_ref() {
             if model::check::run(check, base) == model::check::Outcome::Fails {
-                failing += 1;
+                failing.push(Rot {
+                    id: li.id.clone(),
+                    project: project.to_string(),
+                    // The check's own Debug form. Deliberately not a hand-written
+                    // sentence per kind: a description that has to be kept in
+                    // step with the enum is a description that goes stale, and
+                    // this one only has to say enough to find the thing.
+                    what: format!("{check:?}"),
+                });
             }
         }
     }
@@ -373,12 +426,24 @@ pub fn decay_line(db: &Path, checkouts: Option<&Path>) -> String {
         DecayCheck::Counted { judged: 0, .. } => {
             "decay: no project under --checkouts answers to any item's key, nothing checked".to_string()
         }
-        DecayCheck::Counted { dead: 0, failing: 0, judged } => {
-            format!("decay: none - every anchor of {judged} project-scoped item(s) resolves, every proof holds")
+        // Both live arms say WHOSE rot this is. The session-start notice
+        // counts the repository you are standing in and this counts every
+        // project under --checkouts, so the two numbers legitimately differ -
+        // and until 2026-08-14 neither line said which it was, which read as
+        // the tool contradicting itself.
+        DecayCheck::Counted { dead, failing, judged } if dead.is_empty() && failing.is_empty() => {
+            format!("decay: none - across every project under --checkouts, every anchor of {judged} project-scoped item(s) resolves and every proof holds")
         }
-        DecayCheck::Counted { dead, failing, judged } => format!(
-            "decay: {dead} anchor(s) point at nothing (those facts fire NOWHERE) and {failing} proof(s) now come out FALSE, across {judged} project-scoped item(s)"
-        ),
+        DecayCheck::Counted { dead, failing, judged } => {
+            let mut out = vec![format!(
+                "decay: {} anchor(s) point at nothing (those facts fire NOWHERE) and {} proof(s) now come out FALSE, across {judged} project-scoped item(s) in every project under --checkouts - each one named below; repair with revise (the file moved) or retract (the fact went with it)",
+                dead.len(),
+                failing.len()
+            )];
+            out.extend(name_rot("dead anchor", &dead));
+            out.extend(name_rot("false proof", &failing));
+            out.join("\n")
+        }
     }
 }
 
@@ -908,7 +973,7 @@ pub fn gate_verdict(db: &Path, checkouts: Option<&Path>, project: Option<&str>) 
     let chain_broken = !chain_intact(&events);
     let decay_finding = matches!(
         decay_check(db, checkouts, project),
-        DecayCheck::Counted { dead, failing, .. } if dead > 0 || failing > 0
+        DecayCheck::Counted { dead, failing, .. } if !dead.is_empty() || !failing.is_empty()
     );
     if chain_broken || decay_finding {
         GateVerdict::Failing

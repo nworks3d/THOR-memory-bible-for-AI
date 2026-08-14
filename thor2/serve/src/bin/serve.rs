@@ -397,7 +397,7 @@ fn decay_notice(store: &EventStore, db: &Path, cwd: Option<&Path>) -> Option<Str
     let doctor = sibling("doctor").unwrap_or_else(|| PathBuf::from("doctor"));
     let checkouts = root.parent().unwrap_or(&root);
     Some(format!(
-        "[THOR] {project}: {dead} anchor(s) point at a file that is not there, so those facts fire nowhere, and {failing} proof(s) now come out false. Run `\"{}\" --db \"{}\" --checkouts \"{}\"` to see them, or ask me to repair them.",
+        "[THOR] {project}: {dead} anchor(s) point at a file that is not there, so those facts fire nowhere, and {failing} proof(s) now come out false. Run `\"{}\" --db \"{}\" --checkouts \"{}\"` to see each one named on the decay line, then repair per id with revise (the file moved) or retract (the fact went with it). That report counts EVERY project under the checkouts directory, so its two numbers are larger than this line's, which counts only {project}.",
         doctor.display(), db.display(), checkouts.display()
     ))
 }

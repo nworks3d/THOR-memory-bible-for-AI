@@ -322,17 +322,23 @@ enum DecayCheck {
 /// holds back, it says so out loud rather than reading as the whole list.
 const NAMES_AT_MOST: usize = 20;
 
+/// How many to name: the readable default, or every one of them when the
+/// caller asked for the whole list (`doctor --full`) - a cleanup needs all of
+/// them, and reading the store by hand to get them is the detour this report
+/// exists to remove.
+fn name_cap(full: bool) -> usize {
+    if full { usize::MAX } else { NAMES_AT_MOST }
+}
+
 /// The rotted items as text, one per line, indented under their own line.
-fn name_rot(label: &str, rot: &[Rot]) -> Vec<String> {
+fn name_rot(label: &str, rot: &[Rot], full: bool) -> Vec<String> {
+    let cap = name_cap(full);
     let mut out = Vec::new();
-    for r in rot.iter().take(NAMES_AT_MOST) {
+    for r in rot.iter().take(cap) {
         out.push(format!("  {label}: {} [{}] {}", r.id, r.project, r.what));
     }
-    if rot.len() > NAMES_AT_MOST {
-        out.push(format!(
-            "  {label}: and {} more, not named here",
-            rot.len() - NAMES_AT_MOST
-        ));
+    if rot.len() > cap {
+        out.push(format!("  {label}: and {} more, not named here (use --full)", rot.len() - cap));
     }
     out
 }
@@ -429,7 +435,7 @@ fn decay_check(db: &Path, checkouts: Option<&Path>, project_filter: Option<&str>
     DecayCheck::Counted { dead, failing, judged }
 }
 
-pub fn decay_line(db: &Path, checkouts: Option<&Path>) -> String {
+pub fn decay_line(db: &Path, checkouts: Option<&Path>, full: bool) -> String {
     match decay_check(db, checkouts, None) {
         DecayCheck::StoreUnreadable => "decay: store unreadable, not checked".to_string(),
         DecayCheck::NoCheckouts => {
@@ -452,8 +458,8 @@ pub fn decay_line(db: &Path, checkouts: Option<&Path>) -> String {
                 dead.len(),
                 failing.len()
             )];
-            out.extend(name_rot("dead anchor", &dead));
-            out.extend(name_rot("false proof", &failing));
+            out.extend(name_rot("dead anchor", &dead, full));
+            out.extend(name_rot("false proof", &failing, full));
             out.join("\n")
         }
     }
@@ -837,7 +843,7 @@ pub fn gate_line(db: &Path) -> String {
     out.join("\n")
 }
 
-pub fn crowding_line(db: &Path, checkouts: Option<&Path>) -> String {
+pub fn crowding_line(db: &Path, checkouts: Option<&Path>, full: bool) -> String {
     let Ok(store) = EventStore::open_existing(db) else {
         return "crowding: store unreadable, not checked".to_string();
     };
@@ -949,13 +955,13 @@ pub fn crowding_line(db: &Path, checkouts: Option<&Path>) -> String {
     if settled > 0 {
         out.push(format!("  outranked: {settled} of them already judged as crowded on purpose, not listed"));
     }
-    for (id, where_lost) in never_won.iter().take(NAMES_AT_MOST) {
+    for (id, where_lost) in never_won.iter().take(name_cap(full)) {
         out.push(format!("  outranked: {id} at {where_lost}"));
     }
-    if never_won.len() > NAMES_AT_MOST {
+    if never_won.len() > name_cap(full) {
         out.push(format!(
             "  outranked: and {} more, not named here",
-            never_won.len() - NAMES_AT_MOST
+            never_won.len() - name_cap(full)
         ));
     }
     out.join("\n")
@@ -968,6 +974,7 @@ pub fn report(
     replica: Option<(&str, &str)>,
     model_dir: Option<&Path>,
     checkouts: Option<&Path>,
+    full: bool,
 ) -> Vec<String> {
     vec![
         store_line(db),
@@ -978,8 +985,8 @@ pub fn report(
         gate_line(db),
         teeth_line(db),
         pinned_line(db),
-        decay_line(db, checkouts),
-        crowding_line(db, checkouts),
+        decay_line(db, checkouts, full),
+        crowding_line(db, checkouts, full),
         unjudged_line(db),
         semantic_line(model_dir),
         orphan_projects_line(db, checkouts),
@@ -1331,7 +1338,7 @@ mod tests {
         {
             let _ = EventStore::new(&db).unwrap();
         }
-        let lines = report(&db, None, None, None, None, None);
+        let lines = report(&db, None, None, None, None, None, false);
         assert!(lines.iter().any(|l| l.starts_with("gate:")), "{lines:#?}");
     }
 
@@ -1343,7 +1350,7 @@ mod tests {
             let mut s = EventStore::new(&db).unwrap();
             store::declare(&mut s, "s", "l", "a", &rule("prose-only")).unwrap();
         }
-        let lines = report(&db, None, None, None, None, None);
+        let lines = report(&db, None, None, None, None, None, false);
         assert!(
             lines.iter().any(|l| l.starts_with("provable rules:")),
             "the health check must report proof coverage every run: {lines:?}"
@@ -1374,7 +1381,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let db = dir.path().join("t.db");
         EventStore::new(&db).unwrap();
-        let lines = report(&db, None, None, None, None, None);
+        let lines = report(&db, None, None, None, None, None, false);
         assert_eq!(lines.len(), 13);
         assert!(lines[0].starts_with("memory store:"));
         assert!(lines[1].starts_with("code index:"));
@@ -1405,7 +1412,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let db = dir.path().join("t.db");
         EventStore::new(&db).unwrap();
-        assert!(crowding_line(&db, None).contains("--checkouts"), "{}", crowding_line(&db, None));
+        assert!(crowding_line(&db, None, false).contains("--checkouts"), "{}", crowding_line(&db, None, false));
     }
 
     /// The empty case has to read as an answer, not as a failure: a store whose
@@ -1418,7 +1425,7 @@ mod tests {
         EventStore::new(&db).unwrap();
         let checkouts = dir.path().join("checkouts");
         std::fs::create_dir_all(&checkouts).unwrap();
-        let line = crowding_line(&db, Some(&checkouts));
+        let line = crowding_line(&db, Some(&checkouts), false);
         assert!(line.starts_with("crowding:"), "{line}");
         assert!(!line.contains("--checkouts"), "a checkout WAS given: {line}");
     }

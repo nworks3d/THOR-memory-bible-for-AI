@@ -44,6 +44,13 @@ struct Cli {
     /// Ignored without --gate.
     #[arg(long)]
     project: Option<String>,
+    /// Name every finding instead of the first twenty. The capped lists keep a
+    /// daily report readable; a cleanup needs the whole list, and until
+    /// 2026-08-15 there was no way to get it - the only route was reading the
+    /// store by hand, which is exactly the kind of detour this report exists to
+    /// remove.
+    #[arg(long)]
+    full: bool,
 }
 
 fn main() -> ExitCode {
@@ -64,7 +71,7 @@ fn main() -> ExitCode {
         _ => None,
     };
 
-    for line in ops::health::report(&cli.db, cli.index_db.as_deref(), cli.repo.as_deref(), replica, cli.model_dir.as_deref(), cli.checkouts.as_deref()) {
+    for line in ops::health::report(&cli.db, cli.index_db.as_deref(), cli.repo.as_deref(), replica, cli.model_dir.as_deref(), cli.checkouts.as_deref(), cli.full) {
         println!("{line}");
     }
 

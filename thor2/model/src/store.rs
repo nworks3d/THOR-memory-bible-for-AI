@@ -829,6 +829,23 @@ pub const ANSWER_GUARD_TAG_PREFIX: &str = "answer-guard:";
 /// can still block a wrong write, so archiving one would be throwing away the
 /// only enforcement this memory has. Settle or remove the check first if that
 /// is really what you mean.
+/// `root` is the checkout a check's own path is resolved against, and it is
+/// what lets this tell live protection from dead weight.
+///
+/// THE DEFECT THIS CLOSES, measured 2026-08-15. Retiring version 1 deleted the
+/// tree 120 items were anchored to. 53 archived cleanly; the other 67 carried a
+/// check, and the refusal below turned them away - so they stayed live, firing
+/// nowhere, counted as decay forever. Their checks inspect files that no longer
+/// exist: they cannot block anything, so refusing to archive them protected
+/// nothing and cost the only cleanup that was ever going to happen.
+///
+/// So the refusal now asks whether the check still has something to look AT.
+/// A `Forbidden` check names no file and reaches every write, so it is always
+/// live protection and always refused. Any other check whose own path still
+/// resolves inside `root` is refused exactly as before. Only a check pointing
+/// at something that is not there gives way - and `root: None` (nowhere to
+/// look) keeps the old, strict refusal, because a check that cannot be judged
+/// must never be assumed dead.
 pub fn archive(
     store: &mut EventStore,
     session_id: &str,
@@ -836,6 +853,7 @@ pub fn archive(
     actor: &str,
     entity_id: &str,
     reason: &str,
+    root: Option<&Path>,
 ) -> Result<Event, WriteError> {
     let reason = reason.trim();
     if reason.is_empty() {
@@ -866,13 +884,22 @@ pub fn archive(
             fix: "nothing to do - it does not claim to fire".to_string(),
         }));
     }
-    if existing.check.is_some() {
-        return Err(WriteError::Refused(Refusal {
-            problem: format!("'{entity_id}' carries a runnable check"),
-            fix: "a rule that can prove itself is the only kind that can ever block a wrong \
-                  write; settle or clear the check first if archiving it is really the intent"
-                .to_string(),
-        }));
+    if let Some(check) = existing.check.as_ref() {
+        // Still something to look at? See this function's own doc comment for
+        // the three cases and why only the third one gives way.
+        let still_live = match (crate::check::named_path(check), root) {
+            (None, _) => true,
+            (Some(_), None) => true,
+            (Some(named), Some(root)) => root.join(named.replace('\\', "/")).exists(),
+        };
+        if still_live {
+            return Err(WriteError::Refused(Refusal {
+                problem: format!("'{entity_id}' carries a runnable check"),
+                fix: "a rule that can prove itself is the only kind that can ever block a wrong \
+                      write; settle or clear the check first if archiving it is really the intent"
+                    .to_string(),
+            }));
+        }
     }
     if existing.tags.iter().any(|t| t == DELIBERATE_ANCHOR_TAG) {
         return Err(WriteError::Refused(Refusal {
@@ -888,6 +915,11 @@ pub fn archive(
     updated.kind = Kind::Report;
     updated.bindings = Vec::new(); // a Report may carry none, and must not
     updated.severity = None; // meaningless once it cannot fire
+    // A Report may carry no check (the gate refuses one), and the only checks
+    // that ever reach this line are the ones the refusal above already found
+    // dead - they inspect a file that is not there, so nothing is lost by
+    // dropping them here. The `archived:` tag says where they went.
+    updated.check = None;
     updated.tags.push(format!("archived:{reason}"));
 
     gate::declare(&updated).map_err(WriteError::Refused)?;
@@ -1554,7 +1586,7 @@ mod tests {
         item.project = Some("some-project".to_string());
         declare(&mut store, "s1", "l1", "test", &item).unwrap();
 
-        archive(&mut store, "s1", "l1", "test", "measured-thing", "the script it measured is gone").unwrap();
+        archive(&mut store, "s1", "l1", "test", "measured-thing", "the script it measured is gone", None).unwrap();
 
         let after = show(&store, "measured-thing").unwrap();
         assert_eq!(after.kind, Kind::Report, "it must stop being a kind that claims to fire");
@@ -1576,7 +1608,7 @@ mod tests {
         let mut store = EventStore::in_memory().unwrap();
         let item = sample_with("measured-thing", "that reranker failed both gates");
         declare(&mut store, "s1", "l1", "test", &item).unwrap();
-        archive(&mut store, "s1", "l1", "test", "measured-thing", "anchor gone").unwrap();
+        archive(&mut store, "s1", "l1", "test", "measured-thing", "anchor gone", None).unwrap();
 
         assert!(
             show(&store, "measured-thing").is_ok(),
@@ -1591,7 +1623,7 @@ mod tests {
         declare(&mut store, "s1", "l1", "test", &item).unwrap();
 
         assert!(matches!(
-            archive(&mut store, "s1", "l1", "test", "thing", "   "),
+            archive(&mut store, "s1", "l1", "test", "thing", "   ", None),
             Err(WriteError::Refused(_))
         ));
         assert_eq!(show(&store, "thing").unwrap().kind, Kind::Orientation, "a refused archive changes nothing");
@@ -1607,10 +1639,41 @@ mod tests {
         item.check = Some(Check::PathExists { path: "config/app.toml".to_string() });
         declare(&mut store, "s1", "l1", "test", &item).unwrap();
 
-        let err = archive(&mut store, "s1", "l1", "test", "provable", "anchor gone")
+        let err = archive(&mut store, "s1", "l1", "test", "provable", "anchor gone", None)
             .expect_err("a provable rule must not be archivable in one step");
         assert!(format!("{err:?}").contains("check"), "the refusal must name why: {err:?}");
         assert_eq!(show(&store, "provable").unwrap().kind, Kind::Orientation);
+    }
+
+    /// The other half, and the reason `root` exists at all (measured
+    /// 2026-08-15): a check whose own file was deleted protects nothing, so
+    /// refusing to archive it only kept 67 items alive that fire nowhere. With
+    /// a root to judge against, a live check still refuses and a dead one gives
+    /// way.
+    #[test]
+    fn archiving_allows_a_check_whose_file_is_gone_but_not_one_that_is_there() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("here.toml"), b"real").unwrap();
+
+        let mut store = EventStore::in_memory().unwrap();
+        let mut live = sample_with("still-there", "the config lives in here.toml");
+        live.check = Some(Check::PathExists { path: "here.toml".to_string() });
+        declare(&mut store, "s1", "l1", "test", &live).unwrap();
+        let mut dead = sample_with("file-gone", "the tree this one watched was deleted");
+        dead.check = Some(Check::Contains {
+            path: "gone/src/lib.rs".to_string(),
+            literal: "fn main".to_string(),
+        });
+        declare(&mut store, "s1", "l1", "test", &dead).unwrap();
+
+        assert!(
+            archive(&mut store, "s1", "l1", "test", "still-there", "tidying up", Some(dir.path()))
+                .is_err(),
+            "a check that can still inspect a real file is live protection"
+        );
+        archive(&mut store, "s1", "l1", "test", "file-gone", "the tree it watched is gone", Some(dir.path()))
+            .expect("a check pointing at nothing cannot block, so it must not block its own archive");
+        assert_eq!(show(&store, "file-gone").unwrap().kind, Kind::Report);
     }
 
     #[test]
@@ -1618,10 +1681,10 @@ mod tests {
         let mut store = EventStore::in_memory().unwrap();
         let item = sample_with("thing", "some fact");
         declare(&mut store, "s1", "l1", "test", &item).unwrap();
-        archive(&mut store, "s1", "l1", "test", "thing", "anchor gone").unwrap();
+        archive(&mut store, "s1", "l1", "test", "thing", "anchor gone", None).unwrap();
 
         assert!(matches!(
-            archive(&mut store, "s1", "l1", "test", "thing", "anchor gone"),
+            archive(&mut store, "s1", "l1", "test", "thing", "anchor gone", None),
             Err(WriteError::Refused(_))
         ));
         let after = show(&store, "thing").unwrap();
@@ -1644,7 +1707,7 @@ mod tests {
         item.tags = vec![DELIBERATE_ANCHOR_TAG.to_string()];
         declare(&mut store, "s1", "l1", "test", &item).unwrap();
 
-        let err = archive(&mut store, "s1", "l1", "test", "guards-secrets", "anchor resolves to nothing")
+        let err = archive(&mut store, "s1", "l1", "test", "guards-secrets", "anchor resolves to nothing", None)
             .expect_err("an anchor marked deliberate must survive any sweep");
         assert!(format!("{err:?}").contains("deliberately absent"), "the refusal must say why: {err:?}");
         assert!(show(&store, "guards-secrets").unwrap().kind.can_fire(), "it must still fire");
@@ -1655,7 +1718,7 @@ mod tests {
         let mut store = EventStore::in_memory().unwrap();
         let item = sample_with("guards-secrets", "this file is gitignored and must never be committed");
         declare(&mut store, "s1", "l1", "test", &item).unwrap();
-        archive(&mut store, "s1", "l1", "test", "guards-secrets", "swept by mistake").unwrap();
+        archive(&mut store, "s1", "l1", "test", "guards-secrets", "swept by mistake", None).unwrap();
 
         restore_deliberate_anchor(
             &mut store,
@@ -1679,7 +1742,7 @@ mod tests {
 
         // And now it is immune to the same mistake.
         assert!(matches!(
-            archive(&mut store, "s1", "l1", "test", "guards-secrets", "anchor resolves to nothing"),
+            archive(&mut store, "s1", "l1", "test", "guards-secrets", "anchor resolves to nothing", None),
             Err(WriteError::Refused(_))
         ));
     }
@@ -1702,9 +1765,9 @@ mod tests {
         declare(&mut store, "s1", "l1", "test", &item).unwrap();
 
         let long = "x".repeat(ARCHIVE_REASON_LIMIT + 1);
-        assert!(matches!(archive(&mut store, "s1", "l1", "test", "thing", &long), Err(WriteError::Refused(_))));
+        assert!(matches!(archive(&mut store, "s1", "l1", "test", "thing", &long, None), Err(WriteError::Refused(_))));
         assert!(matches!(
-            archive(&mut store, "s1", "l1", "test", "thing", "two, reasons"),
+            archive(&mut store, "s1", "l1", "test", "thing", "two, reasons", None),
             Err(WriteError::Refused(_))
         ));
     }

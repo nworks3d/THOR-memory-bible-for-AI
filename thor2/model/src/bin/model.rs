@@ -259,7 +259,18 @@ fn main() {
         }
         Command::Archive { id, reason, session_id, lineage_id, actor } => {
             let mut event_store = open_store(&cli.db);
-            match store::archive(&mut event_store, &session_id, &lineage_id, &actor, &id, &reason) {
+            // The checkout this ran in, so a check pointing at a file that is
+            // gone no longer blocks the archive - see `store::archive`.
+            let root = checkout_root();
+            match store::archive(
+                &mut event_store,
+                &session_id,
+                &lineage_id,
+                &actor,
+                &id,
+                &reason,
+                root.as_deref(),
+            ) {
                 Ok(event) => println!("archived {id} (seq {})", event.seq),
                 Err(e) => {
                     eprintln!("refused: {e}");

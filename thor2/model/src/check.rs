@@ -62,7 +62,7 @@ pub const MAX_CHECK_FILE_BYTES: u64 = 1_048_576;
 /// comment on `Check`). `run` below treats `None` as a complete answer in
 /// its own right and never reaches the root-resolution machinery this
 /// exists to feed.
-fn named_path(check: &Check) -> Option<&str> {
+pub fn named_path(check: &Check) -> Option<&str> {
     match check {
         Check::PathExists { path } => Some(path),
         Check::Contains { path, .. } => Some(path),

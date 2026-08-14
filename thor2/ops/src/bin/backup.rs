@@ -22,12 +22,28 @@ use thor_core::event_store::EventStore;
     about = "Export the event log into a git clone, then commit and push it"
 )]
 struct Cli {
-    /// Path to the store to back up.
+    /// Path to the store to back up, or - with --restore-from - the FRESH store
+    /// to rebuild into.
     #[arg(long)]
     db: PathBuf,
     /// Path to an existing git clone with an `origin` remote and a `main` branch.
+    /// Required for a backup; ignored when restoring.
     #[arg(long)]
-    repo: PathBuf,
+    repo: Option<PathBuf>,
+    /// Rebuild a store from an exported log instead of backing one up: point it
+    /// at an `events.jsonl` from this repo.
+    ///
+    /// WHY THIS FLAG EXISTS. `thor_core::backup::restore_jsonl` was written,
+    /// tested and reachable from nowhere: 2.0 could write a backup every session
+    /// and had no way on earth to read one back. A backup you cannot restore is
+    /// a promise, not a fallback - found 2026-08-15 while documenting the
+    /// restore steps and discovering there were none.
+    ///
+    /// Restores only into a store that does not exist yet or is empty, and
+    /// verifies every replayed hash against the recorded one, so a log that was
+    /// tampered with fails loudly instead of quietly becoming your memory.
+    #[arg(long = "restore-from")]
+    restore_from: Option<PathBuf>,
     /// Directory inside the repo to write into. One plain name, no slashes.
     #[arg(long, default_value = "thor2")]
     subdir: String,
@@ -41,6 +57,35 @@ struct Cli {
 fn main() -> ExitCode {
     let cli = Cli::parse();
 
+    // Restore mode, checked first: it is the one path that must work when the
+    // live store is gone, so it never opens an existing store.
+    if let Some(from) = &cli.restore_from {
+        let file = match std::fs::File::open(from) {
+            Ok(f) => f,
+            Err(e) => {
+                eprintln!("cannot read the exported log at {}: {e}", from.display());
+                return ExitCode::FAILURE;
+            }
+        };
+        let mut store = match EventStore::new(&cli.db) {
+            Ok(s) => s,
+            Err(e) => {
+                eprintln!("cannot create the store at {}: {e}", cli.db.display());
+                return ExitCode::FAILURE;
+            }
+        };
+        return match backup::restore_jsonl(&mut store, std::io::BufReader::new(file)) {
+            Ok(n) => {
+                println!("restored {n} events into {}", cli.db.display());
+                ExitCode::SUCCESS
+            }
+            Err(e) => {
+                eprintln!("restore failed: {e}");
+                ExitCode::FAILURE
+            }
+        };
+    }
+
     let store = match EventStore::open_existing(&cli.db) {
         Ok(store) => store,
         Err(e) => {
@@ -48,16 +93,20 @@ fn main() -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
-    if !cli.repo.join(".git").exists() {
+    let Some(repo) = cli.repo.clone() else {
+        eprintln!("--repo is required to back up (or pass --restore-from to rebuild a store instead)");
+        return ExitCode::FAILURE;
+    };
+    if !repo.join(".git").exists() {
         eprintln!(
             "{} is not a git clone (no .git) - point --repo at a clone that already has an origin",
-            cli.repo.display()
+            repo.display()
         );
         return ExitCode::FAILURE;
     }
 
     // A backup is a write and a declaration, so it fails loudly (CONTRACT R5).
-    match backup::backup_to_repo(&store, &cli.repo, &cli.subdir, cli.force) {
+    match backup::backup_to_repo(&store, &repo, &cli.subdir, cli.force) {
         Ok(line) => {
             println!("{line}");
             ExitCode::SUCCESS

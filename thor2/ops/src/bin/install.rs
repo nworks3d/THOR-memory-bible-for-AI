@@ -103,13 +103,24 @@ fn main() -> ExitCode {
 
     // A hook pointing at a binary that is not there fails OPEN: the agent
     // carries on and the memory simply never speaks again. Nothing reports
-    // that, so it is worth one line here while it is still fixable.
+    // that afterwards, and THIS is the only moment it is still visible - so it
+    // is a refusal, not a warning.
+    //
+    // A warning stood here until 2026-08-14. It went to stderr in the middle
+    // of a wall of "+ done" lines, which is precisely where an install that
+    // did not work hides: a newcomer reads the successes, restarts the agent,
+    // and owns a memory that will never speak to them. An installer that can
+    // see the failure and completes anyway is the same silent-failure class
+    // this whole system exists to refuse.
     if !serve_exe.exists() {
         eprintln!(
-            "warning: there is no file at {} - the hooks will be written, but until that binary \
-             exists the memory will stay silent without ever reporting an error",
+            "there is no file at {} - refusing to write hooks that call it. A hook fails open, so \
+             this would install quietly and stay broken: the agent carries on, the memory never \
+             speaks, and nothing ever reports it. Build it first (cargo build --release --features \
+             semantic, in thor2), or name the real one with --serve-exe.",
             serve_exe.display()
         );
+        return ExitCode::FAILURE;
     }
 
     println!("memory:       {}", db.display());

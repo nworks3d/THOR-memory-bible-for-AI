@@ -1115,6 +1115,26 @@ fn strip_invocation_wrapper(command: &str) -> String {
 /// to treat an empty string as a command at all, so this is defence in depth
 /// rather than a reachable case for a live item - the write gate already
 /// refuses an empty Target value).
+/// The ONE definition of "this rule's `Command` anchor names the command about
+/// to run", raw spelling or with its shell wrapper taken off - the composition
+/// `first_command_violation` always used inline, given a name so a second
+/// caller cannot drift from it.
+///
+/// THE DEFECT THIS CLOSES, reproduced against the real store on 2026-08-14.
+/// The blocking arm used this comparison; the SERVING path used
+/// `rank::target_matches`, which decides whole-string-or-path-segment
+/// equality. So a rule anchored to "gh repo edit" was served for a bare
+/// `gh repo edit` and stayed silent for `gh repo edit <repo> --visibility
+/// public` - the real invocation, the one it was written for. A whole binding
+/// kind quietly did not do what it says, and the store's most dangerous rule
+/// was in it. See this module's top-of-file doc comment for why the two
+/// comparisons exist at all; the fix is that command matching now has one
+/// definition, not that `target_matches` was wrong about paths.
+pub(crate) fn command_anchor_names(anchor: &str, command: &str) -> bool {
+    command_anchor_matches(anchor, command)
+        || command_anchor_matches(anchor, &strip_invocation_wrapper(command))
+}
+
 fn command_anchor_matches(anchor: &str, command: &str) -> bool {
     let anchor_words: Vec<String> = anchor.split_whitespace().map(str::to_lowercase).collect();
     if anchor_words.is_empty() {
@@ -1152,6 +1172,9 @@ fn first_command_violation<'a>(
         let Some(anchor) = command_bindings(&candidate.item)
             .into_iter()
             .find(|a| command_anchor_matches(a, command) || command_anchor_matches(a, &normalised))
+        // `command_anchor_names` is this same pair, and the serving path now
+        // calls it; the inline form is kept here only because `normalised` is
+        // hoisted out of the loop.
         else {
             continue;
         };

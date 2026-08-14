@@ -75,6 +75,23 @@ fn binding_matches(binding: &Binding, input: &ServeInput) -> bool {
     match binding {
         Binding::Always => false,
         Binding::Moment(action) => input.moments.contains(action),
+        // A Command binding is the one kind whose two sides are not the same
+        // sort of string: the rule declares a command ("gh repo edit"), the
+        // input carries a whole invocation ("gh repo edit x --visibility
+        // public"). `target_matches` compares those as paths - equality or a
+        // segment suffix - so a real, argument-bearing command essentially
+        // never matched, and every fact anchored to a command was silent at
+        // the exact moment it was written for. Reproduced against the real
+        // store on 2026-08-14 on the rule guarding repo visibility.
+        //
+        // The guard arm had already solved this and said so in its own doc
+        // comment; the serving path simply never used it. This is that one
+        // definition, not a second one - see
+        // `absent_guard::command_anchor_names`.
+        Binding::Target { kind: TargetKind::Command, value } => input
+            .targets
+            .iter()
+            .any(|(k, v)| *k == TargetKind::Command && crate::absent_guard::command_anchor_names(value, v)),
         Binding::Target { kind, value } => input
             .targets
             .iter()
@@ -364,6 +381,38 @@ mod tests {
             context: String::new(), project: None,
         };
         assert_eq!(select(&[c], &input).len(), 1);
+    }
+
+    /// THE DEFECT, reproduced against the real store on 2026-08-14 before it
+    /// was fixed here: a Command binding was compared the way a path is, so a
+    /// rule anchored to "gh repo edit" applied to a bare `gh repo edit` and
+    /// was SILENT for `gh repo edit <repo> --visibility public` - the only
+    /// form anyone actually types, and the one the rule exists for. A whole
+    /// binding kind that does not fire at its own moment is the worst failure
+    /// this system has, because nothing reports it.
+    #[test]
+    fn a_command_binding_fires_on_the_real_invocation_not_only_the_bare_words() {
+        let mut c = base("x4b", Kind::Rule);
+        c.item.bindings = vec![Binding::Target { kind: TargetKind::Command, value: "gh repo edit".to_string() }];
+        let with_args = ServeInput {
+            moments: vec![],
+            targets: vec![(TargetKind::Command, "gh repo edit nworks3d/x --visibility public".to_string())],
+            context: String::new(),
+            project: None,
+        };
+        assert_eq!(select(&[c.clone_for_test()], &with_args).len(), 1, "the arguments are the normal case");
+
+        // And the narrowness the guard arm already proved: a different
+        // subcommand is a different command, and a mention is not a run.
+        for miss in ["gh repo view nworks3d/x", "echo remember to gh repo edit later"] {
+            let input = ServeInput {
+                moments: vec![],
+                targets: vec![(TargetKind::Command, miss.to_string())],
+                context: String::new(),
+                project: None,
+            };
+            assert!(select(&[c.clone_for_test()], &input).is_empty(), "must not fire on: {miss}");
+        }
     }
 
     #[test]

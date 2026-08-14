@@ -34,6 +34,30 @@ no pressure, no paywall, everything stays open either way.
 
 *Prefer watching? The video above walks through what THOR is and why it exists.*
 
+## What it does
+
+**Remembers what you tell it.** A rule, a gotcha, a decision, the shape of the
+project. Once, in your own words. It stays until you change it.
+
+**Hands it back at the right moment.** Not a search box you have to remember.
+The note arrives while you are touching the file or running the command it is
+about, in a conversation that never heard it.
+
+**Stops a wrong change, not just warns about it.** A note carrying something
+checkable can refuse the write outright. Most notes only inform, and that is
+deliberate: a rule that blocks honest work is the most expensive thing this
+system can do.
+
+**Keeps projects apart.** Every project has its own memory. One repo's rules
+never leak into another.
+
+**Says when it has rotted.** It counts its own dead ends: notes pointing at
+files that moved, notes nothing ever reads, notes crowded out by louder ones.
+Out loud, in plain language, so you can fix them.
+
+**Stays on your machine.** No account, no key, no server. Nothing is sent
+anywhere, ever.
+
 ## What that looks like in practice
 
 Months ago you found out the hard way that this project is pinned to an older

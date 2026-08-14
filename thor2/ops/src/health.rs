@@ -320,18 +320,18 @@ enum DecayCheck {
 /// normal repair session needs no second surface, small enough that a sweep
 /// of 128 does not bury every other line in the report - and whatever it
 /// holds back, it says so out loud rather than reading as the whole list.
-const DECAY_NAMES_AT_MOST: usize = 20;
+const NAMES_AT_MOST: usize = 20;
 
 /// The rotted items as text, one per line, indented under their own line.
 fn name_rot(label: &str, rot: &[Rot]) -> Vec<String> {
     let mut out = Vec::new();
-    for r in rot.iter().take(DECAY_NAMES_AT_MOST) {
+    for r in rot.iter().take(NAMES_AT_MOST) {
         out.push(format!("  {label}: {} [{}] {}", r.id, r.project, r.what));
     }
-    if rot.len() > DECAY_NAMES_AT_MOST {
+    if rot.len() > NAMES_AT_MOST {
         out.push(format!(
             "  {label}: and {} more, not named here",
-            rot.len() - DECAY_NAMES_AT_MOST
+            rot.len() - NAMES_AT_MOST
         ));
     }
     out
@@ -385,7 +385,19 @@ fn decay_check(db: &Path, checkouts: Option<&Path>, project_filter: Option<&str>
         }
         judged += 1;
         for binding in &li.item.bindings {
-            if let model::item::Binding::Target { kind: model::item::TargetKind::Path, value } = binding {
+            // Path AND Dir. A fact anchored to a directory that no longer
+            // exists fires exactly as nowhere as one anchored to a deleted
+            // file, and this loop counted only the first kind: reported by a
+            // session on 2026-08-14 that had a dead Dir anchor in front of it
+            // while this line said zero. `proof_line`'s location arm above
+            // already treats the two kinds as one thing; this is the same
+            // pair, and leaving Dir out here made "no decay" mean "no decay
+            // among the anchors I happen to look at".
+            if let model::item::Binding::Target {
+                kind: model::item::TargetKind::Path | model::item::TargetKind::Dir,
+                value,
+            } = binding
+            {
                 // An absolute path is somewhere else on this machine, not in
                 // the checkout, so it is not this line's business.
                 if value.contains(':') || value.starts_with('/') || value.starts_with("\\\\") {
@@ -765,12 +777,16 @@ pub fn gate_line(db: &Path) -> String {
     };
     let mut refused = 0usize;
     let mut stood_aside = 0usize;
-    let mut rules: std::collections::BTreeSet<String> = Default::default();
+    let mut rules: std::collections::BTreeMap<String, usize> = Default::default();
+    let mut sessions: std::collections::BTreeMap<String, usize> = Default::default();
+    let mut actors: std::collections::BTreeMap<String, usize> = Default::default();
     for event in &events {
         match event.kind {
             thor_core::event_store::EventKind::GateRefused => {
                 refused += 1;
-                rules.insert(event.entity_id.clone());
+                *rules.entry(event.entity_id.clone()).or_default() += 1;
+                *sessions.entry(event.session_id.clone()).or_default() += 1;
+                *actors.entry(event.actor.clone()).or_default() += 1;
             }
             thor_core::event_store::EventKind::GateStoodAside => stood_aside += 1,
             _ => {}
@@ -779,10 +795,46 @@ pub fn gate_line(db: &Path) -> String {
     if refused == 0 && stood_aside == 0 {
         return "gate: has never refused a write, and has never stood aside from one".to_string();
     }
-    format!(
-        "gate: {refused} refusals by {} distinct rules, {stood_aside} stand-asides, lifetime (a stand-aside is the stale-rule nudge holding off for the rest of a session; no prohibition stands aside SINCE 2026-08-08, so older ones in this total are real prohibitions that did)",
-        rules.len()
-    )
+    // WHICH rules, not just how many, since 2026-08-14. This is the one line
+    // that claims 2.0 works, and it was unreadable in the exact case that
+    // matters: a probe fired against the real store writes a refusal that
+    // counts the same as a real one (13 of the first 13 were probes, recorded
+    // 2026-08-08). A total cannot be un-mixed afterwards. The ids can - a
+    // throwaway probe id is obvious on sight, and a rule that has really
+    // stopped something deserves to be named anyway.
+    let mut named: Vec<(String, usize)> = rules.into_iter().collect();
+    named.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
+    // And HOW CONCENTRATED, because that is the shape a probe run has: a
+    // dozen refusals in one sitting is somebody testing the gate, a dozen
+    // spread over a dozen sessions is the gate doing its job. Nothing marks a
+    // write as a probe, so this does not decide it - it shows the reader the
+    // one thing that tells the two apart.
+    let busiest = sessions.values().copied().max().unwrap_or(0);
+    let mut out = vec![format!(
+        "gate: {refused} refusals by {} distinct rules across {} session(s), the busiest of them accounting for {busiest} - a burst inside one session is what a probe run looks like, not what protection looks like. {stood_aside} stand-asides, lifetime (a stand-aside is the stale-rule nudge holding off for the rest of a session; no prohibition stands aside SINCE 2026-08-08, so older ones in this total are real prohibitions that did)",
+        named.len(),
+        sessions.len()
+    )];
+    // WHO tried the write, and shown only when that is more than one answer.
+    // A refusal written by "hook" is a tool call the guard actually stopped;
+    // one written by a CLI is somebody testing the gate against the real
+    // store, which is the thing that quietly inflates this whole line (see
+    // the store's own note on probing against a throwaway instead). Measured
+    // 2026-08-14: all of them were "hook", so a per-actor list would have been
+    // one line saying nothing - it earns its place the moment a second actor
+    // appears, and not before.
+    if actors.len() > 1 {
+        for (actor, count) in &actors {
+            out.push(format!("  written by: {actor} ({count}x)"));
+        }
+    }
+    for (id, count) in named.iter().take(NAMES_AT_MOST) {
+        out.push(format!("  refused by: {id} ({count}x)"));
+    }
+    if named.len() > NAMES_AT_MOST {
+        out.push(format!("  refused by: and {} more rule(s), not named here", named.len() - NAMES_AT_MOST));
+    }
+    out.join("\n")
 }
 
 pub fn crowding_line(db: &Path, checkouts: Option<&Path>) -> String {
@@ -831,6 +883,11 @@ pub fn crowding_line(db: &Path, checkouts: Option<&Path>) -> String {
         std::collections::HashSet::new(),
     );
     let mut worst: Option<(usize, String, String)> = None;
+    // Where each item lost, so the ones that never win anywhere can be NAMED
+    // and folded. Same reason as the decay line: "185 items are invisible" is
+    // a number nobody can act on, and the loop that produced it is the only
+    // place that ever knew which 185.
+    let mut lost_at: std::collections::BTreeMap<String, String> = Default::default();
     for (project, path) in &anchors {
         let mut input = serve::input::ServeInput::default();
         input.add_file(path);
@@ -844,6 +901,8 @@ pub fn crowding_line(db: &Path, checkouts: Option<&Path>) -> String {
             eligible.insert(r.id.clone());
             if shown.contains(r.id.as_str()) {
                 reachable.insert(r.id.clone());
+            } else {
+                lost_at.entry(r.id.clone()).or_insert_with(|| format!("{path} in {project}"));
             }
         }
         if worst.as_ref().map(|(n, _, _)| served.all.len() > *n).unwrap_or(true) {
@@ -855,11 +914,12 @@ pub fn crowding_line(db: &Path, checkouts: Option<&Path>) -> String {
     if invisible == 0 {
         return format!("crowding: none - every one of {} eligible item(s) wins a place somewhere", eligible.len());
     }
-    match worst {
+    let headline = match worst {
         Some((n, project, path)) if n > serve::render::MAX_ITEMS => format!(
             "crowding: {invisible} of {} item(s) are eligible at their own trigger and NEVER shown there, \
              because a block holds {} - they are current and correctly bound, just permanently outranked; \
-             worst pool: {n} claimants at {path} in {project}",
+             worst pool: {n} claimants at {path} in {project}. Fold them into the item that already carries \
+             their ground, or archive them - a place that is full is not fixed by adding another claimant",
             eligible.len(),
             serve::render::MAX_ITEMS
         ),
@@ -867,7 +927,21 @@ pub fn crowding_line(db: &Path, checkouts: Option<&Path>) -> String {
             "crowding: {invisible} of {} item(s) are eligible at their own trigger and never shown there",
             eligible.len()
         ),
+    };
+    let mut never_won: Vec<(&String, &String)> =
+        lost_at.iter().filter(|(id, _)| !reachable.contains(*id)).collect();
+    never_won.sort_by(|a, b| a.0.cmp(b.0));
+    let mut out = vec![headline];
+    for (id, where_lost) in never_won.iter().take(NAMES_AT_MOST) {
+        out.push(format!("  outranked: {id} at {where_lost}"));
     }
+    if never_won.len() > NAMES_AT_MOST {
+        out.push(format!(
+            "  outranked: and {} more, not named here",
+            never_won.len() - NAMES_AT_MOST
+        ));
+    }
+    out.join("\n")
 }
 
 pub fn report(

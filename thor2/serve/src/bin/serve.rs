@@ -1119,6 +1119,16 @@ fn record_teeth_asked(db: &Path, session_id: &str) {
     let _ = std::fs::write(&path, format!("{trimmed}\n"));
 }
 
+/// How many unanswered rules one turn is asked about at once.
+///
+/// WHY A BATCH, since 2026-08-14. One per session is a burn that never
+/// finishes: measured that day at 336 waiting, which is one a day for the
+/// better part of a year, while the answer to each is usually one sentence.
+/// The judgement debt had exactly this shape and exactly this fix. Five, not
+/// all of them: the wall this is deliberately not is a debt that hands over
+/// 336 rules and ends every turn until they are gone.
+const TEETH_DEBT_BATCH_MAX: usize = 5;
+
 fn teeth_debt(store: &EventStore) -> Option<String> {
     let mut candidates: Vec<(String, String, String)> = serve::live::live_items(store)
         .into_iter()
@@ -1130,12 +1140,24 @@ fn teeth_debt(store: &EventStore) -> Option<String> {
     // Lowest id first: a stable order, so the same fact is asked until it is
     // answered rather than a different one every turn.
     candidates.sort_by(|a, b| a.0.cmp(&b.0));
-    let (id, text, literal) = candidates.first()?;
-    let left = candidates.len().saturating_sub(1);
+    if candidates.is_empty() {
+        return None;
+    }
+    let batch_len = candidates.len().min(TEETH_DEBT_BATCH_MAX);
+    let left = candidates.len() - batch_len;
+    let mut items_block = String::new();
+    for (id, text, literal) in candidates.iter().take(TEETH_DEBT_BATCH_MAX) {
+        items_block.push_str(&format!("\n- '{id}' names \"{literal}\": {text}"));
+    }
+    let left_note = if left > 0 {
+        format!(" {left} more are waiting behind this batch.")
+    } else {
+        String::new()
+    };
     Some(format!(
-        "[THOR] '{id}' has never been asked whether it can refuse anything, and its own text names something a guard could look for: \"{literal}\". Answer it before ending the turn, and {left} other rule(s) are waiting behind it. \
-         Is there a text whose presence MEANS the mistake is happening? If YES, give this rule a check with that literal - forbidden for a command or for any file, absent for one named file - and re-anchor it if the check needs a command it does not have. If NO (an authorised action looks identical to an unauthorised one, or the rule is about something forgotten rather than something typed), add '{}<why not>' to its tags with revise - the reason IS the answer, a bare '{}' is refused, and mark is a verdict on where an item fired and cannot tag anything - and it stays exactly as it is. \
-         Both answers settle it for good; only leaving it unanswered brings it back. The rule says: {text}",
+        "[THOR] {batch_len} rule(s) have never been asked whether they can refuse anything, and each one's own text names something a guard could look for - listed below. Answer ALL {batch_len} before ending the turn.{left_note} \
+         Is there a text whose presence MEANS the mistake is happening? If YES, give that rule a check with that literal - forbidden for a command or for any file, absent for one named file - and re-anchor it if the check needs a command it does not have. If NO (an authorised action looks identical to an unauthorised one, or the rule is about something forgotten rather than something typed), add '{}<why not>' to its tags with revise - the reason IS the answer, a bare '{}' is refused, and mark is a verdict on where an item fired and cannot tag anything - and it stays exactly as it is. \
+         Both answers settle a rule for good; only leaving one unanswered brings it back.{items_block}",
         model::store::NO_LITERAL_REASON_PREFIX,
         model::store::NO_LITERAL_TAG
     ))
@@ -2283,6 +2305,30 @@ mod judgement_debt_tests {
         let asked = teeth_debt(&store).expect("a rule naming a flag must be found by the sweep itself");
         assert!(asked.contains("names-a-flag"), "it must name which rule: {asked}");
         assert!(asked.contains("--force"), "and quote what it spotted: {asked}");
+    }
+
+    /// One rule per session is a burn that never finishes: 336 were waiting on
+    /// 2026-08-14, and the answer to each is a single sentence. The batch is
+    /// what turns a year into weeks. It must also say what it held back - five
+    /// names with nothing after them read as the whole backlog.
+    #[test]
+    fn the_burn_asks_a_batch_and_says_what_it_held_back() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("t.db");
+        let mut store = EventStore::new(&db).unwrap();
+        for i in 0..TEETH_DEBT_BATCH_MAX + 2 {
+            legacy_unanswered(&mut store, &format!("unarmed-{i}"), &format!("Draai npm audit fix --force-{i} nooit"));
+        }
+
+        let asked = teeth_debt(&store).expect("several rules are unanswered");
+        for i in 0..TEETH_DEBT_BATCH_MAX {
+            assert!(asked.contains(&format!("unarmed-{i}")), "the whole batch is named: {asked}");
+        }
+        assert!(
+            !asked.contains(&format!("unarmed-{TEETH_DEBT_BATCH_MAX}")),
+            "and it stops at the cap: {asked}"
+        );
+        assert!(asked.contains("2 more are waiting"), "silence about the rest would read as done: {asked}");
     }
 
     #[test]

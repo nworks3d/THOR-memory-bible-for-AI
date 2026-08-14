@@ -109,6 +109,30 @@ enum Command {
         #[arg(long)]
         id: String,
     },
+    /// Turn a live item into archive material: same id, text and history,
+    /// still found by lookup, but it stops claiming to fire. For a fact whose
+    /// SUBJECT is gone (a frozen tree, a deleted file) - not for one that is
+    /// wrong, which is `retract`'s job. Refuses an item that carries a
+    /// runnable check (that is the only kind that can still block a wrong
+    /// write) and one already archived. See `store::archive`.
+    ///
+    /// The one runnable entry point to `store::archive`, which until
+    /// 2026-08-14 existed only in tests - so the one session that needed it
+    /// had to read the raw SQLite to do by hand what this now does.
+    Archive {
+        #[arg(long)]
+        id: String,
+        /// Why it can no longer fire. Becomes an `archived:<reason>` tag, so
+        /// under 120 characters, one plain phrase, no comma or line break.
+        #[arg(long)]
+        reason: String,
+        #[arg(long, default_value = "cli")]
+        session_id: String,
+        #[arg(long, default_value = "cli")]
+        lineage_id: String,
+        #[arg(long, default_value = "cli")]
+        actor: String,
+    },
 }
 
 fn parse_moment_arg(s: &str) -> Result<Binding, String> {
@@ -233,6 +257,16 @@ fn main() {
                 }
             }
         }
+        Command::Archive { id, reason, session_id, lineage_id, actor } => {
+            let mut event_store = open_store(&cli.db);
+            match store::archive(&mut event_store, &session_id, &lineage_id, &actor, &id, &reason) {
+                Ok(event) => println!("archived {id} (seq {})", event.seq),
+                Err(e) => {
+                    eprintln!("refused: {e}");
+                    std::process::exit(1);
+                }
+            }
+        }
     }
 }
 
@@ -284,7 +318,7 @@ mod tests {
                 assert_eq!(check_path, Some("README.md".to_string()));
                 assert_eq!(check_literal, Some("GPLv3".to_string()));
             }
-            Command::Show { .. } => panic!("expected Declare"),
+            _ => panic!("expected Declare"),
         }
     }
 
@@ -301,7 +335,7 @@ mod tests {
                 assert_eq!(check_literal, None);
                 assert!(check_literals.is_empty());
             }
-            Command::Show { .. } => panic!("expected Declare"),
+            _ => panic!("expected Declare"),
         }
     }
 
@@ -343,7 +377,27 @@ mod tests {
             Command::Declare { check_literals, .. } => {
                 assert_eq!(check_literals, vec!["\u{2014}".to_string(), "\u{2013}".to_string(), "...".to_string()]);
             }
-            Command::Show { .. } => panic!("expected Declare"),
+            _ => panic!("expected Declare"),
+        }
+    }
+
+    /// The Archive subcommand's own flag wiring - the one thing only this CLI
+    /// can prove, mirroring the declare wiring tests above. `store::archive`'s
+    /// behaviour is proven canonically beside the function in store.rs; what
+    /// stays here is that `--id`/`--reason` reach the parameters clap's
+    /// kebab-case derivation is expected to name.
+    #[test]
+    fn archive_flags_parse_into_the_expected_fields() {
+        let cli = Cli::try_parse_from([
+            "model", "--db", "x.db", "archive", "--id", "i1", "--reason", "the tree it describes is frozen",
+        ])
+        .expect("the archive flags must parse");
+        match cli.command {
+            Command::Archive { id, reason, .. } => {
+                assert_eq!(id, "i1");
+                assert_eq!(reason, "the tree it describes is frozen");
+            }
+            _ => panic!("expected Archive"),
         }
     }
 

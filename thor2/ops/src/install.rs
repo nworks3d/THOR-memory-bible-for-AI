@@ -794,7 +794,17 @@ mod tests {
         // A real binary at the new location, so only the OLD one is missing.
         let new_exe = dir.path().join("serve.exe");
         fs::write(&new_exe, b"not really a binary, but it exists").unwrap();
-        let old_command = "\"C:\\gone\\bin\\serve.exe\" --db \"C:\\gone\\thor.db\" hook";
+        // The GONE binary's path uses THIS platform's own separators, never a
+        // Windows literal. `stale_thor_command` decides staleness with
+        // `Path::file_name`, and on Linux a backslash is an ordinary character:
+        // "C:\gone\serve.exe" is then ONE filename component, not
+        // ".../serve.exe", so it never matched our file name and the repoint
+        // silently did not fire. That made this test pass on Windows and fail on
+        // the Linux CI runner - caught the first time a v2 tag actually built,
+        // on 2026-08-14.
+        let gone = dir.path().join("gone");
+        let old_command =
+            format!("\"{}\" --db \"{}\" hook", gone.join("serve.exe").display(), gone.join("thor.db").display());
         fs::write(
             &path,
             serde_json::to_string_pretty(&json!({
@@ -804,7 +814,8 @@ mod tests {
         )
         .unwrap();
 
-        let specs = standard_hooks(&new_exe.display().to_string(), "C:\\new\\thor.db");
+        let specs =
+            standard_hooks(&new_exe.display().to_string(), &dir.path().join("thor.db").display().to_string());
         let report = install_hooks(&path, &specs).unwrap();
 
         assert_eq!(
@@ -812,14 +823,14 @@ mod tests {
             HookOutcome::Replaced
         );
         assert!(
-            report.replaced.iter().any(|c| c == old_command),
+            report.replaced.iter().any(|c| c == &old_command),
             "the replacement must be reported, or the move happened silently: {:?}",
             report.replaced
         );
         let written: Value = serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
         let groups = written["hooks"]["SessionStart"].as_array().unwrap();
         assert_eq!(groups.len(), 1, "it must be repointed in place, never appended beside the dead one");
-        assert!(!format!("{groups:?}").contains("C:\\\\gone"), "the dead path must be gone: {groups:?}");
+        assert!(!format!("{groups:?}").contains("gone"), "the dead path must be gone: {groups:?}");
     }
 
     /// The other half, and the reason this is narrow: somebody running two

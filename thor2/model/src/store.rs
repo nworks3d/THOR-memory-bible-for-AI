@@ -734,6 +734,50 @@ pub const DELIBERATE_ANCHOR_TAG: &str = "deliberate-anchor";
 /// have teeth, but because it must have been ASKED.
 pub const NO_LITERAL_TAG: &str = "no-literal";
 
+/// The same answer, with the reason it was given: `no-literal:<why>`.
+///
+/// THE DEFECT THIS CLOSES, found in a session review on 2026-08-14. The tag
+/// above is an exit from the gate, and it was the only exit here that cost
+/// nothing. `archive` demands a reason. `retract` demands a reason. Every Rule
+/// demands a falsifier. But "there is nothing a guard could catch here" was a
+/// bare word, taken on the writer's say-so, and after it nothing in the system
+/// ever asked again. An exit that is cheaper to take than the work it excuses
+/// is the exit that gets taken: the review found a rule about a command tagged
+/// rather than checked, and the tag ended the conversation.
+///
+/// Nothing can verify the reason, and that is not the point. No machine can
+/// tell an honest "nothing to catch" from a lazy one - if one could, this
+/// would be a check and not a tag (see `NO_LITERAL_TAG` above). What a reason
+/// buys is that the answer can be read back, counted, and disagreed with by
+/// whoever comes next. A bare word cannot be argued with.
+pub const NO_LITERAL_REASON_PREFIX: &str = "no-literal:";
+
+/// Short enough to write, long enough that "no" is not a reason.
+pub const NO_LITERAL_REASON_MIN: usize = 20;
+
+/// What one tag says about the teeth question.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TeethAnswer<'a> {
+    /// The bare `no-literal`, with no reason. Still honoured for an item that
+    /// already carried it - see `gate::revise` - and never accepted as a new
+    /// answer.
+    Bare,
+    /// `no-literal:<why>`, carrying its reason (already trimmed, possibly
+    /// empty if the writer typed the prefix and stopped).
+    Reasoned(&'a str),
+}
+
+/// Read one tag as an answer to the teeth question, or `None` if it is not
+/// one. The single definition of what answering looks like, so the gate that
+/// accepts an answer and the debt that stops asking after one can never
+/// disagree about which tags count.
+pub fn teeth_answer(tag: &str) -> Option<TeethAnswer<'_>> {
+    if let Some(reason) = tag.strip_prefix(NO_LITERAL_REASON_PREFIX) {
+        return Some(TeethAnswer::Reasoned(reason.trim()));
+    }
+    (tag == NO_LITERAL_TAG).then_some(TeethAnswer::Bare)
+}
+
 /// Sometimes a fact belongs exactly where it is and the place is honestly full
 /// of heavier things. The crowding debt has always SAID so - "leave it and say
 /// why" is the third of the three ways out it offers - but saying why happened

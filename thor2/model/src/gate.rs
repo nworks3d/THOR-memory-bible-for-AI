@@ -603,7 +603,43 @@ pub fn candidate_literal(text: &str) -> Option<String> {
 }
 
 
-fn shape_problems(item: &Item) -> Vec<Refusal> {
+/// The reason on a `no-literal:<why>` answer, held to the same shape as
+/// `store::archive`'s reason for the same reason: it becomes a tag, and search
+/// matches on tags.
+fn no_literal_reason_problem(reason: &str) -> Option<Refusal> {
+    let len = reason.chars().count();
+    if len < crate::store::NO_LITERAL_REASON_MIN {
+        return Some(Refusal::new(
+            format!("the reason on this rule's teeth answer is {len} characters"),
+            format!(
+                "write at least {}: name what the mistake would look like and why no text marks it - \
+                 'no' and 'n/a' are the bare answer with extra steps",
+                crate::store::NO_LITERAL_REASON_MIN
+            ),
+        ));
+    }
+    if len > crate::store::ARCHIVE_REASON_LIMIT {
+        return Some(Refusal::new(
+            format!("the reason on this rule's teeth answer is {len} characters"),
+            format!(
+                "keep it under {}: it becomes a tag, and search matches on tags",
+                crate::store::ARCHIVE_REASON_LIMIT
+            ),
+        ));
+    }
+    if reason.contains(',') || reason.contains('\n') || reason.contains('\r') {
+        return Some(Refusal::new(
+            "the reason on this rule's teeth answer contains a comma or a line break",
+            "write it as one plain phrase - it travels as a single tag",
+        ));
+    }
+    None
+}
+
+/// `bare_answer_allowed` is the one thing about an item this cannot see for
+/// itself: whether the bare `no-literal` it carries was already there. Only
+/// `revise` knows, and only `revise` passes true.
+fn shape_problems(item: &Item, bare_answer_allowed: bool) -> Vec<Refusal> {
     let mut problems = Vec::new();
     if item.kind == Kind::Rule && item.bindings.is_empty() {
         problems.push(Refusal::new(
@@ -640,21 +676,41 @@ fn shape_problems(item: &Item) -> Vec<Refusal> {
     if item.kind == Kind::Rule
         && (matches!(item.severity, Some(Severity::Irreversible) | Some(Severity::Costly)) || names_something)
         && item.check.is_none()
-        && !item.tags.iter().any(|t| {
-            t == crate::store::NO_LITERAL_TAG || t.starts_with(crate::store::ANSWER_GUARD_TAG_PREFIX)
-        })
+        && !item.tags.iter().any(|t| t.starts_with(crate::store::ANSWER_GUARD_TAG_PREFIX))
     {
-        problems.push(Refusal::new(
-            "this rule carries no check, so it can only inform while the mistake happens - and it is \
-             either marked expensive or names something concrete in its own text",
-            format!(
-                "answer one question: is there a text whose presence MEANS the mistake is happening? \
-                 If yes, add a check with that literal - forbidden for a command or for any file, \
-                 absent for one named file. If no (an authorised action looks identical to an \
-                 unauthorised one), put '{}' in its tags and it goes in as it is.",
-                crate::store::NO_LITERAL_TAG
-            ),
-        ));
+        match item.tags.iter().find_map(|t| crate::store::teeth_answer(t)) {
+            None => problems.push(Refusal::new(
+                "this rule carries no check, so it can only inform while the mistake happens - and it is \
+                 either marked expensive or names something concrete in its own text",
+                format!(
+                    "answer one question: is there a text whose presence MEANS the mistake is happening? \
+                     If yes, add a check with that literal - forbidden for a command or for any file, \
+                     absent for one named file. If no (an authorised action looks identical to an \
+                     unauthorised one), put '{}<why not>' in its tags - the reason is the answer, and a \
+                     bare '{}' no longer counts.",
+                    crate::store::NO_LITERAL_REASON_PREFIX,
+                    crate::store::NO_LITERAL_TAG
+                ),
+            )),
+            // Only an item that already carried the bare word keeps it, and
+            // only `revise` ever says so. Re-asking every rule written before
+            // the reason existed would be the wall the backlog burn was built
+            // to avoid; refusing to accept a NEW bare one costs nobody a
+            // second turn.
+            Some(crate::store::TeethAnswer::Bare) if !bare_answer_allowed => problems.push(Refusal::new(
+                format!("this rule answers the teeth question with a bare '{}' and no reason", crate::store::NO_LITERAL_TAG),
+                format!(
+                    "say why nothing can catch it: tag it '{}<why not>' instead. Nothing here can verify \
+                     the reason - the point is that the next reader can disagree with it, which a bare \
+                     word gives them no way to do.",
+                    crate::store::NO_LITERAL_REASON_PREFIX
+                ),
+            )),
+            Some(crate::store::TeethAnswer::Bare) => {}
+            Some(crate::store::TeethAnswer::Reasoned(reason)) => {
+                problems.extend(no_literal_reason_problem(reason));
+            }
+        }
     }
     if item.kind.can_fire() {
         let len = item.text.chars().count();
@@ -690,7 +746,11 @@ fn combined(problems: Vec<Refusal>) -> Refusal {
 }
 
 pub fn declare(item: &Item) -> Result<(), Refusal> {
-    let problems = shape_problems(item);
+    declare_inner(item, false)
+}
+
+fn declare_inner(item: &Item, bare_answer_allowed: bool) -> Result<(), Refusal> {
+    let problems = shape_problems(item, bare_answer_allowed);
     match problems.len() {
         0 => {}
         1 => return Err(problems.into_iter().next().expect("length checked")),
@@ -831,7 +891,12 @@ fn dropped_field(name: &'static str) -> Refusal {
 /// The write-time gate for a revise: everything `declare` requires, PLUS no
 /// field the existing item had may silently vanish (refusal ground 9).
 pub fn revise(existing: &Item, updated: &Item) -> Result<(), Refusal> {
-    declare(updated)?;
+    // The one concession to the store as it already is: a rule that carried
+    // the bare `no-literal` before the reason was required keeps it, so
+    // correcting an old fact never costs a round trip over a question that
+    // was answered - badly, but answered - long before.
+    let carried_bare = existing.tags.iter().any(|t| t == crate::store::NO_LITERAL_TAG);
+    declare_inner(updated, carried_bare)?;
     if !existing.bindings.is_empty() && updated.bindings.is_empty() {
         return Err(dropped_field("bindings"));
     }
@@ -1717,11 +1782,70 @@ mod tests {
         let mut item = base(Kind::Rule);
         item.bindings = vec![Binding::Always];
         item.severity = Some(Severity::Irreversible);
-        item.tags = vec![crate::store::NO_LITERAL_TAG.to_string()];
+        item.tags = vec![format!(
+            "{}an authorised action looks exactly like an unauthorised one",
+            crate::store::NO_LITERAL_REASON_PREFIX
+        )];
         assert!(
             declare(&item).is_ok(),
             "a rule with nothing literal to catch is legitimate - the tag records that it was asked"
         );
+    }
+
+    /// The defect this closes, found in a session review on 2026-08-14: the
+    /// answer "nothing can catch this" was a bare word, so silencing the gate
+    /// was cheaper than satisfying it, and nothing could ever be argued with
+    /// afterwards.
+    #[test]
+    fn a_bare_answer_with_no_reason_is_refused_on_a_new_rule() {
+        let mut item = base(Kind::Rule);
+        item.bindings = vec![Binding::Always];
+        item.severity = Some(Severity::Irreversible);
+        item.tags = vec![crate::store::NO_LITERAL_TAG.to_string()];
+        let err = declare(&item).unwrap_err();
+        assert!(err.problem.contains("no reason"), "names what is missing: {}", err.problem);
+        assert!(
+            err.fix.contains(crate::store::NO_LITERAL_REASON_PREFIX),
+            "names the way out: {}",
+            err.fix
+        );
+    }
+
+    /// A reason short enough to be the bare answer with extra steps is the bare
+    /// answer. Without this, "no-literal:no" walks straight through.
+    #[test]
+    fn a_reason_too_short_to_say_anything_is_refused() {
+        let mut item = base(Kind::Rule);
+        item.bindings = vec![Binding::Always];
+        item.severity = Some(Severity::Irreversible);
+        item.tags = vec![format!("{}n/a", crate::store::NO_LITERAL_REASON_PREFIX)];
+        let err = declare(&item).unwrap_err();
+        assert!(err.problem.contains("characters"), "names the length: {}", err.problem);
+    }
+
+    /// The store as it already is: hundreds of rules answered "no" before a
+    /// reason was ever required. Re-asking all of them on the next revise would
+    /// be the wall the backlog burn exists to avoid, so an item that ALREADY
+    /// carried the bare word keeps it - and only there.
+    #[test]
+    fn a_bare_answer_already_on_an_item_survives_a_revise_of_something_else() {
+        let mut existing = base(Kind::Rule);
+        existing.bindings = vec![Binding::Always];
+        existing.severity = Some(Severity::Irreversible);
+        existing.tags = vec![crate::store::NO_LITERAL_TAG.to_string()];
+
+        let mut updated = existing.clone();
+        updated.text = "never force-push to main, said better".to_string();
+        assert!(
+            revise(&existing, &updated).is_ok(),
+            "correcting an old fact must not cost a round trip over a question it already answered"
+        );
+
+        // And the grandfather reaches exactly that item, not the ground itself:
+        // a rule that never carried the word is still refused for adding it now.
+        let mut never_answered = existing.clone();
+        never_answered.tags = vec!["safety".to_string()];
+        assert!(revise(&never_answered, &updated).is_err(), "the exemption is per item, not global");
     }
 
     /// The third honest answer, and the one the owner's own reporting rule
@@ -1790,7 +1914,10 @@ mod tests {
         );
 
         let mut answered = now_heavy.clone();
-        answered.tags = vec![crate::store::NO_LITERAL_TAG.to_string()];
+        answered.tags = vec![format!(
+            "{}an authorised action looks exactly like an unauthorised one",
+            crate::store::NO_LITERAL_REASON_PREFIX
+        )];
         assert!(revise(&light, &answered).is_ok(), "and answering it lets the re-rating through");
     }
 
@@ -2753,7 +2880,10 @@ mod tests {
             // omission has no text whose presence betrays it. The tag is that
             // answer, and it keeps this test about scope, which is its subject.
             let mut item = global(Kind::Rule, text);
-            item.tags = vec![crate::store::NO_LITERAL_TAG.to_string()];
+            item.tags = vec![format!(
+                "{}an omission has no text whose presence betrays it",
+                crate::store::NO_LITERAL_REASON_PREFIX
+            )];
             assert!(declare(&item).is_ok(), "must stay writable: {text}");
         }
     }

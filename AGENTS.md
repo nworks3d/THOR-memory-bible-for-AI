@@ -152,7 +152,10 @@ whether there is a text whose presence *means* the mistake is happening. If
 there is, add a proof built on that exact text: a forbidden check on a command
 target for a dangerous command, or on every file for text that must never be
 written anywhere. If there is not - a judgement rule like "check with me first"
-has nothing to catch - tag it `no-literal` and it goes in unchanged. Never widen
+has nothing to catch - tag it `no-literal:<why not>` and it goes in unchanged.
+The reason is the answer: a bare `no-literal` is refused, because an exit that
+costs nothing is the one that gets taken instead of the work. Nothing can verify
+your reason; the point is that the next reader can disagree with it. Never widen
 the text to catch more: a rule that blocks legitimate work is the most expensive
 thing this system can do.
 

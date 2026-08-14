@@ -1688,7 +1688,7 @@ mod tests {
             // one is bound Always, so there is no literal to forbid: banning
             // "--force" everywhere would refuse the sentence that documents the
             // rule. The tag is the honest answer, not a way around the gate.
-            tags: vec![model::store::NO_LITERAL_TAG.to_string()],
+            tags: vec![format!("{}a test fixture with nothing literal to catch", model::store::NO_LITERAL_REASON_PREFIX)],
             expires: None,
             key: None,
             falsifier: Some("a force-push to main lands clean, nobody reverts it".to_string()),

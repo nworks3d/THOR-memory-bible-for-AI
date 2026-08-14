@@ -22,7 +22,7 @@ fn rule_always_for_project(id: &str, project: &str) -> Item {
         project: Some(project.to_string()),
         // Gate ground 11: this file tests project scoping, and a generic
         // standing rule has no literal to catch.
-        tags: vec![model::store::NO_LITERAL_TAG.to_string()],
+        tags: vec![format!("{}a test fixture with nothing literal to catch", model::store::NO_LITERAL_REASON_PREFIX)],
         expires: None,
         key: None,
         falsifier: Some(format!("the standing rule for {project} turns out to be wrong")),

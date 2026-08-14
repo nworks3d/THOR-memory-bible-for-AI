@@ -22,7 +22,7 @@ fn moment_rule(id: &str) -> Item {
         project: None,
         // Gate ground 11: this tests the mark CLI, not teeth, and a generic
         // "never <id> without checking first" has no literal to catch.
-        tags: vec![model::store::NO_LITERAL_TAG.to_string()],
+        tags: vec![format!("{}a test fixture with nothing literal to catch", model::store::NO_LITERAL_REASON_PREFIX)],
         expires: None,
         key: None,
         falsifier: Some(format!("{id} turns out to be safe without checking first")),

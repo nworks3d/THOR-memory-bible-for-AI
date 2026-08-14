@@ -31,7 +31,7 @@ fn rule_always(id: &str) -> Item {
         project: None,
         // Gate ground 11: these fixtures test which surface delivers what, and
         // a generic "standing rule N" has no literal to catch.
-        tags: vec![model::store::NO_LITERAL_TAG.to_string()],
+        tags: vec![format!("{}a test fixture with nothing literal to catch", model::store::NO_LITERAL_REASON_PREFIX)],
         expires: None,
         key: None,
         falsifier: Some(format!("standing rule {id} turns out to be wrong")),
@@ -48,7 +48,7 @@ fn rule_moment(id: &str, action: Action) -> Item {
         severity: Some(Severity::Irreversible),
         project: None,
         // Same as rule_always above.
-        tags: vec![model::store::NO_LITERAL_TAG.to_string()],
+        tags: vec![format!("{}a test fixture with nothing literal to catch", model::store::NO_LITERAL_REASON_PREFIX)],
         expires: None,
         key: None,
         falsifier: Some(format!("{id} turns out to be safe without checking first")),

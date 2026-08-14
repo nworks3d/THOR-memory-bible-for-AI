@@ -183,7 +183,7 @@ mod tests {
                 project: None,
                 // Gate ground 11: filler rules for a crowding test have nothing
                 // literal to catch, and saying so is what lets them in.
-                tags: vec![store::NO_LITERAL_TAG.to_string()],
+                tags: vec![format!("{}a test fixture with nothing literal to catch", store::NO_LITERAL_REASON_PREFIX)],
                 expires: None,
                 key: None,
                 falsifier: Some(format!("rule number {i} turns out to be wrong")),

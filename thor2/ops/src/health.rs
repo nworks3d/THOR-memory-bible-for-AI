@@ -240,11 +240,31 @@ pub fn proof_line(db: &Path) -> String {
             None => {}
         }
     }
+    // The other population, and until 2026-08-14 nothing counted it: the rules
+    // that were ASKED whether they could refuse and answered no. That answer is
+    // the one exit from the gate nothing can verify, so the only honest thing
+    // to do with it is show how much of the store rests on it - and how much of
+    // that was taken on a bare word, before the reason was required. Bare ones
+    // are grandfathered by `gate::revise`, never re-asked by the backlog burn,
+    // and would otherwise be invisible forever.
+    let (mut answered_no, mut without_reason) = (0usize, 0usize);
+    for i in &fireable {
+        match i.item.tags.iter().find_map(|t| model::store::teeth_answer(t)) {
+            Some(model::store::TeethAnswer::Bare) => {
+                answered_no += 1;
+                without_reason += 1;
+            }
+            Some(model::store::TeethAnswer::Reasoned(_)) => answered_no += 1,
+            None => {}
+        }
+    }
     format!(
         "provable rules: {} of {} rule(s)/orientation(s) carry a runnable check ({:.1}%) - of those, \
          {forbidding} can refuse a write that introduces something forbidden, {location} can refuse a \
          write for landing in a place that is out of bounds, {protecting} can only refuse one that \
-         removes a required line from their own file, and {blocks_nothing} block nothing at all",
+         removes a required line from their own file, and {blocks_nothing} block nothing at all; \
+         {answered_no} other rule(s) were asked and answered that nothing can catch them, {without_reason} \
+         of those without saying why (a bare answer nothing will ask about again)",
         with_check,
         fireable.len(),
         100.0 * with_check as f64 / fireable.len() as f64
@@ -1054,7 +1074,7 @@ mod tests {
             heavy_prose.severity = Some(model::item::Severity::Irreversible);
             // Since gate ground 11 this is the only way a heavy rule carries no
             // check: asked, and the answer was that there is nothing to catch.
-            heavy_prose.tags = vec![store::NO_LITERAL_TAG.to_string()];
+            heavy_prose.tags = vec![format!("{}a test fixture with nothing literal to catch", store::NO_LITERAL_REASON_PREFIX)];
             store::declare(&mut s, "s", "l", "a", &heavy_prose).unwrap();
 
             let mut heavy_armed = rule("heavy-and-armed");

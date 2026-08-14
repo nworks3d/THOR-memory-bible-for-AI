@@ -402,9 +402,9 @@ pub fn working_contract() -> Vec<model::item::Item> {
         rule(
             "answer-whether-a-rule-can-refuse",
             "A rule you call expensive, or that names a command, flag or path, is asked one \
-             question before it is stored: is there a text whose presence MEANS the mistake is \
-             happening? If yes, add a check with that literal. If no, tag it no-literal. Both \
-             answers are fine; silence is not.",
+             question first: is there a text whose presence MEANS the mistake is happening? If \
+             yes, add a check with that literal. If no, tag it no-literal:<why not> - the reason \
+             is the answer. Both answers are fine; silence is not.",
             "A rule marked irreversible or costly is stored without ever being asked whether it \
              can refuse anything.",
         ),

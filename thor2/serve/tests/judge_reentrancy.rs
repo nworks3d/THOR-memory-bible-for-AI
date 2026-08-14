@@ -32,7 +32,7 @@ fn always_rule(id: &str) -> Item {
         severity: Some(Severity::Irreversible),
         project: None,
         // Gate ground 11: a synthetic standing rule has no literal to catch.
-        tags: vec![model::store::NO_LITERAL_TAG.to_string()],
+        tags: vec![format!("{}a test fixture with nothing literal to catch", model::store::NO_LITERAL_REASON_PREFIX)],
         expires: None,
         key: None,
         falsifier: Some("this rule turns out to be wrong for this synthetic fixture".to_string()),

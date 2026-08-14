@@ -331,7 +331,7 @@ fn a_context_surface_still_renders_with_no_system_message() {
             project: None,
             // Gate ground 11: this file tests the response guard, and the rule
             // is bound to a moment with no literal to catch.
-            tags: vec![model::store::NO_LITERAL_TAG.to_string()],
+            tags: vec![format!("{}a test fixture with nothing literal to catch", model::store::NO_LITERAL_REASON_PREFIX)],
             expires: None,
             key: None,
             falsifier: Some("a force-push to main lands clean with nobody reverting it".to_string()),

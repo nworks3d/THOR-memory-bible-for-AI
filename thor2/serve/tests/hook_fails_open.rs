@@ -93,7 +93,7 @@ fn the_same_binary_does_print_a_block_when_nothing_is_wrong() {
             project: None,
             // Gate ground 11: this test is about the hook failing open, and the
             // rule is bound to a moment with no literal to catch.
-            tags: vec![model::store::NO_LITERAL_TAG.to_string()],
+            tags: vec![format!("{}a test fixture with nothing literal to catch", model::store::NO_LITERAL_REASON_PREFIX)],
             expires: None,
             key: None,
             falsifier: Some("a force-push to main lands clean with nobody reverting it".to_string()),

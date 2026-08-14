@@ -299,6 +299,16 @@ fn current_project_from_cwd() -> Option<String> {
 /// SILENT ON EVERY FAILURE, per R5's read-and-inject policy: no checkout, no
 /// git root, an unreadable stamp, a check that cannot run - all of it means
 /// no notice, never a guess and never an error on this channel.
+/// The binary named `name` sitting next to this one, with the platform's own
+/// executable suffix. Mirrors `ops::install`'s own `sibling` helper: nothing
+/// in this deployment is ever on PATH, so a message that names a bare
+/// command someone could type is not actually runnable without this.
+fn sibling(name: &str) -> Option<PathBuf> {
+    let exe = std::env::current_exe().ok()?;
+    let dir = exe.parent()?;
+    Some(dir.join(format!("{name}{}", std::env::consts::EXE_SUFFIX)))
+}
+
 fn decay_notice(store: &EventStore, db: &Path, cwd: Option<&Path>) -> Option<String> {
     let root = project::git_root(cwd?)?;
     let project = project::resolve_project(&root)?;
@@ -384,8 +394,11 @@ fn decay_notice(store: &EventStore, db: &Path, cwd: Option<&Path>) -> Option<Str
     // not evidence that it is wrong, and some of them are dead on purpose.
 
     let _ = std::fs::write(&stamp, &today);
+    let doctor = sibling("doctor").unwrap_or_else(|| PathBuf::from("doctor"));
+    let checkouts = root.parent().unwrap_or(&root);
     Some(format!(
-        "[THOR] {project}: {dead} anchor(s) point at a file that is not there, so those facts fire nowhere, and {failing} proof(s) now come out false. Run `doctor --checkouts` to see them, or ask me to repair them."
+        "[THOR] {project}: {dead} anchor(s) point at a file that is not there, so those facts fire nowhere, and {failing} proof(s) now come out false. Run `\"{}\" --db \"{}\" --checkouts \"{}\"` to see them, or ask me to repair them.",
+        doctor.display(), db.display(), checkouts.display()
     ))
 }
 
@@ -1111,7 +1124,7 @@ fn teeth_debt(store: &EventStore) -> Option<String> {
         .into_iter()
         .filter(|li| li.item.kind.can_fire())
         .filter(|li| li.item.check.is_none())
-        .filter(|li| !li.item.tags.iter().any(|t| t == model::store::NO_LITERAL_TAG))
+        .filter(|li| !li.item.tags.iter().any(|t| model::store::teeth_answer(t).is_some()))
         .filter_map(|li| model::gate::candidate_literal(&li.item.text).map(|lit| (li.id.clone(), li.item.text.clone(), lit)))
         .collect();
     // Lowest id first: a stable order, so the same fact is asked until it is
@@ -1121,10 +1134,70 @@ fn teeth_debt(store: &EventStore) -> Option<String> {
     let left = candidates.len().saturating_sub(1);
     Some(format!(
         "[THOR] '{id}' has never been asked whether it can refuse anything, and its own text names something a guard could look for: \"{literal}\". Answer it before ending the turn, and {left} other rule(s) are waiting behind it. \
-         Is there a text whose presence MEANS the mistake is happening? If YES, give this rule a check with that literal - forbidden for a command or for any file, absent for one named file - and re-anchor it if the check needs a command it does not have. If NO (an authorised action looks identical to an unauthorised one, or the rule is about something forgotten rather than something typed), add '{}' to its tags with revise - mark is a verdict on where an item fired and cannot tag anything - and it stays exactly as it is. \
+         Is there a text whose presence MEANS the mistake is happening? If YES, give this rule a check with that literal - forbidden for a command or for any file, absent for one named file - and re-anchor it if the check needs a command it does not have. If NO (an authorised action looks identical to an unauthorised one, or the rule is about something forgotten rather than something typed), add '{}<why not>' to its tags with revise - the reason IS the answer, a bare '{}' is refused, and mark is a verdict on where an item fired and cannot tag anything - and it stays exactly as it is. \
          Both answers settle it for good; only leaving it unanswered brings it back. The rule says: {text}",
+        model::store::NO_LITERAL_REASON_PREFIX,
         model::store::NO_LITERAL_TAG
     ))
+}
+
+/// Does this item ACTUALLY reach a block at one of its own bindings, as the
+/// real ranker decides it?
+///
+/// THE DEFECT THIS CLOSES. `model::store::capacity` counts rivals of the same
+/// weight or heavier and calls the pool full at `MAX_ITEMS`. That is right for
+/// a WRITE-time note: it is a warning, deliberately pessimistic, and the gate
+/// itself refuses only when every rival is strictly HEAVIER - see `capacity`'s
+/// own doc comment for why equal weight is a note and not a refusal. It is the
+/// wrong test for a debt that holds the turn. Equal-weight rivals outrank
+/// nothing; closeness and the promotion prior settle those ties at serve time,
+/// so an item can sit third of four in the real block while the estimate still
+/// calls its pool full.
+///
+/// Measured 2026-08-13: a fact was folded out of a 24-claimant pool into the
+/// shown four, `why` put it third of four, and the debt went on demanding an
+/// answer about it every turn. That is the one shape of message this system is
+/// least allowed to have - a report that no longer matches what is true. Worse,
+/// the only way offered to silence it was the `crowded-on-purpose` tag, so
+/// fixing the problem properly led straight to recording a decision that is
+/// false.
+///
+/// So the estimate stays the TRIGGER and the real ranker becomes the JUDGE:
+/// only an item that reaches no block at ANY of its bindings still owes an
+/// answer.
+fn reaches_a_block(store: &EventStore, id: &str, item: &model::item::Item) -> bool {
+    use model::item::Binding;
+    for binding in &item.bindings {
+        // Pinned: `session_start` serves it whole at every session start, so it
+        // never competes for a place and can never be crowded out of one.
+        if matches!(binding, Binding::Always) {
+            return true;
+        }
+        let mut input = ServeInput { project: item.project.clone(), ..Default::default() };
+        match binding {
+            Binding::Moment(action) => input.moments.push(action.clone()),
+            // A DIRECTORY binding reaches no automatic surface: a file touch
+            // offers the path, never its parent, so `rank::select` drops it
+            // before comparing anything (see `model::store::capacity`). Feeding
+            // it back as a Dir target here would match it against itself and
+            // report an item as reachable that a real session can never see.
+            Binding::Target { kind: model::item::TargetKind::Dir, .. } => continue,
+            Binding::Target { kind, value } => {
+                input.targets.push((*kind, value.clone()));
+                // The real surface carries the command or path as context and
+                // `rank::closeness` reads it. The binding's own value is the
+                // closest honest stand-in for the moment this item was written
+                // for; leaving it empty would score every candidate alike and
+                // measure a ranking nobody ever sees.
+                input.context = value.clone();
+            }
+            Binding::Always => continue,
+        }
+        if serve::serve(store, &input).selection.shown.iter().any(|r| r.id == id) {
+            return true;
+        }
+    }
+    false
 }
 
 fn crowding_debt(store: &EventStore, db_path: &Path, session_id: &str) -> Option<String> {
@@ -1167,6 +1240,13 @@ fn crowding_debt(store: &EventStore, db_path: &Path, session_id: &str) -> Option
         let Ok(model::store::Capacity::Crowded(note)) = model::store::capacity(store, &item) else {
             continue;
         };
+        // The estimate above is the trigger, never the verdict: ask the real
+        // ranker whether this item is actually kept out of every block it could
+        // reach. See `reaches_a_block` for the day a fact that had just been
+        // folded INTO the shown four kept being asked about anyway.
+        if reaches_a_block(store, &id, &item) {
+            continue;
+        }
         return Some(format!(
             "[THOR] '{id}' was stored this session onto a place that is already full, so it will probably never be read there. The memory said so when you wrote it. Deal with it before ending the turn, in this order: (1) FOLD it - if an existing item almost says the same thing, revise that one to carry your point and retract yours; (2) RE-ANCHOR it - if it is really about a narrower file or command than the one it hangs on, move it there with revise; (3) LEAVE IT - sometimes the place is honestly full of heavier things, and then that is the answer: say in your reply which items hold it, and add '{}' to its tags with revise (mark is a verdict on where an item fired and cannot tag anything) so it is recorded as a decision rather than an oversight. Saying it only in prose settles nothing and this will ask again next turn. What you never do is raise its severity to make it visible: that pushes a heavier warning out to show a lighter one. The note said: {note} The item says: {}",
  model::store::CROWDED_ON_PURPOSE_TAG, item.text
@@ -1189,6 +1269,13 @@ fn crowding_debt(store: &EventStore, db_path: &Path, session_id: &str) -> Option
 /// items that fire most - exactly the ones whose bindings are worth
 /// revisiting. Forty more firings is a long way to earn a second question.
 const JUDGEMENT_DEBT_AFTER: usize = 40;
+
+/// How many owed items one blocked Stop asks about at once. Unbounded would
+/// just move the problem this exists to fix (see `judgement_debt`'s own doc
+/// comment) into a single enormous block instead of many small ones; this
+/// keeps each block itself bounded while still settling the common case (a
+/// handful owed) in one round instead of one Stop per id.
+const JUDGEMENT_DEBT_BATCH_MAX: usize = 20;
 
 /// Ask for a verdict on ONE item that has fired over and over and has never
 /// once been judged, or nothing.
@@ -1226,6 +1313,19 @@ const JUDGEMENT_DEBT_AFTER: usize = 40;
 /// forty-two owed were of exactly that kind, found by trying to pay one.
 /// What is left fires because a TRIGGER matched, and there the question is
 /// real: the trigger can be wrong.
+///
+/// ASKS ABOUT THE WHOLE OWED SET IN ONE BLOCK, up to
+/// `JUDGEMENT_DEBT_BATCH_MAX`, not one item per Stop. Unpinning a batch of
+/// long-pinned items (see `serve unpin`) makes all of them owed at once -
+/// each carried a large lifetime serving count from its time as `Always`,
+/// which crosses `JUDGEMENT_DEBT_AFTER` the moment the pin comes off - and a
+/// long conversation pays the FULL conversation history again on every Stop
+/// it takes to answer, one id per turn. Measured 2026-08-13: five separate
+/// one-item Stops to judge a backlog that batching would have settled in
+/// one. The termination property is unchanged: still one block per Stop
+/// (`stop_hook_active` still short-circuits the retry), still one verdict
+/// call per id, just several ids asked about in that single block instead of
+/// a queue paid out one Stop at a time.
 fn judgement_debt(store: &EventStore, session_id: &str) -> Option<String> {
     use thor_core::event_store::EventKind;
     let events = store.event_kinds().ok()?;
@@ -1290,11 +1390,21 @@ fn judgement_debt(store: &EventStore, session_id: &str) -> Option<String> {
         return None;
     }
     owed.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
-    let (id, count) = owed.first()?;
-    let remaining = owed.len();
-    let text = model::store::show(store, id).ok().map(|i| i.text).unwrap_or_default();
+    let total_owed = owed.len();
+    let batch_len = total_owed.min(JUDGEMENT_DEBT_BATCH_MAX);
+    let mut items_block = String::new();
+    for (id, count) in owed.iter().take(JUDGEMENT_DEBT_BATCH_MAX) {
+        let text = model::store::show(store, id).ok().map(|i| i.text).unwrap_or_default();
+        items_block.push_str(&format!("\n- '{id}' ({count}x since last judged, if ever): {text}"));
+    }
+    let held_back = total_owed - batch_len;
+    let held_back_note = if held_back > 0 {
+        format!(" {held_back} more beyond this batch will follow on a later turn.")
+    } else {
+        String::new()
+    };
     Some(format!(
-        "[THOR] '{id}' has been served {count} times since it was last judged, if ever, and {remaining} item(s) are in that state. Judge this one before ending the turn: call mark with its id, noise:true if it did not belong where it fired, or plain if it helped. FIRST look at whether it is still TRUE - the text is below. If the code or the file says otherwise, revise it against what you can see there; that is a repair, not noise, and marking it noise would leave a wrong fact in place. Observed 2026-08-09: a session asked to judge a fact checked it, found it contradicted the code, and corrected it - being made to judge is what created the occasion to look. Two noise judgements since the last mark of usefulness retire an item from every injection surface while leaving it findable; a mark of usefulness clears the noise recorded before it, and a noise mark recorded after it still counts. Nothing else in this system ever retires noise - a serving count decides nothing and silence decides nothing. The item says: {text}"
+        "[THOR] {batch_len} item(s) have fired repeatedly since they were last judged, if ever - listed below. Judge ALL {batch_len} before ending the turn: call mark once per id, noise:true if it did not belong where it fired, or plain if it helped.{held_back_note} FIRST look at whether each is still TRUE - if the code or the file says otherwise, revise it against what you can see there; that is a repair, not noise, and marking it noise would leave a wrong fact in place. Two noise judgements since the last mark of usefulness retire an item from every injection surface while leaving it findable; a mark of usefulness clears the noise recorded before it, and a noise mark recorded after it still counts. Nothing else in this system ever retires noise - a serving count decides nothing and silence decides nothing.{items_block}"
     ))
 }
 
@@ -1951,6 +2061,115 @@ mod judgement_debt_tests {
         }
     }
 
+    /// A crowded PATH pool: `MAX_ITEMS` items of equal weight claiming one
+    /// file, whose texts share no words with the path, so closeness separates
+    /// none of them from each other.
+    fn crowd_a_path(store: &mut EventStore, project: &str) {
+        const DISTINCT: [&str; 5] = [
+            "a webhook retry backs off before it gives up entirely",
+            "the estimator rounds a quote up to whole cents",
+            "a spool label carries the batch it came from",
+            "the scheduler skips a printer that is on hold",
+            "an invoice number never restarts inside a year",
+        ];
+        for i in 0..model::item::MAX_ITEMS {
+            let item = Item {
+                id: format!("pathholder-{i}"),
+                kind: Kind::Rule,
+                text: DISTINCT[i % DISTINCT.len()].to_string(),
+                bindings: vec![Binding::Target {
+                    kind: model::item::TargetKind::Path,
+                    value: "server/app.js".to_string(),
+                }],
+                severity: None,
+                project: Some(project.to_string()),
+                tags: vec![],
+                expires: None,
+                key: None,
+                falsifier: Some(format!("path holder {i} turns out not to matter")),
+                check: None,
+            };
+            model::store::declare(store, "earlier", "earlier", "t", &item).expect("fixture must store");
+        }
+    }
+
+    fn path_newcomer(id: &str, project: &str, text: &str) -> Item {
+        Item {
+            id: id.to_string(),
+            kind: Kind::Rule,
+            text: text.to_string(),
+            bindings: vec![Binding::Target {
+                kind: model::item::TargetKind::Path,
+                value: "server/app.js".to_string(),
+            }],
+            severity: None,
+            project: Some(project.to_string()),
+            tags: vec![],
+            expires: None,
+            key: None,
+            falsifier: Some("this newcomer turns out not to matter".to_string()),
+            check: None,
+        }
+    }
+
+    /// THE DEFECT THIS PREVENTS. `capacity` counts rivals of the same weight or
+    /// heavier and calls the pool full - correct as a deliberately pessimistic
+    /// WRITE-time warning, wrong as the debt's verdict. Equal weight outranks
+    /// nothing; closeness settles those ties at serve time. Measured 2026-08-13
+    /// on a fact that had just been folded INTO the shown four and was still
+    /// asked about every turn, with the `crowded-on-purpose` tag as the only
+    /// offered exit - so answering it honestly meant recording a decision that
+    /// was false.
+    #[test]
+    fn a_crowded_estimate_settles_itself_when_the_item_really_reaches_the_block() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("t.db");
+        let mut store = EventStore::new(&db).unwrap();
+        crowd_a_path(&mut store, "p");
+        record_session_watermark(&db, "now");
+        // Same weight and same pool, so the estimate still calls it full - but
+        // its text shares words with the path, which is what wins the tie.
+        let mine = path_newcomer("mine", "p", "the server app entry point stays free of route handlers");
+        model::store::declare(&mut store, "mcp", "mcp", "t", &mine).unwrap();
+
+        assert!(
+            matches!(model::store::capacity(&store, &mine), Ok(model::store::Capacity::Crowded(_))),
+            "fixture sanity: the write-time estimate must still call this pool full"
+        );
+        assert!(
+            crowding_debt(&store, &db, "now").is_none(),
+            "an item the real ranker does show must not be asked about as though it were invisible"
+        );
+    }
+
+    /// The other half, and the one that must not regress: an item that really
+    /// cannot appear still holds the turn. Without it, "ask the real ranker"
+    /// could quietly become "never ask anything".
+    ///
+    /// A DIRECTORY binding is the honest case, and the reason a plain crowded
+    /// pool is not: measured while writing this, a newcomer of equal weight on
+    /// a full PATH pool is shown anyway - it wins on recency and pushes an
+    /// older holder out - so the write-time note overstated that case too. A
+    /// Dir binding reaches no automatic surface at all (`rank::select` drops it
+    /// before comparing a single path), so here the estimate and the ranker
+    /// agree, and the debt is owed.
+    #[test]
+    fn an_item_that_can_never_appear_still_holds_the_turn() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("t.db");
+        let mut store = EventStore::new(&db).unwrap();
+        record_session_watermark(&db, "now");
+        let mut mine = path_newcomer("mine", "p", "everything under this folder is generated, never hand-edited");
+        mine.bindings = vec![Binding::Target {
+            kind: model::item::TargetKind::Dir,
+            value: "server/generated".to_string(),
+        }];
+        model::store::declare(&mut store, "mcp", "mcp", "t", &mine).unwrap();
+
+        let asked = crowding_debt(&store, &db, "now").expect("an item no surface can reach must still hold the turn");
+        assert!(asked.contains("mine"), "{asked}");
+    }
+
     /// THE LAZINESS THIS REMOVES. The write response already said "this may
     /// well never be shown there". Across two real sessions that note was
     /// reported and then left alone, and the fact stayed invisible. A
@@ -2076,7 +2295,7 @@ mod judgement_debt_tests {
 
         let item = model::store::show(&store, "answer-me").unwrap();
         let mut answered_no = item.clone();
-        answered_no.tags.push(model::store::NO_LITERAL_TAG.to_string());
+        answered_no.tags.push(format!("{}a test fixture with nothing literal to catch", model::store::NO_LITERAL_REASON_PREFIX));
         model::store::revise(&mut store, "s", "l", "a", &item, &answered_no).unwrap();
         assert!(teeth_debt(&store).is_none(), "answering 'nothing to catch' must settle it for good");
     }
@@ -2299,6 +2518,67 @@ mod judgement_debt_tests {
         declare(&mut store, "rarely", false);
         serve_it(&mut store, "rarely", JUDGEMENT_DEBT_AFTER - 1);
         assert!(judgement_debt(&store, "s").is_none());
+    }
+
+    /// THE DEFECT THIS PREVENTS: unpinning a batch of long-pinned items (each
+    /// carrying a large lifetime serving count from its time as `Always`)
+    /// makes all of them owed in the same instant, and asking about them one
+    /// per Stop turns a single backlog into that many separate blocked turns
+    /// - each one repaying a long conversation's full history for a single
+    /// id. One block must be able to carry more than one id.
+    #[test]
+    fn multiple_owed_items_are_all_asked_about_in_one_block() {
+        let mut store = EventStore::in_memory().unwrap();
+        declare(&mut store, "first", false);
+        declare(&mut store, "second", false);
+        serve_it(&mut store, "first", JUDGEMENT_DEBT_AFTER);
+        serve_it(&mut store, "second", JUDGEMENT_DEBT_AFTER);
+
+        let asked = judgement_debt(&store, "s").expect("two owed items must still produce one block");
+        assert!(asked.contains("first"), "{asked}");
+        assert!(asked.contains("second"), "{asked}");
+    }
+
+    /// A verdict on one of several owed items settles only that one - the
+    /// others must still be owed and still asked about together, not
+    /// silently cleared as a side effect of somebody else's answer.
+    #[test]
+    fn judging_one_of_several_leaves_the_rest_owed_together() {
+        let mut store = EventStore::in_memory().unwrap();
+        declare(&mut store, "answered", false);
+        declare(&mut store, "still-owed-a", false);
+        declare(&mut store, "still-owed-b", false);
+        serve_it(&mut store, "answered", JUDGEMENT_DEBT_AFTER);
+        serve_it(&mut store, "still-owed-a", JUDGEMENT_DEBT_AFTER);
+        serve_it(&mut store, "still-owed-b", JUDGEMENT_DEBT_AFTER);
+
+        serve::mark::record_useful(&mut store, "s", "s", "t", "2026-08-13T00:00:00Z", "answered").unwrap();
+
+        let asked = judgement_debt(&store, "s").expect("two items are still owed");
+        assert!(!asked.contains("answered"), "a settled item must not reappear: {asked}");
+        assert!(asked.contains("still-owed-a"), "{asked}");
+        assert!(asked.contains("still-owed-b"), "{asked}");
+    }
+
+    /// THE CAP MUST STAY A CAP, not become a new unbounded block under a
+    /// different name - the whole point of batching was to stop paying a
+    /// long conversation's full history once per owed id, not to risk one
+    /// enormous block instead. Past the cap, it must say how many it held
+    /// back rather than silently dropping them.
+    #[test]
+    fn the_batch_is_capped_and_names_how_many_it_held_back() {
+        let mut store = EventStore::in_memory().unwrap();
+        let n = JUDGEMENT_DEBT_BATCH_MAX + 3;
+        for i in 0..n {
+            let id = format!("owed-{i}");
+            declare(&mut store, &id, false);
+            serve_it(&mut store, &id, JUDGEMENT_DEBT_AFTER);
+        }
+
+        let asked = judgement_debt(&store, "s").expect("a large backlog is still owed");
+        let shown = (0..n).filter(|i| asked.contains(&format!("owed-{i}"))).count();
+        assert_eq!(shown, JUDGEMENT_DEBT_BATCH_MAX, "the block must show exactly the cap, not more: {asked}");
+        assert!(asked.contains(&format!("{} more", n - JUDGEMENT_DEBT_BATCH_MAX)), "{asked}");
     }
 }
 

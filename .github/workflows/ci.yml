@@ -22,55 +22,10 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
-  build-and-test:
-    name: ${{ matrix.name }}
-    runs-on: ${{ matrix.os }}
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          # The server/NAS shape: no ONNX, pure bm25.
-          - name: linux / default (bm25)
-            os: ubuntu-latest
-            features: ""
-          # The client shape: the semantic recall path.
-          - name: windows / semantic
-            os: windows-latest
-            features: "--features semantic"
-          # Keeps the semantic path honest on Linux too (the courier is not
-          # Windows-only); this is what the linux release asset is built from.
-          - name: linux / semantic
-            os: ubuntu-latest
-            features: "--features semantic"
-
-    steps:
-      - uses: actions/checkout@v4
-
-      - uses: dtolnay/rust-toolchain@stable
-
-      # Compiling fastembed/ort/tokenizers/rusqlite from scratch is the slow
-      # part; cache keyed on the lockfile so a docs-only PR is fast.
-      - uses: Swatinem/rust-cache@v2
-        with:
-          workspaces: thor
-
-      - name: Build
-        working-directory: thor
-        run: cargo build --release ${{ matrix.features }}
-
-      # The library suite runs WITHOUT a local embedding model or a daemon (the
-      # semantic path degrades to bm25 when they are absent), so a clean runner
-      # is a valid place to run it. This step runs across the feature matrix, so
-      # there is no single test count: measured 2026-07-21, the default build has
-      # 234 tests and the semantic build 280, all passing with no model present.
-      - name: Test
-        working-directory: thor
-        run: cargo test --release ${{ matrix.features }} --lib
-
-  # Version 2, which had NO automated coverage at all until 2026-08-08 - the
-  # job above builds `thor/` only, so every one of 2.0's tests ran solely on
-  # the maintainer's own machine. A rebuild that nothing tests is a rebuild
-  # nobody can trust.
+  # Version 1 had its own build-and-test job here until 2026-08-15. Version 1 is
+  # retired: its source is no longer in this tree, and the v1.0.0 tag still holds
+  # it for anyone who needs to look. A job that builds a directory nobody ships
+  # is a job that only ever fails.
   #
   # `--all-targets`, not `--lib`: 2.0 puts the refusals it cares most about in
   # integration tests (the write path, the neighbourhood toll, the global tier)

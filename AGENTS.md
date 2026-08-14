@@ -24,10 +24,6 @@ A few MB means `--features semantic` was left off, and searching by meaning is
 now silently missing: it returns nothing at all, with no error anywhere. Build
 it again rather than carrying on.
 
-The ready-made downloads on the Releases page are still version 1. If they want
-a binary rather than a build, that is version 1 they are getting, and
-`docs/1.0/SETUP.md` is the page for it.
-
 **2. Install it.** One command does the whole setup, and in the common case it
 takes no arguments at all:
 
@@ -206,4 +202,3 @@ apart, not an error to work around.
 - [thor2/README.md](thor2/README.md) - the program: how it is built, what each part does
 - [thor2/CONTRACT.md](thor2/CONTRACT.md) - the standard it is judged against
 - [thor2/SPEC-ENFORCEMENT.md](thor2/SPEC-ENFORCEMENT.md) - how a note proves itself
-- [docs/1.0/](docs/1.0/) - version 1, for anyone still running it

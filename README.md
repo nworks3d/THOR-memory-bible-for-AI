@@ -217,10 +217,6 @@ cd thor2 && cargo build --release --features semantic
 > two apart is size. Look at `thor2/target/release/serve.exe` - over 20 MB is
 > the right build, a few MB is the wrong one. Build it again with the flag.
 
-The downloads on the [Releases](../../releases) page are still version 1. If you
-want a ready-made binary rather than a build, that is version 1 you are getting,
-and [docs/1.0/SETUP.md](docs/1.0/SETUP.md) is the page for it.
-
 **Step 2 - install it.** One command does the whole setup, and in the normal
 case you type no paths at all:
 
@@ -345,7 +341,6 @@ you. The tool is here. The verdict is yours.
 | [thor2/CONTRACT.md](thor2/CONTRACT.md) | the standard version 2 is judged against, and the test enforcing each rule |
 | [thor2/SPEC-ENFORCEMENT.md](thor2/SPEC-ENFORCEMENT.md) | how a note proves itself, in detail |
 | [CONTRIBUTING.md](CONTRIBUTING.md) | changing THOR: the bar for a pull request |
-| [docs/1.0/](docs/1.0/) | version 1, kept for anyone still running it |
 
 ## Thanks
 
@@ -357,8 +352,7 @@ you. The tool is here. The verdict is yours.
   knowledge; here it set the bar THOR had to clear, and for a long stretch it
   cleared plenty of its own. Every early comparison in this project was against
   mimir, wins and losses both published on purpose, because a rival that good
-  deserves honest numbers. Moving from mimir? `thor/tools/export_mimir.py`
-  brings your notes across.
+  deserves honest numbers.
 - **Ideas borrowed, both ways.** Two things THOR does came from mimir's own
   work and were rebuilt here in THOR's own way, and mimir in turn credits THOR
   for reading code into memory and for checking memory on every message -

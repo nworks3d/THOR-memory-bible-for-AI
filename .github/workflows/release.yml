@@ -192,8 +192,8 @@ jobs:
             running. Then run `doctor` to see whether it is actually healthy.
 
             New here? The README walks through it step by step. Coming from version 1?
-            Your old notes are not lost - see the README's own note on that; and version 1's
-            documentation is still in `docs/1.0/`.
+            Your old notes are not lost - see the README's own note on that; version 1
+            itself is retired, and its source and docs stay reachable at the v1.0.0 tag.
 
             **What has actually been run**
 

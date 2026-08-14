@@ -614,8 +614,20 @@ fn hook_once(db_path: &Path) -> Option<HookOutput> {
         // Asked first because it is the only one whose answer decays: the
         // person who wrote the fact still knows what it was for, and tomorrow
         // nobody does.
-        if let Some(reason) =
-            EventStore::open_existing(db_path).ok().and_then(|s| crowding_debt(&s, db_path, &session_id))
+        // The project THIS session is working in, from the payload's own cwd -
+        // resolved here because the shared `session_project` below is computed
+        // after this early Stop branch returns. It routes the crowding nag to
+        // the session whose project the fact belongs to (see crowding_debt).
+        let stop_project = payload
+            .get("cwd")
+            .and_then(|v| v.as_str())
+            .map(PathBuf::from)
+            .or_else(|| std::env::current_dir().ok())
+            .as_deref()
+            .and_then(project::resolve_project);
+        if let Some(reason) = EventStore::open_existing(db_path)
+            .ok()
+            .and_then(|s| crowding_debt(&s, db_path, &session_id, stop_project.as_deref()))
         {
             return Some(HookOutput::Decision(
                 serde_json::json!({ "decision": "block", "reason": reason }),
@@ -1222,7 +1234,12 @@ fn reaches_a_block(store: &EventStore, id: &str, item: &model::item::Item) -> bo
     false
 }
 
-fn crowding_debt(store: &EventStore, db_path: &Path, session_id: &str) -> Option<String> {
+fn crowding_debt(
+    store: &EventStore,
+    db_path: &Path,
+    session_id: &str,
+    current_project: Option<&str>,
+) -> Option<String> {
     use thor_core::event_store::EventKind;
     let since = session_watermark(db_path, session_id)?;
     let events = store.get_all_events().ok()?;
@@ -1253,6 +1270,24 @@ fn crowding_debt(store: &EventStore, db_path: &Path, session_id: &str) -> Option
             continue;
         }
         let Ok(item) = model::store::show(store, &id) else { continue };
+        // A fact scoped to a project this session is NOT working in was almost
+        // certainly not written by this session. It cannot be told apart by the
+        // event's own id - every tool-server write is stamped the constant
+        // "mcp" (see this function's watermark note), so a second session
+        // running concurrently against the SAME store lands its writes above
+        // this session's watermark and they read as ours. The item's own scope
+        // is the signal the id is not: a session in repo X gets nagged about a
+        // crowded fact in repo Y that another session actually wrote. So the
+        // nag is routed by project - this session hears only about facts in its
+        // own project, or global ones (no project), which belong to everyone.
+        // Measured 2026-08-14: a business-repo fact nagged a THOR-dev session
+        // twice. When this session's own project cannot be resolved, nothing is
+        // filtered - the watermark stands alone, exactly as before.
+        if let (Some(cur), Some(p)) = (current_project, item.project.as_deref()) {
+            if cur != p {
+                continue;
+            }
+        }
         // Exit 3 taken: the crowd was judged deserved. See the tag's own doc
         // comment for the day this exit existed in the message but nowhere in
         // the code, and the item kept coming back every turn.
@@ -2159,7 +2194,7 @@ mod judgement_debt_tests {
             "fixture sanity: the write-time estimate must still call this pool full"
         );
         assert!(
-            crowding_debt(&store, &db, "now").is_none(),
+            crowding_debt(&store, &db, "now", None).is_none(),
             "an item the real ranker does show must not be asked about as though it were invisible"
         );
     }
@@ -2188,7 +2223,7 @@ mod judgement_debt_tests {
         }];
         model::store::declare(&mut store, "mcp", "mcp", "t", &mine).unwrap();
 
-        let asked = crowding_debt(&store, &db, "now").expect("an item no surface can reach must still hold the turn");
+        let asked = crowding_debt(&store, &db, "now", None).expect("an item no surface can reach must still hold the turn");
         assert!(asked.contains("mine"), "{asked}");
     }
 
@@ -2207,7 +2242,7 @@ mod judgement_debt_tests {
         record_session_watermark(&db, "now");
         model::store::declare(&mut store, "mcp", "mcp", "t", &crowded_newcomer("mine", "p")).unwrap();
 
-        let asked = crowding_debt(&store, &db, "now").expect("a crowded write must hold the turn");
+        let asked = crowding_debt(&store, &db, "now", None).expect("a crowded write must hold the turn");
         assert!(asked.contains("mine"), "{asked}");
         assert!(asked.contains("FOLD"), "it must say what to do, not just that something is wrong: {asked}");
         assert!(asked.contains("never do is raise its severity"), "{asked}");
@@ -2225,9 +2260,9 @@ mod judgement_debt_tests {
         model::store::declare(&mut store, "mcp", "mcp", "t", &crowded_newcomer("theirs", "p")).unwrap();
         record_session_watermark(&db, "today");
 
-        assert!(crowding_debt(&store, &db, "today").is_none(), "a fresh session inherits no older mess");
+        assert!(crowding_debt(&store, &db, "today", None).is_none(), "a fresh session inherits no older mess");
         assert!(
-            crowding_debt(&store, &db, "never-started").is_none(),
+            crowding_debt(&store, &db, "never-started", None).is_none(),
             "a session whose start was never seen must stay silent, never inherit everything"
         );
     }
@@ -2242,11 +2277,11 @@ mod judgement_debt_tests {
         crowd_a_moment(&mut store, "p");
         record_session_watermark(&db, "now");
         model::store::declare(&mut store, "mcp", "mcp", "t", &crowded_newcomer("mine", "p")).unwrap();
-        assert!(crowding_debt(&store, &db, "now").is_some(), "fixture sanity");
+        assert!(crowding_debt(&store, &db, "now", None).is_some(), "fixture sanity");
 
         model::store::retract(&mut store, "mcp", "mcp", "t", "mine", "folded into the item that already said it")
             .unwrap();
-        assert!(crowding_debt(&store, &db, "now").is_none(), "folding it away settles it, with no marker to update");
+        assert!(crowding_debt(&store, &db, "now", None).is_none(), "folding it away settles it, with no marker to update");
     }
 
     /// The other way out: move it somewhere with room. Same story - the debt
@@ -2260,7 +2295,7 @@ mod judgement_debt_tests {
         record_session_watermark(&db, "now");
         let mine = crowded_newcomer("mine", "p");
         model::store::declare(&mut store, "mcp", "mcp", "t", &mine).unwrap();
-        assert!(crowding_debt(&store, &db, "now").is_some(), "fixture sanity");
+        assert!(crowding_debt(&store, &db, "now", None).is_some(), "fixture sanity");
 
         let mut moved = mine.clone();
         moved.bindings = vec![Binding::Target {
@@ -2268,7 +2303,39 @@ mod judgement_debt_tests {
             value: "server/lib/labels.js".to_string(),
         }];
         model::store::revise(&mut store, "mcp", "mcp", "t", &mine, &moved).unwrap();
-        assert!(crowding_debt(&store, &db, "now").is_none(), "a place with room settles it");
+        assert!(crowding_debt(&store, &db, "now", None).is_none(), "a place with room settles it");
+    }
+
+    /// The cross-session leak this closes, measured 2026-08-14: two Claude
+    /// sessions share one store, every tool-server write is stamped the
+    /// constant "mcp", so the second session's writes land above the first's
+    /// watermark and read as the first's own. The item's PROJECT is the signal
+    /// the id is not - a session working in one repo is nagged only about
+    /// crowded facts in that repo, or global ones, never another repo's.
+    #[test]
+    fn a_crowded_fact_in_another_project_does_not_nag_this_session() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("t.db");
+        let mut store = EventStore::new(&db).unwrap();
+        crowd_a_moment(&mut store, "p");
+        record_session_watermark(&db, "now");
+        model::store::declare(&mut store, "mcp", "mcp", "t", &crowded_newcomer("theirs", "p")).unwrap();
+
+        // A session working in a DIFFERENT project hears nothing about it.
+        assert!(
+            crowding_debt(&store, &db, "now", Some("other-repo")).is_none(),
+            "a fact scoped to another project was another session's write, not this one's"
+        );
+        // The session whose project it belongs to still gets nagged.
+        assert!(
+            crowding_debt(&store, &db, "now", Some("p")).is_some(),
+            "the session actually in that project must still hear it"
+        );
+        // With no project to route by, nothing is filtered - the watermark stands alone.
+        assert!(
+            crowding_debt(&store, &db, "now", None).is_some(),
+            "an unresolved project falls back to the old behaviour"
+        );
     }
 
     /// A rule as it exists in a store written BEFORE the gate started asking:
@@ -2397,13 +2464,13 @@ mod judgement_debt_tests {
         record_session_watermark(&db, "now");
         let mine = crowded_newcomer("mine", "p");
         model::store::declare(&mut store, "mcp", "mcp", "t", &mine).unwrap();
-        assert!(crowding_debt(&store, &db, "now").is_some(), "fixture sanity");
+        assert!(crowding_debt(&store, &db, "now", None).is_some(), "fixture sanity");
 
         let mut judged = mine.clone();
         judged.tags.push(model::store::CROWDED_ON_PURPOSE_TAG.to_string());
         model::store::revise(&mut store, "mcp", "mcp", "t", &mine, &judged).unwrap();
         assert!(
-            crowding_debt(&store, &db, "now").is_none(),
+            crowding_debt(&store, &db, "now", None).is_none(),
             "a recorded decision settles it, with the item exactly as crowded as before"
         );
     }

@@ -28,25 +28,28 @@ The ready-made downloads on the Releases page are still version 1. If they want
 a binary rather than a build, that is version 1 they are getting, and
 `docs/1.0/SETUP.md` is the page for it.
 
-**2. Install it.** One command does the whole setup:
+**2. Install it.** One command does the whole setup, and in the common case it
+takes no arguments at all:
 
 ```sh
-thor2/target/release/install.exe --settings "<their settings.json>" --mcp-json "<their .mcp.json>"
+thor2/target/release/install.exe
 ```
 
-It creates their memory if there is not one yet, wires THOR in so it speaks on
-its own, and registers the part you write through. It backs up both files
-first, never removes anything it did not put there, and a second run changes
-nothing.
+It finds Claude Code's own two config files by itself - the per-user
+`settings.json` for the hooks, and `~/.claude.json` for the tool server you
+write through - creates their memory if there is not one yet, seeds the notes
+in the next section, and wires it all together. It backs up both files first,
+never removes anything it did not put there, and a second run changes nothing.
 
-Those two paths are the only ones it will not guess, because they are the two
-files it writes to. It works the rest out: the programs next to itself, and
-their memory in the usual per-user place. Use `--db` and `--serve-exe` if they
-want to decide themselves.
+Nothing to type in the normal case. For an unusual setup: `--settings` and
+`--mcp-json` point it at other files, `--db` and `--serve-exe` override the
+rest, and `--no-mcp` installs a memory the agent can read but not write, on
+purpose.
 
-If it warns that the program it points at is not there, stop and fix that
-first. A missing program does not produce an error later - it produces silence,
-and their memory simply never speaks.
+If it stops because a program it needs is not next to it, build it first
+(step 1). It refuses rather than install a hook that points at a missing
+binary - a missing program produces no error later, only silence, and their
+memory would simply never speak.
 
 **3. Have them restart the assistant once.** Both of those files are read at
 startup only. Until they restart, nothing you just installed is running. This
@@ -64,7 +67,7 @@ without it, just with simpler matching.
 **5. Give the project its own memory.** From the project folder:
 
 ```sh
-thor2/target/release/install.exe --settings "<their settings.json>" --project "<project-name>"
+thor2/target/release/install.exe --project "<project-name>"
 ```
 
 Skip this and THOR gets worse the more they use it, because every search starts

@@ -82,31 +82,33 @@ Under 20 MB means you built the wrong thing. Build again with the flag.
 
 ## Install it
 
-One command does the whole setup:
+One command does the whole setup, and in the common case it takes no arguments:
 
 ```bash
-target/release/install.exe --settings "<agent settings.json>" --mcp-json "<.mcp.json>"
+target/release/install.exe
 ```
 
 It creates the store if there is not one yet, wires in the four hooks, and
-registers the tool server the agent writes through. Both files are backed up to
-`<path>.bak` before anything touches them, nothing this tool did not put there
-is ever removed, and a second run reports everything as already present and
-writes nothing.
+registers the tool server the agent writes through. The two files it writes are
+found on their own - the per-user `settings.json` for the hooks and
+`~/.claude.json` for the tool server. Both are backed up to `<path>.bak` before
+anything touches them, nothing this tool did not put there is ever removed, and
+a second run reports everything as already present and writes nothing.
 
-A store it just created also gets four pinned notes on how to write a fact that
-comes back: anchoring, correcting instead of duplicating, what a refusal is, and
-that words inform while only a proof forbids. They go in through
+A store it just created also gets a set of pinned notes on how to write a fact
+that comes back: anchoring, correcting instead of duplicating, what a refusal
+is, that words inform while only a proof forbids, saying what actually happened,
+and answering whether a rule can refuse. They go in through
 `model::store::declare`, the same gate every other write uses, and a refusal is
 reported rather than worked around - a memory whose own gate rejects the notes
 it ships with is worth seeing. An EXISTING store is never seeded, so upgrading
 never pushes anything into someone's real notes.
 
-Those two paths have no defaults, on purpose: they are the two files this
-command WRITES to, and a tool that rewrites a config file should never guess
-which one. Everything else is worked out - the binaries next to the installer,
-and the store in the per-user data directory. `--db`, `--serve-exe`, `--mcp-exe`
-and `--code-index-root` override each of those.
+The two written files default to Claude Code's own per-user locations - not a
+guess, but the one documented place each lives, printed before it is used and
+backed up first. `--settings` and `--mcp-json` send them elsewhere (a project's
+own `.mcp.json`, say), `--no-mcp` installs a read-only memory on purpose, and
+`--db`, `--serve-exe`, `--mcp-exe` and `--code-index-root` override the rest.
 
 `--project <key>` additionally writes a `.thor-project` marker in the current
 directory, which is what gives a checkout its own scope. It refuses to change a
@@ -119,9 +121,10 @@ The four hooks are `SessionStart` (what the agent is handed at the start),
 tell themselves apart by the payload.
 
 A hook pointing at a binary that is not there fails OPEN: the agent carries on
-and the memory simply never speaks again, with no error anywhere. The installer
-prints a warning when the path it is about to write does not exist yet, which is
-the only moment that is cheap to notice.
+and the memory simply never speaks again, with no error anywhere. So the
+installer refuses rather than write such a hook - if the `serve` or `mcp` binary
+it would point at is not present, it stops and says which, at the one moment
+that is cheap to notice.
 
 ## Check it
 

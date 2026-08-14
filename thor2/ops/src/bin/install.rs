@@ -18,8 +18,9 @@
 
 use clap::Parser;
 use ops::install::{
-    default_data_dir, ensure_store, install_hooks, install_tool_server, seed_working_contract,
-    standard_hooks, write_project_marker, HookOutcome, MarkerOutcome, ServerOutcome, StoreOutcome,
+    default_data_dir, default_settings_path, default_user_mcp_path, ensure_store, install_hooks,
+    install_tool_server, seed_working_contract, standard_hooks, write_project_marker, HookOutcome,
+    MarkerOutcome, ServerOutcome, StoreOutcome,
 };
 use std::path::PathBuf;
 use std::process::ExitCode;
@@ -30,17 +31,24 @@ use std::process::ExitCode;
     about = "Set THOR up: create the store, wire the hooks, register the tool server"
 )]
 struct Cli {
-    /// The agent's settings.json to install the hooks into. Backed up to
-    /// <path>.bak first. Required: this command writes to it, and a tool that
-    /// rewrites a config file should never guess which one.
+    /// The settings.json to install the hooks into. Backed up to <path>.bak
+    /// first. Defaults to Claude Code's own per-user file
+    /// (~/.claude/settings.json) - name one only to write somewhere else.
     #[arg(long)]
-    settings: PathBuf,
+    settings: Option<PathBuf>,
 
-    /// The .mcp.json to register the tool server in. Backed up the same way.
-    /// Leave it out and the hooks are installed on their own, which gives the
-    /// agent a memory it can read but never write to.
+    /// The file to register the tool server in. Backed up the same way.
+    /// Defaults to Claude Code's per-user MCP config (~/.claude.json), so the
+    /// agent can write its memory in every project. Name one to write
+    /// elsewhere (a project's own .mcp.json, say).
     #[arg(long = "mcp-json")]
     mcp_json: Option<PathBuf>,
+
+    /// Install the hooks WITHOUT registering the tool server. The agent will
+    /// then be able to READ its memory but never write to it - only for the
+    /// rare case where that is what you actually want.
+    #[arg(long = "no-mcp")]
+    no_mcp: bool,
 
     /// The `serve` binary the hooks will call. Defaults to the one next to
     /// this installer.
@@ -89,7 +97,13 @@ fn main() -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
-    let mcp_exe = cli.mcp_exe.or_else(|| sibling("mcp"));
+    // Filtered on existence on purpose: `sibling` returns a path whether or
+    // not the file is there, and registering a tool server that points at a
+    // binary that is not present is the same silent half-install the serve
+    // check below refuses - the agent would simply never be able to write,
+    // with nothing saying why. A missing binary here becomes `None`, which the
+    // step-3 match turns into a loud refusal, not a dead registration.
+    let mcp_exe = cli.mcp_exe.or_else(|| sibling("mcp")).filter(|p| p.exists());
     let db = match cli.db.or_else(|| data_dir.as_ref().map(|d| d.join("thor.db"))) {
         Some(p) => p,
         None => {
@@ -100,6 +114,42 @@ fn main() -> ExitCode {
     let code_index_root = cli
         .code_index_root
         .or_else(|| db.parent().map(|d| d.join("codeindex")));
+
+    // The two files this command WRITES to. Defaulted to Claude Code's own
+    // per-user locations (see default_settings_path / default_user_mcp_path)
+    // rather than demanded as absolute paths a newcomer has no way to know -
+    // which was the actual reported blocker. Both writers back up first and
+    // only ever add, so a well-known default keeps the safety and drops the
+    // friction.
+    let settings = match cli.settings.clone().or_else(default_settings_path) {
+        Some(p) => p,
+        None => {
+            eprintln!("could not find your home directory to place settings.json - name it with --settings");
+            return ExitCode::FAILURE;
+        }
+    };
+    let mcp_target: Option<PathBuf> = if cli.no_mcp {
+        None
+    } else {
+        match cli.mcp_json.clone().or_else(default_user_mcp_path) {
+            Some(p) => Some(p),
+            None => {
+                eprintln!(
+                    "could not find your home directory to place the MCP config - name it with \
+                     --mcp-json, or pass --no-mcp to install a read-only memory on purpose"
+                );
+                return ExitCode::FAILURE;
+            }
+        }
+    };
+    // ~/.claude may not exist yet on a machine where Claude Code has never run.
+    // install_hooks writes the file, so its parent has to be there first;
+    // best-effort, because install_hooks reports the real error if it is not.
+    if let Some(parent) = settings.parent() {
+        if !parent.as_os_str().is_empty() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+    }
 
     // A hook pointing at a binary that is not there fails OPEN: the agent
     // carries on and the memory simply never speaks again. Nothing reports
@@ -125,9 +175,14 @@ fn main() -> ExitCode {
 
     println!("memory:       {}", db.display());
     println!("hooks call:   {}", serve_exe.display());
-    match &mcp_exe {
-        Some(p) => println!("writes via:   {}", p.display()),
-        None => println!("writes via:   (not set - the agent will not be able to write)"),
+    println!("hooks into:   {}  (backed up first)", settings.display());
+    match (&mcp_target, &mcp_exe) {
+        (Some(p), Some(exe)) => {
+            println!("writes via:   {}", exe.display());
+            println!("registered:   {}  (backed up first)", p.display());
+        }
+        (Some(_), None) => println!("writes via:   (mcp binary not found - see below)"),
+        (None, _) => println!("writes via:   (--no-mcp - a memory the agent can read but not write)"),
     }
     println!();
 
@@ -162,7 +217,7 @@ fn main() -> ExitCode {
 
     // 2. The hooks: what lets the memory speak at all.
     let specs = standard_hooks(&serve_exe.display().to_string(), &db.display().to_string());
-    match install_hooks(&cli.settings, &specs) {
+    match install_hooks(&settings, &specs) {
         Ok(report) => {
             for (event, outcome) in &report.results {
                 match outcome {
@@ -186,7 +241,7 @@ fn main() -> ExitCode {
     }
 
     // 3. The tool server: what lets the agent write back.
-    match (&cli.mcp_json, &mcp_exe) {
+    match (&mcp_target, &mcp_exe) {
         (Some(path), Some(exe)) => {
             let mut args = vec!["--db".to_string(), db.display().to_string()];
             if let Some(root) = &code_index_root {
@@ -214,11 +269,11 @@ fn main() -> ExitCode {
             }
         }
         (Some(_), None) => {
-            eprintln!("--mcp-json was given but `mcp` could not be found - name it with --mcp-exe");
+            eprintln!("the memory needs the `mcp` binary to be writable, and it is not next to this installer - name it with --mcp-exe, or pass --no-mcp to install a read-only memory on purpose");
             return ExitCode::FAILURE;
         }
         (None, _) => {
-            println!("- no tool server registered (--mcp-json was not given)");
+            println!("- no tool server registered (--no-mcp)");
             println!("  the agent will be able to READ its memory but never write to it");
         }
     }

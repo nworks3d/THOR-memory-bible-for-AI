@@ -32,6 +32,42 @@ pub fn default_data_dir() -> Option<PathBuf> {
     Some(base.join("thor2"))
 }
 
+/// The user's home directory: `USERPROFILE` on Windows, then `HOME`. The one
+/// thing every default path below is relative to.
+fn home_dir() -> Option<PathBuf> {
+    std::env::var("USERPROFILE").or_else(|_| std::env::var("HOME")).map(PathBuf::from).ok()
+}
+
+/// Claude Code's per-user settings file, where its `hooks` and `permissions`
+/// live: `~/.claude/settings.json`.
+///
+/// WHY DEFAULTING THIS IS NOT THE "never guess a file I write to" violation it
+/// looks like. That rule exists so this tool never rewrites the WRONG file.
+/// This is not a guess: it is the single documented per-user location, the
+/// same on every machine Claude Code runs on, and `install_hooks` only ever
+/// appends to it and writes a `.bak` first. Requiring a newcomer to type a
+/// path they have never needed to know was the actual reported blocker; a
+/// well-known default that is printed before it is used removes it without
+/// giving up the safety, which is the backup and the append-only writer, not
+/// the absence of a default.
+pub fn default_settings_path() -> Option<PathBuf> {
+    home_dir().map(|h| h.join(".claude").join("settings.json"))
+}
+
+/// Claude Code's per-user MCP config: `~/.claude.json`. A tool server written
+/// under its top-level `mcpServers` object is available in EVERY project, which
+/// is what a global THOR install wants. `install_tool_server` preserves every
+/// other key in that (large, stateful) file and backs it up first.
+///
+/// Defaulted for the same reason as `default_settings_path`, and it matters
+/// more here: leaving the MCP target unset gave a newcomer a memory the agent
+/// could READ but never WRITE to - a THOR that quietly does half its job. The
+/// working default makes writing-back the normal outcome instead of the one
+/// you had to know to ask for.
+pub fn default_user_mcp_path() -> Option<PathBuf> {
+    home_dir().map(|h| h.join(".claude.json"))
+}
+
 /// What happened to the store itself on this run.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StoreOutcome {

@@ -221,32 +221,35 @@ The downloads on the [Releases](../../releases) page are still version 1. If you
 want a ready-made binary rather than a build, that is version 1 you are getting,
 and [docs/1.0/SETUP.md](docs/1.0/SETUP.md) is the page for it.
 
-**Step 2 - install it.** One command does the whole setup:
+**Step 2 - install it.** One command does the whole setup, and in the normal
+case you type no paths at all:
 
 ```sh
-thor2/target/release/install.exe --settings "C:\Users\you\.claude\settings.json" --mcp-json "C:\Users\you\.mcp.json"
+thor2/target/release/install.exe
 ```
 
-It creates your memory if you do not have one yet, wires THOR into your
-assistant, and registers the part your assistant writes through. It backs up
-both files before it touches them, it never removes anything it did not put
-there, and running it twice changes nothing the second time.
+It finds your assistant's own two configuration files by itself, creates your
+memory if you do not have one yet, wires THOR into your assistant, and registers
+the part your assistant writes through. It backs up both files before it touches
+them, it never removes anything it did not put there, and running it twice
+changes nothing the second time.
 
-A brand new memory does not arrive empty. It gets four short notes on how to
-write a note that comes back to you later, and your assistant is handed them at
-the start of every conversation from then on. That matters more than it sounds:
-an assistant with nothing in front of it writes notes in a shape that never
-fires again, and neither of you would notice for weeks. They are ordinary notes
-- unpin one, rewrite it in your own words, or throw it out. An existing memory
-is never seeded, so upgrading never pushes anything into your own notes.
+A brand new memory does not arrive empty. It gets a handful of short notes on
+how to write a note that comes back to you later, and your assistant is handed
+them at the start of every conversation from then on. That matters more than it
+sounds: an assistant with nothing in front of it writes notes in a shape that
+never fires again, and neither of you would notice for weeks. They are ordinary
+notes - unpin one, rewrite it in your own words, or throw it out. An existing
+memory is never seeded, so upgrading never pushes anything into your own notes.
 
-Those two paths are the only ones it will not guess, because they are the two
-files it writes to. Everything else it works out on its own: the programs next
-to itself, and your memory in the usual per-user place for your system. Name
-them yourself with `--db` and `--serve-exe` if you would rather decide.
+You only reach for a flag if your setup is unusual: `--settings` and `--mcp-json`
+send it at other files, `--db` and `--serve-exe` override where it looks, and
+`--no-mcp` sets up a memory your assistant can read but not write, on purpose.
+If a program it needs is missing, it stops and says so rather than installing
+something that would sit silent.
 
-**Then restart your assistant.** It reads both of those files once, when it
-starts. Until you restart it, nothing you just installed is running.
+**Then restart your assistant.** The part it writes through only comes alive
+after a restart. Until then, it can already read the memory but not add to it.
 
 **Step 3 - check it.**
 
@@ -262,7 +265,7 @@ nothing.
 **Step 4 - give each project its own memory.** From that project's folder:
 
 ```sh
-thor2/target/release/install.exe --settings "C:\Users\you\.claude\settings.json" --project "my-project"
+thor2/target/release/install.exe --project "my-project"
 ```
 
 This matters more than it sounds. Skip it and THOR gets *worse* the more you use

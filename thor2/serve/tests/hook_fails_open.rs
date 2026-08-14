@@ -16,7 +16,7 @@ fn run_hook(db_path: &std::path::Path, stdin_payload: &str) -> (std::process::Ex
         .stderr(Stdio::piped())
         .spawn()
         .expect("failed to start the serve binary");
-    child.stdin.take().unwrap().write_all(stdin_payload.as_bytes()).unwrap();
+    let _ = child.stdin.take().unwrap().write_all(stdin_payload.as_bytes());
     let out = child.wait_with_output().expect("failed to wait on the serve binary");
     (out.status, out.stdout, out.stderr)
 }

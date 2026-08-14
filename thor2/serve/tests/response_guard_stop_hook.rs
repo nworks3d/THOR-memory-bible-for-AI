@@ -32,7 +32,7 @@ fn run_hook(db: &std::path::Path, payload: &str) -> String {
         .stdout(Stdio::piped())
         .spawn()
         .expect("spawn serve");
-    child.stdin.take().unwrap().write_all(payload.as_bytes()).unwrap();
+    let _ = child.stdin.take().unwrap().write_all(payload.as_bytes());
     let out = child.wait_with_output().expect("wait serve");
     assert!(out.status.success(), "the hook must always exit 0");
     String::from_utf8(out.stdout).unwrap()

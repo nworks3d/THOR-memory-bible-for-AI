@@ -87,7 +87,13 @@ fn run_hook(db: &Path, payload: &str, marked_depth: Option<&str>) -> std::proces
         cmd.env(JUDGE_DEPTH_ENV, depth);
     }
     let mut child = cmd.spawn().expect("spawn serve");
-    child.stdin.take().unwrap().write_all(payload.as_bytes()).unwrap();
+    // The write may fail with a broken pipe, and that is not an error here: a
+    // marked (re-entrant) invocation exits at once WITHOUT reading stdin, so on
+    // Linux the child is gone before the payload is written. Windows tolerates
+    // the same write, which is why this passed there and failed only on the CI
+    // runner (2026-08-14). What the hook actually did is judged by the output
+    // below, never by whether every byte reached a process that had already left.
+    let _ = child.stdin.take().unwrap().write_all(payload.as_bytes());
     child.wait_with_output().expect("wait for serve")
 }
 

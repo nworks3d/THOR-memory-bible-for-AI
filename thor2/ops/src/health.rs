@@ -928,10 +928,27 @@ pub fn crowding_line(db: &Path, checkouts: Option<&Path>) -> String {
             eligible.len()
         ),
     };
-    let mut never_won: Vec<(&String, &String)> =
-        lost_at.iter().filter(|(id, _)| !reachable.contains(*id)).collect();
+    // An item already judged deliberately crowded is not a repair job, and
+    // listing it again every run is what turns a work list into wallpaper.
+    // Judging one therefore SHRINKS this list - that is the finish line the
+    // grind needs - while the count of them is still said out loud, so the
+    // list getting shorter can never be mistaken for the crowd getting
+    // smaller.
+    let judged_crowded: std::collections::HashSet<String> = serve::live::live_items(&store)
+        .iter()
+        .filter(|li| li.item.tags.iter().any(|t| t == model::store::CROWDED_ON_PURPOSE_TAG))
+        .map(|li| li.id.clone())
+        .collect();
+    let mut never_won: Vec<(&String, &String)> = lost_at
+        .iter()
+        .filter(|(id, _)| !reachable.contains(*id) && !judged_crowded.contains(*id))
+        .collect();
     never_won.sort_by(|a, b| a.0.cmp(b.0));
+    let settled = invisible - never_won.len().min(invisible);
     let mut out = vec![headline];
+    if settled > 0 {
+        out.push(format!("  outranked: {settled} of them already judged as crowded on purpose, not listed"));
+    }
     for (id, where_lost) in never_won.iter().take(NAMES_AT_MOST) {
         out.push(format!("  outranked: {id} at {where_lost}"));
     }

@@ -1305,7 +1305,7 @@ fn crowding_debt(
             continue;
         }
         return Some(format!(
-            "[THOR] '{id}' was stored this session onto a place that is already full, so it will probably never be read there. The memory said so when you wrote it. Deal with it before ending the turn, in this order: (1) FOLD it - if an existing item almost says the same thing, revise that one to carry your point and retract yours; (2) RE-ANCHOR it - if it is really about a narrower file or command than the one it hangs on, move it there with revise; (3) LEAVE IT - sometimes the place is honestly full of heavier things, and then that is the answer: say in your reply which items hold it, and add '{}' to its tags with revise (mark is a verdict on where an item fired and cannot tag anything) so it is recorded as a decision rather than an oversight. Saying it only in prose settles nothing and this will ask again next turn. What you never do is raise its severity to make it visible: that pushes a heavier warning out to show a lighter one. The note said: {note} The item says: {}",
+            "[THOR] '{id}' was stored this session onto a place that is already full, so it will probably never be read there. The memory said so when you wrote it. Deal with it before ending the turn, in this order: (1) FOLD it - if an existing item almost says the same thing, revise that one to carry your point and retract yours; (2) RE-ANCHOR it - if it is really about a narrower file or command than the one it hangs on, move it there with revise; (3) LEAVE IT - sometimes the place is honestly full of heavier things, and then that is the answer: say in your reply which items hold it, and add '{}' to its tags with revise - BARE, exactly as written here: this tag is matched whole, so appending a reason to it is silently ignored and this will keep asking every turn (that is the opposite of 'no-literal:<why>', which requires one). mark is a verdict on where an item fired and cannot tag anything. Recorded that way it is a decision rather than an oversight. Saying it only in prose settles nothing and this will ask again next turn. What you never do is raise its severity to make it visible: that pushes a heavier warning out to show a lighter one. The note said: {note} The item says: {}",
  model::store::CROWDED_ON_PURPOSE_TAG, item.text
         ));
     }
@@ -2472,6 +2472,56 @@ mod judgement_debt_tests {
         assert!(
             crowding_debt(&store, &db, "now", None).is_none(),
             "a recorded decision settles it, with the item exactly as crowded as before"
+        );
+    }
+
+    /// THE DEFECT THIS PREVENTS, measured 2026-08-15 in a session that had just
+    /// thinned 39 crowded facts: the tag is matched WHOLE, so writing it with a
+    /// reason attached settles nothing and the debt asks again every turn. The
+    /// worker had every reason to attach one - the neighbouring `no-literal`
+    /// exit REQUIRES a reason - so the two exits read as one convention and are
+    /// opposites. This is the trap; the next test is the message that names it.
+    #[test]
+    fn a_reason_appended_to_the_tag_does_not_settle_the_debt() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("t.db");
+        let mut store = EventStore::new(&db).unwrap();
+        crowd_a_moment(&mut store, "p");
+        record_session_watermark(&db, "now");
+        let mine = crowded_newcomer("mine", "p");
+        model::store::declare(&mut store, "mcp", "mcp", "t", &mine).unwrap();
+
+        let mut judged = mine.clone();
+        judged.tags.push(format!(
+            "{}:de plek is eerlijk vol met zwaardere regels",
+            model::store::CROWDED_ON_PURPOSE_TAG
+        ));
+        model::store::revise(&mut store, "mcp", "mcp", "t", &mine, &judged).unwrap();
+        assert!(
+            crowding_debt(&store, &db, "now", None).is_some(),
+            "a reason attached to the tag is not the tag - the debt must keep asking, \
+             which is exactly why the message has to say so"
+        );
+    }
+
+    /// A trap the code cannot forgive has to be named where the worker reads it.
+    /// The `no-literal` exit already states its own form; this one did not, and
+    /// that asymmetry is what cost a session an hour.
+    #[test]
+    fn the_message_says_the_tag_counts_only_bare() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("t.db");
+        let mut store = EventStore::new(&db).unwrap();
+        crowd_a_moment(&mut store, "p");
+        record_session_watermark(&db, "now");
+        let mine = crowded_newcomer("mine", "p");
+        model::store::declare(&mut store, "mcp", "mcp", "t", &mine).unwrap();
+
+        let message = crowding_debt(&store, &db, "now", None).expect("fixture sanity");
+        assert!(message.contains("BARE"), "the message must say the tag takes no reason");
+        assert!(
+            message.contains("no-literal"),
+            "and must name the neighbouring exit it is the opposite of"
         );
     }
 

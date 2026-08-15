@@ -122,51 +122,7 @@ Everything stays on your machine. No cloud, no account, no subscription, and
 nothing to sign up for. If some optional piece is missing, THOR quietly falls
 back to a simpler way of working instead of breaking.
 
-## What changed in version 2
-
-Version 1 remembered well and never argued. It would hand your assistant a note
-at the right moment and hope. Version 2 is the same memory with a spine.
-
-- **A note can refuse.** The headline, and the rest of this section is about it.
-  Version 1 could only speak.
-- **Bad notes no longer get in.** A note that cannot ever fire, has nothing that
-  would prove it wrong, runs on for a page, or simply repeats one you already
-  have: turned away at the door, with the reason and the fix. Version 1 stored
-  whatever it was given, and you found out months later that half of it was
-  unreachable.
-- **It counts what it actually did.** How many notes can refuse something, how
-  many ever have, how much of your memory nothing re-reads. Version 1 had no
-  number for the one thing it was built to do, which is how a safety net stays
-  broken for a year.
-- **Maintenance is no longer optional.** At the end of a turn it asks for one
-  thing: judge a note that keeps firing, fix one you just filed where it will
-  never be seen, answer whether an expensive note can refuse anything. One at a
-  time, and it will not be waved off with a promise to do it later.
-- **It costs almost nothing to carry.** A note is capped at 300 characters and a
-  block at four notes and 1200 characters, so what lands in the conversation is
-  a few hundred tokens, not a whole rules file re-read on every turn. A memory
-  of ten thousand notes costs the same per turn as one of fifty. Nothing calls
-  out to a model to decide what to send - it is a local program reading a local
-  file, so there is no network round trip in front of your keystroke. The one
-  exception is the handful you deliberately pin: those are read out in full at
-  the start of a conversation, so pin sparingly and the cap does the rest.
-  Measured on the author's own machine and memory: about 110 ms per call and
-  around 1500 characters delivered when something applies, against roughly 660
-  ms for version 1. One machine, one memory - treat it as an order of magnitude,
-  not a specification.
-- **Stale notes are hunted, not left to rot.** A note whose proof comes out
-  false is reported instead of quietly going on being wrong. A note that keeps
-  firing without anyone ever saying whether it belonged gets asked about, and
-  two verdicts of "this did not belong" retire it from every channel while
-  leaving it findable. In version 1 a note that went wrong simply stayed.
-- **Crowding is visible and refused.** Only a few notes fit in a block, so notes
-  compete. Version 2 counts that competition, tells you when you have just
-  stored something onto a spot too crowded to ever show it, names what is
-  holding the place, and refuses the write outright when every spot the note
-  could take is already full of heavier ones. Version 1 accepted it and said
-  nothing, which is how a memory fills up with advice nobody will ever see.
-
-### A note that can actually stop you
+## A note that can actually stop you
 
 Showing a warning at the right moment is worth a lot, and for a long time that
 was all THOR could do. A note could speak. It could not refuse.
@@ -224,6 +180,50 @@ the text the real command uses. A misspelled fragment is wired perfectly and
 guards nothing. That is why the health check reports two different numbers - how
 many notes could refuse something, and how many ever actually did. Trust the
 second one.
+
+## What changed in version 2
+
+Version 1 remembered well and never argued. It would hand your assistant a note
+at the right moment and hope. Version 2 is the same memory with a spine.
+
+- **A note can refuse.** The headline, and the rest of this section is about it.
+  Version 1 could only speak.
+- **Bad notes no longer get in.** A note that cannot ever fire, has nothing that
+  would prove it wrong, runs on for a page, or simply repeats one you already
+  have: turned away at the door, with the reason and the fix. Version 1 stored
+  whatever it was given, and you found out months later that half of it was
+  unreachable.
+- **It counts what it actually did.** How many notes can refuse something, how
+  many ever have, how much of your memory nothing re-reads. Version 1 had no
+  number for the one thing it was built to do, which is how a safety net stays
+  broken for a year.
+- **Maintenance is no longer optional.** At the end of a turn it asks for one
+  thing: judge a note that keeps firing, fix one you just filed where it will
+  never be seen, answer whether an expensive note can refuse anything. One at a
+  time, and it will not be waved off with a promise to do it later.
+- **It costs almost nothing to carry.** A note is capped at 300 characters and a
+  block at four notes and 1200 characters, so what lands in the conversation is
+  a few hundred tokens, not a whole rules file re-read on every turn. A memory
+  of ten thousand notes costs the same per turn as one of fifty. Nothing calls
+  out to a model to decide what to send - it is a local program reading a local
+  file, so there is no network round trip in front of your keystroke. The one
+  exception is the handful you deliberately pin: those are read out in full at
+  the start of a conversation, so pin sparingly and the cap does the rest.
+  Measured on the author's own machine and memory: about 110 ms per call and
+  around 1500 characters delivered when something applies, against roughly 660
+  ms for version 1. One machine, one memory - treat it as an order of magnitude,
+  not a specification.
+- **Stale notes are hunted, not left to rot.** A note whose proof comes out
+  false is reported instead of quietly going on being wrong. A note that keeps
+  firing without anyone ever saying whether it belonged gets asked about, and
+  two verdicts of "this did not belong" retire it from every channel while
+  leaving it findable. In version 1 a note that went wrong simply stayed.
+- **Crowding is visible and refused.** Only a few notes fit in a block, so notes
+  compete. Version 2 counts that competition, tells you when you have just
+  stored something onto a spot too crowded to ever show it, names what is
+  holding the place, and refuses the write outright when every spot the note
+  could take is already full of heavier ones. Version 1 accepted it and said
+  nothing, which is how a memory fills up with advice nobody will ever see.
 
 ## Getting started
 
@@ -367,6 +367,33 @@ questions.
 Then check what you have built with `doctor`. It tells you plainly how much of
 your memory can actually stop a wrong change, how often it has, and which parts
 nothing ever re-reads.
+
+### If you arrive with a memory you already have
+
+Everything above describes a memory that starts empty. If you are coming from
+version 1, or from any pile of notes written before proofs existed, the shape is
+different and worth saying plainly, because the obvious plan does not work.
+
+THOR asks you about one old note per session. That is a brake, not a broom. It
+keeps the pile from growing while you work, and it was never meant to clear one:
+at one a day, a backlog of thousands outlives you.
+
+The broom is the health check, pointed at the folder your projects actually live
+in:
+
+```bash
+doctor --db <your thor.db> --checkouts <the folder holding your projects> --full
+```
+
+That names every note whose anchor points at nothing, every proof that now comes
+out false, and every note stored somewhere too crowded to ever be shown. Set
+aside an afternoon rather than a coffee, and go through it in one sitting. The
+list is long because the memory is old, not because anything is broken.
+
+Two things make that afternoon safe to be decisive in. Correcting a note keeps
+the old version, so nothing you wrote is lost and you can always read back what
+it used to say. And removing one does not delete it either: it stops being
+handed to anyone, stays findable, and the reason you gave stays attached to it.
 
 ## Does it work?
 

@@ -1,0 +1,62 @@
+# THOR 2.0's memory server in a container, over stdio.
+#
+# This is NOT the NAS replica image - that one is `Dockerfile` beside this
+# file, it ships the log-shipping receiver, and it opens a port. This one
+# ships a single program that talks the memory protocol on standard input
+# and output, which is what a directory or a client that wants to see the
+# tool list needs. Nothing here listens on a network.
+#
+# Two things this image has to get right, both learned by running it:
+#
+# 1. `mcp` refuses to start when the store does not exist, on purpose: a
+#    server that quietly creates an empty memory next to a typo in the path
+#    is worse than one that stops and says the path is wrong. A container
+#    starts with no store at all, so the entry point below writes one first
+#    note, which is what creates the file. Mount a real store on /data and
+#    that step is skipped and yours is opened untouched.
+#
+# 2. No `semantic` feature. That pulls in the ONNX runtime and the embedding
+#    model, which is a large download and a lot of build time for something
+#    an introspecting client never calls. Search here answers on the letter,
+#    exactly like the replica image. Build with the feature only if you
+#    actually want meaning-based lookup inside the container.
+#
+# Build from the REPOSITORY ROOT, not from thor2/:
+#
+#   docker build -f thor2/deploy/Dockerfile.mcp -t thor-mcp .
+#   docker run --rm -i -v thor-data:/data thor-mcp
+
+FROM rust:1-bookworm AS build
+WORKDIR /src
+COPY thor2/ ./
+# `model` comes along only to create the first store - see the entry point.
+RUN cargo build --release --bin mcp --bin model
+
+FROM debian:bookworm-slim
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends ca-certificates \
+ && rm -rf /var/lib/apt/lists/*
+COPY --from=build /src/target/release/mcp /usr/local/bin/mcp
+COPY --from=build /src/target/release/model /usr/local/bin/model
+
+# The store lives here. Mount a volume to keep what the memory learns; without
+# one it starts empty every run, which is fine for a health check and useless
+# for anything else.
+ENV THOR_DB=/data/thor.db
+VOLUME /data
+
+# Written here rather than copied in, so this file stands on its own: a
+# directory that only accepts a Dockerfile can build it with nothing else.
+RUN printf '%s\n' \
+  '#!/bin/sh' \
+  'set -e' \
+  'if [ ! -f "$THOR_DB" ]; then' \
+  '  mkdir -p "$(dirname "$THOR_DB")"' \
+  '  model --db "$THOR_DB" declare --id container-first-note --kind report \' \
+  '    --text "This memory was created empty by the container image, because the memory server opens an existing store and never creates one. Replace it by mounting your own store on /data." >/dev/null' \
+  'fi' \
+  'exec mcp --db "$THOR_DB"' \
+  > /usr/local/bin/thor-mcp \
+ && chmod +x /usr/local/bin/thor-mcp
+
+ENTRYPOINT ["/usr/local/bin/thor-mcp"]

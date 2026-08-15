@@ -227,8 +227,30 @@ second one.
 
 ## Getting started
 
-**Step 1 - build it.** You need a Rust toolchain. Nothing else: no key to get,
-no model to download first, no account.
+**The short way - one command.** It downloads the latest release, checks the
+download against the checksum published next to it, unpacks it into your home
+folder, and runs the whole setup.
+
+Windows, in PowerShell:
+
+```powershell
+irm https://raw.githubusercontent.com/nworks3d/THOR-memory-bible-for-AI/main/install.ps1 | iex
+```
+
+Linux:
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/nworks3d/THOR-memory-bible-for-AI/main/install.sh | sh
+```
+
+No administrator rights, and nothing is installed outside your own user folder.
+It touches two files of yours, your assistant's settings and the list of tools
+it may use, and backs up both before it does. Rather read the script before you
+run it? Open that same link in a browser first. There is no macOS build yet, so
+on a Mac take the route below.
+
+**Or build it yourself.** You need a Rust toolchain. Nothing else: no key to
+get, no model to download first, no account.
 
 ```sh
 cd thor2 && cargo build --release --features semantic
@@ -241,8 +263,8 @@ cd thor2 && cargo build --release --features semantic
 > two apart is size. Look at `thor2/target/release/serve.exe` - over 20 MB is
 > the right build, a few MB is the wrong one. Build it again with the flag.
 
-**Step 2 - install it.** One command does the whole setup, and in the normal
-case you type no paths at all:
+Then run the setup yourself. That is the same step the one-command install ends
+with, and in the normal case you type no paths at all:
 
 ```sh
 thor2/target/release/install.exe

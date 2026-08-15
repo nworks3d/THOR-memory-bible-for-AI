@@ -636,15 +636,42 @@ fn no_literal_reason_problem(reason: &str) -> Option<Refusal> {
     None
 }
 
-/// `bare_answer_allowed` is the one thing about an item this cannot see for
-/// itself: whether the bare `no-literal` it carries was already there. Only
-/// `revise` knows, and only `revise` passes true.
-fn shape_problems(item: &Item, bare_answer_allowed: bool) -> Vec<Refusal> {
+/// `bare_answer_allowed` and `symbol_only_allowed` are the two things about an
+/// item this cannot see for itself: whether the bare `no-literal` it carries,
+/// and whether the symbol-only anchor it has, were already there. Only `revise`
+/// knows, and only `revise` passes true.
+fn shape_problems(item: &Item, bare_answer_allowed: bool, symbol_only_allowed: bool) -> Vec<Refusal> {
     let mut problems = Vec::new();
     if item.kind == Kind::Rule && item.bindings.is_empty() {
         problems.push(Refusal::new(
             "a Rule with no binding can never fire",
             "give it at least one binding: Moment(<action>), a Target, or Always",
+        ));
+    }
+    // Ground 20: an anchor that is ONLY a symbol is an anchor that never fires.
+    //
+    // A symbol binding reaches an item exactly when that word shows up in a
+    // prompt as a whole token (see `serve::prompt`), which almost never
+    // happens for a function name or a config key. MEASURED on the owner's own
+    // store, 2026-08-15: of 2369 fireable items 1794 had never once fired, and
+    // 1067 of those - sixty percent of the whole silence - were anchored to a
+    // symbol and nothing else. They were not wrong and not stale; they were
+    // unreachable, and `decay` cannot see it because the anchor still resolves.
+    //
+    // Almost all of them arrived in one early import. Of everything written
+    // since, six carry this shape - so this ground closes a door that is
+    // already nearly shut, which is exactly when closing it is cheap.
+    //
+    // A symbol ALONGSIDE a path, a command or a moment is untouched: the symbol
+    // adds a way in, it just may not be the only one.
+    if item.kind.can_fire()
+        && !symbol_only_allowed
+        && !item.bindings.is_empty()
+        && item.bindings.iter().all(|b| matches!(b, Binding::Target { kind: TargetKind::Symbol, .. }))
+    {
+        problems.push(Refusal::new(
+            "every binding on this item is a symbol, and a symbol only reaches you when that exact word appears in a prompt",
+            "anchor it to the file or the command the fact is really about, or bind it to the moment it applies at - keep the symbol beside that if you like, it just cannot be the only way in",
         ));
     }
     if item.kind.can_fire() && item.falsifier.as_deref().map(str::trim).unwrap_or("").is_empty() {
@@ -746,11 +773,11 @@ fn combined(problems: Vec<Refusal>) -> Refusal {
 }
 
 pub fn declare(item: &Item) -> Result<(), Refusal> {
-    declare_inner(item, false)
+    declare_inner(item, false, false)
 }
 
-fn declare_inner(item: &Item, bare_answer_allowed: bool) -> Result<(), Refusal> {
-    let problems = shape_problems(item, bare_answer_allowed);
+fn declare_inner(item: &Item, bare_answer_allowed: bool, symbol_only_allowed: bool) -> Result<(), Refusal> {
+    let problems = shape_problems(item, bare_answer_allowed, symbol_only_allowed);
     match problems.len() {
         0 => {}
         1 => return Err(problems.into_iter().next().expect("length checked")),
@@ -896,7 +923,16 @@ pub fn revise(existing: &Item, updated: &Item) -> Result<(), Refusal> {
     // correcting an old fact never costs a round trip over a question that
     // was answered - badly, but answered - long before.
     let carried_bare = existing.tags.iter().any(|t| t == crate::store::NO_LITERAL_TAG);
-    declare_inner(updated, carried_bare)?;
+    // The same concession for ground 20: an item that was ALREADY anchored to
+    // nothing but a symbol stays correctable. Refusing those would lock the
+    // very backlog this ground exists to drain - you could no longer fix a
+    // typo, add a falsifier or re-anchor one without first solving it.
+    let carried_symbol_only = !existing.bindings.is_empty()
+        && existing
+            .bindings
+            .iter()
+            .all(|b| matches!(b, Binding::Target { kind: TargetKind::Symbol, .. }));
+    declare_inner(updated, carried_bare, carried_symbol_only)?;
     if !existing.bindings.is_empty() && updated.bindings.is_empty() {
         return Err(dropped_field("bindings"));
     }
@@ -1486,6 +1522,56 @@ pub fn warnings(item: &Item) -> Vec<Warning> {
 mod tests {
     use super::*;
     use crate::item::{Kind, Severity};
+
+    /// GROUND 20. THE DEFECT THIS PREVENTS, measured on the owner's store
+    /// 2026-08-15: 1067 items - sixty percent of everything that had never
+    /// fired - were anchored to a symbol and nothing else. A symbol only
+    /// reaches you when that word appears in a prompt, so they were silent by
+    /// construction, and `decay` never noticed because the anchor still
+    /// resolved.
+    #[test]
+    fn a_symbol_is_never_the_only_way_in() {
+        let mut item = base(Kind::Rule);
+        item.bindings = vec![Binding::Target {
+            kind: TargetKind::Symbol,
+            value: "append_mutate_checked".to_string(),
+        }];
+        let err = declare(&item).expect_err("a symbol-only anchor can never fire");
+        assert!(err.problem.contains("symbol"), "the refusal must name the anchor: {}", err.problem);
+    }
+
+    /// The symbol is not the problem - being the ONLY reach is. A fact that
+    /// also names the file it lives in keeps both.
+    #[test]
+    fn a_symbol_beside_a_real_anchor_is_fine() {
+        let mut item = base(Kind::Rule);
+        item.bindings = vec![
+            Binding::Target { kind: TargetKind::Symbol, value: "append_mutate_checked".to_string() },
+            Binding::Target { kind: TargetKind::Path, value: "src/courier.rs".to_string() },
+        ];
+        declare(&item).expect("a symbol alongside a path still fires at the path");
+    }
+
+    /// THE TRAP THIS AVOIDS: refusing the shape on revise as well would lock
+    /// the backlog it exists to drain - the 695 that still carry it could no
+    /// longer be corrected, re-anchored or even given a falsifier.
+    #[test]
+    fn an_item_that_already_had_a_symbol_only_anchor_stays_correctable() {
+        let mut existing = base(Kind::Rule);
+        existing.bindings =
+            vec![Binding::Target { kind: TargetKind::Symbol, value: "contiguous_tip".to_string() }];
+        let mut updated = existing.clone();
+        updated.text = "contiguous_tip returns the highest contiguous sequence number".to_string();
+        revise(&existing, &updated).expect("an old symbol-only fact must stay correctable");
+
+        // ... but a fresh one written today does not get in through revise.
+        let mut fresh = base(Kind::Rule);
+        fresh.bindings = vec![Binding::Target { kind: TargetKind::Path, value: "src/courier.rs".to_string() }];
+        let mut narrowed = fresh.clone();
+        narrowed.bindings =
+            vec![Binding::Target { kind: TargetKind::Symbol, value: "contiguous_tip".to_string() }];
+        revise(&fresh, &narrowed).expect_err("a real anchor may not be traded for a symbol-only one");
+    }
 
     fn base(kind: Kind) -> Item {
         Item {

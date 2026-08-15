@@ -17,6 +17,7 @@
 //! platform keeps per-user data.
 
 use clap::Parser;
+use ops::githooks;
 use ops::install::{
     default_data_dir, default_settings_path, default_user_mcp_path, ensure_store, install_hooks,
     install_tool_server, seed_working_contract, standard_hooks, write_project_marker, HookOutcome,
@@ -240,7 +241,57 @@ fn main() -> ExitCode {
         }
     }
 
-    // 3. The tool server: what lets the agent write back.
+    // 3. The git hooks: what keeps the code index from drifting. Only when we
+    // know where the indexes live - without an index root there is nothing for
+    // a refresh to update, and wiring a machine-wide git setting for nothing is
+    // exactly the kind of surprise this installer must not spring.
+    if let Some(root) = &code_index_root {
+        let hooks_dir = db.parent().map(|d| d.join("githooks"));
+        let codeindex_exe = serve_exe.with_file_name(if cfg!(windows) {
+            "codeindex.exe"
+        } else {
+            "codeindex"
+        });
+
+        match (hooks_dir, codeindex_exe.exists()) {
+            (Some(hooks_dir), true) => {
+                let exe = codeindex_exe.display().to_string().replace('\\', "/");
+                let index_root = root.display().to_string().replace('\\', "/");
+                match githooks::install_git_hooks(&hooks_dir, &exe, &index_root) {
+                    Ok(results) => {
+                        let added = results.iter().filter(|(_, o)| *o != HookOutcome::AlreadyPresent).count();
+                        if added == 0 {
+                            println!("= git hooks already in {} ({} of them)", hooks_dir.display(), results.len());
+                        } else {
+                            println!("+ {added} git hook(s) written to {}", hooks_dir.display());
+                        }
+                        match githooks::wire_hooks_path(&hooks_dir) {
+                            Ok(githooks::HooksPathOutcome::Set) => {
+                                println!("+ git now runs them in every repository (core.hooksPath)");
+                                println!("  your repositories' own hooks still run: each of ours hands control back");
+                            }
+                            Ok(githooks::HooksPathOutcome::AlreadyOurs) => {
+                                println!("= git already runs them in every repository")
+                            }
+                            Ok(githooks::HooksPathOutcome::Foreign(theirs)) => {
+                                println!("! core.hooksPath already points at {theirs} - left alone");
+                                println!("  the index will not refresh itself until that is resolved");
+                            }
+                            Err(e) => println!("! could not tell git about them: {e}"),
+                        }
+                    }
+                    Err(e) => println!("! could not write the git hooks: {e}"),
+                }
+            }
+            (_, false) => println!(
+                "! no codeindex binary beside {} - skipped the git hooks",
+                serve_exe.display()
+            ),
+            (None, _) => println!("! could not work out where to keep the git hooks - skipped"),
+        }
+    }
+
+    // 4. The tool server: what lets the agent write back.
     match (&mcp_target, &mcp_exe) {
         (Some(path), Some(exe)) => {
             let mut args = vec!["--db".to_string(), db.display().to_string()];
@@ -278,7 +329,7 @@ fn main() -> ExitCode {
         }
     }
 
-    // 4. The project scope, only when asked for.
+    // 5. The project scope, only when asked for.
     if let Some(key) = &cli.project {
         let here = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
         match write_project_marker(&here, key) {

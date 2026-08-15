@@ -33,6 +33,12 @@ COPY thor2/ ./
 RUN cargo build --release --bin mcp --bin model
 
 FROM debian:bookworm-slim
+
+# How the public server directory proves this image belongs to the entry that
+# claims it: the label has to match the `name` field in server.json at the
+# repository root. Change one and the other stops verifying.
+LABEL io.modelcontextprotocol.server.name="io.github.nworks3d/thor"
+
 RUN apt-get update \
  && apt-get install -y --no-install-recommends ca-certificates \
  && rm -rf /var/lib/apt/lists/*

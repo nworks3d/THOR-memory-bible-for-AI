@@ -1,0 +1,101 @@
+# Put THOR in the public directory of memory servers, so people can find it
+# without already knowing it exists.
+#
+# The directory does not host anything itself: it stores a record that points
+# at an image, and it only accepts that record from someone who can prove they
+# own both. The proof here needs no secret of ours. GitHub signs a short-lived
+# token for this workflow (`id-token: write`), the directory checks that
+# signature, and that is what establishes the `io.github.nworks3d/` namespace
+# in server.json as ours. Nothing to store, nothing to rotate, nothing to leak.
+#
+# Ownership of the image is proved separately, by a label inside it that has to
+# equal the `name` in server.json - see thor2/deploy/Dockerfile.mcp.
+#
+# Runs on a version tag, which is the same moment the release itself is built.
+# It can also be started by hand, and then it publishes whatever version
+# server.json already names.
+
+name: Publish to the MCP server directory
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write   # lets the directory verify this repository, without a secret
+      packages: write   # lets us push the image to this repository's own registry
+      contents: read
+
+    steps:
+      - uses: actions/checkout@v4
+
+      # A tag decides the version; a hand-started run falls back to whatever
+      # server.json says, so the two can never silently disagree.
+      - name: Work out the version
+        id: v
+        run: |
+          if [ "$GITHUB_REF_TYPE" = "tag" ]; then
+            version="${GITHUB_REF_NAME#v}"
+          else
+            version="$(jq -r .version server.json)"
+          fi
+          owner="$(printf '%s' "${{ github.repository_owner }}" | tr '[:upper:]' '[:lower:]')"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "image=ghcr.io/$owner/thor-mcp" >> "$GITHUB_OUTPUT"
+          echo "publishing $version as ghcr.io/$owner/thor-mcp"
+
+      - name: Sign in to the container registry
+        run: printf '%s' "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
+
+      # Built from the repository root: the image copies thor2/ out of the
+      # checkout, so the context has to be the whole tree.
+      - name: Build the image
+        run: |
+          docker build \
+            -f thor2/deploy/Dockerfile.mcp \
+            -t "${{ steps.v.outputs.image }}:${{ steps.v.outputs.version }}" \
+            -t "${{ steps.v.outputs.image }}:latest" \
+            .
+
+      # Proves the image actually answers before anything is published about
+      # it. A directory entry pointing at an image that does not start is worse
+      # than no entry: it is found, tried once, and remembered as broken.
+      - name: Check that it answers
+        run: |
+          printf '%s\n%s\n' \
+            '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"ci","version":"1"}}}' \
+            '{"jsonrpc":"2.0","id":2,"method":"tools/list"}' \
+            | docker run --rm -i "${{ steps.v.outputs.image }}:${{ steps.v.outputs.version }}" > answers.json
+          test "$(grep -c '"result"' answers.json)" -eq 2 \
+            || { echo "the image did not answer both requests"; cat answers.json; exit 1; }
+          echo "the image answered introspection"
+
+      - name: Push the image
+        run: |
+          docker push "${{ steps.v.outputs.image }}:${{ steps.v.outputs.version }}"
+          docker push "${{ steps.v.outputs.image }}:latest"
+
+      # The record has to name the exact tag that was just pushed, not a
+      # floating one: a directory entry that silently follows `latest` stops
+      # describing the thing people read about.
+      - name: Point the record at what was pushed
+        run: |
+          jq --arg v "${{ steps.v.outputs.version }}" \
+             --arg i "${{ steps.v.outputs.image }}:${{ steps.v.outputs.version }}" \
+             '.version = $v | .packages[0].identifier = $i' \
+             server.json > server.tmp && mv server.tmp server.json
+          cat server.json
+
+      - name: Install the publisher
+        run: |
+          curl -fsSL "https://github.com/modelcontextprotocol/registry/releases/latest/download/mcp-publisher_linux_amd64.tar.gz" \
+            | tar xz mcp-publisher
+
+      - name: Publish
+        run: |
+          ./mcp-publisher login github-oidc
+          ./mcp-publisher publish

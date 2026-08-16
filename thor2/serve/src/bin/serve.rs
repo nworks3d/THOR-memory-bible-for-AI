@@ -1305,7 +1305,7 @@ fn crowding_debt(
             continue;
         }
         return Some(format!(
-            "[THOR] '{id}' was stored this session onto a place that is already full, so it will probably never be read there. The memory said so when you wrote it. Deal with it before ending the turn, in this order: (1) FOLD it - if an existing item almost says the same thing, revise that one to carry your point and retract yours; (2) RE-ANCHOR it - if it is really about a narrower file or command than the one it hangs on, move it there with revise; (3) LEAVE IT - sometimes the place is honestly full of heavier things, and then that is the answer: say in your reply which items hold it, and add '{}' to its tags with revise - BARE, exactly as written here: this tag is matched whole, so appending a reason to it is silently ignored and this will keep asking every turn (that is the opposite of 'no-literal:<why>', which requires one). mark is a verdict on where an item fired and cannot tag anything. Recorded that way it is a decision rather than an oversight. Saying it only in prose settles nothing and this will ask again next turn. What you never do is raise its severity to make it visible: that pushes a heavier warning out to show a lighter one. The note said: {note} The item says: {}",
+            "[THOR] '{id}' was stored this session onto a place that is already full, so it will probably never be read there. The memory said so when you wrote it. Deal with it before ending the turn, in this order: (1) FOLD it - if an existing item almost says the same thing, revise that one to carry your point and retract yours; (2) RE-ANCHOR it - if it is really about a narrower file or command than the one it hangs on, move it there with revise; (3) LEAVE IT - and this exit is narrower than it sounds, so read the condition before taking it. It is honest ONLY when the seats are held by rules that can each REFUSE a write: archiving one of those is refused by the gate anyway, and folding it would spend a check. If the seats are held by DESCRIPTIONS instead, this is the wrong answer - archive a description to free its seat, since it stays fully findable and the rule that can actually block takes its place. When the condition really holds: say in your reply which items hold it, and add '{}' to its tags with revise - BARE, exactly as written here: this tag is matched whole, so appending a reason to it is silently ignored and this will keep asking every turn (that is the opposite of 'no-literal:<why>', which requires one). mark is a verdict on where an item fired and cannot tag anything. Recorded that way it is a decision rather than an oversight. Saying it only in prose settles nothing and this will ask again next turn. What you never do is raise its severity to make it visible: that pushes a heavier warning out to show a lighter one. The note said: {note} The item says: {}",
  model::store::CROWDED_ON_PURPOSE_TAG, item.text
         ));
     }
@@ -2501,6 +2501,42 @@ mod judgement_debt_tests {
             crowding_debt(&store, &db, "now", None).is_some(),
             "a reason attached to the tag is not the tag - the debt must keep asking, \
              which is exactly why the message has to say so"
+        );
+    }
+
+    /// THE CONTRADICTION THIS CLOSES, reported by a session evaluation on
+    /// 2026-08-16: the owner's standing requirement is zero crowding, while this
+    /// message offered "sometimes the place is honestly full of heavier things"
+    /// as an unconditional third exit. Both cannot be true, and a worker who
+    /// follows the message ends up in breach of the requirement.
+    ///
+    /// The condition that makes exit 3 honest is narrow and now stated: seats
+    /// held by rules that can each REFUSE a write. Those cannot be archived (the
+    /// gate turns that down) and folding one would spend a check. A seat held by
+    /// a description is the opposite case - it should be archived so the rule
+    /// that can block takes the seat.
+    #[test]
+    fn leaving_it_is_offered_only_for_seats_held_by_rules_that_can_refuse() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("t.db");
+        let mut store = EventStore::new(&db).unwrap();
+        crowd_a_moment(&mut store, "p");
+        record_session_watermark(&db, "now");
+        let mine = crowded_newcomer("mine", "p");
+        model::store::declare(&mut store, "mcp", "mcp", "t", &mine).unwrap();
+
+        let message = crowding_debt(&store, &db, "now", None).expect("fixture sanity");
+        assert!(
+            message.contains("REFUSE a write"),
+            "exit 3 must name the condition that makes it honest"
+        );
+        assert!(
+            message.contains("archive a description"),
+            "and must say what to do when the seats are held by descriptions instead"
+        );
+        assert!(
+            !message.contains("full of heavier things"),
+            "the unconditional wording contradicted the owner's zero-crowding requirement"
         );
     }
 

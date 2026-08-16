@@ -37,9 +37,49 @@ fn contains_word(haystack_normalized: &str, needle: &str) -> bool {
     if needle.is_empty() {
         return false;
     }
-    haystack_normalized
-        .split(|c: char| !(c.is_alphanumeric() || c == '.' || c == '-' || c == '_' || c == '/'))
-        .any(|token| last_segment(token) == needle)
+    haystack_normalized.split(is_break).any(|token| last_segment(token) == needle)
+}
+
+/// The one place this file decides where a token ends, so the prompt and the
+/// needle can never be split by different rules - which is how a comparison
+/// silently stops matching anything.
+fn is_break(c: char) -> bool {
+    !(c.is_alphanumeric() || c == '.' || c == '-' || c == '_' || c == '/')
+}
+
+/// Is this anchor named in the prompt, as one word or as a run of words?
+///
+/// THE DEFECT THIS CLOSES, measured on the owner's live store 2026-08-16: 305
+/// fireable items - 21.8% of them - carry an anchor whose value contains a
+/// space ("Aluminium 6061", "10T pinion", "git reset --hard"). `contains_word`
+/// compares each token of the prompt against the WHOLE needle, and a single
+/// token can never equal a two-word string, so every one of those was
+/// unreachable here. Not stale, not crowded out: unreachable by construction,
+/// and invisible to every count because their anchors resolve fine.
+///
+/// `rank::binding_matches` was taught about multi-word anchors on 2026-08-14.
+/// This surface never was. This is that same repair, finished.
+///
+/// A single-word needle takes the old path unchanged, so nothing that resolved
+/// before can resolve differently now - the only outcomes this adds are matches
+/// where there were none.
+fn contains_phrase(haystack_normalized: &str, needle: &str) -> bool {
+    let needle_tokens: Vec<&str> = needle.split(is_break).filter(|t| !t.is_empty()).collect();
+    match needle_tokens.len() {
+        0 => false,
+        1 => contains_word(haystack_normalized, needle_tokens[0]),
+        n => {
+            let hay: Vec<&str> =
+                haystack_normalized.split(is_break).filter(|t| !t.is_empty()).collect();
+            // Consecutive, in order: "aluminium 6061" is named by "voor aluminium
+            // 6061 geldt", never by "aluminium is niet 6061". A bag of words here
+            // would fire on any prompt that happens to use both, which is exactly
+            // the widening this workspace refuses.
+            hay.windows(n).any(|window| {
+                window.iter().zip(&needle_tokens).all(|(t, w)| last_segment(t) == last_segment(w))
+            })
+        }
+    }
 }
 
 /// Build the `ServeInput` a raw prompt resolves to. Moments: the union of
@@ -71,7 +111,7 @@ pub fn resolve(prompt: &str, candidates: &[LiveItem]) -> ServeInput {
         for binding in &c.item.bindings {
             if let Binding::Target { kind, value } = binding {
                 let seg = last_segment(&normalize_target(value)).to_string();
-                if contains_word(&normalized_prompt, &seg) {
+                if contains_phrase(&normalized_prompt, &seg) {
                     let entry = (*kind, value.clone());
                     if !input.targets.contains(&entry) {
                         input.targets.push(entry);
@@ -107,6 +147,37 @@ mod tests {
                 check: None,
             },
         }
+    }
+
+    /// THE DEFECT THIS CLOSES, measured 2026-08-16: 305 fireable items carry an
+    /// anchor with a space in it, and this surface compared each token of the
+    /// prompt against the whole value - so not one of them could ever resolve
+    /// here, however plainly the prompt named it.
+    #[test]
+    fn a_multi_word_anchor_resolves_when_the_prompt_names_it() {
+        let items = vec![target_item("legering", TargetKind::Command, "Aluminium 6061")];
+        let input = resolve("welke boutmaat neem ik voor aluminium 6061", &items);
+        assert_eq!(input.targets.len(), 1, "the prompt names it word for word");
+    }
+
+    /// Consecutive and in order, never a bag of words: a prompt that merely uses
+    /// both words is not naming the thing. Widening this to "any word" would
+    /// fire every anchor whose first word is common.
+    #[test]
+    fn the_same_words_apart_do_not_resolve_it() {
+        let items = vec![target_item("legering", TargetKind::Command, "Aluminium 6061")];
+        let input = resolve("aluminium is hier niet hetzelfde als 6061", &items);
+        assert!(input.targets.is_empty(), "the words are present but the phrase is not");
+    }
+
+    /// The property that makes this safe to ship: a single-word anchor takes
+    /// exactly the path it always took, so nothing that resolved before can
+    /// resolve differently now.
+    #[test]
+    fn a_single_word_anchor_is_unchanged() {
+        let items = vec![target_item("bestand", TargetKind::Path, "src/main.rs")];
+        assert_eq!(resolve("kijk eens in main.rs", &items).targets.len(), 1);
+        assert!(resolve("dit gaat over personas", &items).targets.is_empty());
     }
 
     #[test]

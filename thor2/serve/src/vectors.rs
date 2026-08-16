@@ -45,9 +45,35 @@ impl VectorStore {
         conn.execute_batch("PRAGMA journal_mode = WAL")?;
         conn.execute_batch("PRAGMA synchronous = NORMAL")?;
         conn.execute_batch(
+            // `part` is which piece of the item's text this vector covers, 0
+            // for the first. One row per part instead of one per item: see
+            // `get_many_best` for the defect that change closes. An older
+            // sidecar has no `part` column at all, so it is simply rebuilt -
+            // this file is derived and always rebuildable, which is exactly
+            // why it may carry a schema that moves.
             "CREATE TABLE IF NOT EXISTS meta(k TEXT PRIMARY KEY, v TEXT NOT NULL);
-             CREATE TABLE IF NOT EXISTS vec(id TEXT PRIMARY KEY, content_hash TEXT NOT NULL, v BLOB NOT NULL);",
+             CREATE TABLE IF NOT EXISTS vec(id TEXT NOT NULL, part INTEGER NOT NULL DEFAULT 0, content_hash TEXT NOT NULL, v BLOB NOT NULL, PRIMARY KEY (id, part));",
         )?;
+
+        // A sidecar written before parts existed still has the one-row-per-id
+        // table, and `CREATE TABLE IF NOT EXISTS` leaves it exactly as it is -
+        // so the first write would fail with "no column named part". Drop and
+        // recreate rather than ALTER: this file is derived and rebuilt from the
+        // log in one command, so throwing it away costs a rebuild and nothing
+        // else, while a half-migrated sidecar would keep answering with vectors
+        // whose provenance nobody can state.
+        let has_part: bool = conn
+            .prepare("PRAGMA table_info(vec)")?
+            .query_map([], |r| r.get::<_, String>(1))?
+            .flatten()
+            .any(|name| name == "part");
+        if !has_part {
+            conn.execute_batch(
+                "DROP TABLE vec;
+                 CREATE TABLE vec(id TEXT NOT NULL, part INTEGER NOT NULL DEFAULT 0, content_hash TEXT NOT NULL, v BLOB NOT NULL, PRIMARY KEY (id, part));
+                 DELETE FROM meta WHERE k='model_id';",
+            )?;
+        }
         Ok(Self { conn })
     }
 
@@ -79,16 +105,33 @@ impl VectorStore {
     /// storing a corrupt row - a bad row here would silently poison every
     /// future cosine comparison it takes part in.
     pub fn upsert_batch(&mut self, rows: &[(String, String, Vec<f32>)]) -> Result<()> {
-        for (id, _, v) in rows {
+        let parts: Vec<(String, usize, String, Vec<f32>)> =
+            rows.iter().map(|(id, h, v)| (id.clone(), 0usize, h.clone(), v.clone())).collect();
+        self.upsert_parts(&parts)
+    }
+
+    /// Insert/replace vectors that may cover SEVERAL parts of one item. Every
+    /// part of an id must be written in the same call: the id's old rows are
+    /// cleared first, so a rebuild can never leave a stale part behind that a
+    /// later query would still score against.
+    pub fn upsert_parts(&mut self, rows: &[(String, usize, String, Vec<f32>)]) -> Result<()> {
+        for (id, _, _, v) in rows {
             if v.len() != DIM {
                 bail!("refusing to store id '{id}' with dim {} (expected {DIM})", v.len());
             }
         }
         let tx = self.conn.transaction()?;
         {
-            let mut st = tx.prepare("INSERT OR REPLACE INTO vec(id, content_hash, v) VALUES(?,?,?)")?;
-            for (id, hash, v) in rows {
-                st.execute(params![id, hash, f32_to_blob(v)])?;
+            let mut del = tx.prepare("DELETE FROM vec WHERE id = ?")?;
+            let mut seen: std::collections::HashSet<&str> = std::collections::HashSet::new();
+            for (id, _, _, _) in rows {
+                if seen.insert(id.as_str()) {
+                    del.execute(params![id])?;
+                }
+            }
+            let mut st = tx.prepare("INSERT OR REPLACE INTO vec(id, part, content_hash, v) VALUES(?,?,?,?)")?;
+            for (id, part, hash, v) in rows {
+                st.execute(params![id, *part as i64, hash, f32_to_blob(v)])?;
             }
         }
         tx.commit()?;
@@ -97,8 +140,11 @@ impl VectorStore {
 
     /// Every stored `(id, content_hash)` pair - used by `report` to compare
     /// against live content without paying to decode every vector blob.
+    /// One row per ITEM, never per part: every part of an item shares the same
+    /// content hash, so counting parts here would report an item as several
+    /// and make `report`'s stale/missing arithmetic nonsense.
     pub fn all_ids_and_hashes(&self) -> Result<Vec<(String, String)>> {
-        let mut st = self.conn.prepare("SELECT id, content_hash FROM vec")?;
+        let mut st = self.conn.prepare("SELECT id, content_hash FROM vec WHERE part = 0")?;
         let rows = st.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?;
         let mut out = Vec::new();
         for row in rows {
@@ -111,9 +157,46 @@ impl VectorStore {
     /// vector, or a corrupt blob, is simply absent from the map, never an
     /// error - the caller (`lookup::search_best_effort`) treats an absent id
     /// as "no semantic opinion" and falls back to the text-only hits.
+    /// For each id, the vector of the part that best matches `query_vec`.
+    ///
+    /// THE DEFECT THIS CLOSES, measured 2026-08-16 on the owner's own store.
+    /// One vector per item averages a whole document into a point that is close
+    /// to nothing in particular, and the longer the item the worse it gets. A
+    /// stored pizza recipe scored 0.490 against a question about its own
+    /// hydration - just under the 0.50 floor, so the answer came back empty.
+    /// Its best paragraph scored 0.628. A research report scored 0.287 whole
+    /// and 0.509 by its best paragraph. Short items do not move at all, which
+    /// is what makes this safe: it can only raise a score, never lower one.
+    ///
+    /// Returning the best PART's vector rather than a score keeps every caller
+    /// downstream unchanged - the ranking core still works on one vector per
+    /// id, and never learns that parts exist.
+    pub fn get_many_best(&self, ids: &[String], query_vec: &[f32]) -> Result<HashMap<String, Vec<f32>>> {
+        let mut out = HashMap::with_capacity(ids.len());
+        let mut st = self.conn.prepare("SELECT v FROM vec WHERE id = ? ORDER BY part")?;
+        for id in ids {
+            let Ok(rows) = st.query_map(params![id], |r| r.get::<_, Vec<u8>>(0)) else { continue };
+            let mut best: Option<(f32, Vec<f32>)> = None;
+            for blob in rows.flatten() {
+                let Some(v) = blob_to_f32(&blob) else { continue };
+                if v.len() != query_vec.len() {
+                    continue;
+                }
+                let score: f32 = v.iter().zip(query_vec).map(|(a, b)| a * b).sum();
+                if best.as_ref().is_none_or(|(b, _)| score > *b) {
+                    best = Some((score, v));
+                }
+            }
+            if let Some((_, v)) = best {
+                out.insert(id.clone(), v);
+            }
+        }
+        Ok(out)
+    }
+
     pub fn get_many(&self, ids: &[String]) -> Result<HashMap<String, Vec<f32>>> {
         let mut out = HashMap::with_capacity(ids.len());
-        let mut st = self.conn.prepare("SELECT v FROM vec WHERE id = ?")?;
+        let mut st = self.conn.prepare("SELECT v FROM vec WHERE id = ? AND part = 0")?;
         for id in ids {
             if let Ok(blob) = st.query_row(params![id], |r| r.get::<_, Vec<u8>>(0)) {
                 if let Some(v) = blob_to_f32(&blob) {
@@ -166,13 +249,169 @@ pub fn build(store: &EventStore, model_dir: &Path, vectors_path: &Path) -> Resul
         return Ok(0);
     }
     let mut embedder = Embedder::load(model_dir)?;
-    let texts: Vec<String> = candidates.iter().map(|li| li.item.text.clone()).collect();
-    let vectors = embedder.embed_many(&texts)?;
-    let rows: Vec<(String, String, Vec<f32>)> =
-        candidates.into_iter().zip(vectors).map(|(li, v)| (li.id, content_hash(&li.item.text), v)).collect();
-    let n = rows.len();
-    vs.upsert_batch(&rows)?;
+
+    // One vector per PART, not per item. Two defects close together here: the
+    // embedder truncates at 1000 characters, so everything past that in a long
+    // item never reached the model at all; and a single vector for a whole
+    // document averages every subject in it into a point near none of them.
+    // Measured 2026-08-16 - see `VectorStore::get_many_best` for the numbers.
+    //
+    // A short item yields exactly one part, so its stored vector is bit for bit
+    // what it was before this change. That is what keeps the ranking that was
+    // tuned on short, identifier-shaped items from moving underneath it.
+    let mut flat_ids: Vec<(String, usize, String)> = Vec::new();
+    let mut flat_texts: Vec<String> = Vec::new();
+    // PART 0 IS ALWAYS THE WHOLE ITEM, and the pieces follow from 1. That is
+    // not tidiness: a binary built before parts existed reads this sidecar with
+    // a plain "give me this id's vector" and takes what comes back first. If
+    // part 0 were the first paragraph, every older binary reading a rebuilt
+    // sidecar would silently start scoring questions against opening lines
+    // only - a live behaviour change nobody asked for, from a data migration.
+    // With the whole item at 0, an older binary behaves exactly as it always
+    // did, and only a binary that knows about parts sees the improvement.
+    for li in &candidates {
+        let hash = content_hash(&li.item.text);
+        flat_ids.push((li.id.clone(), 0usize, hash.clone()));
+        flat_texts.push(li.item.text.clone());
+
+        let pieces = split_for_embedding(&li.item.text);
+        if pieces.len() > 1 {
+            for (i, part) in pieces.into_iter().enumerate() {
+                flat_ids.push((li.id.clone(), i + 1, hash.clone()));
+                flat_texts.push(part);
+            }
+        }
+    }
+    let vectors = embedder.embed_many(&flat_texts)?;
+    let rows: Vec<(String, usize, String, Vec<f32>)> =
+        flat_ids.into_iter().zip(vectors).map(|((id, part, hash), v)| (id, part, hash, v)).collect();
+    let n = candidates.len();
+    vs.upsert_parts(&rows)?;
     Ok(n)
+}
+
+/// The most a single part may carry, comfortably under the embedder's own
+/// 1000-character truncation so a part is never cut in half by it.
+const PART_CHARS: usize = 700;
+
+/// Split an item's text into pieces small enough to be embedded whole.
+///
+/// Paragraphs first, because a paragraph is where one subject lives. A
+/// paragraph longer than the bound is cut on the last sentence end that fits,
+/// and only failing that on the bound itself - a piece that ends mid-sentence
+/// still embeds, it just carries less. Short items come back as one piece,
+/// unchanged.
+pub fn split_for_embedding(text: &str) -> Vec<String> {
+    if text.chars().count() <= PART_CHARS {
+        return vec![text.to_string()];
+    }
+    let mut parts: Vec<String> = Vec::new();
+    let mut current = String::new();
+    for para in text.split("\n\n") {
+        let para = para.trim();
+        if para.is_empty() {
+            continue;
+        }
+        if current.chars().count() + para.chars().count() <= PART_CHARS {
+            if !current.is_empty() {
+                current.push_str("\n\n");
+            }
+            current.push_str(para);
+            continue;
+        }
+        if !current.is_empty() {
+            parts.push(std::mem::take(&mut current));
+        }
+        // A single paragraph over the bound: cut it into sentence-sized pieces.
+        let mut rest: Vec<char> = para.chars().collect();
+        while rest.len() > PART_CHARS {
+            // Prefer a sentence end, then any word boundary, and only cut
+            // blind if the text offers neither. Cutting on the bound alone
+            // splits a word in half and feeds the model a fragment that means
+            // nothing - caught by `splitting_keeps_every_word`, which counted
+            // one word more coming out than went in.
+            // A cut of 0 would drain nothing and spin here forever - a text
+            // beginning with whitespace is enough to trigger it, and a build
+            // that hangs is worse than one that splits a word. Never below 1,
+            // and fall back to the bound when the boundary found is useless.
+            let cut = rest[..PART_CHARS]
+                .windows(2)
+                .rposition(|w| w[0] == '.' && w[1].is_whitespace())
+                .map(|i| i + 1)
+                .or_else(|| rest[..PART_CHARS].iter().rposition(|c| c.is_whitespace()))
+                .filter(|c| *c > 0)
+                .unwrap_or(PART_CHARS);
+            let head: String = rest[..cut].iter().collect();
+            parts.push(head.trim().to_string());
+            rest.drain(..cut);
+        }
+        current = rest.iter().collect::<String>().trim().to_string();
+    }
+    if !current.is_empty() {
+        parts.push(current);
+    }
+    if parts.is_empty() {
+        parts.push(text.to_string());
+    }
+    parts
+}
+
+#[cfg(test)]
+mod split_tests {
+    use super::*;
+
+    /// The property that keeps this change from moving anything that was
+    /// already tuned: a short item is still exactly one vector, byte for byte
+    /// what it was before parts existed.
+    #[test]
+    fn a_short_item_is_still_one_part() {
+        let text = "MIN_SIMILARITY is 0.50, raised from 0.45 on 2026-08-05.";
+        assert_eq!(split_for_embedding(text), vec![text.to_string()]);
+    }
+
+    /// THE DEFECT THIS PREVENTS, measured 2026-08-16: the embedder truncates at
+    /// 1000 characters, so everything past that in a long item never reached
+    /// the model. Every part must therefore stay under that bound.
+    #[test]
+    fn no_part_is_long_enough_to_be_truncated_by_the_embedder() {
+        let para = "Een alinea over hydratatie en bloem. ".repeat(40);
+        let text = format!("{para}\n\n{para}\n\n{para}");
+        let parts = split_for_embedding(&text);
+        assert!(parts.len() > 1, "a long item must be split at all");
+        for p in &parts {
+            assert!(p.chars().count() <= PART_CHARS, "a part of {} chars would be cut", p.chars().count());
+        }
+    }
+
+    /// THE HANG THIS PREVENTS, hit on the real store 2026-08-16: when the only
+    /// boundary inside the bound sits at position 0, the cut consumed nothing
+    /// and the loop spun forever. A build that never returns is worse than one
+    /// that splits a word, so a cut is never allowed to be zero.
+    #[test]
+    fn a_boundary_at_the_very_start_cannot_stall_the_split() {
+        let text = format!(" {}", "x".repeat(PART_CHARS * 3));
+        let parts = split_for_embedding(&text);
+        assert!(!parts.is_empty());
+        for p in &parts {
+            assert!(p.chars().count() <= PART_CHARS);
+        }
+    }
+
+    /// Nothing may be dropped on the floor: every word of the item has to end
+    /// up in some part, or the search would go quiet about content that is
+    /// really there - the exact failure this whole change exists to fix.
+    #[test]
+    fn splitting_keeps_every_word() {
+        let text = format!("{}\n\n{}\n\n{}", "eerste ".repeat(200), "tweede ".repeat(200), "derde ".repeat(200));
+        let parts = split_for_embedding(&text);
+        let joined: String = parts.join(" ");
+        for woord in ["eerste", "tweede", "derde"] {
+            assert!(joined.contains(woord), "{woord} disappeared while splitting");
+        }
+        let orig = text.split_whitespace().count();
+        let after = joined.split_whitespace().count();
+        assert_eq!(orig, after, "splitting must not lose or duplicate a word");
+    }
 }
 
 /// "Hoeveel er zijn en of ze bij de huidige inhoud passen" - the count-and-

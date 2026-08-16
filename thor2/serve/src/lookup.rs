@@ -490,7 +490,11 @@ pub fn search_best_effort_cached(
     // guess.
     let mut want_ids: Vec<String> = text_hits.iter().map(|h| h.id.clone()).collect();
     want_ids.extend(sem_candidates.iter().map(|li| li.id.clone()));
-    let Ok(vectors) = vs.get_many(&want_ids) else {
+    // Best PART per item, not the item's single average: a long item is stored
+    // as several vectors and answers with whichever piece the question is
+    // actually about. A short item has exactly one part, so this is identical
+    // to the old fetch for everything the current ranking was tuned on.
+    let Ok(vectors) = vs.get_many_best(&want_ids, &query_vec) else {
         return text_hits;
     };
 

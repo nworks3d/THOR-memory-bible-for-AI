@@ -112,6 +112,155 @@ pub fn search_with_expired(store: &EventStore, query: &str) -> (Vec<LookupHit>, 
     (hits, withheld)
 }
 
+// ------------------------------------------------------- surface 4: catalogue
+
+/// One named collection: a `Lookup` item, whole and never ranked.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Register {
+    pub key: String,
+    pub id: String,
+    /// Non-blank lines. A register's whole point is that this number is exact.
+    pub rows: usize,
+    /// First and last `YYYY-MM-DD` seen at the start of a line, if any. String
+    /// order is date order, so no date type is needed to say "when did this
+    /// last grow".
+    pub first_date: Option<String>,
+    pub last_date: Option<String>,
+}
+
+/// What lives under one scope.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ScopeEntry {
+    pub scope: String,
+    pub registers: Vec<Register>,
+    /// Live `Report` items carrying this scope. Counted, never listed here:
+    /// the list is derived on request, so there is no second truth to drift.
+    pub documents: usize,
+}
+
+/// Every address the memory can be asked for by name.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Catalog {
+    pub scopes: Vec<ScopeEntry>,
+    /// Live items carrying no scope at all. THE LEAK COUNTER: if this climbs
+    /// while the scoped counts stand still, the writing side is leaking, and
+    /// nothing else in this system would say so.
+    pub unscoped: usize,
+}
+
+/// THE DOOR THAT WAS MISSING. Measured on the owner's store 2026-08-16: 2
+/// `Lookup` items out of 3523, and neither had ever been served. Not because
+/// they were wrong - because `search` filters `Lookup` out by design (it
+/// answers only to its own exact key) and nothing could ask which keys exist.
+/// A holder nobody can discover is a write-only holder.
+///
+/// Read-only, and complete by construction: one pass over the live items, the
+/// same pass `search` already makes, with no ranking, no floor and no cap. Its
+/// size is bounded by the number of registers, never by the number of rows.
+pub fn catalog(store: &EventStore) -> Catalog {
+    let mut by_scope: std::collections::BTreeMap<String, ScopeEntry> = Default::default();
+    let mut unscoped = 0usize;
+
+    for li in live_items(store) {
+        match li.item.kind {
+            // A register announces its own scope: the first word of its key.
+            // That is what makes the lane self-declaring - the thing that
+            // opens a scope is the thing that carries it, so there is no table
+            // to keep in step and nothing that can fall behind.
+            Kind::Lookup => {
+                let Some(key) = li.item.key.clone().filter(|k| !k.trim().is_empty()) else { continue };
+                let scope = key.split_whitespace().next().unwrap_or(&key).to_string();
+                let rows: Vec<&str> = li.item.text.lines().filter(|l| !l.trim().is_empty()).collect();
+                let dates: Vec<String> = rows.iter().filter_map(|l| leading_date(l)).collect();
+                by_scope.entry(scope.clone()).or_insert_with(|| ScopeEntry {
+                    scope,
+                    registers: Vec::new(),
+                    documents: 0,
+                });
+                let entry = by_scope.get_mut(key.split_whitespace().next().unwrap_or(&key)).expect("just inserted");
+                entry.registers.push(Register {
+                    key,
+                    id: li.id.clone(),
+                    rows: rows.len(),
+                    first_date: dates.first().cloned(),
+                    last_date: dates.last().cloned(),
+                });
+            }
+            Kind::Report | Kind::Chunk => match li.item.project.as_deref() {
+                Some(p) if !p.trim().is_empty() => {
+                    by_scope
+                        .entry(p.to_string())
+                        .or_insert_with(|| ScopeEntry {
+                            scope: p.to_string(),
+                            registers: Vec::new(),
+                            documents: 0,
+                        })
+                        .documents += 1;
+                }
+                _ => unscoped += 1,
+            },
+            _ => {
+                if li.item.project.as_deref().map(str::trim).unwrap_or("").is_empty() {
+                    unscoped += 1;
+                }
+            }
+        }
+    }
+
+    let mut scopes: Vec<ScopeEntry> = by_scope.into_values().collect();
+    for s in &mut scopes {
+        s.registers.sort_by(|a, b| a.key.cmp(&b.key));
+    }
+    Catalog { scopes, unscoped }
+}
+
+/// The `YYYY-MM-DD` a register row starts with, if it starts with one. Kept
+/// deliberately dumb: ten characters, four-two-two with hyphens, all digits.
+/// A row without one is not an error, it simply carries no date.
+fn leading_date(line: &str) -> Option<String> {
+    let s: String = line.trim_start().chars().take(10).collect();
+    let b = s.as_bytes();
+    if b.len() == 10
+        && b[4] == b'-'
+        && b[7] == b'-'
+        && b.iter().enumerate().all(|(i, c)| i == 4 || i == 7 || c.is_ascii_digit())
+    {
+        Some(s)
+    } else {
+        None
+    }
+}
+
+/// The catalogue as a person reads it. One place, so both doors say the same.
+pub fn render_catalog(cat: &Catalog) -> String {
+    if cat.scopes.is_empty() && cat.unscoped == 0 {
+        return "this memory holds nothing yet".to_string();
+    }
+    let mut out = String::new();
+    for s in &cat.scopes {
+        out.push_str(&format!(
+            "scope {:<20} {} register(s), {} document(s)\n",
+            s.scope,
+            s.registers.len(),
+            s.documents
+        ));
+        for r in &s.registers {
+            let span = match (&r.first_date, &r.last_date) {
+                (Some(a), Some(b)) => format!("   {a} .. {b}"),
+                _ => String::new(),
+            };
+            out.push_str(&format!("  {:<26} id={:<22} {:>4} rows{}\n", r.key, r.id, r.rows, span));
+        }
+    }
+    if cat.unscoped > 0 {
+        out.push_str(&format!("({} live item(s) carry no scope at all.)\n", cat.unscoped));
+    }
+    out.push_str(
+        "Ask for a register by key to get it whole - never ranked, never capped, never expiring.\n",
+    );
+    out
+}
+
 /// Does this item's text or any of its tags contain `needle`, already
 /// lowercased by the caller? The one place the haystack is defined, so the
 /// phrase pass and the all-words fallback can never search different fields.

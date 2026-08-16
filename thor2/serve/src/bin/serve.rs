@@ -80,6 +80,12 @@ enum Command {
     LookupKey {
         key: String,
     },
+    /// Every address this memory can be asked for by name: the registers
+    /// (`Lookup` items, returned whole and never ranked) and how many
+    /// documents each scope holds, plus how many live items carry no scope
+    /// at all. Read-only. The same answer the agent's `lookup` gives when it
+    /// is called with neither a query nor a key - one definition, two doors.
+    Catalog,
     /// Surface 4's code door: search the code index built by the code-index
     /// binary against a repository. Every hit carries the commit it came
     /// from; the index's own drift against the repository's current state
@@ -239,6 +245,10 @@ fn main() {
         Command::Prompt { text } => cmd_prompt(&cli.db, &text),
         Command::Search { query } => cmd_search(&cli.db, &query),
         Command::LookupKey { key } => cmd_lookup_key(&cli.db, &key),
+        Command::Catalog => {
+            let store = open_store_or_die(&cli.db);
+            print!("{}", lookup::render_catalog(&lookup::catalog(&store)));
+        }
         Command::SearchCode { index_db, repo, query, limit } => cmd_search_code(&index_db, &repo, &query, limit),
         Command::WhereUsed { index_db, repo, name, limit } => cmd_where_used(&index_db, &repo, &name, limit),
         Command::Outline { index_db, path } => cmd_outline(&index_db, &path),

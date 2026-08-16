@@ -1217,11 +1217,17 @@ impl ThorMcpServer {
                     None => Ok(format!("no lookup found for key '{key}'")),
                 };
             }
-            let query = args
-                .query
-                .as_deref()
-                .filter(|q| !q.is_empty())
-                .ok_or_else(|| "pass 'query' (free-text search) or 'key' (an exact Lookup key)".to_string())?;
+            // NEITHER given is not a mistake any more: it asks what addresses
+            // exist. THE DEFECT THIS CLOSES, measured 2026-08-16: the store
+            // held 2 Lookup items out of 3523 and neither had ever been
+            // served, because `search` filters that kind out by design and
+            // nothing could ask which keys exist. A holder nobody can discover
+            // is a write-only holder, so the kind stayed unused and lists were
+            // stored as loose facts instead - where an answer is capped and
+            // looks complete.
+            let Some(query) = args.query.as_deref().filter(|q| !q.is_empty()) else {
+                return Ok(serve::lookup::render_catalog(&serve::lookup::catalog(s)));
+            };
             // Letter AND meaning, exactly like the CLI's own `search` - see
             // `with_vectors` for the defect that came from these two doors
             // answering differently. Degrades to the literal search on its
@@ -3256,11 +3262,47 @@ mod tests {
         assert!(miss.contains("no lookup found"), "{miss}");
     }
 
+    /// CHANGED DELIBERATELY on 2026-08-17, and the old promise is written out
+    /// so the change is not silent: calling `lookup` with neither argument used
+    /// to be a named error telling you to pass one. It now answers the question
+    /// that error made unanswerable - which addresses exist.
+    ///
+    /// THE DEFECT THIS CLOSES: the store held 2 `Lookup` items out of 3523 and
+    /// neither had ever been served. `search` filters that kind out by design,
+    /// so the only way in is an exact key - and nothing could ask which keys
+    /// there are. A holder nobody can discover is a write-only holder, which is
+    /// why lists ended up stored as loose facts instead, where an answer is
+    /// capped and still looks complete.
     #[tokio::test]
-    async fn lookup_with_neither_query_nor_key_is_a_named_error() {
+    async fn lookup_with_neither_query_nor_key_returns_the_catalogue() {
         let srv = server();
+        let mut register = blank_report("reg-boeken");
+        register.kind = "lookup".to_string();
+        register.key = Some("boeken 2026-08".to_string());
+        register.text = "2026-08-11 Dune\n2026-08-16 Piranesi".to_string();
+        register.expires = None;
+        assert!(srv.remember(Parameters(register)).await.starts_with("stored"));
+
         let reply = srv.lookup(Parameters(LookupArgs { query: None, key: None })).await;
-        assert!(reply.contains("query") && reply.contains("key"), "{reply}");
+        assert!(reply.contains("boeken"), "the scope must be named: {reply}");
+        assert!(reply.contains("2 rows"), "the row count must be exact: {reply}");
+        assert!(reply.contains("2026-08-11"), "the span must show when it starts: {reply}");
+    }
+
+    /// The register's own key decides its scope, so opening a lane costs
+    /// nothing but writing the register - there is no table to keep in step.
+    #[tokio::test]
+    async fn a_register_announces_its_own_scope() {
+        let srv = server();
+        let mut register = blank_report("reg-uitgaven-2026-08");
+        register.kind = "lookup".to_string();
+        register.key = Some("uitgaven 2026-08".to_string());
+        register.text = "2026-08-16 tandarts 85 euro".to_string();
+        register.expires = None;
+        assert!(srv.remember(Parameters(register)).await.starts_with("stored"));
+
+        let reply = srv.lookup(Parameters(LookupArgs { query: None, key: None })).await;
+        assert!(reply.contains("scope uitgaven"), "the first word of the key is the scope: {reply}");
     }
 
     /// THE DEFECT THIS PREVENTS (GAP 1): before this server cached a loaded

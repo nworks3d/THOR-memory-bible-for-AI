@@ -236,7 +236,18 @@ fn live_items_from_fold(store: &EventStore) -> anyhow::Result<Vec<(String, Item)
 /// `text`, only by liveness (`core`'s `item_binding` table projects
 /// bindings, not kind or text), so that part of the cost is unavoidable
 /// without a schema change.
-fn find_near_duplicate(store: &EventStore, item: &Item) -> anyhow::Result<Option<String>> {
+/// Why a new item collided with a live one. The two need different words: a
+/// duplicate TEXT says "revise that item instead"; a duplicate KEY says "that
+/// address is taken", and the fix is a different address, not a revise.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Collision {
+    /// Same kind, same or near-same text.
+    Text,
+    /// Same kind, and a key that normalises to an existing one.
+    Key,
+}
+
+fn find_near_duplicate(store: &EventStore, item: &Item) -> anyhow::Result<Option<(String, Collision)>> {
     let candidates = if store.heads_projection_current() {
         live_items_from_projection(store)?
     } else {
@@ -249,6 +260,28 @@ fn find_near_duplicate(store: &EventStore, item: &Item) -> anyhow::Result<Option
     for (id, existing) in candidates {
         if existing.kind != item.kind {
             continue; // only a live item of the SAME kind can be a near-duplicate
+        }
+        // A register is found by its KEY, so two registers whose keys differ
+        // only in case, spacing or a hyphen are the same address written twice
+        // - and the text comparison below can never catch them, because two
+        // registers about one subject legitimately hold completely different
+        // rows. `by_key` returns the first match, so the second one is
+        // unreachable from the moment it is written: a whole collection that
+        // exists and cannot be asked for.
+        //
+        // Checked BEFORE the project rule below on purpose. An address is an
+        // address whatever scope it was declared under, and unlike a rule there
+        // is no case where two projects each legitimately need their own copy
+        // of the same key.
+        //
+        // THE DEFECT THIS CLOSES, measured 2026-08-16: food knowledge lived in
+        // three places at once ("eten", "BBQ ideetjes", and no scope), and
+        // nothing at write time ever said so. This is that guard, on the one
+        // field where a second spelling costs a whole collection.
+        if let (Some(existing_key), Some(new_key)) = (&existing.key, &item.key) {
+            if normalize_for_comparison(existing_key) == normalize_for_comparison(new_key) {
+                return Ok(Some((id, Collision::Key)));
+            }
         }
         // Two items scoped to DIFFERENT projects are not copies of each other,
         // however alike they read. Two repositories can genuinely carry the
@@ -275,10 +308,10 @@ fn find_near_duplicate(store: &EventStore, item: &Item) -> anyhow::Result<Option
         }
         let existing_normalized = normalize_for_comparison(&existing.text);
         if existing_normalized == new_normalized {
-            return Ok(Some(id));
+            return Ok(Some((id, Collision::Text)));
         }
         if jaccard_similarity(&new_words, &word_set(&existing_normalized)) >= NEAR_DUPLICATE_JACCARD_THRESHOLD {
-            return Ok(Some(id));
+            return Ok(Some((id, Collision::Text)));
         }
     }
     Ok(None)
@@ -435,12 +468,27 @@ pub fn declare(
 ) -> Result<Event, WriteError> {
     let item = normalized(item);
     gate::declare(&item).map_err(WriteError::Refused)?;
-    if let Some(existing_id) = find_near_duplicate(store, &item).map_err(WriteError::Store)? {
-        return Err(WriteError::Refused(Refusal {
-            problem: format!("this is a near-duplicate of an existing live item (id '{existing_id}')"),
-            fix: format!(
-                "revise the existing item '{existing_id}' instead of storing a second copy of the same fact"
-            ),
+    if let Some((existing_id, why)) = find_near_duplicate(store, &item).map_err(WriteError::Store)? {
+        return Err(WriteError::Refused(match why {
+            Collision::Text => Refusal {
+                problem: format!("this is a near-duplicate of an existing live item (id '{existing_id}')"),
+                fix: format!(
+                    "revise the existing item '{existing_id}' instead of storing a second copy of the same fact"
+                ),
+            },
+            // A different problem needs different words: the texts may share
+            // nothing at all. What collides is the ADDRESS, and a second one
+            // is unreachable - `by_key` answers with the first.
+            Collision::Key => Refusal {
+                problem: format!(
+                    "an item already answers to this key, give or take case and punctuation (id '{existing_id}')"
+                ),
+                fix: format!(
+                    "add to '{existing_id}' instead - a second item on the same key can never be reached, since a key \
+                     lookup answers with the first. If this really is a different collection, give it a key that \
+                     differs by more than a capital or a hyphen"
+                ),
+            },
         }));
     }
     // CONTRACT R1's own refusal class, unpaid until 2026-08-08: an item that
@@ -1770,6 +1818,64 @@ mod tests {
             archive(&mut store, "s1", "l1", "test", "thing", "two, reasons", None),
             Err(WriteError::Refused(_))
         ));
+    }
+
+    /// THE DEFECT THIS CLOSES, measured on the owner's live store 2026-08-16:
+    /// one subject lived at three addresses at once, and nothing at write time
+    /// ever said so. A register is reached ONLY by its key, and `by_key`
+    /// answers with the first match - so a second register whose key differs
+    /// by a capital or a hyphen is a whole collection that exists and can
+    /// never be asked for.
+    ///
+    /// The text check cannot catch this: two registers about one subject hold
+    /// completely different rows, which is exactly what the texts below are.
+    #[test]
+    fn a_second_register_on_the_same_key_is_refused_however_it_is_spelled() {
+        let mut store = EventStore::in_memory().unwrap();
+
+        let mut first = sample_with("reg-boeken", "2026-08-11 Dune\n2026-08-16 Piranesi");
+        first.kind = Kind::Lookup;
+        first.key = Some("boeken".to_string());
+        first.bindings = vec![];
+        first.falsifier = None;
+        declare(&mut store, "s1", "l1", "test", &first).unwrap();
+
+        let mut second = sample_with("reg-boeken-2", "2025-01-02 Anna Karenina");
+        second.kind = Kind::Lookup;
+        second.key = Some("Boeken".to_string());
+        second.bindings = vec![];
+        second.falsifier = None;
+
+        match declare(&mut store, "s1", "l1", "test", &second) {
+            Err(WriteError::Refused(r)) => {
+                assert!(r.problem.contains("key"), "the refusal must name the real reason: {}", r.problem);
+                assert!(r.problem.contains("reg-boeken"), "and name the item holding it: {}", r.problem);
+            }
+            other => panic!("a second register on the same key must be refused, got {other:?}"),
+        }
+    }
+
+    /// A key that is genuinely different is not a collision. The guard exists
+    /// to stop a second SPELLING, never a second collection - a monthly log is
+    /// meant to have one register per month.
+    #[test]
+    fn two_registers_with_genuinely_different_keys_both_stand() {
+        let mut store = EventStore::in_memory().unwrap();
+
+        let mut july = sample_with("reg-uitgaven-07", "2026-07-04 filament 42 euro");
+        july.kind = Kind::Lookup;
+        july.key = Some("uitgaven 2026-07".to_string());
+        july.bindings = vec![];
+        july.falsifier = None;
+        declare(&mut store, "s1", "l1", "test", &july).unwrap();
+
+        let mut august = sample_with("reg-uitgaven-08", "2026-08-16 tandarts 85 euro");
+        august.kind = Kind::Lookup;
+        august.key = Some("uitgaven 2026-08".to_string());
+        august.bindings = vec![];
+        august.falsifier = None;
+        declare(&mut store, "s1", "l1", "test", &august)
+            .expect("one register per month is the shape this lane is built on");
     }
 
     #[test]

@@ -95,7 +95,24 @@ jobs:
           curl -fsSL "https://github.com/modelcontextprotocol/registry/releases/latest/download/mcp-publisher_linux_amd64.tar.gz" \
             | tar xz mcp-publisher
 
+      # A version already in the directory is not a failure. Re-running this
+      # for the same version is a normal thing to do - the image gets rebuilt
+      # after a fix to the Dockerfile itself, say - and the registry rightly
+      # refuses to list one version twice. Treating that as a red cross means a
+      # commit stays permanently marked failed for having done nothing wrong,
+      # which is how a red cross stops meaning anything. Every OTHER failure
+      # still fails.
       - name: Publish
         run: |
+          # Without pipefail the `if` would read tee's exit code, which is
+          # always 0, and every failure here would look like a success.
+          set -o pipefail
           ./mcp-publisher login github-oidc
-          ./mcp-publisher publish
+          if ./mcp-publisher publish 2>&1 | tee publish.log; then
+            exit 0
+          fi
+          if grep -q "cannot publish duplicate version" publish.log; then
+            echo "this version is already listed in the directory - nothing to do"
+            exit 0
+          fi
+          exit 1

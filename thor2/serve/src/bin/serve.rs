@@ -86,6 +86,13 @@ enum Command {
     /// at all. Read-only. The same answer the agent's `lookup` gives when it
     /// is called with neither a query nor a key - one definition, two doors.
     Catalog,
+    /// One scope, opened: every item filed under it, one line each, complete
+    /// and in date order. The step after `catalog` - and the same answer the
+    /// agent's `lookup` gives when it is called with a scope and no query.
+    Scope {
+        /// The scope's name, as `catalog` lists it.
+        name: String,
+    },
     /// Surface 4's code door: search the code index built by the code-index
     /// binary against a repository. Every hit carries the commit it came
     /// from; the index's own drift against the repository's current state
@@ -248,6 +255,10 @@ fn main() {
         Command::Catalog => {
             let store = open_store_or_die(&cli.db);
             print!("{}", lookup::render_catalog(&lookup::catalog(&store)));
+        }
+        Command::Scope { name } => {
+            let store = open_store_or_die(&cli.db);
+            print!("{}", lookup::render_scope(&name, &lookup::in_scope(&store, &name)));
         }
         Command::SearchCode { index_db, repo, query, limit } => cmd_search_code(&index_db, &repo, &query, limit),
         Command::WhereUsed { index_db, repo, name, limit } => cmd_where_used(&index_db, &repo, &name, limit),

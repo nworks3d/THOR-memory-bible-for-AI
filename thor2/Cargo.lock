@@ -446,7 +446,7 @@ checksum = "c8d4a3bb8b1e0c1050499d1815f5ab16d04f0959b233085fb31653fbfc9d98f9"
 
 [[package]]
 name = "codeindex"
-version = "2.0.0"
+version = "2.1.0"
 dependencies = [
  "rusqlite",
  "tempfile",
@@ -1542,7 +1542,7 @@ dependencies = [
 
 [[package]]
 name = "intent"
-version = "2.0.0"
+version = "2.1.0"
 dependencies = [
  "regex",
  "serde",
@@ -1634,6 +1634,14 @@ name = "libm"
 version = "0.2.16"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b6d2cec3eae94f9f509c767b45932f1ada8350c4bdb85af2fcab4a3c14807981"
+
+[[package]]
+name = "library"
+version = "2.1.0"
+dependencies = [
+ "rusqlite",
+ "tempfile",
+]
 
 [[package]]
 name = "libredox"
@@ -1738,11 +1746,12 @@ dependencies = [
 
 [[package]]
 name = "mcp"
-version = "2.0.0"
+version = "2.1.0"
 dependencies = [
  "anyhow",
  "axum",
  "clap",
+ "library",
  "model",
  "rmcp",
  "schemars",
@@ -1795,7 +1804,7 @@ dependencies = [
 
 [[package]]
 name = "model"
-version = "2.0.0"
+version = "2.1.0"
 dependencies = [
  "anyhow",
  "clap",
@@ -2056,12 +2065,13 @@ dependencies = [
 
 [[package]]
 name = "ops"
-version = "2.0.0"
+version = "2.1.0"
 dependencies = [
  "anyhow",
  "axum",
  "clap",
  "codeindex",
+ "library",
  "mcp",
  "model",
  "reqwest",
@@ -2833,7 +2843,7 @@ dependencies = [
 
 [[package]]
 name = "serve"
-version = "2.0.0"
+version = "2.1.0"
 dependencies = [
  "anyhow",
  "clap",
@@ -3082,7 +3092,7 @@ dependencies = [
 
 [[package]]
 name = "thor-core"
-version = "2.0.0"
+version = "2.1.0"
 dependencies = [
  "anyhow",
  "rusqlite",

@@ -283,7 +283,20 @@ fn suggested_check(item: &model::item::Item, root: &std::path::Path) -> Vec<Stri
     Vec::new()
 }
 
-const INSTRUCTIONS: &str = "THOR 2.0's agent surface: fourteen tools, no more. retract removes an item \
+const INSTRUCTIONS: &str = "THOR's agent surface: sixteen tools, no more. TWO SEPARATE MEMORIES \
+live behind them, and picking the wrong one is the mistake to avoid. The CODE lane (remember, revise, \
+retract, lookup, get, history, pin, unpin, mark, resolve, status, search_code, where_used, outline) \
+holds facts about code, projects and how to work; it has a write gate, standing rules that fire on \
+their own, and a hard cap on how much is ever shown at once. The LIBRARY (library to read, shelve to \
+write) holds the owner's everyday knowledge - recipes, books read, a training log, expenses - in its \
+own file, and nothing in it is ever injected, ranked against a rule, or counted toward any cap. \
+Anything about his own life goes to shelve, never to remember. \
+IF THIS SERVER IS A REPLICA (an away-from-the-desk connector) every writing tool answers 'queued for \
+the main machine' instead of writing: the call is applied later on the main machine, where the write \
+gate runs, so it is NOT here yet and will not turn up in lookup here. That is not a failure - do not \
+retry it, and do not fall back to a different tool. A replica has no library to READ, so it will say \
+so plainly; filing still works, because a filing is queued like anything else. \
+retract removes an item \
 that is simply WRONG (a reason is required; nothing is deleted, history still walks it), resolve \
 settles an id that get reports as DIVERGED, history walks one id's whole life oldest first, and \
 search_code, where_used and outline answer the three CODE questions - find text in the source, who defines and uses a symbol, what one file declares - each with the commit the index was read at on every answer. This \
@@ -353,6 +366,23 @@ pub struct TargetArg {
 /// version is that "important" was a word anybody could write, and the store
 /// counted it as protection without ever trying it.
 ///
+/// Append the scopes that exist to the one refusal that needs them.
+///
+/// THE FRICTION THIS REMOVES. The gate is handed an item and never the store,
+/// so a write with no scope could only be told the rule - leaving a fresh
+/// agent to write, be refused, look the scopes up, and write again. Three
+/// calls for one fact, and the write gate has been reworded repeatedly to
+/// avoid exactly that. With the list attached the second call is the last one.
+///
+/// Matched on `gate::NO_SCOPE_PROBLEM` rather than on a phrase, so rewording
+/// the refusal can never quietly unhook this.
+fn with_scope_menu(refusal: String, store: &thor_core::event_store::EventStore) -> String {
+    if !refusal.contains(model::gate::NO_SCOPE_PROBLEM) {
+        return refusal;
+    }
+    format!("{refusal}\n{}", serve::lookup::scope_menu(store))
+}
+
 /// Only a check that is TRIED and stays SILENT is refused. A check that cannot
 /// be tried without a working copy passes - reporting it as unproven belongs
 /// to `doctor`, not to a door that would otherwise refuse every file-reading
@@ -608,13 +638,13 @@ pub struct ReviseArgs {
     pub always: Option<bool>,
 }
 
-#[derive(Deserialize, schemars::JsonSchema)]
+#[derive(Deserialize, Serialize, schemars::JsonSchema)]
 pub struct PinArgs {
     /// The id to pin (add the Always binding to it).
     pub id: String,
 }
 
-#[derive(Deserialize, schemars::JsonSchema)]
+#[derive(Deserialize, Serialize, schemars::JsonSchema)]
 pub struct UnpinArgs {
     /// The id to unpin (remove the Always binding from it).
     pub id: String,
@@ -634,13 +664,54 @@ pub struct LookupArgs {
     /// answer only to their own `key`, see below).
     #[serde(default)]
     pub query: Option<String>,
+    /// One scope, by name, as the catalogue lists it. On its own it opens that
+    /// scope: every item filed under it, one line each, complete. Together with
+    /// `query` it narrows that search to this scope alone.
+    #[serde(default)]
+    pub scope: Option<String>,
     /// An exact Lookup key. When given, this is the ONLY parameter used -
-    /// `query` is ignored - and only a real Lookup item can ever answer it.
+    /// `query` and `scope` are ignored - and only a real Lookup item can ever
+    /// answer it.
     #[serde(default)]
     pub key: Option<String>,
 }
 
 #[derive(Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct LibraryArgs {
+    /// One shelf, by name. On its own it lists that shelf, one line per entry.
+    /// With `query` it searches inside that shelf only.
+    #[serde(default)]
+    pub shelf: Option<String>,
+    /// Free text. Searched over titles, bodies and labels, in four steps that
+    /// end in a list to read rather than in an empty answer.
+    #[serde(default)]
+    pub query: Option<String>,
+    /// Narrow one shelf to the entries carrying this label. Labels are how a
+    /// big shelf stays usable - there are never sub-shelves.
+    #[serde(default)]
+    pub label: Option<String>,
+    /// One entry's number, as the listings show it. Returns it whole.
+    #[serde(default)]
+    pub id: Option<i64>,
+}
+
+#[derive(Deserialize, Serialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct ShelveArgs {
+    /// An EXISTING shelf. If none fits, ask the owner - you may not create one.
+    pub shelf: String,
+    /// One line that stands on its own. This is the index.
+    pub title: String,
+    /// The rest, at any length. Optional.
+    #[serde(default)]
+    pub body: String,
+    /// Optional labels for filtering inside a shelf.
+    #[serde(default)]
+    pub labels: Vec<String>,
+}
+
+#[derive(Deserialize, Serialize, schemars::JsonSchema)]
 pub struct MarkArgs {
     /// The id of the item being judged.
     pub id: String,
@@ -666,7 +737,7 @@ pub struct RetractArgs {
     pub reason: String,
 }
 
-#[derive(Deserialize, schemars::JsonSchema)]
+#[derive(Deserialize, Serialize, schemars::JsonSchema)]
 pub struct ResolveArgs {
     /// The diverged id.
     pub id: String,
@@ -785,6 +856,13 @@ pub struct ThorMcpServer {
     /// `thor_core::inbox` for why a replica may never append to its own log).
     /// `None` on the authority itself, which is every local session.
     inbox: Option<Arc<PathBuf>>,
+    /// THE SECOND LANE, in its own file. Everyday knowledge - recipes, books
+    /// read, a training log - lives here and nowhere near the event store, so
+    /// it can never take one of the four slots, never crowd a standing rule,
+    /// and never turn up in the same list as a project. `None` means the two
+    /// library tools say plainly that no library is configured; they never
+    /// answer empty, which would read as "you have nothing filed".
+    library: Option<Arc<PathBuf>>,
     #[allow(dead_code)] // read only inside the #[tool_handler] macro expansion
     tool_router: ToolRouter<Self>,
 }
@@ -800,6 +878,7 @@ impl ThorMcpServer {
             embedder_cache: Arc::new(Mutex::new(None)),
             root: None,
             inbox: None,
+            library: None,
             tool_router: Self::tool_router(),
         }
     }
@@ -817,6 +896,7 @@ impl ThorMcpServer {
             embedder_cache: Arc::new(Mutex::new(None)),
             root: None,
             inbox: None,
+            library: None,
             tool_router: Self::tool_router(),
         }
     }
@@ -834,6 +914,17 @@ impl ThorMcpServer {
     /// The agent is the door he actually uses.
     pub fn with_vectors(mut self, vectors: std::path::PathBuf) -> Self {
         self.vectors = Some(vectors);
+        self
+    }
+
+    /// Point the two library tools at the library's own file.
+    ///
+    /// A DIFFERENT FILE, ALWAYS, and never this store's. The everyday lane and
+    /// the code lane share no table, no index and no address space, so nothing
+    /// filed in one can ever be ranked against, crowded out by, or listed
+    /// beside anything in the other.
+    pub fn with_library(mut self, library: PathBuf) -> Self {
+        self.library = Some(Arc::new(library));
         self
     }
 
@@ -918,7 +1009,7 @@ impl ThorMcpServer {
         }
     }
 
-    #[tool(description = "Declare a NEW memory item (Rule/Orientation/Report/Lookup/Chunk), through the write gate (model::store::declare). A Rule/Orientation with no binding, no falsifier, or over 300 characters is REFUSED with the exact reason and what to fix instead - that is the gate doing its job, not a failure of this tool, and nothing is written when it fires. Call lookup first so you revise an existing item instead of storing a near-duplicate. Optionally set check_kind plus either check_literal or check_literals (check_kind one of path_exists/contains/absent/absent_all/forbidden) to give a Rule or Orientation a machine-runnable proof of its own currency, alongside its required prose falsifier, never instead of it: a rule whose check currently HOLDS is the only kind of rule this memory ever uses to block a write outright (see serve's write guard); prose alone can inform, but can never block. path_exists/contains/absent/absent_all also need check_path, the exact file the check inspects; forbidden takes no check_path at all. Use check_kind absent_all with check_literals (a set) when ONE rule forbids SEVERAL literals together in one specific file; use check_kind forbidden with check_literals instead when the rule forbids something self-contained with nothing to anchor to (e.g. a typography rule banning six different punctuation characters wherever they are written is one forbidden item with a six-entry set, never six near-identical items each banning one, and never absent_all anchored to one directory as a formality - that only proves the rule current for that directory, leaving it silently not firing anywhere else it was meant to apply). A forbidden check reaches wherever its BINDING says, and there are exactly two bindings that carry a reach it can honour: always (every file write) and a command target (that one command, matched with sudo, a full path and a .exe suffix all taken off first). That second form is how a COMMAND prohibition - never run this exact thing - becomes a real refusal instead of prose: give the item a command target and a forbidden check whose literal is the dangerous fragment, and give it NO always binding unless writing those same words in a file is also forbidden, or the rule will refuse the documentation that describes it. A forbidden check on any other binding passes this gate, looks like the strongest form, and can never fire.")]
+    #[tool(description = "Declare a NEW memory item (Rule/Orientation/Report/Lookup/Chunk), through the write gate (model::store::declare). A Rule/Orientation with no binding, no falsifier, or over 300 characters is REFUSED with the exact reason and what to fix instead - that is the gate doing its job, not a failure of this tool, and nothing is written when it fires. Call lookup first so you revise an existing item instead of storing a near-duplicate. A Report/Chunk MUST carry a project - that is its scope, the collection it is filed under (recipes, books read, a training log, expenses) - and one with no scope is REFUSED, because it would belong to no collection and opening one would never show it. So before storing anything of the owner's own life, call lookup with NO arguments to see which scopes exist and pick the one it belongs to; the refusal lists them too if you get there first. If none fits, ASK the owner whether this needs a new scope and what to call it - never invent a scope name on his behalf, and never file something under a scope it does not belong to just to get past the gate. A Rule/Orientation may still be global (no project): a standing rule that holds in every project is what that is for. Optionally set check_kind plus either check_literal or check_literals (check_kind one of path_exists/contains/absent/absent_all/forbidden) to give a Rule or Orientation a machine-runnable proof of its own currency, alongside its required prose falsifier, never instead of it: a rule whose check currently HOLDS is the only kind of rule this memory ever uses to block a write outright (see serve's write guard); prose alone can inform, but can never block. path_exists/contains/absent/absent_all also need check_path, the exact file the check inspects; forbidden takes no check_path at all. Use check_kind absent_all with check_literals (a set) when ONE rule forbids SEVERAL literals together in one specific file; use check_kind forbidden with check_literals instead when the rule forbids something self-contained with nothing to anchor to (e.g. a typography rule banning six different punctuation characters wherever they are written is one forbidden item with a six-entry set, never six near-identical items each banning one, and never absent_all anchored to one directory as a formality - that only proves the rule current for that directory, leaving it silently not firing anywhere else it was meant to apply). A forbidden check reaches wherever its BINDING says, and there are exactly two bindings that carry a reach it can honour: always (every file write) and a command target (that one command, matched with sudo, a full path and a .exe suffix all taken off first). That second form is how a COMMAND prohibition - never run this exact thing - becomes a real refusal instead of prose: give the item a command target and a forbidden check whose literal is the dangerous fragment, and give it NO always binding unless writing those same words in a file is also forbidden, or the rule will refuse the documentation that describes it. A forbidden check on any other binding passes this gate, looks like the strongest form, and can never fire.")]
     async fn remember(&self, Parameters(args): Parameters<RememberArgs>) -> String {
         if let Some(queued) = self.capture("remember", &args) {
             return queued;
@@ -962,7 +1053,7 @@ impl ThorMcpServer {
                     root.as_deref().map(|p| p.as_path()),
                     Some(s),
                 )),
-                Err(e) => Err(format!("REFUSED: {e}")),
+                Err(e) => Err(with_scope_menu(format!("REFUSED: {e}"), s)),
             }
         })
         .await
@@ -1136,7 +1227,7 @@ impl ThorMcpServer {
                         Some(s),
                     ))
                 }
-                Err(e) => Err(format!("REFUSED: {e}")),
+                Err(e) => Err(with_scope_menu(format!("REFUSED: {e}"), s)),
             }
         })
         .await
@@ -1154,6 +1245,9 @@ impl ThorMcpServer {
     /// binding at all is refused there, exactly as it is for `remember`).
     #[tool(description = "Pin an item: add the Always binding, so it is served in full at every session start (model::store::revise), keeping every other binding and field untouched. Idempotent - pinning an item that is already pinned changes nothing and is not an error. Refused, loudly, by the same write gate as remember/revise when this kind may carry no binding at all (a Report or a Chunk).")]
     async fn pin(&self, Parameters(args): Parameters<PinArgs>) -> String {
+        if let Some(queued) = self.capture("pin", &args) {
+            return queued;
+        }
         self.blocking(move |s| {
             let existing = model::store::show(s, &args.id).map_err(|e| format!("cannot pin: {e}"))?;
             if existing.bindings.contains(&Binding::Always) {
@@ -1171,6 +1265,9 @@ impl ThorMcpServer {
 
     #[tool(description = "Unpin an item: remove the Always binding (model::store::revise), keeping every other binding and field untouched. Idempotent - unpinning an item with no Always binding changes nothing and is not an error. Refused, loudly, when removing Always would leave the item with NO binding at all: a Rule or Orientation with no binding can never fire, so this never silently creates an unfireable item - give it another binding (a Moment or a Target) first, or leave it pinned.")]
     async fn unpin(&self, Parameters(args): Parameters<UnpinArgs>) -> String {
+        if let Some(queued) = self.capture("unpin", &args) {
+            return queued;
+        }
         self.blocking(move |s| {
             let existing = model::store::show(s, &args.id).map_err(|e| format!("cannot unpin: {e}"))?;
             if !existing.bindings.contains(&Binding::Always) {
@@ -1205,7 +1302,7 @@ impl ThorMcpServer {
         .await
     }
 
-    #[tool(description = "Search THOR's memory (surface 4, OPZOEKEN): every live item, every project, archive kinds (Report/Chunk) fully included - never scoped to 'the current project' the way session start is. Pass 'query' for a free-text search over an item's text and tags; pass 'key' for the exact key of one Lookup item (query is then ignored). Call this BEFORE remember, so you revise an existing item instead of storing a near-duplicate. Never an injection surface: nothing found here is ever pushed at you unprompted - you asked for it.")]
+    #[tool(description = "Search THOR's memory (surface 4, OPZOEKEN): every live item, every project, archive kinds (Report/Chunk) fully included - never scoped to 'the current project' the way session start is. FOUR WAYS IN. Call it with NO arguments to get the catalogue: which scopes exist and what each holds - start here whenever you do not already know where something lives. Pass 'scope' alone to open one, listing every item it holds, one line each, complete. Pass 'scope' with 'query' to search inside it. Pass 'query' alone to search everything, or 'key' for the exact key of one Lookup item (everything else is then ignored). A collection - books read, recipes, a diary, expenses - is a SCOPE holding one item per entry, never one item holding every entry: to add to it, remember a new item carrying that scope, never append to an existing one. Call this BEFORE remember, so you revise an existing item instead of storing a near-duplicate. Never an injection surface: nothing found here is ever pushed at you unprompted - you asked for it.")]
     async fn lookup(&self, Parameters(args): Parameters<LookupArgs>) -> String {
         let vectors = self.vectors.clone();
         #[cfg(feature = "semantic")]
@@ -1225,8 +1322,15 @@ impl ThorMcpServer {
             // is a write-only holder, so the kind stayed unused and lists were
             // stored as loose facts instead - where an answer is capped and
             // looks complete.
+            let scope = args.scope.as_deref().filter(|sc| !sc.trim().is_empty());
             let Some(query) = args.query.as_deref().filter(|q| !q.is_empty()) else {
-                return Ok(serve::lookup::render_catalog(&serve::lookup::catalog(s)));
+                // A scope on its own opens that folder; nothing at all asks
+                // which folders there are. Two steps, and the first one is
+                // discoverable without knowing a single name in advance.
+                return Ok(match scope {
+                    Some(sc) => serve::lookup::render_scope(sc, &serve::lookup::in_scope(s, sc)),
+                    None => serve::lookup::render_catalog(&serve::lookup::catalog(s)),
+                });
             };
             // Letter AND meaning, exactly like the CLI's own `search` - see
             // `with_vectors` for the defect that came from these two doors
@@ -1247,12 +1351,27 @@ impl ThorMcpServer {
                 Some(_) => serve::lookup::search(s, query),
                 None => serve::lookup::search(s, query),
             };
+            // Narrowing to one scope happens LAST, on the finished ranking, so
+            // a scoped search returns exactly the hits an unscoped one would
+            // have returned in the same order - minus the ones filed
+            // elsewhere. It can never surface something the plain search
+            // would not have found.
+            let hits = match scope {
+                Some(sc) => serve::lookup::only_scope(hits, sc),
+                None => hits,
+            };
             // How many the expiry rule held back, so a thin answer is never
             // mistaken for an empty memory (see lookup::search_with_expired).
             let withheld = serve::lookup::search_with_expired(s, query).1;
             let mut out = String::new();
             if hits.is_empty() {
-                out.push_str(&format!("no matches for '{query}'\n"));
+                match scope {
+                    Some(sc) => out.push_str(&format!(
+                        "no matches for '{query}' in scope '{sc}'. Drop 'scope' to search everywhere, \
+                         or pass scope alone to see everything it holds.\n"
+                    )),
+                    None => out.push_str(&format!("no matches for '{query}'\n")),
+                }
             }
             // A CAP, AND IT SAYS SO. Reported from a real session and
             // reproduced: a single common word returned 270,000 characters
@@ -1286,8 +1405,64 @@ impl ThorMcpServer {
         .await
     }
 
+    #[tool(description = "READ THE LIBRARY: the owner's everyday knowledge - recipes, books read, a training log, expenses - kept completely apart from the code lane. Nothing here is ever injected, ranked against a rule, or counted toward any cap: it is a different file, and you only ever see it because you asked. FOUR WAYS IN. No arguments: the shelves and how much each holds - start here whenever you do not already know where something lives. 'shelf': that shelf's index, one line per entry (add 'label' to narrow a big one). 'id': one entry, whole. 'query' (optionally with 'shelf'): search. A search NEVER answers 'nothing' - if the words miss, it hands back the shelf or the shelf list to read, because the words someone asks with are rarely the words they wrote. So when a question is about the owner's own life rather than about code, come here FIRST and read, instead of concluding the memory is empty.")]
+    async fn library(&self, Parameters(args): Parameters<LibraryArgs>) -> String {
+        const SHOWN: usize = 50;
+        let Some(path) = self.library.clone() else {
+            return "no library is configured for this server, so nothing can be read from it. This is not the same as an empty library - tell the owner the library path is not wired up.".to_string();
+        };
+        let lib = match ::library::Library::open(path.as_path()) {
+            Ok(lib) => lib,
+            Err(e) => return e,
+        };
+        if let Some(id) = args.id {
+            return match lib.get(id) {
+                Ok(Some(entry)) => ::library::render_entry(&entry),
+                Ok(None) => format!("no entry {id} in the library"),
+                Err(e) => e,
+            };
+        }
+        if let Some(query) = args.query.as_deref().filter(|q| !q.trim().is_empty()) {
+            return match lib.search(query, args.shelf.as_deref()) {
+                Ok(found) => ::library::render_found(&found, SHOWN),
+                Err(e) => e,
+            };
+        }
+        match args.shelf.as_deref().filter(|s| !s.trim().is_empty()) {
+            Some(shelf) => match lib.entries(shelf, args.label.as_deref()) {
+                Ok(entries) => ::library::render_shelf(shelf, &entries, SHOWN),
+                Err(e) => e,
+            },
+            None => match lib.shelves() {
+                Ok(shelves) => ::library::render_shelves(&shelves),
+                Err(e) => e,
+            },
+        }
+    }
+
+    #[tool(description = "FILE ONE ENTRY IN THE LIBRARY (the everyday lane, never the code lane). Use this - not remember - for anything about the owner's own life: a recipe, a book he read, a training session, an expense. The title is ONE line and is what a shelf listing shows, so make it stand on its own; the body holds the rest, at any length. YOU CANNOT CREATE A SHELF. If no existing shelf fits, the write is refused and names the shelves that do exist - then ASK the owner whether this needs a new shelf and what to call it, and let him create it. Never invent a shelf, and never file something on a shelf it does not belong to just to get past the refusal: that is how a library stops being worth reading. Growth inside a shelf goes into 'labels', never into more shelves. A near-duplicate of something already on that shelf is refused, pointing at the entry that exists, so read before you write.")]
+    async fn shelve(&self, Parameters(args): Parameters<ShelveArgs>) -> String {
+        if let Some(queued) = self.capture("shelve", &args) {
+            return queued;
+        }
+        let Some(path) = self.library.clone() else {
+            return "no library is configured for this server, so nothing can be filed. Tell the owner the library path is not wired up - do not fall back to remember for everyday knowledge.".to_string();
+        };
+        let lib = match ::library::Library::open(path.as_path()) {
+            Ok(lib) => lib,
+            Err(e) => return e,
+        };
+        match lib.add(&args.shelf, &args.title, &args.body, &args.labels) {
+            Ok(id) => format!("filed {id} on shelf {}", args.shelf.trim()),
+            Err(refusal) => format!("REFUSED: {refusal}"),
+        }
+    }
+
     #[tool(description = "Judge an item you were served or looked up. Default records that it HELPED (serve::mark::record_useful), which clears the noise recorded BEFORE it - not the noise recorded after: the latest verdict is the one that counts, because a reader is allowed to change their mind about an item that has drifted. Pass noise:true for the opposite - this did not belong where it fired - and two of those SINCE the last mark of usefulness retire it from the injection surfaces while leaving it fully findable via lookup. The noise side is the ONLY thing that retires anything: a serving count decides nothing, because firing often is what relevance looks like (see serve::decay for the day that was measured). Judging as you go is where this is done best.")]
     async fn mark(&self, Parameters(args): Parameters<MarkArgs>) -> String {
+        if let Some(queued) = self.capture("mark", &args) {
+            return queued;
+        }
         self.blocking(move |s| {
             let now = serve::time::now_iso8601();
             let written = if args.noise {
@@ -1378,6 +1553,9 @@ impl ThorMcpServer {
 
     #[tool(description = "Settle an item that has more than one current head (model::store::resolve), which is what `get` reports as DIVERGED - two machines revised the same fact without seeing each other. Name the revision hash that survives in 'keep' and EVERY other current head in 'discard'. The head set is recomputed under the write lock, so a head that appeared while you were deciding makes this fail loudly instead of silently dropping someone else's revision. Read the item's history first; never guess which head is real.")]
     async fn resolve(&self, Parameters(args): Parameters<ResolveArgs>) -> String {
+        if let Some(queued) = self.capture("resolve", &args) {
+            return queued;
+        }
         self.blocking(move |s| {
             match model::store::resolve(
                 s,
@@ -1491,6 +1669,34 @@ pub enum CapturedOutcome {
     NotApplied(String),
 }
 
+/// Every tool this build can replay from a capture inbox.
+///
+/// THE HANDSHAKE THIS EXISTS FOR. A replica queues CALLS, and the authority
+/// replays them; if the replica runs a newer build it can queue a call this
+/// one has never heard of. That used to be discovered one op at a time, in the
+/// middle of applying a batch, and the batch was acked anyway - so the write
+/// was gone and the message even claimed it had been kept. With this list the
+/// drain can check the WHOLE batch before applying any of it and stop.
+///
+/// Kept beside `apply_captured` and asserted against it by
+/// `mcp/tests/replica_never_writes_locally.rs`, so a new tool cannot be
+/// replayable-but-unlisted or listed-but-unreplayable.
+pub const REPLAYABLE_TOOLS: &[&str] =
+    &["remember", "revise", "retract", "pin", "unpin", "resolve", "mark", "shelve"];
+
+/// The captures in `ops` naming a tool THIS build cannot replay, deduplicated
+/// and in a stable order. Empty means the batch can be applied in full.
+pub fn unreplayable_tools(ops: &[InboxOp]) -> Vec<String> {
+    let mut unknown: Vec<String> = ops
+        .iter()
+        .map(|op| op.tool.clone())
+        .filter(|tool| !REPLAYABLE_TOOLS.contains(&tool.as_str()))
+        .collect();
+    unknown.sort();
+    unknown.dedup();
+    unknown
+}
+
 impl ThorMcpServer {
     /// Replay one captured call against THIS store, as if the caller had made
     /// it here. The write gate runs now, at the authority, which is the whole
@@ -1524,14 +1730,67 @@ impl ThorMcpServer {
                 Ok(args) => self.retract(Parameters(args)).await,
                 Err(e) => format!("arguments do not parse as a retract call: {e}"),
             },
+            // THE FOUR THAT LEAKED, wired 2026-08-17. Every one of these
+            // appends to the log (mark writes an event; pin/unpin go through
+            // revise; resolve settles a divergence), and every one of them was
+            // running STRAIGHT INTO THE REPLICA'S OWN LOG - the exact thing
+            // `capture`'s own doc comment says a replica must never do,
+            // because its chain has to stay a pure prefix of the authority's
+            // or the next shipment is refused as a fork. `mark` is the worst
+            // of the four in practice: every session is nudged to judge what
+            // it was served, so it is the write a remote agent makes most.
+            "pin" => match serde_json::from_value::<PinArgs>(op.args.clone()) {
+                Ok(args) => self.pin(Parameters(args)).await,
+                Err(e) => format!("arguments do not parse as a pin call: {e}"),
+            },
+            "unpin" => match serde_json::from_value::<UnpinArgs>(op.args.clone()) {
+                Ok(args) => self.unpin(Parameters(args)).await,
+                Err(e) => format!("arguments do not parse as an unpin call: {e}"),
+            },
+            "resolve" => match serde_json::from_value::<ResolveArgs>(op.args.clone()) {
+                Ok(args) => self.resolve(Parameters(args)).await,
+                Err(e) => format!("arguments do not parse as a resolve call: {e}"),
+            },
+            "mark" => match serde_json::from_value::<MarkArgs>(op.args.clone()) {
+                Ok(args) => self.mark(Parameters(args)).await,
+                Err(e) => format!("arguments do not parse as a mark call: {e}"),
+            },
+            // The second lane travels the same road. One inbox, one owner:
+            // a library written on the replica could never be reconciled with
+            // the one here, so a filing is queued exactly like a fact.
+            "shelve" => match serde_json::from_value::<ShelveArgs>(op.args.clone()) {
+                Ok(args) => self.shelve(Parameters(args)).await,
+                Err(e) => format!("arguments do not parse as a shelve call: {e}"),
+            },
+            // CORRECTED 2026-08-17: this used to promise "the capture is kept
+            // until it applies", which was never true - the drain acks the
+            // batch whether or not a call landed, so the capture was gone. A
+            // message that says a write is safe when it is not is worse than
+            // no message, so it now says where the copy actually is.
             other => format!(
-                "unknown captured tool '{other}' - the replica that captured this runs a newer \
-                 build than this authority. Update the authority and drain again; the capture is \
-                 kept until it applies."
+                "unknown captured tool '{other}' - the replica that captured this runs a NEWER \
+                 build than this authority, so this call cannot be replayed here and the queue \
+                 clears anyway. It is written to the store's own .stranded-captures.jsonl. \
+                 Update the authority to the replica's build, then replay it from that file."
             ),
         };
-        let landed =
-            text.starts_with("stored ") || text.starts_with("revised ") || text.starts_with("retracted ");
+        // Every success line of every captured tool, listed once. A tool whose
+        // line is missing here is reported NOT applied even when it landed -
+        // the safe direction, per this function's own doc comment: a capture
+        // wrongly reported failed gets looked at, one wrongly reported applied
+        // is simply gone.
+        const LANDED: &[&str] = &[
+            "stored ",
+            "revised ",
+            "retracted ",
+            "pinned ",
+            "unpinned ",
+            "resolved ",
+            "marked useful: ",
+            "marked noise: ",
+            "filed ",
+        ];
+        let landed = LANDED.iter().any(|prefix| text.starts_with(prefix));
         if landed {
             CapturedOutcome::Applied(text)
         } else {
@@ -1566,7 +1825,15 @@ pub fn run_in(db: &Path, code: Option<CodeIndexPaths>, root: Option<PathBuf>) ->
         None => ThorMcpServer::new(store),
     }
     // Same sidecar path the CLI derives, from the one place that derives it.
-    .with_vectors(serve::semantic_paths::default_vectors_path(db));
+    .with_vectors(serve::semantic_paths::default_vectors_path(db))
+    // The everyday lane, in its own file beside the store. Wired on THIS
+    // path only - the stdio server, which is the machine that owns its data.
+    // The HTTP replica deliberately gets no library: a replica may not append
+    // to anything of its own, and unlike remember/revise there is no capture
+    // inbox to divert a filing into. There the two tools say plainly that no
+    // library is configured, which is the truth, rather than writing a second
+    // copy that could never be reconciled.
+    .with_library(library::default_path(db));
     let server = match root {
         Some(root) => server.with_root(root),
         None => server,
@@ -3240,7 +3507,7 @@ mod tests {
         assert!(srv.remember(Parameters(a)).await.starts_with("stored"));
         assert!(srv.remember(Parameters(b)).await.starts_with("stored"));
 
-        let reply = srv.lookup(Parameters(LookupArgs { query: Some("filament".to_string()), key: None })).await;
+        let reply = srv.lookup(Parameters(LookupArgs { scope: None, query: Some("filament".to_string()), key: None })).await;
         assert!(reply.contains("cross-proj-a"), "{reply}");
         assert!(reply.contains("cross-proj-b"), "expected an item from a different project too: {reply}");
     }
@@ -3255,10 +3522,10 @@ mod tests {
         lookup_item.expires = None;
         assert!(srv.remember(Parameters(lookup_item)).await.starts_with("stored"));
 
-        let hit = srv.lookup(Parameters(LookupArgs { query: None, key: Some("release-checklist".to_string()) })).await;
+        let hit = srv.lookup(Parameters(LookupArgs { scope: None, query: None, key: Some("release-checklist".to_string()) })).await;
         assert!(hit.contains("RELEASE.md"), "{hit}");
 
-        let miss = srv.lookup(Parameters(LookupArgs { query: None, key: Some("no-such-key".to_string()) })).await;
+        let miss = srv.lookup(Parameters(LookupArgs { scope: None, query: None, key: Some("no-such-key".to_string()) })).await;
         assert!(miss.contains("no lookup found"), "{miss}");
     }
 
@@ -3283,7 +3550,7 @@ mod tests {
         register.expires = None;
         assert!(srv.remember(Parameters(register)).await.starts_with("stored"));
 
-        let reply = srv.lookup(Parameters(LookupArgs { query: None, key: None })).await;
+        let reply = srv.lookup(Parameters(LookupArgs { scope: None, query: None, key: None })).await;
         assert!(reply.contains("boeken"), "the scope must be named: {reply}");
         assert!(reply.contains("2 rows"), "the row count must be exact: {reply}");
         assert!(reply.contains("2026-08-11"), "the span must show when it starts: {reply}");
@@ -3301,8 +3568,118 @@ mod tests {
         register.expires = None;
         assert!(srv.remember(Parameters(register)).await.starts_with("stored"));
 
-        let reply = srv.lookup(Parameters(LookupArgs { query: None, key: None })).await;
+        let reply = srv.lookup(Parameters(LookupArgs { scope: None, query: None, key: None })).await;
         assert!(reply.contains("scope uitgaven"), "the first word of the key is the scope: {reply}");
+    }
+
+    /// THE COMPLAINT THIS ANSWERS, from the owner on 2026-08-17: a collection
+    /// must work like an index, not like one page with a thousand lines on it.
+    ///
+    /// So a collection GROWS by writing another ordinary item carrying the same
+    /// scope - never by appending to a page that already exists - and opening
+    /// the scope lists them, one line each. Two books, two items, two lines,
+    /// with the second one not glued onto the first.
+    #[tokio::test]
+    async fn a_second_entry_in_a_scope_is_its_own_item_not_a_line_glued_onto_the_first() {
+        let srv = server();
+        for (id, text) in [
+            ("boek-dune", "2026-08-11 Dune - Frank Herbert, uitgelezen"),
+            ("boek-piranesi", "2026-08-16 Piranesi - Susanna Clarke, halverwege"),
+        ] {
+            let mut book = blank_report(id);
+            book.project = Some("boeken".to_string());
+            book.text = text.to_string();
+            assert!(srv.remember(Parameters(book)).await.starts_with("stored"));
+        }
+
+        let reply = srv
+            .lookup(Parameters(LookupArgs { scope: Some("boeken".to_string()), query: None, key: None }))
+            .await;
+        assert!(reply.contains("scope boeken: 2 item(s)"), "the true size comes first: {reply}");
+        let listed: Vec<&str> = reply.lines().filter(|l| l.starts_with("  boek-")).collect();
+        assert_eq!(listed.len(), 2, "one line per book, in date order: {reply}");
+        assert!(listed[0].contains("Dune") && listed[1].contains("Piranesi"), "{reply}");
+    }
+
+    /// A scope narrows a search; it can never widen one. The unscoped answer
+    /// holds both books, the scoped answer holds only the one filed there.
+    #[tokio::test]
+    async fn a_scope_narrows_a_query_to_that_scope_alone() {
+        let srv = server();
+        for (id, text, scope) in [
+            ("boek-desem", "Desem - het complete handboek over gist", "boeken"),
+            ("recept-desem", "Desembrood bakken: 20 uur rijzen op kamertemperatuur", "eten"),
+        ] {
+            let mut it = blank_report(id);
+            it.project = Some(scope.to_string());
+            it.text = text.to_string();
+            assert!(srv.remember(Parameters(it)).await.starts_with("stored"));
+        }
+
+        let wide = srv.lookup(Parameters(LookupArgs { scope: None, query: Some("desem".to_string()), key: None })).await;
+        assert!(wide.contains("boek-desem") && wide.contains("recept-desem"), "{wide}");
+
+        let narrow = srv
+            .lookup(Parameters(LookupArgs {
+                scope: Some("boeken".to_string()),
+                query: Some("desem".to_string()),
+                key: None,
+            }))
+            .await;
+        assert!(narrow.contains("boek-desem"), "the hit filed here survives: {narrow}");
+        assert!(!narrow.contains("recept-desem"), "the one filed elsewhere is gone: {narrow}");
+    }
+
+    /// THE FRICTION THIS REMOVES. Without the list attached, a fresh agent
+    /// needs three calls to file one everyday fact: write, get refused, look up
+    /// the scopes, write again. The refusal has to carry the choice, because
+    /// the gate that produces it is handed an item and never the store.
+    #[tokio::test]
+    async fn a_write_with_no_scope_is_refused_with_the_existing_scopes_named() {
+        let srv = server();
+        let mut filed = blank_report("recept-1");
+        filed.project = Some("eten".to_string());
+        filed.text = "Zoete aardappel uit de oven met bruine boter.".to_string();
+        assert!(srv.remember(Parameters(filed)).await.starts_with("stored"));
+
+        let mut loose = blank_report("sportschema-1");
+        loose.project = None;
+        loose.text = "Push/pull/legs, drie keer per week.".to_string();
+        let reply = srv.remember(Parameters(loose)).await;
+
+        assert!(reply.contains("REFUSED"), "a write with no scope must not land: {reply}");
+        assert!(reply.contains("scopes that already exist"), "the choice must come with the refusal: {reply}");
+        assert!(reply.contains("eten"), "and it must name the real ones: {reply}");
+        assert!(reply.contains("ask the owner"), "if none fits, asking beats inventing: {reply}");
+    }
+
+    /// The list is attached to THAT refusal only. Every other refusal stays as
+    /// short as it was - a menu stapled to an unrelated complaint is noise.
+    #[tokio::test]
+    async fn any_other_refusal_does_not_get_the_scope_list_stapled_to_it() {
+        let srv = server();
+        let mut too_long = blank_report("rule-too-long");
+        too_long.kind = "rule".to_string();
+        too_long.project = None;
+        too_long.text = "x".repeat(400);
+        too_long.always = true;
+        too_long.falsifier = Some("this turns out to be wrong".to_string());
+        let reply = srv.remember(Parameters(too_long)).await;
+
+        assert!(reply.contains("REFUSED"), "{reply}");
+        assert!(!reply.contains("scopes that already exist"), "only the no-scope refusal carries the list: {reply}");
+    }
+
+    /// An empty scope says so and points back at the catalogue, rather than
+    /// looking like a memory that holds nothing at all.
+    #[tokio::test]
+    async fn an_unknown_scope_names_itself_and_points_back_at_the_catalogue() {
+        let srv = server();
+        let reply = srv
+            .lookup(Parameters(LookupArgs { scope: Some("bestaatniet".to_string()), query: None, key: None }))
+            .await;
+        assert!(reply.contains("bestaatniet"), "{reply}");
+        assert!(reply.contains("no arguments"), "the way back is named: {reply}");
     }
 
     /// THE DEFECT THIS PREVENTS (GAP 1): before this server cached a loaded
@@ -3326,8 +3703,8 @@ mod tests {
         let srv = ThorMcpServer::new(EventStore::in_memory().unwrap()).with_vectors(vectors_path);
         srv.remember(Parameters(base_remember("cache-regression-1"))).await;
 
-        let first = srv.lookup(Parameters(LookupArgs { query: Some("force-push".to_string()), key: None })).await;
-        let second = srv.lookup(Parameters(LookupArgs { query: Some("force-push".to_string()), key: None })).await;
+        let first = srv.lookup(Parameters(LookupArgs { scope: None, query: Some("force-push".to_string()), key: None })).await;
+        let second = srv.lookup(Parameters(LookupArgs { scope: None, query: Some("force-push".to_string()), key: None })).await;
         assert_eq!(first, second, "two consecutive lookups on the same server must answer identically");
         assert!(first.contains("cache-regression-1"), "{first}");
     }
@@ -3338,7 +3715,12 @@ mod tests {
             kind: "report".to_string(),
             text: "placeholder".to_string(),
             severity: None,
-            project: None,
+            // A scope by default, for the same reason model's own gate fixture
+            // carries one: ground 21 refuses archive material that names no
+            // scope, so without this every test here would be exercising that
+            // ground instead of the one it is named after. The tests that mean
+            // to have no scope clear it explicitly.
+            project: Some("test-project".to_string()),
             tags: vec![],
             expires: Some("2027-01-01".to_string()),
             key: None,
@@ -3393,7 +3775,7 @@ mod tests {
             let item = model::store::show(&store, "noisy-1").unwrap();
             assert!(decay.is_stale(&item), "two judgements must retire it from the injection surfaces");
         }
-        let found = srv.lookup(Parameters(LookupArgs { query: Some("noisy-1".to_string()), key: None })).await;
+        let found = srv.lookup(Parameters(LookupArgs { scope: None, query: Some("noisy-1".to_string()), key: None })).await;
         assert!(found.contains("noisy-1"), "and it must stay findable via lookup: {found}");
     }
 

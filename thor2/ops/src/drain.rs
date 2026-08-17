@@ -75,14 +75,44 @@ pub fn drain_from(db: &Path, base: &str, token: &str) -> anyhow::Result<DrainSum
         return Ok(DrainSummary { pulled: 0, applied: 0, not_applied: 0, lines: Vec::new() });
     }
 
+    // THE VERSION GUARD, and it runs BEFORE a single call is applied.
+    //
+    // A replica running a newer build queues calls this authority has never
+    // heard of. Discovering that one op at a time, halfway through a batch,
+    // meant the batch was acked anyway and those writes were gone. Checking
+    // the whole batch up front means the opposite: nothing is applied, nothing
+    // is acked, and the queue is served again unchanged on the next drain (see
+    // `inbox::rotate_and_read`, which re-serves an un-acked batch rather than
+    // dropping it). So the fix is a deploy, not a recovery - update this
+    // machine to the replica's build and drain again, and everything lands.
+    //
+    // Deliberately the whole batch and not just the unknown calls: applying
+    // the known ones now would ack them away, and then the un-acked remainder
+    // could never be replayed in the order it was captured.
+    let unknown = mcp::unreplayable_tools(&pulled.ops);
+    if !unknown.is_empty() {
+        bail!(
+            "this machine cannot replay {} of the queued call(s) - the connector is running a NEWER \
+             build than this one. NOTHING was applied and the queue was NOT cleared, so no write is \
+             lost: update this machine to the connector's build and drain again. Unknown here: {}",
+            unknown.len(),
+            unknown.join(", ")
+        );
+    }
+
     let store = EventStore::open_existing(db)?;
-    let server = mcp::ThorMcpServer::new(store);
+    // The replay server needs the SAME library the local session uses, or a
+    // filing captured on the replica arrives here and is told there is no
+    // library - which is how a queued recipe becomes a stranded one. Found by
+    // draining a real queue rather than by reasoning about it.
+    let server = mcp::ThorMcpServer::new(store).with_library(library::default_path(db));
 
     let runtime = tokio::runtime::Runtime::new()?;
-    let (applied, not_applied, lines) = runtime.block_on(async {
+    let (applied, not_applied, mut lines, stranded) = runtime.block_on(async {
         let mut applied = 0usize;
         let mut not_applied = 0usize;
         let mut lines = Vec::new();
+        let mut stranded: Vec<&InboxOp> = Vec::new();
         // Sequentially and in capture order: a revise that follows a remember
         // in the same batch has to see the item the remember created.
         for op in &pulled.ops {
@@ -94,16 +124,70 @@ pub fn drain_from(db: &Path, base: &str, token: &str) -> anyhow::Result<DrainSum
                 mcp::CapturedOutcome::NotApplied(text) => {
                     not_applied += 1;
                     lines.push(format!("LOST {}: {text}", label(op)));
+                    stranded.push(op);
                 }
             }
         }
-        (applied, not_applied, lines)
+        (applied, not_applied, lines, stranded)
     });
+
+    // NOTHING IS DROPPED WITHOUT A COPY, added 2026-08-17 after auditing this
+    // path rather than after losing something.
+    //
+    // The ack above is unconditional on purpose (see this module's own header:
+    // a permanent refusal must never park every later capture behind it). But
+    // "cleared from the queue" was being read as "handled", and one refusal in
+    // particular is NOT permanent: "unknown captured tool" simply means the
+    // replica runs a newer build, and its own message even promised "the
+    // capture is kept until it applies" - which was false, because the ack
+    // drops the batch either way. Updating the authority fixed nothing,
+    // because the call was already gone.
+    //
+    // So every call that did not land is written out beside the store first.
+    // The queue still clears, the report still says what happened, and the
+    // writes themselves are still on disk to look at or replay by hand.
+    if !stranded.is_empty() {
+        let path = stranded_path(db);
+        match append_stranded(&path, &stranded) {
+            Ok(()) => lines.push(format!(
+                "the {} call(s) above were kept in {} - the queue clears either way, so this file is the only copy",
+                stranded.len(),
+                path.display()
+            )),
+            // Never let this stop the drain: the batch has already been
+            // applied, and failing here would only strand it a second time.
+            Err(e) => lines.push(format!(
+                "WARNING: the {} call(s) above could NOT be written to {} ({e}), so they exist nowhere now",
+                stranded.len(),
+                path.display()
+            )),
+        }
+    }
 
     // Only now, once every call in the batch has been attempted.
     ack_inbox(base, token)?;
 
     Ok(DrainSummary { pulled: pulled.ops.len(), applied, not_applied, lines })
+}
+
+/// Where a call that could not be replayed is parked: beside the store it was
+/// meant for, so it travels with a backup of that store and is never somewhere
+/// only this one machine knows about.
+pub fn stranded_path(db: &Path) -> std::path::PathBuf {
+    let mut name = db.file_name().unwrap_or_else(|| std::ffi::OsStr::new("thor.db")).to_os_string();
+    name.push(".stranded-captures.jsonl");
+    db.with_file_name(name)
+}
+
+/// Append the calls, one JSON object per line, in the order they were captured.
+/// Appended and never rewritten: an earlier drain's strandings stay put.
+fn append_stranded(path: &Path, ops: &[&InboxOp]) -> anyhow::Result<()> {
+    use std::io::Write;
+    let mut file = std::fs::OpenOptions::new().create(true).append(true).open(path)?;
+    for op in ops {
+        writeln!(file, "{}", serde_json::to_string(op)?)?;
+    }
+    Ok(())
 }
 
 #[cfg(test)]

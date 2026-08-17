@@ -9,6 +9,11 @@ description = "The agent-facing MCP surface: remember/revise/pin/unpin/get/looku
 thor-core = { path = "../core" }
 model = { path = "../model" }
 serve = { path = "../serve" }
+# The second lane. This server is the ONLY place the two lanes meet, and they
+# meet as two separate tools over two separate files - `library` itself depends
+# on nothing from the code side, so nothing filed there can reach an injection
+# surface even by mistake.
+library = { path = "../library" }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 clap = { version = "4", features = ["derive"] }

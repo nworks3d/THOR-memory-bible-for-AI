@@ -136,6 +136,15 @@ pub struct ScopeEntry {
     /// Live `Report` items carrying this scope. Counted, never listed here:
     /// the list is derived on request, so there is no second truth to drift.
     pub documents: usize,
+    /// Live items carrying this scope that can still FIRE - rules and
+    /// orientations, the code lane rather than the library.
+    ///
+    /// Counted separately but never left out of the total, because the
+    /// catalogue and `in_scope` have to agree about how big a scope is.
+    /// Measured on the owner's store 2026-08-17, before this field existed:
+    /// the catalogue announced 42 for a scope that opened to 54 items, and a
+    /// count that disagrees with the thing it counts is worse than no count.
+    pub fireable: usize,
 }
 
 /// Every address the memory can be asked for by name.
@@ -176,6 +185,7 @@ pub fn catalog(store: &EventStore) -> Catalog {
                     scope,
                     registers: Vec::new(),
                     documents: 0,
+                    fireable: 0,
                 });
                 let entry = by_scope.get_mut(key.split_whitespace().next().unwrap_or(&key)).expect("just inserted");
                 entry.registers.push(Register {
@@ -194,16 +204,29 @@ pub fn catalog(store: &EventStore) -> Catalog {
                             scope: p.to_string(),
                             registers: Vec::new(),
                             documents: 0,
+                            fireable: 0,
                         })
                         .documents += 1;
                 }
                 _ => unscoped += 1,
             },
-            _ => {
-                if li.item.project.as_deref().map(str::trim).unwrap_or("").is_empty() {
-                    unscoped += 1;
+            // Rules and orientations: the code lane. They still belong to
+            // their scope's total - `in_scope` returns them - so a scope that
+            // holds them must say so rather than quietly leave them out.
+            _ => match li.item.project.as_deref() {
+                Some(p) if !p.trim().is_empty() => {
+                    by_scope
+                        .entry(p.to_string())
+                        .or_insert_with(|| ScopeEntry {
+                            scope: p.to_string(),
+                            registers: Vec::new(),
+                            documents: 0,
+                            fireable: 0,
+                        })
+                        .fireable += 1;
                 }
-            }
+                _ => unscoped += 1,
+            },
         }
     }
 
@@ -238,11 +261,15 @@ pub fn render_catalog(cat: &Catalog) -> String {
     }
     let mut out = String::new();
     for s in &cat.scopes {
+        // The total comes FIRST and is the sum of the three, so this number
+        // and the one `in_scope` reports can never drift apart.
         out.push_str(&format!(
-            "scope {:<20} {} register(s), {} document(s)\n",
+            "scope {:<20} {:>4} item(s) = {} register(s), {} document(s), {} rule(s)\n",
             s.scope,
+            s.registers.len() + s.documents + s.fireable,
             s.registers.len(),
-            s.documents
+            s.documents,
+            s.fireable
         ));
         for r in &s.registers {
             let span = match (&r.first_date, &r.last_date) {
@@ -256,7 +283,152 @@ pub fn render_catalog(cat: &Catalog) -> String {
         out.push_str(&format!("({} live item(s) carry no scope at all.)\n", cat.unscoped));
     }
     out.push_str(
-        "Ask for a register by key to get it whole - never ranked, never capped, never expiring.\n",
+        "Open a scope by name to see what it holds, one line per item. Ask for a register by key \
+         to get it whole - never ranked, never capped, never expiring.\n",
+    );
+    out
+}
+
+/// The scopes that exist, as one line to choose from - names and sizes only,
+/// never contents.
+///
+/// FOR A REFUSAL, which is why it is this small. A write that names no scope
+/// is refused by the gate, and the gate can only name the rule: it is handed
+/// an item and never the store. Appending this turns "look up which scopes
+/// exist, then write again" into "write again", which is the difference
+/// between three calls and two. Sorted by size, biggest first: the scope an
+/// everyday fact belongs to is almost never the emptiest one.
+pub fn scope_menu(store: &EventStore) -> String {
+    let cat = catalog(store);
+    let mut sized: Vec<(usize, String)> = cat
+        .scopes
+        .iter()
+        .map(|s| (s.registers.len() + s.documents + s.fireable, s.scope.clone()))
+        .collect();
+    sized.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.cmp(&b.1)));
+    if sized.is_empty() {
+        return "there are no scopes yet, so this one would be the first - ask the owner what to call it".to_string();
+    }
+    // Bounded on purpose: a refusal that grows with the store stops being
+    // readable exactly when the store is worth reading.
+    const MAX_SHOWN: usize = 25;
+    let shown: Vec<String> = sized.iter().take(MAX_SHOWN).map(|(n, s)| format!("{s} ({n})")).collect();
+    let tail = if sized.len() > MAX_SHOWN {
+        format!(", and {} more - call lookup with no arguments for all of them", sized.len() - MAX_SHOWN)
+    } else {
+        String::new()
+    };
+    format!("scopes that already exist: {}{tail}", shown.join(", "))
+}
+
+// ------------------------------------------------------ surface 4: one scope
+
+/// A folder listing shows this many items before it says how many it did not.
+pub const MAX_SCOPE_ROWS: usize = 200;
+
+/// Everything filed under one scope, as a list of one-line headings.
+///
+/// THE SHAPE THIS REPLACES. A growing collection used to have to live inside
+/// ONE `Lookup` item - every book on its own line of a single page - because
+/// that was the only holder whose answer could not be ranked away or capped.
+/// That page is unreadable at a hundred rows, cannot be filtered, has no room
+/// for a book's own notes, and grows only by appending to a blob of text.
+///
+/// Here a collection is simply the items carrying the same scope: each one an
+/// ordinary item, written the ordinary way, added by writing another one. The
+/// collection is what you get by naming the scope, and this listing is the
+/// index into it. Complete by construction - one pass over the live items, no
+/// ranking, no similarity floor, no expiry filter - so the count at the top is
+/// the true size even when the rendering below it is cut.
+pub fn in_scope(store: &EventStore, scope: &str) -> Vec<LookupHit> {
+    let want = scope.trim().to_lowercase();
+    let mut hits: Vec<LookupHit> = live_items(store)
+        .into_iter()
+        .filter(|li| match li.item.kind {
+            // A register announces its own scope through the first word of its
+            // key, exactly as `catalog` reads it, so a scope holds its own
+            // registers too and the two doors can never disagree about where
+            // something lives.
+            Kind::Lookup => li
+                .item
+                .key
+                .as_deref()
+                .and_then(|k| k.split_whitespace().next())
+                .is_some_and(|first| first.to_lowercase() == want),
+            _ => li
+                .item
+                .project
+                .as_deref()
+                .is_some_and(|p| p.trim().to_lowercase() == want),
+        })
+        .map(|li| LookupHit { id: li.id, item: li.item })
+        .collect();
+
+    // Dated entries in date order, undated after them by id. A reading list, a
+    // diary and a ledger are all written in time order, and a listing that
+    // ignores that is a bag of rows rather than a record. Undated items are not
+    // an error - they simply have no place on the timeline, so they follow it.
+    hits.sort_by(|a, b| match (opening_date(&a.item.text), opening_date(&b.item.text)) {
+        (Some(x), Some(y)) => x.cmp(&y).then_with(|| a.id.cmp(&b.id)),
+        (Some(_), None) => std::cmp::Ordering::Less,
+        (None, Some(_)) => std::cmp::Ordering::Greater,
+        (None, None) => a.id.cmp(&b.id),
+    });
+    hits
+}
+
+/// Keep only the hits filed under `scope`. Applied AFTER a search, so the order
+/// a query earned is untouched: this narrows, it never reorders.
+pub fn only_scope(hits: Vec<LookupHit>, scope: &str) -> Vec<LookupHit> {
+    let want = scope.trim().to_lowercase();
+    hits.into_iter()
+        .filter(|h| h.item.project.as_deref().is_some_and(|p| p.trim().to_lowercase() == want))
+        .collect()
+}
+
+/// The date a row belongs on: the `YYYY-MM-DD` its first non-blank line starts
+/// with, if it starts with one.
+fn opening_date(text: &str) -> Option<String> {
+    text.lines().find(|l| !l.trim().is_empty()).and_then(leading_date)
+}
+
+/// The first non-blank line, shortened to something a list can hold.
+fn headline(text: &str) -> String {
+    const MAX: usize = 100;
+    let line = text.lines().find(|l| !l.trim().is_empty()).unwrap_or("").trim();
+    if line.chars().count() <= MAX {
+        return line.to_string();
+    }
+    let cut: String = line.chars().take(MAX).collect();
+    match cut.rfind(char::is_whitespace).filter(|i| *i > MAX / 2) {
+        Some(i) => format!("{}...", &cut[..i]),
+        None => format!("{cut}..."),
+    }
+}
+
+/// One scope as a person reads it: how many, then one line each.
+pub fn render_scope(scope: &str, hits: &[LookupHit]) -> String {
+    if hits.is_empty() {
+        return format!(
+            "scope '{scope}' holds nothing. Call lookup with no arguments for the scopes that do exist.\n"
+        );
+    }
+    let mut out = format!("scope {scope}: {} item(s)\n", hits.len());
+    for hit in hits.iter().take(MAX_SCOPE_ROWS) {
+        out.push_str(&format!("  {:<22} {}\n", hit.id, headline(&hit.item.text)));
+    }
+    // A CAP, AND IT SAYS SO - the same rule the query door follows. The count
+    // on the first line is the whole truth about the size either way.
+    if hits.len() > MAX_SCOPE_ROWS {
+        out.push_str(&format!(
+            "({} more not shown. Add 'query' to search inside this scope.)\n",
+            hits.len() - MAX_SCOPE_ROWS
+        ));
+    }
+    out.push_str(
+        "One line per item, not its whole text: ask for one by id with get, or add 'query' to \
+         search inside this scope. To add to this scope, remember a new item carrying it - never \
+         append to an existing one.\n",
     );
     out
 }
@@ -862,7 +1034,13 @@ mod tests {
             text: text.to_string(),
             bindings: vec![],
             severity: None,
-            project: project.map(str::to_string),
+            // A scope by default for archive material, because ground 21
+            // refuses it without one - otherwise every fixture here would be
+            // exercising that ground instead of the search behaviour it is
+            // named after. An explicit scope always wins.
+            project: project
+                .map(str::to_string)
+                .or_else(|| (!kind.can_fire()).then(|| "test-project".to_string())),
             tags: vec![],
             expires: if kind == Kind::Report { Some("2027-01-01".to_string()) } else { None },
             key: None,
@@ -873,6 +1051,127 @@ mod tests {
             },
             check: None,
         }
+    }
+
+    /// A collection is a SCOPE holding one item per entry, so opening it must
+    /// return every entry - and only that scope's entries. This is the whole
+    /// point of the shape: a book is added by writing another item, never by
+    /// appending a line to a page that already exists.
+    #[test]
+    fn a_scope_opens_to_every_item_filed_under_it_and_nothing_else() {
+        let mut store = EventStore::in_memory().unwrap();
+        for (id, text, scope) in [
+            ("dune", "2026-08-11 Dune - Frank Herbert, uitgelezen", Some("boeken")),
+            ("piranesi", "2026-08-16 Piranesi - Susanna Clarke, halverwege", Some("boeken")),
+            ("pizza", "2026-08-01 Napolitaans deeg, 65% hydratatie", Some("eten")),
+            ("elders", "2026-08-02 een feit in een derde scope", Some("investments")),
+        ] {
+            store::declare(&mut store, "s", "l", "t", &item(id, Kind::Report, text, scope)).unwrap();
+        }
+
+        let hits = in_scope(&store, "boeken");
+        let ids: Vec<&str> = hits.iter().map(|h| h.id.as_str()).collect();
+        assert_eq!(ids, vec!["dune", "piranesi"], "only this scope, and all of it");
+    }
+
+    /// THE DEFECT THIS CLOSES, measured on the owner's own store 2026-08-17:
+    /// the catalogue announced 42 for a scope that opened to 54 items, because
+    /// it counted documents and registers but silently skipped the rules filed
+    /// there. A count that disagrees with the thing it counts is worse than no
+    /// count at all - so the two doors are tied together here.
+    #[test]
+    fn the_catalogues_total_for_a_scope_equals_what_opening_that_scope_returns() {
+        let mut store = EventStore::in_memory().unwrap();
+        let mut doc = item("doc", Kind::Report, "een document in deze scope", Some("gemengd"));
+        doc.project = Some("gemengd".to_string());
+        store::declare(&mut store, "s", "l", "t", &doc).unwrap();
+
+        let mut regel = item("regel", Kind::Rule, "een vuurbare regel in dezelfde scope", Some("gemengd"));
+        regel.bindings = vec![Binding::Target { kind: TargetKind::Path, value: "src/lib.rs".to_string() }];
+        regel.severity = Some(Severity::HouseStyle);
+        store::declare(&mut store, "s", "l", "t", &regel).unwrap();
+
+        let mut reg = item("reg", Kind::Lookup, "2026-08-01 een rij", None);
+        reg.key = Some("gemengd lijst".to_string());
+        store::declare(&mut store, "s", "l", "t", &reg).unwrap();
+
+        let cat = catalog(&store);
+        let entry = cat.scopes.iter().find(|s| s.scope == "gemengd").expect("the scope must be listed");
+        let announced = entry.registers.len() + entry.documents + entry.fireable;
+        assert_eq!(announced, 3, "one of each kind: {entry:?}");
+        assert_eq!(announced, in_scope(&store, "gemengd").len(), "the catalogue must not undercount its own scope");
+    }
+
+    /// A reading list, a diary and a ledger are written in time order, so the
+    /// listing follows the dates the rows carry rather than the ids they were
+    /// minted with - ids are hashes and carry no order at all.
+    #[test]
+    fn a_scope_lists_dated_entries_in_date_order_and_undated_ones_after_them() {
+        let mut store = EventStore::in_memory().unwrap();
+        for (id, text) in [
+            ("zzz-oldest", "2026-01-02 het eerste boek"),
+            ("aaa-newest", "2026-09-30 het laatste boek"),
+            ("mmm-undated", "een boek zonder datum"),
+        ] {
+            store::declare(&mut store, "s", "l", "t", &item(id, Kind::Report, text, Some("boeken"))).unwrap();
+        }
+
+        let ids: Vec<String> = in_scope(&store, "boeken").into_iter().map(|h| h.id).collect();
+        assert_eq!(ids, vec!["zzz-oldest", "aaa-newest", "mmm-undated"], "date order first, undated last");
+    }
+
+    /// A register announces its own scope through its key, and `catalog` reads
+    /// it that way, so opening the scope has to find it too - otherwise the
+    /// catalogue would name a scope whose contents are one item short.
+    #[test]
+    fn a_scope_holds_its_own_registers_as_well_as_its_documents() {
+        let mut store = EventStore::in_memory().unwrap();
+        let mut reg = item("uitgaven-2026", Kind::Lookup, "2026-08-01 huur 900", None);
+        reg.key = Some("uitgaven 2026".to_string());
+        store::declare(&mut store, "s", "l", "t", &reg).unwrap();
+
+        let ids: Vec<String> = in_scope(&store, "uitgaven").into_iter().map(|h| h.id).collect();
+        assert_eq!(ids, vec!["uitgaven-2026"], "the first word of the key is the scope");
+    }
+
+    /// The listing is an index, not a dump: one line per item, so a scope with
+    /// a hundred entries stays readable. That is the defect the whole shape
+    /// exists to avoid - a page of a thousand lines nobody can use.
+    #[test]
+    fn a_scope_listing_shows_one_shortened_line_per_item_never_its_whole_text() {
+        let mut store = EventStore::in_memory().unwrap();
+        let long = format!("2026-08-11 Dune - {}", "een heel lange notitie ".repeat(30));
+        store::declare(&mut store, "s", "l", "t", &item("dune", Kind::Report, &long, Some("boeken"))).unwrap();
+
+        let rendered = render_scope("boeken", &in_scope(&store, "boeken"));
+        let body: Vec<&str> = rendered.lines().filter(|l| l.starts_with("  dune")).collect();
+        assert_eq!(body.len(), 1, "exactly one line for the item: {rendered}");
+        assert!(body[0].contains("Dune"), "the heading survives: {}", body[0]);
+        assert!(body[0].ends_with("..."), "and the rest is cut, visibly: {}", body[0]);
+        assert!(!body[0].contains(long.trim_end()), "the whole text is never printed");
+    }
+
+    /// Narrowing a search to one scope may only ever REMOVE hits. If it could
+    /// add one, a scoped search would be a different search rather than the
+    /// same one seen through a window.
+    #[test]
+    fn narrowing_a_search_to_a_scope_only_ever_removes_hits_never_reorders_them() {
+        let mut store = EventStore::in_memory().unwrap();
+        for (id, text, scope) in [
+            ("b1", "deeg en boeken staan samen op dezelfde plank", Some("boeken")),
+            ("e1", "een kilo deeg, gerezen, plus boeken erover geleend", Some("eten")),
+            ("b2", "boeken over deeg, van gist tot desem uitgelegd", Some("boeken")),
+        ] {
+            store::declare(&mut store, "s", "l", "t", &item(id, Kind::Report, text, scope)).unwrap();
+        }
+
+        let wide = search(&store, "deeg boeken");
+        let wide_order: Vec<String> = wide.iter().map(|h| h.id.clone()).collect();
+        let narrow: Vec<String> = only_scope(wide, "boeken").into_iter().map(|h| h.id).collect();
+
+        assert_eq!(narrow, vec!["b1", "b2"]);
+        let kept: Vec<&String> = wide_order.iter().filter(|id| narrow.contains(id)).collect();
+        assert_eq!(kept, narrow.iter().collect::<Vec<_>>(), "the surviving hits keep the order they had");
     }
 
     /// THE DEFECT THIS CLOSES, reported from a real session and reproduced:
@@ -1288,7 +1587,7 @@ mod semantic_search_tests {
             text: text.to_string(),
             bindings: vec![],
             severity: None,
-            project: None,
+            project: Some("test-project".to_string()),
             tags: vec![],
             expires: Some("2027-01-01".to_string()),
             key: None,
@@ -1420,7 +1719,7 @@ mod semantic_search_tests {
             text: format!("a settled report: {subject}"),
             bindings: vec![],
             severity: None,
-            project: None,
+            project: Some("test-project".to_string()),
             tags: vec![],
             expires: Some(expires.to_string()),
             key: None,

@@ -56,7 +56,9 @@ mod tests {
             text: "do the thing".to_string(),
             bindings: vec![Binding::Always],
             severity: None,
-            project: None,
+            // Archive material needs a scope (gate ground 21); a fireable item
+            // is allowed to be global and stays that way here.
+            project: (!kind.can_fire()).then(|| "test-project".to_string()),
             tags: vec![],
             expires: None,
             key: None,

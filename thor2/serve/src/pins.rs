@@ -153,7 +153,8 @@ mod tests {
             text: format!("a synthetic fixture report for {id}"),
             bindings: vec![],
             severity: None,
-            project: None,
+            // Archive material needs a scope (gate ground 21).
+            project: Some("test-project".to_string()),
             tags: vec![format!("source:{source}")],
             expires: Some("2027-01-01".to_string()),
             key: None,

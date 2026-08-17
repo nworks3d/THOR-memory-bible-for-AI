@@ -1,0 +1,21 @@
+[package]
+name = "library"
+version.workspace = true
+edition = "2021"
+license = "GPL-3.0-or-later"
+description = "The second lane: an indexable library of everyday knowledge, fully apart from the code lane"
+
+# DELIBERATELY NO DEPENDENCY ON model/serve/core. The owner's requirement is
+# that this stands fully apart from code and design work and never competes
+# with the guard, the four slots or the global rules. A crate that could not
+# reach the event store even if it wanted to is the cheapest way to guarantee
+# that - the separation is enforced by the dependency graph, not by care.
+[dependencies]
+rusqlite = { version = "0.31", features = ["bundled"] }
+
+[[bin]]
+name = "library"
+path = "src/bin/library.rs"
+
+[dev-dependencies]
+tempfile = "3"

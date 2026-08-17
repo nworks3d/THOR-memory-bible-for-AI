@@ -225,6 +225,38 @@ at the right moment and hope. Version 2 is the same memory with a spine.
   could take is already full of heavier ones. Version 1 accepted it and said
   nothing, which is how a memory fills up with advice nobody will ever see.
 
+## New in 2.1: a second memory, for everything that is not code
+
+The memory above is built for work. It has a gate, notes that interrupt you,
+and a hard cap on how much ever reaches the conversation - all of which is
+exactly wrong for a recipe.
+
+So 2.1 adds a library, and it is a genuinely separate thing: its own file, its
+own two commands, and no way to reach the first memory at all. Nothing you put
+in it can ever interrupt you, compete with a note, or take up room in a block.
+You only ever see it because you asked.
+
+It works the way a shelf works.
+
+- **Everything lives on a shelf**, and shelves do not nest. Books, recipes, a
+  training log, what you spent. Filing something without naming a shelf is
+  refused, and the refusal lists the shelves you have, so your assistant picks
+  from real ones instead of inventing a name.
+- **Only you create a shelf.** If nothing fits, your assistant has to ask you
+  what the new one should be called. This is the rule that stops a tidy list of
+  eight from becoming a sprawl of sixty.
+- **A shelf that grows gets labels, never a split.** Two hundred recipes on one
+  shelf, filtered by "bbq" or "dessert", stays one shelf. That is what keeps the
+  list of shelves short enough to hold in your head.
+- **You get an index, not a wall of text.** Open a shelf and you see one line
+  per entry. Ask for one by number to read it whole.
+- **The same thing twice is refused**, pointing at the entry you already have.
+- **Nothing is ever deleted.** Retiring an entry takes it out of the listing and
+  leaves it readable.
+- **A search never answers "nothing".** If your words miss - and they will, since
+  the words you ask with are rarely the words you wrote - it hands you the shelf
+  to read instead. Asking for "ribbetjes" when you wrote "ribben" finds it.
+
 ## Getting started
 
 **The short way - one command.** It downloads the latest release, checks the

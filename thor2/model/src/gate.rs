@@ -772,11 +772,26 @@ fn combined(problems: Vec<Refusal>) -> Refusal {
     )
 }
 
+/// The problem ground 21 refuses with, as a constant.
+///
+/// The gate is handed an `Item` and nothing else - it cannot see the store, so
+/// it can name the RULE but never the scopes that actually exist. A layer that
+/// CAN see the store matches on this to append them, which is the difference
+/// between a refusal costing one more call and costing three (refuse, look up,
+/// write again). Anything that matches on this string must use this constant,
+/// so rewording the refusal can never silently unhook the list.
+pub const NO_SCOPE_PROBLEM: &str = "this is archive material with no scope, so it joins the unscoped pile: it belongs to no collection, and opening one will never show it";
+
 pub fn declare(item: &Item) -> Result<(), Refusal> {
-    declare_inner(item, false, false)
+    declare_inner(item, false, false, false)
 }
 
-fn declare_inner(item: &Item, bare_answer_allowed: bool, symbol_only_allowed: bool) -> Result<(), Refusal> {
+fn declare_inner(
+    item: &Item,
+    bare_answer_allowed: bool,
+    symbol_only_allowed: bool,
+    unscoped_allowed: bool,
+) -> Result<(), Refusal> {
     let problems = shape_problems(item, bare_answer_allowed, symbol_only_allowed);
     match problems.len() {
         0 => {}
@@ -865,6 +880,44 @@ fn declare_inner(item: &Item, bare_answer_allowed: bool, symbol_only_allowed: bo
             }
         }
     }
+    // GROUND 21: archive material with no scope falls on a pile nobody opens.
+    //
+    // MEASURED on the owner's store 2026-08-17, which is why this ground
+    // exists: 603 of 2134 reports carried no scope at all. They are not lost -
+    // a search still finds them - but they belong to no collection, so opening
+    // a scope will never show them and a person browsing what they know will
+    // never meet them. The scope field is optional at the tool surface and
+    // nothing fills it in, so "forgot to say where this goes" was the default
+    // outcome of every write rather than the exception.
+    //
+    // The complement of ground 19, and deliberately the opposite gate: that one
+    // governs what may FIRE everywhere, this one governs what must be FILED.
+    // A Rule or Orientation may still be global - a standing rule that holds in
+    // every project is the whole point of the guard lane - so this is gated on
+    // `!can_fire()` exactly where ground 19 is gated on `can_fire()`.
+    //
+    // `unscoped_allowed` grandfathers what is already stored, for the same
+    // reason ground 19 lets a global item be revised into a scoped one: 603
+    // items that could not be corrected without first being deleted would be
+    // worse than the defect.
+    //
+    // A Lookup is exempt when it carries a key, because a register announces
+    // its scope through the FIRST WORD of that key - that is how the catalogue
+    // and the scope listing both read it. Demanding a project as well would
+    // create a second place to say the same thing, and two places to say one
+    // thing is one place to disagree.
+    let filed_by_key = item.kind == Kind::Lookup
+        && item.key.as_deref().map(str::trim).is_some_and(|k| !k.is_empty());
+    if !item.kind.can_fire()
+        && !unscoped_allowed
+        && !filed_by_key
+        && item.project.as_deref().map(str::trim).unwrap_or("").is_empty()
+    {
+        return Err(Refusal::new(
+            NO_SCOPE_PROBLEM,
+            "give it a scope - pick the one it belongs to from the scopes that already exist. If none fits, ask the owner whether this needs a new scope and what to call it; never invent one on his behalf",
+        ));
+    }
     // GROUND 10: a Rule/Orientation never expires by design (ground 2), which
     // is exactly where staleness has nowhere else to hide - a detector that
     // decides at READ time whether such a fact has gone stale depends on a
@@ -932,7 +985,12 @@ pub fn revise(existing: &Item, updated: &Item) -> Result<(), Refusal> {
             .bindings
             .iter()
             .all(|b| matches!(b, Binding::Target { kind: TargetKind::Symbol, .. }));
-    declare_inner(updated, carried_bare, carried_symbol_only)?;
+    // The same concession for ground 21: archive material that was ALREADY
+    // stored without a scope stays correctable. 603 such items exist, and
+    // freezing them until someone files them would make fixing a typo or an
+    // expiry impossible - the backlog this ground exists to stop growing.
+    let carried_unscoped = existing.project.as_deref().map(str::trim).unwrap_or("").is_empty();
+    declare_inner(updated, carried_bare, carried_symbol_only, carried_unscoped)?;
     if !existing.bindings.is_empty() && updated.bindings.is_empty() {
         return Err(dropped_field("bindings"));
     }
@@ -2930,15 +2988,78 @@ mod tests {
         }
     }
 
+    /// CHANGED DELIBERATELY on 2026-08-17, and the old promise is written out
+    /// so the change is not silent: a global Report used to be ACCEPTED here,
+    /// because archive material is found by searching and never served
+    /// unprompted, so it was not ground 19's problem.
+    ///
+    /// It still is not ground 19's problem - but ground 21 now refuses it for
+    /// a different reason: a report with no scope belongs to no collection, so
+    /// opening one will never show it. Ground 19 stays gated on `can_fire`,
+    /// exactly as before; this asserts WHICH ground speaks, not just that one
+    /// does.
     #[test]
-    fn a_global_report_naming_a_source_file_is_accepted() {
-        // Archive material is found by searching, never served unprompted, so
-        // it is not this ground's problem - the same gating grounds 4, 10, 11
-        // and 12 use.
+    fn a_global_report_is_refused_for_having_no_scope_not_for_naming_a_file() {
         let mut item = base(Kind::Report);
         item.project = None;
         item.text = "The measurement lives in serve/src/lookup.rs.".to_string();
-        assert!(declare(&item).is_ok());
+        let refusal = declare(&item).expect_err("a report with no scope must be refused");
+        assert_eq!(refusal.problem, NO_SCOPE_PROBLEM, "ground 21 must be the one speaking: {refusal:?}");
+        assert!(refusal.fix.contains("ask the owner"), "asking beats inventing a scope name: {refusal:?}");
+
+        // And the scope is the whole fix: naming one makes the very same text
+        // acceptable, file mention included.
+        item.project = Some("The-AI-memory-bible".to_string());
+        assert!(declare(&item).is_ok(), "ground 19 still does not apply to archive material");
+    }
+
+    // -------------------------------------------------------- ground 21
+    //
+    // THE DEFECT THIS CLOSES, measured on the owner's store 2026-08-17: 603 of
+    // 2134 reports carried no scope. The field is optional at the tool surface
+    // and nothing fills it in, so "no scope" was the default outcome of a write
+    // rather than a deliberate choice. Those items are still findable by
+    // searching - they are simply in no collection, so browsing never meets
+    // them.
+
+    /// The guard lane is untouched: a standing rule that holds everywhere is
+    /// exactly what a global item is FOR, and refusing those would break the
+    /// thing ground 19 was built to protect.
+    #[test]
+    fn a_global_rule_is_still_allowed_because_a_standing_rule_holds_everywhere() {
+        let mut item = base(Kind::Rule);
+        item.project = None;
+        item.text = "Never add assistant attribution to a commit message.".to_string();
+        item.bindings = vec![Binding::Always];
+        assert!(declare(&item).is_ok(), "ground 21 must not reach the guard lane");
+    }
+
+    /// The 603 that already exist stay correctable. Freezing them until someone
+    /// files them would make fixing a typo impossible, which is worse than the
+    /// defect - the same concession grounds 19 and 20 make.
+    #[test]
+    fn a_report_already_stored_without_a_scope_can_still_be_revised() {
+        let mut existing = base(Kind::Report);
+        existing.project = None;
+        existing.text = "Een oud feit dat nooit een scope kreeg.".to_string();
+
+        let mut updated = existing.clone();
+        updated.text = "Een oud feit dat nooit een scope kreeg, nu zonder typo.".to_string();
+        assert!(revise(&existing, &updated).is_ok(), "an existing unscoped item stays correctable");
+
+        // And filing it is always allowed, which is the repair this ground wants.
+        updated.project = Some("The-AI-memory-bible".to_string());
+        assert!(revise(&existing, &updated).is_ok());
+    }
+
+    /// Blank is not a scope. Without this, the whole ground is one space
+    /// character away from being decorative.
+    #[test]
+    fn a_scope_of_only_whitespace_is_no_scope_at_all() {
+        let mut item = base(Kind::Report);
+        item.project = Some("   ".to_string());
+        item.text = "Een feit met een lege scope.".to_string();
+        assert!(declare(&item).is_err(), "whitespace must not pass as a scope");
     }
 
     #[test]

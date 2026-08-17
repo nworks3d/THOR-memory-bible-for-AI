@@ -491,7 +491,7 @@ mod tests {
             text: text.to_string(),
             bindings: vec![],
             severity: None,
-            project: None,
+            project: (!kind.can_fire()).then(|| "test-project".to_string()),
             tags: vec![],
             expires: if kind == Kind::Report { Some("2027-01-01".to_string()) } else { None },
             key: if kind == Kind::Lookup { Some(format!("{id}-key")) } else { None },

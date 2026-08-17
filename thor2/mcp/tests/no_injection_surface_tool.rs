@@ -76,6 +76,15 @@ fn no_tool_names_an_injection_surface_entry_point() {
 /// All eight go through `model` or `serve::lookup`, so the write gate still
 /// governs everything that lands and nothing here can reach an injection
 /// surface - the test above still proves that half independently.
+///
+/// To SIXTEEN on 2026-08-17, in one step, and these two are different in kind:
+/// `library` and `shelve` are the second lane - the owner's everyday knowledge,
+/// in its own file, reached through the `library` crate, which depends on
+/// nothing from the code side at all. They cannot reach the event store even
+/// by mistake, so nothing filed through `shelve` can ever be injected, ranked
+/// against a standing rule, or counted toward any cap. That is the whole
+/// reason they are a separate pair of tools over a separate file rather than
+/// a scope, a kind, or a field.
 #[test]
 fn the_tool_set_is_exactly_the_closed_list() {
     let lib_rs = Path::new(env!("CARGO_MANIFEST_DIR")).join("src").join("lib.rs");
@@ -102,6 +111,7 @@ fn the_tool_set_is_exactly_the_closed_list() {
         vec![
             "get",
             "history",
+            "library",
             "lookup",
             "mark",
             "outline",
@@ -111,6 +121,7 @@ fn the_tool_set_is_exactly_the_closed_list() {
             "retract",
             "revise",
             "search_code",
+            "shelve",
             "status",
             "unpin",
             "where_used",

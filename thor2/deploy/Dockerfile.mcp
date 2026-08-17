@@ -59,6 +59,7 @@ RUN printf '%s\n' \
   'if [ ! -f "$THOR_DB" ]; then' \
   '  mkdir -p "$(dirname "$THOR_DB")"' \
   '  model --db "$THOR_DB" declare --id container-first-note --kind report \' \
+  '    --project getting-started \' \
   '    --text "This memory was created empty by the container image, because the memory server opens an existing store and never creates one. Replace it by mounting your own store on /data." >/dev/null' \
   'fi' \
   'exec mcp --db "$THOR_DB"' \

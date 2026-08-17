@@ -3,7 +3,7 @@
   "name": "io.github.nworks3d/thor",
   "title": "THOR",
   "description": "Local memory for coding agents. A rule with a runnable proof can refuse a wrong command.",
-  "version": "2.0.0",
+  "version": "2.1.0",
   "repository": {
     "url": "https://github.com/nworks3d/THOR-memory-bible-for-AI",
     "source": "github"
@@ -12,7 +12,7 @@
   "packages": [
     {
       "registryType": "oci",
-      "identifier": "ghcr.io/nworks3d/thor-mcp:2.0.0",
+      "identifier": "ghcr.io/nworks3d/thor-mcp:2.1.0",
       "transport": {
         "type": "stdio"
       }

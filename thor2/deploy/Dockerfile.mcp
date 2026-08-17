@@ -39,6 +39,16 @@ FROM debian:bookworm-slim
 # repository root. Change one and the other stops verifying.
 LABEL io.modelcontextprotocol.server.name="io.github.nworks3d/thor"
 
+# What the package page shows a visitor. Without these it says "No description
+# provided" and links nowhere, which is a poor first impression of a thing whose
+# whole pitch is that it explains itself. `source` is also what makes the
+# package page link back to the repository it was built from.
+LABEL org.opencontainers.image.title="THOR" \
+      org.opencontainers.image.description="Local memory for coding agents. A rule with a runnable proof can refuse a wrong command, and a second, separate memory holds everyday things - recipes, books read, a training log - where nothing can interrupt you." \
+      org.opencontainers.image.source="https://github.com/nworks3d/THOR-memory-bible-for-AI" \
+      org.opencontainers.image.url="https://github.com/nworks3d/THOR-memory-bible-for-AI" \
+      org.opencontainers.image.licenses="GPL-3.0-or-later"
+
 RUN apt-get update \
  && apt-get install -y --no-install-recommends ca-certificates \
  && rm -rf /var/lib/apt/lists/*

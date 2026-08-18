@@ -465,9 +465,21 @@ fn refuse_a_new_collection(
              which of the two he meant."
         ));
     }
+    // A checkout with no marker is the "new project" case, and the way to fix
+    // it is one command the agent has no other way of learning about.
+    let unscoped_here = root.is_some() && checkout_project(root).is_none();
+    let how = if unscoped_here {
+        format!(
+            "\nThis folder has no memory of its own yet: if it is meant to be THIS project, the owner \
+             gives it one in a single command from here - `install --project {wanted}` - which writes the \
+             marker, reads this project's code, and makes every later write land under that name."
+        )
+    } else {
+        String::new()
+    };
     Err(format!(
         "REFUSED: nothing is filed under '{wanted}' yet, so this write would open a new place in the \
-         memory, and only the owner names one. Nothing was written. Do exactly ONE of these two, in \
+         memory, and only the owner names one. Nothing was written.{how} Do exactly ONE of these two, in \
          this order:\n\
          1. DOES IT FIT SOMEWHERE THAT ALREADY EXISTS? Then file it there. Both lanes are listed \
          below: the work memory (scopes) for the projects, the library (shelves) for anything about \

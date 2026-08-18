@@ -17,6 +17,7 @@
 //! platform keeps per-user data.
 
 use clap::Parser;
+use std::path::Path;
 use ops::githooks;
 use ops::install::{
     default_data_dir, default_settings_path, default_user_mcp_path, ensure_store, install_hooks,
@@ -85,6 +86,25 @@ fn sibling(name: &str) -> Option<PathBuf> {
     let exe = std::env::current_exe().ok()?;
     let dir = exe.parent()?;
     Some(dir.join(format!("{name}{}", std::env::consts::EXE_SUFFIX)))
+}
+
+
+/// Read this project's code once, under its own key, so `search_code`,
+/// `where_used` and `outline` answer here and the post-commit hook has an
+/// index to refresh. `Ok(None)` when one already exists: reading it again
+/// would throw away the commit it is at for no gain.
+fn build_project_index(index_root: &Path, key: &str, repo: &Path) -> anyhow::Result<Option<usize>> {
+    let db = index_root.join(format!("{key}.db"));
+    if db.exists() {
+        return Ok(None);
+    }
+    // Not a git checkout? Then there is nothing to index against a commit,
+    // and saying so beats writing an index that can never be refreshed.
+    anyhow::ensure!(repo.join(".git").exists(), "this folder is not a git checkout");
+    std::fs::create_dir_all(index_root)?;
+    let mut store = codeindex::Store::open(&db).map_err(|e| anyhow::anyhow!(e))?;
+    let stats = codeindex::build_full(&mut store, repo).map_err(|e| anyhow::anyhow!(e))?;
+    Ok(Some(stats.files_indexed))
 }
 
 fn main() -> ExitCode {
@@ -330,6 +350,15 @@ fn main() -> ExitCode {
     }
 
     // 5. The project scope, only when asked for.
+    //
+    // GIVING A FOLDER ITS OWN MEMORY IS ONE ACTION. Measured 2026-08-18, on a
+    // fresh project the owner asked an agent to scope: it had to find three
+    // separate things - the marker file that binds this folder to the key, a
+    // first fact carrying that key so the scope exists at all, and a code
+    // index under the same key so the post-commit hook has something to
+    // refresh. Nothing named them together, and the marker was only found
+    // because the owner pointed at another repository that had one. Three
+    // steps nobody can discover is a step that gets skipped.
     if let Some(key) = &cli.project {
         let here = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
         match write_project_marker(&here, key) {
@@ -339,6 +368,12 @@ fn main() -> ExitCode {
                 eprintln!("everything else is installed, but the project scope was refused: {e}");
                 return ExitCode::FAILURE;
             }
+        }
+        match code_index_root.as_deref().map(|r| build_project_index(r, key, &here)).transpose() {
+            Ok(Some(Some(files))) => println!("+ read this project's code, {files} file(s), so it can be searched and kept fresh on every commit"),
+            Ok(Some(None)) => println!("= this project's code was already read; every commit keeps it fresh"),
+            Ok(None) => {}
+            Err(e) => println!("- the code here could not be read ({e}) - the memory works, code search does not"),
         }
     }
 

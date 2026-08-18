@@ -412,6 +412,58 @@ pub fn working_contract() -> Vec<model::item::Item> {
                 "A folder set up with that one command turns out to be missing its marker, its                  code reading or its refresh on commit.",
             )
         },
+        model::item::Item {
+            tags: vec![
+                "working-contract".to_string(),
+                format!(
+                    "{}a life fact and a work fact are written in the same words",
+                    model::store::NO_LITERAL_REASON_PREFIX
+                ),
+            ],
+            ..rule(
+                "two-lanes-work-and-life",
+                "Two memories live here. Anything about the owner's own life - a recipe, a book, \
+                 a training log, an expense - goes to the library with `shelve`, never \
+                 `remember`. The work memory is for code and projects.",
+                "A recipe stored with remember turns out to be found as easily as one filed \
+                 with shelve.",
+            )
+        },
+        model::item::Item {
+            tags: vec![
+                "working-contract".to_string(),
+                format!(
+                    "{}an invented name looks exactly like a real one, there is no text to catch",
+                    model::store::NO_LITERAL_REASON_PREFIX
+                ),
+            ],
+            ..rule(
+                "never-open-a-place-the-owner-did-not-name",
+                "Never invent a place to file something - not a scope, not a shelf, not a register \
+                 key. Put it where something already lives, and if honestly nothing fits, ASK the \
+                 owner what the new one should be called and use his word. A name you thought of \
+                 is a name he will never look under.",
+                "An agent opens a scope or a shelf under a name of its own and the owner finds it \
+                 again later without being told where it went.",
+            )
+        },
+        model::item::Item {
+            tags: vec![
+                "working-contract".to_string(),
+                format!(
+                    "{}a pile and one long thing are the same characters, only their subject differs",
+                    model::store::NO_LITERAL_REASON_PREFIX
+                ),
+            ],
+            ..rule(
+                "one-entry-is-one-thing",
+                "One entry is ONE thing. Given a schema AND an injury AND the equipment AND a \
+                 measurement, file them as separate entries with labels, not as one block: an \
+                 entry holding five things is found by one of them and corrected by none.",
+                "A single entry holding several subjects turns out to be as findable and as \
+                 correctable as the same content split into one entry per subject.",
+            )
+        },
         rule(
             "a-refusal-is-the-gate-working",
             "A refusal names the exact reason and what to do instead, and nothing is written when \

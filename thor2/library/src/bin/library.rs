@@ -16,11 +16,19 @@ fn usage() -> ! {
   read <id>                        one entry, whole
   search <words...> [--shelf <s>]  four steps, ending in a list to read
   add <shelf> <title> [--body <t>] [--label <l>]...
+  revise <id> [--title <t>] [--body <t>] [--label <l>]...
+                                   correct an entry, keeping its number; the
+                                   old version stays readable with `history`
+  history <id>                     what this entry used to say, oldest first
+  move <id> <shelf>                put it on another shelf, same number
   retire <id> --why <reason>       stops listing it; never deletes it
   labels <shelf>                   the labels in use, with counts
   health                           what the librarian would say out loud
   shelf-new <name> [--note <t>]    THE OWNER'S CALL. An agent asks; it never
-                                   creates a shelf itself."
+                                   creates a shelf itself.
+  export <file>                    write the whole library out as one JSON
+                                   object per line, retired entries included
+  restore <file>                   rebuild an EMPTY library from such a file"
     );
     std::process::exit(2)
 }
@@ -52,6 +60,7 @@ fn main() {
     let why = take_flag(&mut args, "--why").unwrap_or_default();
     let note = take_flag(&mut args, "--note").unwrap_or_default();
     let shelf_flag = take_flag(&mut args, "--shelf");
+    let title_flag = take_flag(&mut args, "--title");
 
     let lib = Library::open(&db).unwrap_or_else(|e| {
         eprintln!("{e}");
@@ -77,7 +86,9 @@ fn main() {
         "shelf" => {
             let name = rest.first().unwrap_or_else(|| usage());
             let entries = lib.entries(name, labels.first().map(String::as_str)).unwrap_or_else(|e| failed(e));
-            print!("{}", render_shelf(name, &entries, SHOWN));
+            // The size of the SHELF, not of the narrowed list - see render_shelf.
+            let total = lib.entries(name, None).unwrap_or_else(|e| failed(e)).len();
+            print!("{}", render_shelf(name, &entries, SHOWN, total));
         }
         "read" => {
             let id: i64 = rest.first().and_then(|s| s.parse().ok()).unwrap_or_else(|| usage());
@@ -100,6 +111,38 @@ fn main() {
             };
             match lib.add(shelf, title, &body, &labels) {
                 Ok(id) => println!("filed {id} on shelf {shelf}"),
+                Err(e) => refused(e),
+            }
+        }
+        "revise" => {
+            let id: i64 = rest.first().and_then(|s| s.parse().ok()).unwrap_or_else(|| usage());
+            let labels_given = if labels.is_empty() { None } else { Some(labels.as_slice()) };
+            let body_given = if body.is_empty() { None } else { Some(body.as_str()) };
+            match lib.revise(id, title_flag.as_deref(), body_given, labels_given) {
+                Ok(()) => println!("revised {id} - the old version stays in `history {id}`"),
+                Err(e) => refused(e),
+            }
+        }
+        "history" => {
+            let id: i64 = rest.first().and_then(|s| s.parse().ok()).unwrap_or_else(|| usage());
+            let past = lib.history(id).unwrap_or_else(|e| failed(e));
+            if past.is_empty() {
+                println!("entry {id} was never corrected");
+            }
+            for (when, title, body, shelf) in past {
+                let where_ = if shelf.is_empty() { String::new() } else { format!("  (stond op {shelf})") };
+                println!("{when}{where_}  {title}
+{body}
+");
+            }
+        }
+        "move" => {
+            let (id, shelf) = match rest {
+                [id, shelf, ..] => (id.parse::<i64>().unwrap_or_else(|_| usage()), shelf),
+                _ => usage(),
+            };
+            match lib.move_to(id, shelf) {
+                Ok(()) => println!("moved {id} to shelf {shelf} - same number, and `history {id}` says where it was"),
                 Err(e) => refused(e),
             }
         }
@@ -128,6 +171,18 @@ fn main() {
             for line in said {
                 println!("{line}");
             }
+        }
+        "export" => {
+            let path = rest.first().unwrap_or_else(|| usage());
+            let mut f = std::fs::File::create(path).unwrap_or_else(|e| failed(e.to_string()));
+            let n = lib.export_jsonl(&mut f).unwrap_or_else(|e| failed(e));
+            println!("wrote {n} line(s) to {path}");
+        }
+        "restore" => {
+            let path = rest.first().unwrap_or_else(|| usage());
+            let text = std::fs::read_to_string(path).unwrap_or_else(|e| failed(e.to_string()));
+            let n = lib.import_jsonl(&text).unwrap_or_else(|e| failed(e));
+            println!("restored {n} line(s) from {path}");
         }
         "shelf-new" => {
             let name = rest.first().unwrap_or_else(|| usage());

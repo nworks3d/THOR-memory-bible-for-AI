@@ -48,6 +48,12 @@ const DUPLICATE_AT: f32 = 0.7;
 /// "ribbetjes" without dragging in everything that merely starts the same.
 const PREFIX_LEN: usize = 4;
 
+/// The longest a title may be. It is the whole index line, and an index you
+/// scroll sideways is not an index. Measured on the owner's own library: the
+/// longest real title is 97 characters, so this refuses a paragraph without
+/// touching anything he already has.
+const TITLE_AT_MOST: usize = 160;
+
 /// What the librarian says when it will not do something: what is wrong, and
 /// what to do instead. Never one without the other - a refusal that does not
 /// say the way out is just a wall.
@@ -99,6 +105,15 @@ pub enum Reached {
     Phrase,
     EveryWord,
     Prefix,
+    /// Not every word was found, and that is not a reason to answer nothing.
+    ///
+    /// THE DEFECT THIS CLOSES, measured 2026-08-18: "eiwit training spier
+    /// creatine gym" returned nothing at all, on a library holding an entry
+    /// about protein and creatine - because one word of the five ("gym") was
+    /// absent, and every step before this one demands ALL of them. A search
+    /// that only answers a perfect question is a search you have to guess
+    /// your way into.
+    SomeWords { matched: usize, of: usize },
 }
 
 impl Reached {
@@ -107,6 +122,12 @@ impl Reached {
             Reached::Phrase => "on the exact phrase",
             Reached::EveryWord => "on every word you used",
             Reached::Prefix => "on the start of your words, so these are near misses on wording",
+            Reached::SomeWords { matched, of } => {
+                // Leaked as a leading number by `render_found`, because a
+                // &'static str cannot carry a count.
+                let _ = (matched, of);
+                "on some of your words - the rest of what you typed is not in here"
+            }
         }
     }
 }
@@ -139,6 +160,14 @@ impl Library {
     /// Its own file, always - never the event store's.
     pub fn open(path: &std::path::Path) -> Result<Self, String> {
         let conn = Connection::open(path).map_err(|e| format!("cannot open the library at {}: {e}", path.display()))?;
+        // WAIT FOR A BUSY WRITER INSTEAD OF FAILING AT ONCE. Three programs
+        // reach this file - the connector when it files something, the drain
+        // when it replays a filing captured away from the desk, and the hourly
+        // backup while it reads - and without this the second one gets
+        // "database is locked" the instant they overlap. The event store has
+        // done exactly this since it was written; the library was missing it.
+        conn.busy_timeout(std::time::Duration::from_secs(5))
+            .map_err(|e| format!("cannot prepare the library: {e}"))?;
         conn.execute_batch(
             "PRAGMA journal_mode=WAL;
              CREATE TABLE IF NOT EXISTS shelf (
@@ -156,9 +185,29 @@ impl Library {
                  updated TEXT NOT NULL,
                  retired TEXT NOT NULL DEFAULT ''
              );
-             CREATE INDEX IF NOT EXISTS entry_by_shelf ON entry(shelf);",
+             CREATE INDEX IF NOT EXISTS entry_by_shelf ON entry(shelf);
+             CREATE TABLE IF NOT EXISTS revision (
+                 entry_id INTEGER NOT NULL REFERENCES entry(id),
+                 title    TEXT NOT NULL,
+                 body     TEXT NOT NULL,
+                 labels   TEXT NOT NULL DEFAULT '',
+                 replaced TEXT NOT NULL,
+                 shelf    TEXT NOT NULL DEFAULT ''
+             );
+             CREATE INDEX IF NOT EXISTS revision_by_entry ON revision(entry_id);",
         )
         .map_err(|e| format!("cannot prepare the library: {e}"))?;
+        // A library made before entries could move has no `shelf` on its
+        // revisions. Added here rather than in a migration step somebody has
+        // to remember to run.
+        let has_shelf = conn
+            .prepare("SELECT shelf FROM revision LIMIT 1")
+            .map(|_| true)
+            .unwrap_or(false);
+        if !has_shelf {
+            conn.execute_batch("ALTER TABLE revision ADD COLUMN shelf TEXT NOT NULL DEFAULT '';")
+                .map_err(|e| format!("cannot prepare the library: {e}"))?;
+        }
         Ok(Library { conn })
     }
 
@@ -248,6 +297,12 @@ impl Library {
             return Err(Refusal::new(
                 "the title runs over more than one line",
                 "keep the title to one line and put the rest in the body",
+            ));
+        }
+        if title.chars().count() > TITLE_AT_MOST {
+            return Err(Refusal::new(
+                format!("the title is {} characters, and it is the whole index line", title.chars().count()),
+                format!("keep it under {TITLE_AT_MOST} - say the one thing it is and move the detail into the body"),
             ));
         }
         let shelves = self.shelves().map_err(|e| Refusal::new(e, "the library could not be read"))?;
@@ -371,12 +426,128 @@ impl Library {
             if !prefixed.is_empty() {
                 return Ok(Found::Hits { reached: Reached::Prefix, entries: prefixed });
             }
+
+            // THE "MOST OF YOUR WORDS" STEP. Everything above demands every
+            // word; this one asks how many were found and hands back the best
+            // it has, saying how weak the claim is. Only when not a single
+            // word lands does the list come back - and then it really is the
+            // right answer, because nothing in the library touches what was
+            // asked.
+            let mut best = 0usize;
+            let mut scored: Vec<(usize, Entry)> = Vec::new();
+            for e in &pool {
+                let tokens = tokens(&haystack(e));
+                // Whole word or a prefix of at least four, exactly as the
+                // steps above match. A raw substring would let "op" or "de"
+                // score against almost every entry and drown the real hit.
+                let hits = words
+                    .iter()
+                    .filter(|w| {
+                        let want = prefix(w);
+                        tokens.iter().any(|t| t == *w)
+                            || (want.len() >= PREFIX_LEN && tokens.iter().any(|t| t.starts_with(&want)))
+                    })
+                    .count();
+                if hits > 0 {
+                    best = best.max(hits);
+                    scored.push((hits, e.clone()));
+                }
+            }
+            if best > 0 {
+                let entries: Vec<Entry> =
+                    scored.into_iter().filter(|(n, _)| *n == best).map(|(_, e)| e).collect();
+                return Ok(Found::Hits {
+                    reached: Reached::SomeWords { matched: best, of: words.len() },
+                    entries,
+                });
+            }
         }
 
         match shelf.map(str::trim).filter(|s| !s.is_empty()) {
             Some(s) => Ok(Found::ShelfInstead { shelf: s.to_string(), entries: pool }),
             None => Ok(Found::ShelvesInstead { shelves: self.shelves()? }),
         }
+    }
+
+    /// Correct an entry that already exists, keeping its number.
+    ///
+    /// WHY THIS EXISTS. Until 2026-08-18 the only way to fix a title, a typo
+    /// or a wrong label was to retire the entry and file a new one - which
+    /// changes the number every reference points at, and splits one thing's
+    /// story across two entries. The code lane has had `revise` from the
+    /// start, for exactly the reason its own doctrine gives: a memory is to
+    /// MAINTAIN, not only to fill.
+    ///
+    /// NOTHING IS LOST: the version being replaced is copied into `revision`
+    /// first, so `history` can walk what an entry used to say. Same promise
+    /// the event log makes, kept the cheap way.
+    pub fn revise(
+        &self,
+        id: i64,
+        title: Option<&str>,
+        body: Option<&str>,
+        labels: Option<&[String]>,
+    ) -> Result<(), Refusal> {
+        let Some(current) = self.get(id).map_err(|e| Refusal::new(e, "the library could not be read"))? else {
+            return Err(Refusal::new(format!("no entry {id}"), "check the number in the shelf listing"));
+        };
+        let new_title = title.map(str::trim).unwrap_or(current.title.as_str());
+        if new_title.is_empty() {
+            return Err(Refusal::new("a title that is now empty", "give it one line that stands on its own"));
+        }
+        if new_title.contains('\n') {
+            return Err(Refusal::new("the title runs over more than one line", "keep the title to one line"));
+        }
+        if new_title.chars().count() > TITLE_AT_MOST {
+            return Err(Refusal::new(
+                format!("the title is {} characters, and it is the whole index line", new_title.chars().count()),
+                format!("keep it under {TITLE_AT_MOST}"),
+            ));
+        }
+        if title.is_some() && new_title != current.title {
+            if let Some(twin) = self.near_duplicate(&current.shelf, new_title)? {
+                if twin.id != id {
+                    return Err(Refusal::new(
+                        format!("'{}' is already on this shelf, as entry {}", twin.title, twin.id),
+                        "revise that one instead, or give this one a title that tells them apart",
+                    ));
+                }
+            }
+        }
+        let now = time::today();
+        self.conn
+            .execute(
+                "INSERT INTO revision (entry_id, title, body, labels, replaced, shelf) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                (id, &current.title, &current.body, current.labels.join(","), &now, &current.shelf),
+            )
+            .map_err(|e| Refusal::new(format!("the old version could not be kept: {e}"), "nothing was changed"))?;
+        self.conn
+            .execute(
+                "UPDATE entry SET title = ?2, body = ?3, labels = ?4, updated = ?5 WHERE id = ?1",
+                (
+                    id,
+                    new_title,
+                    body.map(str::trim).unwrap_or(current.body.as_str()),
+                    labels.map(normalize_labels).unwrap_or_else(|| current.labels.join(",")),
+                    &now,
+                ),
+            )
+            .map_err(|e| Refusal::new(format!("the entry could not be written: {e}"), "try again"))?;
+        Ok(())
+    }
+
+    /// What this entry used to say, oldest first. Empty when it was never
+    /// corrected - which is a different answer from "no such entry", and the
+    /// caller can tell because `get` answers that one.
+    pub fn history(&self, id: i64) -> Result<Vec<(String, String, String, String)>, String> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT replaced, title, body, shelf FROM revision WHERE entry_id = ?1 ORDER BY rowid")
+            .map_err(|e| e.to_string())?;
+        let rows = stmt
+            .query_map([id], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))
+            .map_err(|e| e.to_string())?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(|e| e.to_string())
     }
 
     // -------------------------------------------------------------- health
@@ -402,6 +573,197 @@ impl Library {
             }
         }
         Ok(out)
+    }
+
+    /// Move an entry to another shelf, keeping its number and its history.
+    ///
+    /// The repair for a misfile. Without it the only way was to retire the
+    /// entry and file it again, which changes the number every reference
+    /// points at and splits one thing's story in two.
+    pub fn move_to(&self, id: i64, shelf: &str) -> Result<(), Refusal> {
+        let Some(entry) = self.get(id).map_err(|e| Refusal::new(e, "the library could not be read"))? else {
+            return Err(Refusal::new(format!("no entry {id}"), "check the number in the shelf listing"));
+        };
+        let shelves = self.shelves().map_err(|e| Refusal::new(e, "the library could not be read"))?;
+        let Some(target) = shelves.iter().find(|s| s.name.eq_ignore_ascii_case(shelf.trim())) else {
+            return Err(Refusal::new(
+                format!("there is no shelf called '{}'", shelf.trim()),
+                format!("move it to one of these: {}", shelf_names(&shelves)),
+            ));
+        };
+        if target.name.eq_ignore_ascii_case(&entry.shelf) {
+            return Err(Refusal::new(
+                format!("entry {id} is already on '{}'", entry.shelf),
+                "name the shelf it should move to",
+            ));
+        }
+        if let Some(twin) = self.near_duplicate(&target.name, &entry.title)? {
+            return Err(Refusal::new(
+                format!("'{}' is already on '{}', as entry {}", twin.title, target.name, twin.id),
+                "fold the two together instead of keeping both",
+            ));
+        }
+        let now = time::today();
+        self.conn
+            .execute(
+                "INSERT INTO revision (entry_id, title, body, labels, replaced, shelf) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                (id, &entry.title, &entry.body, entry.labels.join(","), &now, &entry.shelf),
+            )
+            .map_err(|e| Refusal::new(format!("the old version could not be kept: {e}"), "nothing was changed"))?;
+        self.conn
+            .execute("UPDATE entry SET shelf = ?2, updated = ?3 WHERE id = ?1", (id, &target.name, &now))
+            .map_err(|e| Refusal::new(format!("the entry could not be moved: {e}"), "try again"))?;
+        Ok(())
+    }
+
+    // -------------------------------------------------------------- backup
+
+    /// Write the whole library out as one JSON object per line: every shelf
+    /// first, then every entry INCLUDING the retired ones.
+    ///
+    /// WHY THIS EXISTS. The hourly off-site backup exports the event log and
+    /// nothing else, so on 2026-08-18 the library was 84 entries living in one
+    /// file on one machine with no copy anywhere - the exact shape of loss the
+    /// event log was built to make impossible. Text, one line per thing, so a
+    /// git history of it is readable and a half-written file costs one line
+    /// rather than the lot.
+    pub fn export_jsonl(&self, out: &mut impl std::io::Write) -> Result<usize, String> {
+        let mut n = 0;
+        for s in self.shelves()? {
+            let line = serde_json::json!({"kind": "shelf", "name": s.name, "note": s.note, "created": s.created});
+            writeln!(out, "{line}").map_err(|e| e.to_string())?;
+            n += 1;
+        }
+        let all = self.rows(
+            "SELECT id, shelf, title, body, labels, added, updated, retired FROM entry ORDER BY id",
+            [],
+        )?;
+        let mut retired_reason = std::collections::BTreeMap::new();
+        {
+            let mut stmt = self.conn.prepare("SELECT id, retired FROM entry").map_err(|e| e.to_string())?;
+            let rows = stmt
+                .query_map([], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?)))
+                .map_err(|e| e.to_string())?;
+            for row in rows {
+                let (id, why) = row.map_err(|e| e.to_string())?;
+                retired_reason.insert(id, why);
+            }
+        }
+        for e in all {
+            let line = serde_json::json!({
+                "kind": "entry",
+                "id": e.id,
+                "shelf": e.shelf,
+                "title": e.title,
+                "body": e.body,
+                "labels": e.labels,
+                "added": e.added,
+                "updated": e.updated,
+                "retired": retired_reason.get(&e.id).cloned().unwrap_or_default(),
+            });
+            writeln!(out, "{line}").map_err(|e| e.to_string())?;
+            n += 1;
+        }
+        // The corrections too, or a restore quietly drops every older version
+        // and "nothing is ever lost" stops being true the moment you need it.
+        let mut stmt = self
+            .conn
+            .prepare("SELECT entry_id, title, body, labels, replaced, shelf FROM revision ORDER BY rowid")
+            .map_err(|e| e.to_string())?;
+        let rows = stmt
+            .query_map([], |r| {
+                Ok(serde_json::json!({
+                    "kind": "revision",
+                    "entry_id": r.get::<_, i64>(0)?,
+                    "title": r.get::<_, String>(1)?,
+                    "body": r.get::<_, String>(2)?,
+                    "labels": r.get::<_, String>(3)?,
+                    "replaced": r.get::<_, String>(4)?,
+                    "shelf": r.get::<_, String>(5)?,
+                }))
+            })
+            .map_err(|e| e.to_string())?;
+        for row in rows {
+            let line = row.map_err(|e| e.to_string())?;
+            writeln!(out, "{line}").map_err(|e| e.to_string())?;
+            n += 1;
+        }
+        Ok(n)
+    }
+
+    /// Rebuild a library from an export. Only into an EMPTY one, and ids are
+    /// kept exactly as they were, so every reference to an entry number
+    /// survives the restore - a backup that renumbers what it restores is a
+    /// backup that quietly breaks every pointer into it.
+    pub fn import_jsonl(&self, text: &str) -> Result<usize, String> {
+        let existing: i64 = self
+            .conn
+            .query_row("SELECT COUNT(*) FROM entry", [], |r| r.get(0))
+            .map_err(|e| e.to_string())?;
+        if existing > 0 {
+            return Err("this library already holds entries - restore into an empty one".to_string());
+        }
+        let mut n = 0;
+        for (no, line) in text.lines().enumerate() {
+            if line.trim().is_empty() {
+                continue;
+            }
+            let v: serde_json::Value =
+                serde_json::from_str(line).map_err(|e| format!("line {}: {e}", no + 1))?;
+            match v.get("kind").and_then(|k| k.as_str()) {
+                Some("shelf") => {
+                    self.conn
+                        .execute(
+                            "INSERT OR IGNORE INTO shelf (name, note, created) VALUES (?1, ?2, ?3)",
+                            (
+                                v["name"].as_str().unwrap_or_default(),
+                                v["note"].as_str().unwrap_or_default(),
+                                v["created"].as_str().unwrap_or_default(),
+                            ),
+                        )
+                        .map_err(|e| e.to_string())?;
+                }
+                Some("entry") => {
+                    let labels: Vec<String> = v["labels"]
+                        .as_array()
+                        .map(|a| a.iter().filter_map(|l| l.as_str().map(str::to_string)).collect())
+                        .unwrap_or_default();
+                    self.conn
+                        .execute(
+                            "INSERT INTO entry (id, shelf, title, body, labels, added, updated, retired)                              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                            (
+                                v["id"].as_i64().unwrap_or_default(),
+                                v["shelf"].as_str().unwrap_or_default(),
+                                v["title"].as_str().unwrap_or_default(),
+                                v["body"].as_str().unwrap_or_default(),
+                                labels.join(","),
+                                v["added"].as_str().unwrap_or_default(),
+                                v["updated"].as_str().unwrap_or_default(),
+                                v["retired"].as_str().unwrap_or_default(),
+                            ),
+                        )
+                        .map_err(|e| e.to_string())?;
+                }
+                Some("revision") => {
+                    self.conn
+                        .execute(
+                            "INSERT INTO revision (entry_id, title, body, labels, replaced) \
+                             VALUES (?1, ?2, ?3, ?4, ?5)",
+                            (
+                                v["entry_id"].as_i64().unwrap_or_default(),
+                                v["title"].as_str().unwrap_or_default(),
+                                v["body"].as_str().unwrap_or_default(),
+                                v["labels"].as_str().unwrap_or_default(),
+                                v["replaced"].as_str().unwrap_or_default(),
+                            ),
+                        )
+                        .map_err(|e| e.to_string())?;
+                }
+                _ => return Err(format!("line {}: not a shelf, an entry or a revision", no + 1)),
+            }
+            n += 1;
+        }
+        Ok(n)
     }
 
     // ------------------------------------------------------------ internals
@@ -452,11 +814,17 @@ fn prefix(word: &str) -> String {
     word.chars().take(PREFIX_LEN).collect()
 }
 
+/// The comma is the separator this column stores labels with, so a label that
+/// contains one is SPLIT rather than dropped. It used to be filtered out
+/// silently, which meant an entry quietly landed with fewer labels than the
+/// caller asked for - the kind of loss nobody notices until they filter on a
+/// label that was never stored.
 fn normalize_labels(labels: &[String]) -> String {
     let mut clean: Vec<String> = labels
         .iter()
+        .flat_map(|l| l.split(','))
         .map(|l| l.trim().to_lowercase())
-        .filter(|l| !l.is_empty() && !l.contains(','))
+        .filter(|l| !l.is_empty())
         .collect();
     clean.sort();
     clean.dedup();
@@ -504,11 +872,19 @@ pub fn render_shelves(shelves: &[Shelf]) -> String {
 
 /// A shelf as an index: one line per entry, never the whole text. The count on
 /// the first line is the true size even when the listing below it is cut.
-pub fn render_shelf(shelf: &str, entries: &[Entry], shown: usize) -> String {
+pub fn render_shelf(shelf: &str, entries: &[Entry], shown: usize, total: usize) -> String {
     if entries.is_empty() {
         return format!("shelf '{shelf}' is empty.\n");
     }
-    let mut out = format!("shelf {shelf}: {} entr{}\n", entries.len(), if entries.len() == 1 { "y" } else { "ies" });
+    // WHY `total` IS A SEPARATE NUMBER: a listing narrowed by a label used to
+    // print its own length as the size of the shelf, so "shelf eten: 12
+    // entries" appeared for a shelf holding 25. A reader who believes that
+    // number stops looking for the other thirteen.
+    let mut out = if total > entries.len() {
+        format!("shelf {shelf}: {} of {total} entries, narrowed by your label\n", entries.len())
+    } else {
+        format!("shelf {shelf}: {} entr{}\n", entries.len(), if entries.len() == 1 { "y" } else { "ies" })
+    };
     for e in entries.iter().take(shown) {
         let labels = if e.labels.is_empty() { String::new() } else { format!("   [{}]", e.labels.join(" ")) };
         out.push_str(&format!("  {:>5}  {}  {}{labels}\n", e.id, e.added, e.title));
@@ -532,7 +908,13 @@ pub fn render_entry(e: &Entry) -> String {
 pub fn render_found(found: &Found, shown: usize) -> String {
     match found {
         Found::Hits { reached, entries } => {
-            let mut out = format!("{} match(es), {}\n", entries.len(), reached.as_str());
+            let how = match reached {
+                Reached::SomeWords { matched, of } => {
+                    format!("on {matched} of the {of} words you used - the rest is not in here")
+                }
+                other => other.as_str().to_string(),
+            };
+            let mut out = format!("{} match(es), {how}\n", entries.len());
             for e in entries.iter().take(shown) {
                 out.push_str(&format!("  {:>5}  {:<12} {}\n", e.id, e.shelf, e.title));
             }
@@ -545,7 +927,7 @@ pub fn render_found(found: &Found, shown: usize) -> String {
         // NEVER "no results". The thing being asked for is very often on the
         // shelf under a word the asker did not use.
         Found::ShelfInstead { shelf, entries } => {
-            format!("Nothing matched those words, so here is the whole shelf to read instead.\n{}", render_shelf(shelf, entries, shown))
+            format!("Nothing matched those words, so here is the whole shelf to read instead.\n{}", render_shelf(shelf, entries, shown, entries.len()))
         }
         Found::ShelvesInstead { shelves } => {
             format!("Nothing matched those words. Here is what the library holds - open the shelf it would be on.\n{}", render_shelves(shelves))
@@ -744,6 +1126,208 @@ mod tests {
         assert_eq!(lib.shelves().unwrap().len(), 1, "no shelf was created by labelling");
     }
 
+    // -------------------------------------------------------------- revise
+
+    /// The defect this closes: correcting a typo used to mean retiring the
+    /// entry and filing a new one, which changes the number every reference
+    /// points at.
+    #[test]
+    fn revising_keeps_the_number_and_the_old_version_stays_readable() {
+        let (lib, _d) = stocked();
+        let id = lib.entries("eten", None).unwrap()[0].id;
+        lib.revise(id, Some("Spareribs op de Kamado, 120 graden met appelhout"), None, None).unwrap();
+
+        let now = lib.get(id).unwrap().unwrap();
+        assert_eq!(now.id, id, "the number survives a correction");
+        assert!(now.title.contains("appelhout"), "{now:?}");
+        let past = lib.history(id).unwrap();
+        assert_eq!(past.len(), 1, "the version it replaced is kept");
+        assert!(past[0].1.contains("kersenhout"), "and it still says what it used to: {past:?}");
+    }
+
+    #[test]
+    fn revising_only_the_labels_leaves_the_text_alone() {
+        let (lib, _d) = stocked();
+        let id = lib.entries("eten", None).unwrap()[0].id;
+        let before = lib.get(id).unwrap().unwrap().body;
+        lib.revise(id, None, None, Some(&["bbq".to_string(), "vlees".to_string()])).unwrap();
+        let after = lib.get(id).unwrap().unwrap();
+        assert_eq!(after.body, before);
+        assert_eq!(after.labels, vec!["bbq".to_string(), "vlees".to_string()]);
+    }
+
+    /// A correction may not turn one entry into a copy of its neighbour.
+    #[test]
+    fn revising_into_a_title_the_shelf_already_has_is_refused() {
+        let (lib, _d) = stocked();
+        let ids: Vec<i64> = lib.entries("eten", None).unwrap().iter().map(|e| e.id).collect();
+        let refusal = lib
+            .revise(ids[1], Some("Spareribs op de Kamado, 120 graden met kersenhout"), None, None)
+            .expect_err("that is the other entry");
+        assert!(refusal.problem.contains("already on this shelf"), "{refusal:?}");
+    }
+
+    #[test]
+    fn revising_an_entry_that_does_not_exist_says_so() {
+        let (lib, _d) = stocked();
+        assert!(lib.revise(9999, Some("iets"), None, None).is_err());
+    }
+
+    /// THE MEASURED MISS: one word of five was absent and the whole answer
+    /// collapsed to "here is the shelf". A search may not depend on a perfect
+    /// question.
+    #[test]
+    fn a_word_that_is_not_in_the_library_no_longer_wipes_the_answer() {
+        let (lib, _d) = stocked();
+        match lib.search("ribben kersenhout sportschool", None).unwrap() {
+            Found::Hits { reached, entries } => {
+                assert!(matches!(reached, Reached::SomeWords { matched: 2, of: 3 }), "{reached:?}");
+                assert!(entries[0].title.contains("Spareribs"), "{:?}", entries[0]);
+            }
+            other => panic!("the two words that ARE here must still answer, got {other:?}"),
+        }
+    }
+
+    /// A question that touches nothing still gets the list, because then the
+    /// list really is the answer.
+    #[test]
+    fn a_question_that_touches_nothing_still_answers_with_the_shelves() {
+        let (lib, _d) = stocked();
+        assert!(matches!(
+            lib.search("zeppelin quantumharmonica", None).unwrap(),
+            Found::ShelvesInstead { .. }
+        ));
+    }
+
+    /// An exact phrase still wins: the weaker steps only run when the ones
+    /// above them found nothing.
+    #[test]
+    fn the_precise_steps_still_come_first() {
+        let (lib, _d) = stocked();
+        match lib.search("65 procent hydratatie", None).unwrap() {
+            Found::Hits { reached, entries } => {
+                assert_eq!(reached, Reached::Phrase);
+                assert_eq!(entries.len(), 1);
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+
+    // ------------------------------------------------------------ verplaatsen
+
+    #[test]
+    fn moving_an_entry_keeps_its_number_and_records_where_it_was() {
+        let (lib, _d) = stocked();
+        lib.create_shelf("boeken", "").unwrap();
+        let id = lib.entries("eten", None).unwrap()[0].id;
+        lib.move_to(id, "boeken").unwrap();
+
+        let moved = lib.get(id).unwrap().unwrap();
+        assert_eq!(moved.id, id);
+        assert_eq!(moved.shelf, "boeken");
+        assert!(!lib.entries("eten", None).unwrap().iter().any(|e| e.id == id), "gone from the old shelf");
+        assert_eq!(lib.history(id).unwrap().len(), 1, "the move is written down");
+    }
+
+    #[test]
+    fn moving_to_a_shelf_that_does_not_exist_is_refused_with_the_shelves_named() {
+        let (lib, _d) = stocked();
+        let id = lib.entries("eten", None).unwrap()[0].id;
+        let refusal = lib.move_to(id, "sport").expect_err("no such shelf");
+        assert!(refusal.fix.contains("eten"), "{refusal:?}");
+    }
+
+    #[test]
+    fn moving_onto_a_shelf_that_already_holds_the_same_thing_is_refused() {
+        let (lib, _d) = stocked();
+        lib.create_shelf("boeken", "").unwrap();
+        let id = lib.entries("eten", None).unwrap()[0].id;
+        lib.add("boeken", "Spareribs op de Kamado, 120 graden met kersenhout", "", &[]).unwrap();
+        assert!(lib.move_to(id, "boeken").is_err());
+    }
+
+    // ------------------------------------------------- rommel uit de review
+
+    /// It used to be dropped without a word, so an entry landed with fewer
+    /// labels than the caller asked for and nobody noticed until a filter
+    /// came up empty.
+    #[test]
+    fn a_label_with_a_comma_in_it_is_split_not_silently_dropped() {
+        let (lib, _d) = stocked();
+        let id = lib.add("eten", "Frietjes in de airfryer", "", &["snack,bijgerecht".to_string()]).unwrap();
+        let e = lib.get(id).unwrap().unwrap();
+        assert_eq!(e.labels, vec!["bijgerecht".to_string(), "snack".to_string()]);
+    }
+
+    /// The title IS the index line. A paragraph there is an index you cannot
+    /// read.
+    #[test]
+    fn a_title_the_size_of_a_paragraph_is_refused() {
+        let (lib, _d) = stocked();
+        let refusal = lib.add("eten", &"x".repeat(200), "iets", &[]).expect_err("that is not an index line");
+        assert!(refusal.problem.contains("index line"), "{refusal:?}");
+    }
+
+    /// A listing narrowed by a label used to report its own length as the size
+    /// of the shelf, so a reader stopped looking for the rest.
+    #[test]
+    fn a_listing_narrowed_by_a_label_says_how_big_the_shelf_really_is() {
+        let (lib, _d) = stocked();
+        lib.add("eten", "Mac and cheese met cheddar", "", &["bijgerecht".to_string()]).unwrap();
+        let narrowed = lib.entries("eten", Some("bijgerecht")).unwrap();
+        let total = lib.entries("eten", None).unwrap().len();
+        let rendered = render_shelf("eten", &narrowed, 25, total);
+        assert!(rendered.contains("1 of 3 entries"), "{rendered}");
+    }
+
+    /// A correction is only kept if it travels with the backup.
+    #[test]
+    fn a_correction_survives_an_export_and_a_restore() {
+        let (lib, _d) = stocked();
+        let id = lib.entries("eten", None).unwrap()[0].id;
+        lib.revise(id, Some("Spareribs op de Kamado met appelhout"), None, None).unwrap();
+        let mut out: Vec<u8> = Vec::new();
+        lib.export_jsonl(&mut out).unwrap();
+
+        let dir = tempfile::tempdir().unwrap();
+        let fresh = Library::open(&dir.path().join("library.db")).unwrap();
+        fresh.import_jsonl(&String::from_utf8(out).unwrap()).unwrap();
+        let past = fresh.history(id).unwrap();
+        assert_eq!(past.len(), 1, "what it used to say travels too");
+        assert!(past[0].1.contains("kersenhout"), "{past:?}");
+    }
+
+    // -------------------------------------------------------------- backup
+
+    /// A backup you cannot restore is a promise, not a fallback - the same
+    /// lesson the event log learned on 2026-08-15.
+    #[test]
+    fn an_export_restores_into_an_empty_library_with_every_number_intact() {
+        let (lib, _d) = stocked();
+        let retired = lib.add("eten", "Mislukt experiment met bier", "", &[]).unwrap();
+        lib.retire(retired, "smaakte nergens naar").unwrap();
+        let mut out: Vec<u8> = Vec::new();
+        let n = lib.export_jsonl(&mut out).unwrap();
+        assert!(n >= 4, "one line per shelf and per entry, retired included");
+
+        let dir = tempfile::tempdir().unwrap();
+        let fresh = Library::open(&dir.path().join("library.db")).unwrap();
+        fresh.import_jsonl(&String::from_utf8(out).unwrap()).unwrap();
+
+        assert_eq!(fresh.shelves().unwrap().len(), lib.shelves().unwrap().len());
+        assert_eq!(fresh.entries("eten", None).unwrap().len(), lib.entries("eten", None).unwrap().len());
+        let back = fresh.get(retired).unwrap().expect("the retired one travels too, under its own number");
+        assert!(back.retired);
+    }
+
+    #[test]
+    fn restoring_into_a_library_that_already_holds_something_is_refused() {
+        let (lib, _d) = stocked();
+        let mut out: Vec<u8> = Vec::new();
+        lib.export_jsonl(&mut out).unwrap();
+        assert!(lib.import_jsonl(&String::from_utf8(out).unwrap()).is_err());
+    }
+
     // -------------------------------------------------------------- health
 
     #[test]
@@ -770,7 +1354,8 @@ mod tests {
     #[test]
     fn a_shelf_listing_shows_titles_only_and_says_how_many_it_held_back() {
         let (lib, _d) = stocked();
-        let rendered = render_shelf("eten", &lib.entries("eten", None).unwrap(), 1);
+        let entries = lib.entries("eten", None).unwrap();
+        let rendered = render_shelf("eten", &entries, 1, entries.len());
         assert!(rendered.contains("shelf eten: 2 entries"), "{rendered}");
         assert!(!rendered.contains("1000 g bloem"), "a body must never appear in an index: {rendered}");
         assert!(rendered.contains("1 more not shown"), "a cap must say so: {rendered}");

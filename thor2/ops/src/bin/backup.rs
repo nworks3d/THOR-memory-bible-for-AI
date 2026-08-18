@@ -106,6 +106,29 @@ fn main() -> ExitCode {
     }
 
     // A backup is a write and a declaration, so it fails loudly (CONTRACT R5).
+    // THE SECOND LANE TRAVELS WITH THE FIRST. Until 2026-08-18 the hourly
+    // backup carried the event log and nothing else, so the library - the
+    // owner's recipes, books, training log - existed in exactly one file on
+    // one machine. Written before the export below, so both land in the same
+    // commit; a debounced run that commits nothing simply leaves a fresh file
+    // for the next one.
+    let library_path = library::default_path(&cli.db);
+    if library_path.exists() {
+        let out_dir = repo.join(&cli.subdir);
+        match std::fs::create_dir_all(&out_dir)
+            .map_err(|e| e.to_string())
+            .and_then(|()| library::Library::open(&library_path))
+            .and_then(|lib| {
+                let mut f = std::fs::File::create(out_dir.join("library.jsonl")).map_err(|e| e.to_string())?;
+                lib.export_jsonl(&mut f)
+            }) {
+            Ok(n) => println!("library: {n} line(s) exported"),
+            // Never let this stop the event-log backup: half a backup beats
+            // none, and the failure is printed rather than swallowed.
+            Err(e) => eprintln!("library: NOT exported ({e}) - the event log backup still runs"),
+        }
+    }
+
     match backup::backup_to_repo(&store, &repo, &cli.subdir, cli.force) {
         Ok(line) => {
             println!("{line}");

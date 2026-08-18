@@ -1640,6 +1640,7 @@ name = "library"
 version = "2.1.0"
 dependencies = [
  "rusqlite",
+ "serde_json",
  "tempfile",
 ]
 

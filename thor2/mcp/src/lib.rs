@@ -383,6 +383,191 @@ fn with_scope_menu(refusal: String, store: &thor_core::event_store::EventStore) 
     format!("{refusal}\n{}", serve::lookup::scope_menu(store))
 }
 
+/// The collection a write would be filed under: a register announces it
+/// through the first word of its key, exactly as `serve::lookup::catalog`
+/// reads it, and everything else through its project. `None` means the item
+/// joins no collection at all, which grounds 19 and 21 already govern.
+fn filed_under(item: &model::item::Item) -> Option<String> {
+    if item.kind == Kind::Lookup {
+        return item
+            .key
+            .as_deref()
+            .map(str::trim)
+            .filter(|k| !k.is_empty())
+            .and_then(|k| k.split_whitespace().next())
+            .map(str::to_string);
+    }
+    item.project.as_deref().map(str::trim).filter(|p| !p.is_empty()).map(str::to_string)
+}
+
+/// The project key this checkout answers to, as `install --project` wrote it.
+/// A new scope by that name is the owner naming his own repository, not an
+/// agent inventing a collection, so it is the one new name this door allows.
+fn checkout_project(root: Option<&std::path::Path>) -> Option<String> {
+    let text = std::fs::read_to_string(root?.join(".thor-project")).ok()?;
+    text.lines().map(str::trim).find(|l| !l.is_empty()).map(str::to_string)
+}
+
+/// REFUSE OPENING A NEW COLLECTION. The owner names collections; an agent
+/// picks from the ones that exist or asks.
+///
+/// THE DEFECT THIS CLOSES, measured twice in two days on the owner's own
+/// store. A register holding his personal profile was written with a
+/// collection nobody had ever named, without a single question, and the next
+/// session proposed a second one beside it - both times material about his own
+/// life, both times in the work lane rather than in the library, and both
+/// times the only thing standing in the way was a sentence in a tool
+/// description. This workspace's own doctrine says exactly what that is worth:
+/// a reminder was measured not to change behaviour and a gate was, which is
+/// why `library::add` refuses an unknown shelf outright. The work lane had no
+/// equivalent, so the one door with no question on it was the one an agent
+/// reached for.
+///
+/// Deliberately an EXISTENCE check and never a judgement about the text: this
+/// door cannot tell a recipe from a deploy rule, and a heuristic that tried
+/// would be the substring rulebook that has twice failed to generalise here.
+/// What it can tell, exactly, is whether this collection has ever been named
+/// before - and that is the question the agent was skipping.
+///
+/// The refusal names BOTH lanes, because "which scope" is the wrong question
+/// when the honest answer is "this is not work knowledge at all". A door that
+/// only listed scopes would push everyday knowledge deeper into the lane it
+/// does not belong in.
+fn refuse_a_new_collection(
+    item: &model::item::Item,
+    store: &thor_core::event_store::EventStore,
+    library: Option<&std::path::Path>,
+    root: Option<&std::path::Path>,
+    named_by_owner: Option<&str>,
+) -> Result<(), String> {
+    let Some(wanted) = filed_under(item) else { return Ok(()) };
+    let known = serve::lookup::catalog(store);
+    if known.scopes.iter().any(|s| s.scope.eq_ignore_ascii_case(&wanted)) {
+        return Ok(());
+    }
+    if checkout_project(root).is_some_and(|p| p.eq_ignore_ascii_case(&wanted)) {
+        return Ok(());
+    }
+    // THE WAY THROUGH, and the only one: the owner was asked and answered.
+    // Deliberately his NAME repeated back rather than a yes/no flag - a
+    // boolean is a box any caller can tick without a conversation ever having
+    // happened, while a name that has to match the one being written is a
+    // thing you can only fill in if you were told it. It is not proof, and it
+    // is not meant to be: it is the difference between a door that can be
+    // walked through absent-mindedly and one you have to mean.
+    if named_by_owner.map(str::trim).is_some_and(|n| n.eq_ignore_ascii_case(&wanted)) {
+        return Ok(());
+    }
+    if let Some(mismatch) = named_by_owner.map(str::trim).filter(|n| !n.is_empty()) {
+        return Err(format!(
+            "REFUSED: this write says the owner named a new collection '{mismatch}', but it files the item \
+             under '{wanted}'. Those have to be the same word - write it where he said, or ask him again \
+             which of the two he meant."
+        ));
+    }
+    Err(format!(
+        "REFUSED: nothing is filed under '{wanted}' yet, so this write would open a new place in the \
+         memory, and only the owner names one. Nothing was written. Do exactly ONE of these two, in \
+         this order:\n\
+         1. DOES IT FIT SOMEWHERE THAT ALREADY EXISTS? Then file it there. Both lanes are listed \
+         below: the work memory (scopes) for the projects, the library (shelves) for anything about \
+         his own life - a recipe, a book, a training log, an expense. Growth inside a place goes into \
+         labels, never into another place.\n\
+         2. DOES IT HONESTLY FIT NONE OF THEM? Then STOP and ASK HIM what this new one should be \
+         called, and put the word he answers with in 'new_collection_named_by_owner' on your next \
+         call. That is the only way a new place is ever opened.\n\
+         What you may not do is pick the nearest place to be done with it. A fact in the wrong place \
+         is worse than a question: he will not find it, and nobody will notice it is there.\n{}\n{}",
+        serve::lookup::scope_menu(store),
+        shelf_menu(library)
+    ))
+}
+
+/// Past this many characters, a library entry is asked whether it is really
+/// ONE thing.
+///
+/// MEASURED on the owner's own library the night this was written: 74 of 84
+/// entries sit under 300 characters, four more under 600, and the largest
+/// legitimate entry is a single pizza dough recipe at 1478. The pile that
+/// prompted this - a training schema, an injury, the equipment, a body
+/// measurement and a nutrition plan in one - was about 1400. So LENGTH ALONE
+/// CANNOT TELL THEM APART, and a hard cap would refuse the recipe to catch the
+/// pile. The number below is not a limit; it is where the question starts.
+const ASK_IF_LONGER_THAN: usize = 600;
+
+/// Is this long body one thing, or several glued together?
+///
+/// Nothing here judges the text - it cannot, and every attempt in this
+/// workspace to have a rulebook judge content has failed to generalise. What
+/// it does is refuse to let a long entry through in silence: name the single
+/// thing it is, or split it. Measured the same night, on the same pile: prose
+/// in the tool description moved the middle model and did nothing at all to
+/// the cheapest one, which filed the whole pile as one entry twice. A question
+/// that has to be answered is the only thing this workspace has ever measured
+/// as changing that.
+fn refuse_a_pile(args: &ShelveArgs, already_asked: bool) -> Result<(), String> {
+    let body = args.body.trim();
+    if body.chars().count() <= ASK_IF_LONGER_THAN {
+        return Ok(());
+    }
+    let said = args.one_thing_because.as_deref().map(str::trim).unwrap_or("");
+    // A real sentence, not a tick - and only from a caller that has already
+    // been refused once. Answering before the question was asked is what the
+    // cheapest model did on its first try, which is how a five-part pile got
+    // in with a reason that listed all five parts.
+    if already_asked && said.split_whitespace().count() >= 4 {
+        return Ok(());
+    }
+    Err(format!(
+        "REFUSED: this entry's body is {} characters, and at that size it is usually several things          glued together - a schema AND an injury AND the equipment AND a measurement. An entry that          holds five things cannot be found by four of them, and it cannot be corrected without          retiring the whole thing. Nothing was written. Do ONE of these two:
+         1. SPLIT IT. File each thing as its own entry on this same shelf, each with a title that          stands on its own and its own labels. That is what labels are for.
+         2. IT REALLY IS ONE THING? Send it AGAIN with 'one_thing_because' naming that one thing in          a real sentence - \"one pizza dough recipe\", \"one training day from warm-up to last set\".          A long recipe is one thing and goes in on that second call. A reason that lists several          things - the schema AND the food AND the injury - is not naming one thing, it is describing          a pile, and splitting is the answer. This question is always asked once, before any reason          counts.",
+        body.chars().count()
+    ))
+}
+
+/// What makes two shelve calls "the same pile": the shelf and the title, NOT
+/// the body.
+///
+/// MEASURED on the middle model the night this was written: it answered the
+/// question, tightened the text a little on each retry, and every retry read
+/// as a brand new pile that had never been asked - so it was asked again, and
+/// again, thirty-seven calls in twelve minutes. Splitting changes the title
+/// (that is what a split IS), so a split still never inherits a question,
+/// while "same thing, said better" now lands on the second call as it should.
+fn pile_key(args: &ShelveArgs) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    args.shelf.trim().to_lowercase().hash(&mut h);
+    args.title.trim().to_lowercase().hash(&mut h);
+    // A correction usually leaves the title empty to keep the one it has, so
+    // without the number every long correction on a shelf would share one key
+    // - and one refusal would wave the rest through.
+    args.id.hash(&mut h);
+    h.finish()
+}
+
+/// The library's shelves, for a refusal that has to show both lanes. A missing
+/// or unreadable library says so plainly rather than pretending there are no
+/// shelves - "there are none" would read as permission to invent one.
+fn shelf_menu(library: Option<&std::path::Path>) -> String {
+    let Some(path) = library else {
+        return "shelves in the library: no library is wired up on this machine, so ask the owner before \
+                treating this as everyday knowledge"
+            .to_string();
+    };
+    match ::library::Library::open(path).and_then(|lib| lib.shelves()) {
+        Ok(shelves) if shelves.is_empty() => {
+            "shelves in the library: none yet - ask the owner what the first one should be called".to_string()
+        }
+        Ok(shelves) => format!(
+            "shelves in the library: {}",
+            shelves.iter().map(|s| format!("{} ({})", s.name, s.entries)).collect::<Vec<_>>().join(", ")
+        ),
+        Err(e) => format!("shelves in the library: could not be read ({e})"),
+    }
+}
+
 /// Only a check that is TRIED and stays SILENT is refused. A check that cannot
 /// be tried without a working copy passes - reporting it as unproven belongs
 /// to `doctor`, not to a door that would otherwise refuse every file-reading
@@ -533,6 +718,18 @@ pub struct RememberArgs {
     /// session start). Only a Rule/Orientation may set this.
     #[serde(default)]
     pub always: bool,
+    /// THE OWNER JUST NAMED A NEW COLLECTION - repeat that name here, exactly
+    /// as he gave it, and it will be opened.
+    ///
+    /// This is the ONLY way a collection that does not exist yet can be
+    /// written to, and it exists for one flow: nothing that exists fits, you
+    /// showed him the refusal with both lanes in it, you ASKED him, and he
+    /// answered with a name. Never fill this in on your own judgement, never
+    /// to get past a refusal, and never with a name you thought of - the whole
+    /// point is that the naming was his. It must match the project (or the
+    /// register's key) on this same call, or the write is refused anyway.
+    #[serde(default)]
+    pub new_collection_named_by_owner: Option<String>,
 }
 
 /// `Default` is derived on purpose. Every field added here used to break
@@ -636,6 +833,13 @@ pub struct ReviseArgs {
     /// Replaces whether this item is bound Always - see `moments`' own note.
     #[serde(default)]
     pub always: Option<bool>,
+    /// THE OWNER JUST NAMED A NEW COLLECTION - repeat that name here, exactly
+    /// as he gave it. Same field, same rule and same one flow as on remember:
+    /// only after nothing fitted, you showed him the refusal and he answered
+    /// with a name. It must match the project (or key) this call files the
+    /// item under.
+    #[serde(default)]
+    pub new_collection_named_by_owner: Option<String>,
 }
 
 #[derive(Deserialize, Serialize, schemars::JsonSchema)]
@@ -701,7 +905,18 @@ pub struct LibraryArgs {
 pub struct ShelveArgs {
     /// An EXISTING shelf. If none fits, ask the owner - you may not create one.
     pub shelf: String,
-    /// One line that stands on its own. This is the index.
+    /// CORRECT AN ENTRY THAT ALREADY EXISTS instead of filing a new one: its
+    /// number, as the shelf listing shows it. The fields you give replace
+    /// what is there, the number stays, and the version you replaced stays
+    /// readable. Use this whenever something you already filed turns out to
+    /// be wrong, badly worded or missing a label - a second entry saying the
+    /// same thing better is how a shelf becomes unreadable. Omit it to file
+    /// something new.
+    #[serde(default)]
+    pub id: Option<i64>,
+    /// One line that stands on its own. This is the index. When correcting an
+    /// entry (see `id`), leave it empty to keep the title it has.
+    #[serde(default)]
     pub title: String,
     /// The rest, at any length. Optional.
     #[serde(default)]
@@ -709,6 +924,17 @@ pub struct ShelveArgs {
     /// Optional labels for filtering inside a shelf.
     #[serde(default)]
     pub labels: Vec<String>,
+    /// WHY THIS LONG BODY IS STILL ONE THING - required past the length where
+    /// an entry is usually several glued together, and ignored below it.
+    ///
+    /// Name the single thing it is ("one pizza dough recipe", "one training
+    /// day, warm-up to last set"), in a real sentence. If you cannot name it
+    /// in one, that is the answer: it is more than one thing, so file it as
+    /// separate entries on the same shelf and give them labels. Do not write
+    /// filler here to get past the question - the whole reason it is asked is
+    /// that nothing else can tell a long recipe from a pile.
+    #[serde(default)]
+    pub one_thing_because: Option<String>,
 }
 
 #[derive(Deserialize, Serialize, schemars::JsonSchema)]
@@ -863,6 +1089,21 @@ pub struct ThorMcpServer {
     /// library tools say plainly that no library is configured; they never
     /// answer empty, which would read as "you have nothing filed".
     library: Option<Arc<PathBuf>>,
+    /// The long library entries this server has already asked about, so the
+    /// question is asked BEFORE the answer counts.
+    ///
+    /// MEASURED the night this was added: documenting the escape hatch in the
+    /// tool schema meant the cheapest model filled it in on its FIRST attempt
+    /// and never saw the refusal at all - its reason enumerated four things
+    /// while claiming to name one, and the pile went straight in. A door you
+    /// can walk through without stopping is not a door. So the first long
+    /// entry is always refused, and only a caller that comes back after
+    /// reading that refusal can answer it.
+    ///
+    /// In memory on purpose: a restart costs one extra refusal, which is the
+    /// cheapest possible failure mode, and nothing about this belongs in the
+    /// log forever.
+    asked_piles: Arc<Mutex<std::collections::HashSet<u64>>>,
     #[allow(dead_code)] // read only inside the #[tool_handler] macro expansion
     tool_router: ToolRouter<Self>,
 }
@@ -879,6 +1120,7 @@ impl ThorMcpServer {
             root: None,
             inbox: None,
             library: None,
+            asked_piles: Arc::new(Mutex::new(std::collections::HashSet::new())),
             tool_router: Self::tool_router(),
         }
     }
@@ -897,6 +1139,7 @@ impl ThorMcpServer {
             root: None,
             inbox: None,
             library: None,
+            asked_piles: Arc::new(Mutex::new(std::collections::HashSet::new())),
             tool_router: Self::tool_router(),
         }
     }
@@ -1015,6 +1258,7 @@ impl ThorMcpServer {
             return queued;
         }
         let root = self.root.clone();
+        let library = self.library.clone();
         self.blocking(move |s| {
             let kind = Kind::from_str(&args.kind).map_err(|e| format!("invalid 'kind': {e}"))?;
             let severity = match args.severity.as_deref() {
@@ -1046,6 +1290,15 @@ impl ThorMcpServer {
             if let Err(why) = refuse_an_unproven_check(&item) {
                 return Err(why);
             }
+            if let Err(why) = refuse_a_new_collection(
+                &item,
+                s,
+                library.as_deref().map(|p| p.as_path()),
+                root.as_deref().map(|p| p.as_path()),
+                args.new_collection_named_by_owner.as_deref(),
+            ) {
+                return Err(why);
+            }
             match model::store::declare_in(s, SESSION_ID, LINEAGE_ID, ACTOR, &item, root.as_deref().map(|p| p.as_path())) {
                 Ok(event) => Ok(with_warnings(
                     format!("stored '{}' ({:?}, event seq {})", item.id, item.kind, event.seq),
@@ -1068,6 +1321,7 @@ impl ThorMcpServer {
         // `file_aware_warnings`). Cloned out here because the closure below
         // cannot borrow self.
         let revise_root = self.root.clone();
+        let revise_library = self.library.clone();
         self.blocking(move |s| {
             let existing = model::store::show(s, &args.id).map_err(|e| format!("cannot revise: {e}"))?;
             let bindings = if args.moments.is_some() || args.targets.is_some() || args.always.is_some() {
@@ -1216,6 +1470,18 @@ impl ThorMcpServer {
             // Same door as remember: a correction must not be able to swap a
             // working lock for one that fires nothing.
             if let Err(why) = refuse_an_unproven_check(&updated) {
+                return Err(why);
+            }
+            // And the same door as remember on where this gets FILED: moving an
+            // item into a collection nobody has named is opening one, whichever
+            // tool does it.
+            if let Err(why) = refuse_a_new_collection(
+                &updated,
+                s,
+                revise_library.as_deref().map(|p| p.as_path()),
+                revise_root.as_deref().map(|p| p.as_path()),
+                args.new_collection_named_by_owner.as_deref(),
+            ) {
                 return Err(why);
             }
             match model::store::revise(s, SESSION_ID, LINEAGE_ID, ACTOR, &gate_existing, &updated) {
@@ -1430,7 +1696,12 @@ impl ThorMcpServer {
         }
         match args.shelf.as_deref().filter(|s| !s.trim().is_empty()) {
             Some(shelf) => match lib.entries(shelf, args.label.as_deref()) {
-                Ok(entries) => ::library::render_shelf(shelf, &entries, SHOWN),
+                // The size of the SHELF, never of the narrowed list: a count
+                // that shrinks with the filter reads as "that is all there is".
+                Ok(entries) => {
+                    let total = lib.entries(shelf, None).map(|all| all.len()).unwrap_or(entries.len());
+                    ::library::render_shelf(shelf, &entries, SHOWN, total)
+                }
                 Err(e) => e,
             },
             None => match lib.shelves() {
@@ -1440,10 +1711,19 @@ impl ThorMcpServer {
         }
     }
 
-    #[tool(description = "FILE ONE ENTRY IN THE LIBRARY (the everyday lane, never the code lane). Use this - not remember - for anything about the owner's own life: a recipe, a book he read, a training session, an expense. The title is ONE line and is what a shelf listing shows, so make it stand on its own; the body holds the rest, at any length. YOU CANNOT CREATE A SHELF. If no existing shelf fits, the write is refused and names the shelves that do exist - then ASK the owner whether this needs a new shelf and what to call it, and let him create it. Never invent a shelf, and never file something on a shelf it does not belong to just to get past the refusal: that is how a library stops being worth reading. Growth inside a shelf goes into 'labels', never into more shelves. A near-duplicate of something already on that shelf is refused, pointing at the entry that exists, so read before you write.")]
+    #[tool(description = "FILE ONE ENTRY IN THE LIBRARY, OR CORRECT ONE (the everyday lane, never the code lane). Pass 'id' to correct an entry that already exists - same number, old version kept - instead of filing a near-copy beside it. WRITE IT IN THE LANGUAGE THE LIBRARY IS ALREADY WRITTEN IN - open a shelf first and look; this is the owner's personal memory and he searches it in his own words, so a title in another language is a title he will never find. An empty library takes the language the owner is speaking to you in. Never the language you happen to be thinking in. Use this - not remember - for anything about the owner's own life: a recipe, a book he read, a training session, an expense. The title is ONE line and is what a shelf listing shows, so make it stand on its own; the body holds the rest, at any length. YOU CANNOT CREATE A SHELF. If no existing shelf fits, the write is refused and names the shelves that do exist - then ASK the owner whether this needs a new shelf and what to call it, and let him create it. Never invent a shelf, and never file something on a shelf it does not belong to just to get past the refusal: that is how a library stops being worth reading. Growth inside a shelf goes into 'labels', never into more shelves. A near-duplicate of something already on that shelf is refused, pointing at the entry that exists, so read before you write.")]
     async fn shelve(&self, Parameters(args): Parameters<ShelveArgs>) -> String {
         if let Some(queued) = self.capture("shelve", &args) {
             return queued;
+        }
+        {
+            let key = pile_key(&args);
+            let mut asked = self.asked_piles.lock().unwrap();
+            let already = asked.contains(&key);
+            if let Err(why) = refuse_a_pile(&args, already) {
+                asked.insert(key);
+                return why;
+            }
         }
         let Some(path) = self.library.clone() else {
             return "no library is configured for this server, so nothing can be filed. Tell the owner the library path is not wired up - do not fall back to remember for everyday knowledge.".to_string();
@@ -1452,6 +1732,33 @@ impl ThorMcpServer {
             Ok(lib) => lib,
             Err(e) => return e,
         };
+        if let Some(id) = args.id {
+            // THE SILENT MOVE THIS PREVENTS: `revise` works on the number
+            // alone, so naming another shelf used to be ignored and answered
+            // with "revised" - an agent that thought it moved an entry got a
+            // success and the entry never went anywhere.
+            match lib.get(id) {
+                Ok(Some(entry)) if !entry.shelf.eq_ignore_ascii_case(args.shelf.trim()) => {
+                    return format!(
+                        "REFUSED: entry {id} is on shelf '{}', not on '{}'. Correcting works on the entry where                          it is. If it is on the wrong shelf, say so to the owner - moving an entry is his own                          command, and it keeps the number and the history. Name its own shelf to correct it.",
+                        entry.shelf,
+                        args.shelf.trim()
+                    );
+                }
+                Ok(None) => return format!("REFUSED: there is no entry {id} - check the number in the shelf listing"),
+                Err(e) => return e,
+                _ => {}
+            }
+            let labels = if args.labels.is_empty() { None } else { Some(args.labels.as_slice()) };
+            let body = if args.body.trim().is_empty() { None } else { Some(args.body.as_str()) };
+            let title = if args.title.trim().is_empty() { None } else { Some(args.title.as_str()) };
+            return match lib.revise(id, title, body, labels) {
+                Ok(()) => format!(
+                    "revised {id} - what it said before stays readable, and its number did not change"
+                ),
+                Err(refusal) => format!("REFUSED: {refusal}"),
+            };
+        }
         match lib.add(&args.shelf, &args.title, &args.body, &args.labels) {
             Ok(id) => format!("filed {id} on shelf {}", args.shelf.trim()),
             Err(refusal) => format!("REFUSED: {refusal}"),
@@ -1950,8 +2257,37 @@ mod tests {
         ThorMcpServer::new(EventStore::in_memory().unwrap())
     }
 
+    /// A server whose store already holds these collections, seeded through the
+    /// OWNER'S path rather than the agent's door.
+    ///
+    /// Since `refuse_a_new_collection`, filing into a collection nobody has
+    /// named is refused at the agent door on purpose, so a fixture that needs a
+    /// scope can no longer conjure one by writing into it - which is the whole
+    /// point of that door and would otherwise be quietly untested.
+    fn server_knowing(scopes: &[&str]) -> ThorMcpServer {
+        let mut store = EventStore::in_memory().unwrap();
+        for scope in scopes {
+            let seed = model::item::Item {
+                id: format!("seed-{scope}"),
+                kind: Kind::Report,
+                text: format!("the owner named the collection '{scope}'"),
+                bindings: Vec::new(),
+                severity: None,
+                project: Some(scope.to_string()),
+                tags: Vec::new(),
+                expires: None,
+                key: None,
+                falsifier: None,
+                check: None,
+            };
+            model::store::declare(&mut store, "seed", "seed", "owner", &seed).unwrap();
+        }
+        ThorMcpServer::new(store)
+    }
+
     fn base_remember(id: &str) -> RememberArgs {
         RememberArgs {
+            new_collection_named_by_owner: None,
             id: id.to_string(),
             kind: "rule".to_string(),
             text: "never force-push to main".to_string(),
@@ -2006,6 +2342,7 @@ mod tests {
         assert!(stored.starts_with("stored"), "fixture setup must succeed: {stored}");
 
         let revise_args = ReviseArgs {
+            new_collection_named_by_owner: None,
             append: None,
             replace_from: None,
             replace_to: None,
@@ -2321,6 +2658,7 @@ mod tests {
         srv.remember(Parameters(base_remember("revise-1"))).await;
 
         let revise_args = ReviseArgs {
+            new_collection_named_by_owner: None,
             append: None,
             replace_from: None,
             replace_to: None,
@@ -2490,6 +2828,7 @@ mod tests {
         assert!(srv.remember(Parameters(args)).await.starts_with("stored"));
 
         let revise_args = ReviseArgs {
+            new_collection_named_by_owner: None,
             append: None,
             replace_from: None,
             replace_to: None,
@@ -2532,6 +2871,7 @@ mod tests {
         assert!(srv.remember(Parameters(args)).await.starts_with("stored"));
 
         let revise_args = ReviseArgs {
+            new_collection_named_by_owner: None,
             append: None,
             replace_from: None,
             replace_to: None,
@@ -2579,6 +2919,7 @@ mod tests {
         assert!(srv.remember(Parameters(base_remember("check-clear-noop-1"))).await.starts_with("stored"));
 
         let revise_args = ReviseArgs {
+            new_collection_named_by_owner: None,
             append: None,
             replace_from: None,
             replace_to: None,
@@ -2616,6 +2957,7 @@ mod tests {
         assert!(srv.remember(Parameters(args)).await.starts_with("stored"));
 
         let revise_args = ReviseArgs {
+            new_collection_named_by_owner: None,
             append: None,
             replace_from: None,
             replace_to: None,
@@ -2673,6 +3015,7 @@ mod tests {
         assert!(srv.remember(Parameters(args)).await.starts_with("stored"));
 
         let revise_args = ReviseArgs {
+            new_collection_named_by_owner: None,
             append: None,
             replace_from: None,
             replace_to: None,
@@ -2798,6 +3141,7 @@ mod tests {
         assert!(srv.remember(Parameters(args)).await.starts_with("stored"));
 
         let revise_args = ReviseArgs {
+            new_collection_named_by_owner: None,
             append: None,
             replace_from: None,
             replace_to: None,
@@ -2848,6 +3192,7 @@ mod tests {
         assert!(srv.remember(Parameters(args)).await.starts_with("stored"));
 
         let revise_args = ReviseArgs {
+            new_collection_named_by_owner: None,
             append: None,
             replace_from: None,
             replace_to: None,
@@ -2968,6 +3313,7 @@ mod tests {
         assert!(srv.remember(Parameters(args)).await.starts_with("stored"));
 
         let revise_args = ReviseArgs {
+            new_collection_named_by_owner: None,
             append: None,
             replace_from: None,
             replace_to: None,
@@ -3020,6 +3366,7 @@ mod tests {
         assert!(srv.remember(Parameters(args)).await.starts_with("stored"));
 
         let revise_args = ReviseArgs {
+            new_collection_named_by_owner: None,
             append: None,
             replace_from: None,
             replace_to: None,
@@ -3061,6 +3408,7 @@ mod tests {
         assert!(srv.remember(Parameters(args)).await.starts_with("stored"));
 
         let revise_args = ReviseArgs {
+            new_collection_named_by_owner: None,
             append: None,
             replace_from: None,
             replace_to: None,
@@ -3104,7 +3452,7 @@ mod tests {
 
     #[tokio::test]
     async fn revise_clearing_a_populated_severity_succeeds() {
-        let srv = server();
+        let srv = server_knowing(&["thor2"]);
         let mut args = base_remember("clear-severity-1");
         // A second field, left alone by this revise, to prove clearing one
         // field never disturbs a sibling that was never named.
@@ -3112,6 +3460,7 @@ mod tests {
         assert!(srv.remember(Parameters(args)).await.starts_with("stored"));
 
         let revise_args = ReviseArgs {
+            new_collection_named_by_owner: None,
             append: None,
             replace_from: None,
             replace_to: None,
@@ -3142,7 +3491,7 @@ mod tests {
 
     #[tokio::test]
     async fn revise_clearing_a_populated_project_succeeds() {
-        let srv = server();
+        let srv = server_knowing(&["thor2"]);
         let mut args = base_remember("clear-project-1");
         // A REAL project name on purpose, never "global"/"null"/"-" - those
         // spellings already normalise to None on both sides of the
@@ -3155,6 +3504,7 @@ mod tests {
         assert!(srv.remember(Parameters(args)).await.starts_with("stored"));
 
         let revise_args = ReviseArgs {
+            new_collection_named_by_owner: None,
             append: None,
             replace_from: None,
             replace_to: None,
@@ -3192,12 +3542,13 @@ mod tests {
     /// spaces.
     #[tokio::test]
     async fn a_whitespace_only_value_clears_a_field_just_like_an_empty_string() {
-        let srv = server();
+        let srv = server_knowing(&["thor2"]);
         let mut args = base_remember("clear-project-ws");
         args.project = Some("thor2".to_string());
         assert!(srv.remember(Parameters(args)).await.starts_with("stored"));
 
         let revise_args = ReviseArgs {
+            new_collection_named_by_owner: None,
             append: None,
             replace_from: None,
             replace_to: None,
@@ -3227,12 +3578,13 @@ mod tests {
 
     #[tokio::test]
     async fn revise_clearing_a_populated_expires_succeeds() {
-        let srv = server();
+        let srv = server_knowing(&["test-project"]);
         // Only a Report may carry expires (gate::declare ground 2) -
         // blank_report already sets expires: Some("2027-01-01").
         assert!(srv.remember(Parameters(blank_report("clear-expires-1"))).await.starts_with("stored"));
 
         let revise_args = ReviseArgs {
+            new_collection_named_by_owner: None,
             append: None,
             replace_from: None,
             replace_to: None,
@@ -3274,6 +3626,7 @@ mod tests {
         assert!(srv.remember(Parameters(args)).await.starts_with("stored"));
 
         let revise_args = ReviseArgs {
+            new_collection_named_by_owner: None,
             append: None,
             replace_from: None,
             replace_to: None,
@@ -3303,7 +3656,7 @@ mod tests {
 
     #[tokio::test]
     async fn revise_clearing_a_populated_falsifier_succeeds() {
-        let srv = server();
+        let srv = server_knowing(&["test-project"]);
         // A Report on purpose, not a Rule/Orientation: those two REQUIRE a
         // falsifier (gate::declare ground 10), so clearing it there would
         // still be refused by declare(updated) regardless of ground 9,
@@ -3314,6 +3667,7 @@ mod tests {
         assert!(srv.remember(Parameters(args)).await.starts_with("stored"));
 
         let revise_args = ReviseArgs {
+            new_collection_named_by_owner: None,
             append: None,
             replace_from: None,
             replace_to: None,
@@ -3366,6 +3720,7 @@ mod tests {
         assert!(srv.remember(Parameters(args)).await.starts_with("stored"));
 
         let revise_args = ReviseArgs {
+            new_collection_named_by_owner: None,
             append: None,
             replace_from: None,
             replace_to: None,
@@ -3399,7 +3754,7 @@ mod tests {
 
     #[tokio::test]
     async fn pin_adds_the_always_binding_and_it_shows_up() {
-        let srv = server();
+        let srv = server_knowing(&["some-project"]);
         let mut args = base_remember("pin-1");
         args.always = false;
         // A project, because a source-file anchor on a GLOBAL item is refused
@@ -3423,7 +3778,7 @@ mod tests {
 
     #[tokio::test]
     async fn unpin_removes_the_always_binding_but_keeps_the_rest() {
-        let srv = server();
+        let srv = server_knowing(&["some-project"]);
         let mut args = base_remember("unpin-1");
         args.always = true;
         args.project = Some("some-project".to_string()); // see the note in the pin test
@@ -3485,7 +3840,7 @@ mod tests {
         // Named after the defect it prevents: session start scopes to a
         // project on purpose, but lookup (surface 4) must not - an item
         // declared under a DIFFERENT project must still come back.
-        let srv = server();
+        let srv = server_knowing(&["project-a", "project-b"]);
         let mut a = RememberArgs {
             kind: "report".to_string(),
             expires: Some("2027-01-01".to_string()),
@@ -3514,7 +3869,7 @@ mod tests {
 
     #[tokio::test]
     async fn lookup_by_key_answers_only_the_exact_lookup() {
-        let srv = server();
+        let srv = server_knowing(&["release-checklist", "test-project"]);
         let mut lookup_item = blank_report("release-checklist-item");
         lookup_item.kind = "lookup".to_string();
         lookup_item.text = "the release checklist lives in RELEASE.md".to_string();
@@ -3542,7 +3897,7 @@ mod tests {
     /// capped and still looks complete.
     #[tokio::test]
     async fn lookup_with_neither_query_nor_key_returns_the_catalogue() {
-        let srv = server();
+        let srv = server_knowing(&["boeken", "test-project"]);
         let mut register = blank_report("reg-boeken");
         register.kind = "lookup".to_string();
         register.key = Some("boeken 2026-08".to_string());
@@ -3560,7 +3915,7 @@ mod tests {
     /// nothing but writing the register - there is no table to keep in step.
     #[tokio::test]
     async fn a_register_announces_its_own_scope() {
-        let srv = server();
+        let srv = server_knowing(&["uitgaven"]);
         let mut register = blank_report("reg-uitgaven-2026-08");
         register.kind = "lookup".to_string();
         register.key = Some("uitgaven 2026-08".to_string());
@@ -3581,7 +3936,7 @@ mod tests {
     /// with the second one not glued onto the first.
     #[tokio::test]
     async fn a_second_entry_in_a_scope_is_its_own_item_not_a_line_glued_onto_the_first() {
-        let srv = server();
+        let srv = server_knowing(&["boeken"]);
         for (id, text) in [
             ("boek-dune", "2026-08-11 Dune - Frank Herbert, uitgelezen"),
             ("boek-piranesi", "2026-08-16 Piranesi - Susanna Clarke, halverwege"),
@@ -3595,7 +3950,7 @@ mod tests {
         let reply = srv
             .lookup(Parameters(LookupArgs { scope: Some("boeken".to_string()), query: None, key: None }))
             .await;
-        assert!(reply.contains("scope boeken: 2 item(s)"), "the true size comes first: {reply}");
+        assert!(reply.contains("scope boeken: 3 item(s)"), "the true size comes first, seed included: {reply}");
         let listed: Vec<&str> = reply.lines().filter(|l| l.starts_with("  boek-")).collect();
         assert_eq!(listed.len(), 2, "one line per book, in date order: {reply}");
         assert!(listed[0].contains("Dune") && listed[1].contains("Piranesi"), "{reply}");
@@ -3605,7 +3960,7 @@ mod tests {
     /// holds both books, the scoped answer holds only the one filed there.
     #[tokio::test]
     async fn a_scope_narrows_a_query_to_that_scope_alone() {
-        let srv = server();
+        let srv = server_knowing(&["boeken", "eten"]);
         for (id, text, scope) in [
             ("boek-desem", "Desem - het complete handboek over gist", "boeken"),
             ("recept-desem", "Desembrood bakken: 20 uur rijzen op kamertemperatuur", "eten"),
@@ -3636,7 +3991,7 @@ mod tests {
     /// the gate that produces it is handed an item and never the store.
     #[tokio::test]
     async fn a_write_with_no_scope_is_refused_with_the_existing_scopes_named() {
-        let srv = server();
+        let srv = server_knowing(&["eten"]);
         let mut filed = blank_report("recept-1");
         filed.project = Some("eten".to_string());
         filed.text = "Zoete aardappel uit de oven met bruine boter.".to_string();
@@ -3651,6 +4006,262 @@ mod tests {
         assert!(reply.contains("scopes that already exist"), "the choice must come with the refusal: {reply}");
         assert!(reply.contains("eten"), "and it must name the real ones: {reply}");
         assert!(reply.contains("ask the owner"), "if none fits, asking beats inventing: {reply}");
+    }
+
+    /// THE DEFECT THIS CLOSES, measured twice in two days: an agent filed the
+    /// owner's personal profile under a collection nobody had ever named, and
+    /// the next session proposed a second one beside it. Both were about his
+    /// own life and belonged in the library; nothing asked, because nothing
+    /// could.
+    #[tokio::test]
+    async fn opening_a_collection_nobody_named_is_refused_and_names_both_lanes() {
+        let srv = server_knowing(&["eten"]);
+        let mut invented = blank_report("voeding-1");
+        invented.project = Some("voeding-fitness".to_string());
+        invented.text = "140 g eiwit per dag, wei na de training.".to_string();
+        let reply = srv.remember(Parameters(invented)).await;
+
+        assert!(reply.contains("REFUSED"), "an invented collection must not land: {reply}");
+        assert!(reply.contains("voeding-fitness"), "it must say which name it refused: {reply}");
+        assert!(reply.contains("scopes that already exist"), "the work lane, to pick from: {reply}");
+        assert!(reply.contains("shelves in the library"), "and the other lane, which is often the right one: {reply}");
+        assert!(reply.contains("ASK HIM"), "asking beats inventing: {reply}");
+        assert!(
+            reply.contains("new_collection_named_by_owner"),
+            "and the refusal has to say how to finish once he answers: {reply}"
+        );
+    }
+
+    /// A register carries its collection in its own key, so an agent writing
+    /// one is opening a collection whatever it looks like - that is exactly how
+    /// the profile got in.
+    #[tokio::test]
+    async fn a_register_on_an_unnamed_key_is_refused_too() {
+        let srv = server_knowing(&["eten"]);
+        let mut register = blank_report("profiel-1");
+        register.kind = "lookup".to_string();
+        register.key = Some("profiel".to_string());
+        register.project = None;
+        let reply = srv.remember(Parameters(register)).await;
+        assert!(reply.contains("REFUSED"), "a register opens a collection too: {reply}");
+        assert!(reply.contains("profiel"), "{reply}");
+    }
+
+    /// The agent door has to be able to CORRECT what it filed, or the only
+    /// way to fix a typo is a second entry saying the same thing better -
+    /// which is how a shelf stops being worth reading.
+    #[tokio::test]
+    async fn shelve_with_a_number_corrects_that_entry_instead_of_filing_a_second_one() {
+        let dir = tempfile::tempdir().unwrap();
+        let srv = ThorMcpServer::new(EventStore::in_memory().unwrap())
+            .with_library(dir.path().join("library.db"));
+        ::library::Library::open(&dir.path().join("library.db")).unwrap().create_shelf("eten", "").unwrap();
+
+        let filed = srv
+            .shelve(Parameters(ShelveArgs {
+                id: None,
+                shelf: "eten".to_string(),
+                title: "Spareribs met kersenhout".to_string(),
+                body: "Twee uur op 120 graden.".to_string(),
+                labels: vec!["bbq".to_string()],
+                one_thing_because: None,
+            }))
+            .await;
+        assert!(filed.starts_with("filed"), "{filed}");
+        let id: i64 = filed.split_whitespace().nth(1).unwrap().parse().unwrap();
+
+        let fixed = srv
+            .shelve(Parameters(ShelveArgs {
+                id: Some(id),
+                shelf: "eten".to_string(),
+                title: "Spareribs met appelhout".to_string(),
+                body: String::new(),
+                labels: vec![],
+                one_thing_because: None,
+            }))
+            .await;
+        assert!(fixed.starts_with("revised"), "{fixed}");
+
+        let lib = ::library::Library::open(&dir.path().join("library.db")).unwrap();
+        assert_eq!(lib.entries("eten", None).unwrap().len(), 1, "one entry, not two");
+        let now = lib.get(id).unwrap().unwrap();
+        assert!(now.title.contains("appelhout"));
+        assert!(now.body.contains("120 graden"), "a field you did not mention keeps its value");
+        assert_eq!(lib.history(id).unwrap().len(), 1, "and the old version is kept");
+    }
+
+    /// THE PILE THIS REFUSES, measured the night it was written: a schema, an
+    /// injury, the equipment, a measurement and a nutrition plan arrived as one
+    /// entry, twice, from two different models. Prose in the tool description
+    /// moved one of them and not the other.
+    #[tokio::test]
+    async fn a_long_body_with_no_answer_is_refused_and_says_to_split_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let srv = ThorMcpServer::new(EventStore::in_memory().unwrap())
+            .with_library(dir.path().join("library.db"));
+        ::library::Library::open(&dir.path().join("library.db")).unwrap().create_shelf("fitness", "").unwrap();
+
+        let reply = srv
+            .shelve(Parameters(ShelveArgs {
+                id: None,
+                shelf: "fitness".to_string(),
+                title: "Alles over mijn training".to_string(),
+                body: "x".repeat(900),
+                labels: vec![],
+                one_thing_because: None,
+            }))
+            .await;
+        assert!(reply.contains("REFUSED"), "{reply}");
+        assert!(reply.contains("SPLIT IT"), "the first way out is splitting: {reply}");
+        assert!(reply.contains("one_thing_because"), "and the second is naming the one thing: {reply}");
+    }
+
+    /// THE DEFECT THIS CLOSES, measured on the cheapest model: it read the
+    /// escape hatch in the tool schema, filled it in on its FIRST call, and
+    /// never saw the refusal - so the pile landed with a reason that listed
+    /// four things while claiming to name one.
+    #[tokio::test]
+    async fn an_answer_given_before_the_question_was_asked_does_not_count() {
+        let dir = tempfile::tempdir().unwrap();
+        let srv = ThorMcpServer::new(EventStore::in_memory().unwrap())
+            .with_library(dir.path().join("library.db"));
+        ::library::Library::open(&dir.path().join("library.db")).unwrap().create_shelf("fitness", "").unwrap();
+
+        let reply = srv
+            .shelve(Parameters(ShelveArgs {
+                id: None,
+                shelf: "fitness".to_string(),
+                title: "Bovenlichaamtraining na 8 maanden pauze".to_string(),
+                body: "x".repeat(1013),
+                labels: vec![],
+                one_thing_because: Some(
+                    "Dit is een trainingsplan met schema, gewichten, voeding en preventie".to_string(),
+                ),
+            }))
+            .await;
+        assert!(reply.contains("REFUSED"), "the pile must stop at the question: {reply}");
+    }
+
+    /// A long entry that IS one thing goes in - the owner's own library holds a
+    /// pizza dough recipe of 1478 characters, and refusing that to catch a pile
+    /// would be the cure being worse.
+    #[tokio::test]
+    async fn a_long_body_that_names_the_one_thing_it_is_lands() {
+        let dir = tempfile::tempdir().unwrap();
+        let srv = ThorMcpServer::new(EventStore::in_memory().unwrap())
+            .with_library(dir.path().join("library.db"));
+        ::library::Library::open(&dir.path().join("library.db")).unwrap().create_shelf("eten", "").unwrap();
+
+        let args = || ShelveArgs {
+            id: None,
+            shelf: "eten".to_string(),
+            title: "Pizzadeeg voor de Kamado".to_string(),
+            body: "x".repeat(900),
+            labels: vec![],
+            one_thing_because: Some("dit is een recept voor pizzadeeg".to_string()),
+        };
+        // The first call is refused even WITH the reason: answering a question
+        // that was never asked is what let a five-part pile in.
+        let first = srv.shelve(Parameters(args())).await;
+        assert!(first.contains("REFUSED"), "the question comes first: {first}");
+        let second = srv.shelve(Parameters(args())).await;
+        assert!(second.starts_with("filed"), "and the same call after it lands: {second}");
+    }
+
+    /// A tick is not an answer. If four words is too much to write, the honest
+    /// reading is that it was not one thing.
+    #[tokio::test]
+    async fn a_one_word_excuse_does_not_get_a_pile_past_the_question() {
+        let dir = tempfile::tempdir().unwrap();
+        let srv = ThorMcpServer::new(EventStore::in_memory().unwrap())
+            .with_library(dir.path().join("library.db"));
+        ::library::Library::open(&dir.path().join("library.db")).unwrap().create_shelf("eten", "").unwrap();
+
+        let args = || ShelveArgs {
+            id: None,
+            shelf: "eten".to_string(),
+            title: "Van alles".to_string(),
+            body: "x".repeat(900),
+            labels: vec![],
+            one_thing_because: Some("ja".to_string()),
+        };
+        assert!(srv.shelve(Parameters(args())).await.contains("REFUSED"));
+        let again = srv.shelve(Parameters(args())).await;
+        assert!(again.contains("REFUSED"), "a tick is not an answer, however often it is sent: {again}");
+    }
+
+    /// The ordinary entry - and 74 of the owner's 84 are under 300 characters -
+    /// is never asked anything.
+    #[tokio::test]
+    async fn a_normal_sized_entry_is_never_asked_the_question() {
+        let dir = tempfile::tempdir().unwrap();
+        let srv = ThorMcpServer::new(EventStore::in_memory().unwrap())
+            .with_library(dir.path().join("library.db"));
+        ::library::Library::open(&dir.path().join("library.db")).unwrap().create_shelf("eten", "").unwrap();
+
+        let reply = srv
+            .shelve(Parameters(ShelveArgs {
+                id: None,
+                shelf: "eten".to_string(),
+                title: "Spareribs op de Kamado".to_string(),
+                body: "Twee uur op 120 graden met kersenhout, dan 30 minuten in folie.".to_string(),
+                labels: vec!["bbq".to_string()],
+                one_thing_because: None,
+            }))
+            .await;
+        assert!(reply.starts_with("filed"), "{reply}");
+    }
+
+    /// The way through when nothing fits: the agent asked, the owner named it,
+    /// and the name he gave comes back on the next call. Without this the
+    /// refusal is a dead end - it tells the agent to ask and then has nothing
+    /// for the answer.
+    #[tokio::test]
+    async fn a_collection_the_owner_named_himself_is_opened_on_the_next_call() {
+        let srv = server_knowing(&["eten"]);
+        let mut asked = blank_report("loop-1");
+        asked.project = Some("hardlopen".to_string());
+        asked.new_collection_named_by_owner = Some("hardlopen".to_string());
+        assert!(srv.remember(Parameters(asked)).await.starts_with("stored"));
+    }
+
+    /// The name has to be the one being written, or the field is just a box
+    /// that was ticked - which is exactly the enforcement this workspace
+    /// refuses to build.
+    #[tokio::test]
+    async fn a_name_that_does_not_match_what_is_being_written_is_still_refused() {
+        let srv = server_knowing(&["eten"]);
+        let mut sneaky = blank_report("loop-2");
+        sneaky.project = Some("sport".to_string());
+        sneaky.new_collection_named_by_owner = Some("hardlopen".to_string());
+        let reply = srv.remember(Parameters(sneaky)).await;
+        assert!(reply.contains("REFUSED"), "{reply}");
+        assert!(reply.contains("have to be the same word"), "{reply}");
+    }
+
+    /// Filing into a collection that EXISTS is the whole point, and stays one
+    /// call. A door that made every write ask would be friction, not a gate.
+    #[tokio::test]
+    async fn filing_into_a_collection_that_already_exists_still_lands_in_one_call() {
+        let srv = server_knowing(&["eten"]);
+        let mut fits = blank_report("recept-1");
+        fits.project = Some("eten".to_string());
+        fits.text = "Zoete aardappel uit de oven met bruine boter.".to_string();
+        assert!(srv.remember(Parameters(fits)).await.starts_with("stored"));
+    }
+
+    /// The one new name this door allows: the checkout's own project key, which
+    /// the owner wrote himself when he gave the repository a memory. Refusing
+    /// that would mean no new project could ever record its first fact.
+    #[tokio::test]
+    async fn the_checkouts_own_project_key_may_still_be_used_the_first_time() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join(".thor-project"), "verse-repo\n").unwrap();
+        let srv = ThorMcpServer::new(EventStore::in_memory().unwrap()).with_root(dir.path().to_path_buf());
+
+        let mut first = blank_report("eerste-feit");
+        first.project = Some("verse-repo".to_string());
+        assert!(srv.remember(Parameters(first)).await.starts_with("stored"));
     }
 
     /// The list is attached to THAT refusal only. Every other refusal stays as
@@ -3711,6 +4322,7 @@ mod tests {
 
     fn blank_report(id: &str) -> RememberArgs {
         RememberArgs {
+            new_collection_named_by_owner: None,
             id: id.to_string(),
             kind: "report".to_string(),
             text: "placeholder".to_string(),
@@ -3755,7 +4367,7 @@ mod tests {
     /// serving count was measured to be the wrong one.
     #[tokio::test]
     async fn two_noise_judgements_retire_an_item_but_leave_it_findable() {
-        let srv = server();
+        let srv = server_knowing(&["some-project"]);
         // A TARGET-bound rule on purpose: an Always-bound one is exempt from
         // decay by design (a pin is the owner's own standing choice), so
         // using the pinned fixture here would assert against the exemption

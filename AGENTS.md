@@ -67,10 +67,27 @@ thor2/target/release/install.exe --project "<project-name>"
 ```
 
 Skip this and THOR gets worse the more they use it, because every search starts
-competing with projects they were not asking about. It writes a small file
-called `.thor-project` holding that name. It refuses to change a name already
+competing with projects they were not asking about.
+
+That one command does three things, and they are the whole of what "a new
+project" means here:
+
+- it writes a small file called `.thor-project` holding that name, which is
+  what binds this folder to that scope,
+- it reads this project's code once, so searching the code, finding where a
+  symbol is used and outlining a file answer here at all,
+- and from then on every commit keeps that reading fresh by itself.
+
+Run it FROM the folder the code is in. If the code sits one directory down,
+run it there - it does not look downward. It refuses to change a name already
 there, which is correct: renaming a scope would strand every note filed under
-the old one.
+the old one. Two answers you may get instead, both with the fix in them: a
+folder with no git in it cannot be read (start a repository there first), and a
+repository on a network share that git will not open as you needs one
+`safe.directory` line before it can be.
+
+You may not invent the name. The owner names a scope; if nothing that exists
+fits, ask him and use the word he gives you.
 
 **6. Prove it works before you say it works.** Store one real note, then start a
 fresh conversation and check that it comes back. Only then tell them setup is

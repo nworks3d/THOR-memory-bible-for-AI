@@ -24,6 +24,10 @@ use crate::gitutil::{self, ChangedPath, GitError};
 pub enum CodeIndexError {
     /// `path` is not inside a git working tree - refused, not guessed at.
     NotAGitRepo(std::path::PathBuf),
+    /// A real repository git will not read as this user. Kept apart from
+    /// `NotAGitRepo` because the fix is completely different, and calling
+    /// this one "not a repository" sends people looking for the wrong thing.
+    GitRefusesRepo { path: std::path::PathBuf, said: String },
     Git(GitError),
     Sql(rusqlite::Error),
     /// `refresh` was called before `build_full` ever ran against this store.
@@ -34,8 +38,16 @@ impl std::fmt::Display for CodeIndexError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             CodeIndexError::NotAGitRepo(p) => {
-                write!(f, "{} is not inside a git repository - codeindex only ever indexes from git, so there is nothing to read here", p.display())
+                write!(f, "{} is not inside a git repository - codeindex only ever indexes from git, so there is nothing to read here. Run `git init` there first if this is meant to be code", p.display())
             }
+            CodeIndexError::GitRefusesRepo { path, said } => write!(
+                f,
+                "{} IS a git repository, but git refuses to read it as you: {said}. This is what a repository on a \
+                 network share looks like - the folder is owned by another account. Trust it once with \
+                 `git config --global --add safe.directory '%(prefix)///<server>/<share>/<path to the repo>'` and \
+                 build the index again",
+                path.display()
+            ),
             CodeIndexError::Git(e) => write!(f, "{e}"),
             CodeIndexError::Sql(e) => write!(f, "index store error: {e}"),
             CodeIndexError::NotIndexed => {
@@ -197,8 +209,12 @@ pub struct BuildStats {
 /// directory inside the working tree; the actual root git reports is what
 /// gets stored.
 pub fn build_full(store: &mut Store, path: &Path) -> Result<BuildStats, CodeIndexError> {
-    if !gitutil::is_git_repo(path) {
-        return Err(CodeIndexError::NotAGitRepo(path.to_path_buf()));
+    match gitutil::git_verdict(path) {
+        gitutil::GitVerdict::Repo => {}
+        gitutil::GitVerdict::NoRepo => return Err(CodeIndexError::NotAGitRepo(path.to_path_buf())),
+        gitutil::GitVerdict::Refused(said) => {
+            return Err(CodeIndexError::GitRefusesRepo { path: path.to_path_buf(), said })
+        }
     }
     let root = gitutil::repo_root(path)?;
     let commit = gitutil::head_commit(&root)?;
@@ -247,8 +263,12 @@ pub struct RefreshStats {
 /// previously indexed commit and the new one (requirement 3: a refresh never
 /// needs a full reindex). Errors with `NotIndexed` if `build_full` never ran.
 pub fn refresh(store: &mut Store, path: &Path) -> Result<RefreshStats, CodeIndexError> {
-    if !gitutil::is_git_repo(path) {
-        return Err(CodeIndexError::NotAGitRepo(path.to_path_buf()));
+    match gitutil::git_verdict(path) {
+        gitutil::GitVerdict::Repo => {}
+        gitutil::GitVerdict::NoRepo => return Err(CodeIndexError::NotAGitRepo(path.to_path_buf())),
+        gitutil::GitVerdict::Refused(said) => {
+            return Err(CodeIndexError::GitRefusesRepo { path: path.to_path_buf(), said })
+        }
     }
     let root = gitutil::repo_root(path)?;
     let previous_commit = store.indexed_commit()?.ok_or(CodeIndexError::NotIndexed)?;
@@ -539,6 +559,32 @@ pub fn search(
         .collect::<Result<Vec<_>, _>>()?;
 
     Ok(SearchAnswer { hits, provenance })
+}
+
+#[cfg(test)]
+mod git_verdict_tests {
+    use super::*;
+
+    /// A folder with no git in it is one answer; a folder git will not read as
+    /// this user is a different one, and telling them apart is the whole point
+    /// - the second one cost a real session a wrong diagnosis.
+    #[test]
+    fn a_refused_repository_does_not_report_itself_as_no_repository() {
+        let refused = CodeIndexError::GitRefusesRepo {
+            path: std::path::PathBuf::from("//share/project"),
+            said: "fatal: detected dubious ownership in repository".to_string(),
+        };
+        let said = refused.to_string();
+        assert!(said.contains("IS a git repository"), "{said}");
+        assert!(said.contains("safe.directory"), "the way out has to be in it: {said}");
+        assert!(!said.contains("is not inside a git repository"), "{said}");
+    }
+
+    #[test]
+    fn a_folder_without_git_says_to_start_one() {
+        let none = CodeIndexError::NotAGitRepo(std::path::PathBuf::from("/tmp/plain"));
+        assert!(none.to_string().contains("git init"), "{none}");
+    }
 }
 
 #[cfg(test)]

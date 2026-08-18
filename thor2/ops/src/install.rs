@@ -398,6 +398,20 @@ pub fn working_contract() -> Vec<model::item::Item> {
             "Storing a second copy of an existing fact turns out to serve a reader better than \
              revising the original.",
         ),
+        model::item::Item {
+            tags: vec![
+                "working-contract".to_string(),
+                format!(
+                    "{}a forgotten setup step leaves no text behind to catch",
+                    model::store::NO_LITERAL_REASON_PREFIX
+                ),
+            ],
+            ..rule(
+                "a-new-project-is-one-command",
+                "Giving a folder its own memory is ONE command, run FROM the folder holding the                  code: `install --project <name>`. It writes the marker, reads the code once, and                  keeps that reading fresh on every commit. The owner names it - never you.",
+                "A folder set up with that one command turns out to be missing its marker, its                  code reading or its refresh on commit.",
+            )
+        },
         rule(
             "a-refusal-is-the-gate-working",
             "A refusal names the exact reason and what to do instead, and nothing is written when \

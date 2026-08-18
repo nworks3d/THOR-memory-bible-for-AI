@@ -69,11 +69,42 @@ fn run_git(repo_root: &Path, args: &[&str]) -> Result<String, GitError> {
 /// entry point calls first: a directory that fails this must be refused with
 /// a named error, never silently treated as an empty repository.
 pub fn is_git_repo(path: &Path) -> bool {
-    Command::new("git")
+    matches!(git_verdict(path), GitVerdict::Repo)
+}
+
+/// What git says about a folder, in the three answers that mean different
+/// things to whoever has to fix it.
+///
+/// THE DEFECT THIS CLOSES, measured 2026-08-18 on a project living on the
+/// owner's NAS share: git refused the repository with "detected dubious
+/// ownership" (the share is owned by another SID), the check above only saw
+/// "not a success", and the tool reported "is not inside a git repository" -
+/// about a folder holding a perfectly good repository with its whole history.
+/// A wrong diagnosis costs more than no diagnosis: the honest next step is
+/// one config line, and nothing said so.
+pub enum GitVerdict {
+    Repo,
+    NoRepo,
+    /// A repository git will not read as this user, with git's own words.
+    Refused(String),
+}
+
+pub fn git_verdict(path: &Path) -> GitVerdict {
+    let out = Command::new("git")
         .args(["-C", &path.to_string_lossy(), "rev-parse", "--is-inside-work-tree"])
-        .output()
-        .map(|o| o.status.success())
-        .unwrap_or(false)
+        .output();
+    match out {
+        Ok(o) if o.status.success() => GitVerdict::Repo,
+        Ok(o) => {
+            let said = String::from_utf8_lossy(&o.stderr).trim().to_string();
+            if said.contains("dubious ownership") || said.contains("safe.directory") {
+                GitVerdict::Refused(said)
+            } else {
+                GitVerdict::NoRepo
+            }
+        }
+        Err(_) => GitVerdict::NoRepo,
+    }
 }
 
 /// The top-level directory of the repository `path` is inside. Callers store

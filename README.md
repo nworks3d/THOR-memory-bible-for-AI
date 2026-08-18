@@ -331,8 +331,8 @@ after a restart. Until then, it can already read the memory but not add to it.
 thor2/target/release/doctor.exe --db "C:\Users\you\AppData\Local\thor2\thor.db"
 ```
 
-Nine plain-language lines, one per part: whether your memory is healthy, whether
-searching by meaning is switched on, how many of your notes can prove
+Thirteen plain-language lines, one per part: whether your memory is healthy,
+whether searching by meaning is switched on, how many of your notes can prove
 themselves, and how many point at files that are no longer there. It changes
 nothing.
 

@@ -166,6 +166,16 @@ fn candidates_from_projection(
 pub fn candidates_for(store: &EventStore, input: &ServeInput) -> Vec<LiveItem> {
     let moments: Vec<String> = input.moments.iter().map(|a| a.as_str().to_string()).collect();
     let mut target_kinds: Vec<String> = input.targets.iter().map(|(k, _)| target_kind_wire(*k)).collect();
+    // A FILE TOUCH MUST ALSO FETCH THE DIRECTORY RULES ABOVE IT. Since
+    // 2026-08-19 a Dir anchor reaches the files inside it
+    // (`normalize::target_matches`), but this narrowing asks the projection
+    // only for the kinds the input literally carries - a Path - so every
+    // directory rule was dropped before `rank::select` could match it, and
+    // the fix above looked like it did nothing. Found by probing a real rule
+    // anchored at /tmp that stayed silent for /tmp/data.json.
+    if target_kinds.iter().any(|k| k == &target_kind_wire(model::item::TargetKind::Path)) {
+        target_kinds.push(target_kind_wire(model::item::TargetKind::Dir));
+    }
     target_kinds.sort();
     target_kinds.dedup();
     candidates_from_projection(store, &moments, &target_kinds).unwrap_or_else(|| live_items(store))

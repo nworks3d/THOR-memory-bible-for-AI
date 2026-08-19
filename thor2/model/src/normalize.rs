@@ -61,6 +61,38 @@ pub fn last_segment(normalized_value: &str) -> &str {
 }
 
 #[cfg(test)]
+mod dir_anchor_tests {
+    use super::*;
+    use crate::item::TargetKind;
+
+    /// THE DEFECT THIS CLOSES, from a real session 2026-08-19: a rule anchored
+    /// at `/tmp` stayed silent while a file was written to `/tmp/data.json`,
+    /// and spoke only for the bare word `/tmp`. A directory anchor that
+    /// reaches nothing inside it is a rule nobody can ever receive.
+    #[test]
+    fn a_directory_anchor_reaches_a_file_inside_it() {
+        assert!(target_matches(TargetKind::Dir, "/tmp", TargetKind::Path, "/tmp/data.json"));
+        assert!(target_matches(TargetKind::Dir, "src/api", TargetKind::Path, "src/api/orders.js"));
+        assert!(target_matches(TargetKind::Dir, "/tmp", TargetKind::Dir, "/tmp"));
+    }
+
+    /// The separator is the whole safety of it: a rule about /tmp may not
+    /// claim /tmpfiles, exactly as the suffix rule refuses my-orders.js for
+    /// orders.js.
+    #[test]
+    fn a_directory_anchor_stops_at_the_segment_boundary() {
+        assert!(!target_matches(TargetKind::Dir, "/tmp", TargetKind::Path, "/tmpfiles/data.json"));
+        assert!(!target_matches(TargetKind::Dir, "src/api", TargetKind::Path, "src/apiary/bees.js"));
+    }
+
+    /// A file anchor stays a file anchor: it never swallows a whole tree.
+    #[test]
+    fn a_file_anchor_does_not_reach_its_neighbours() {
+        assert!(!target_matches(TargetKind::Path, "src/api", TargetKind::Path, "src/api/orders.js"));
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
@@ -160,12 +192,39 @@ mod tests {
 /// is real, and the write gate already refuses new items anchored on a bare
 /// role name.
 pub fn target_matches(item_kind: crate::item::TargetKind, item_value: &str, in_kind: crate::item::TargetKind, in_value: &str) -> bool {
+    use crate::item::TargetKind;
+    // A DIRECTORY ANCHOR REACHES WHAT IS INSIDE IT, which is the only reading
+    // of a directory that means anything.
+    //
+    // THE DEFECT THIS CLOSES, reported from a real session 2026-08-19: a rule
+    // anchored at `/tmp` - do not write intermediate files there - stayed
+    // silent while a file was written to `/tmp/data.json`, and spoke only for
+    // the bare word `/tmp`. Every comparison here was equality or a SUFFIX,
+    // so a directory matched its own name and nothing under it, and a file
+    // touch offers a Path where the item declares a Dir. Both halves are
+    // fixed here: the kinds may differ when the item's is a directory, and
+    // the comparison is then a prefix on a segment boundary.
+    if item_kind == TargetKind::Dir && matches!(in_kind, TargetKind::Path | TargetKind::Dir) {
+        let dir = normalize_target(item_value);
+        let touched = normalize_target(in_value);
+        return dir == touched || starts_on_segment_boundary(&touched, &dir);
+    }
     if item_kind != in_kind {
         return false;
     }
     let a = normalize_target(item_value);
     let b = normalize_target(in_value);
     a == b || ends_on_segment_boundary(&a, &b) || ends_on_segment_boundary(&b, &a)
+}
+
+/// Does `longer` begin with `shorter`, with a path separator immediately
+/// after it? The separator is what stops a rule about `/tmp` from claiming
+/// `/tmpfiles/notes.md`, the mirror of the suffix rule below.
+fn starts_on_segment_boundary(longer: &str, shorter: &str) -> bool {
+    if shorter.is_empty() || longer.len() <= shorter.len() {
+        return false;
+    }
+    longer.starts_with(shorter) && longer.as_bytes()[shorter.len()] == b'/'
 }
 
 /// Does `longer` end with `shorter`, with a path separator immediately before

@@ -447,9 +447,32 @@ fn haystack_contains(hit: &LookupHit, needle: &str) -> bool {
 /// `rank::a_lookup_answers_only_its_own_key_never_a_moment_or_target`, the
 /// injection-side half of this same guarantee).
 pub fn by_key(store: &EventStore, key: &str) -> Option<LookupHit> {
-    live_items(store)
+    let items = live_items(store);
+    if let Some(li) =
+        items.iter().find(|li| li.item.kind == Kind::Lookup && li.item.key.as_deref() == Some(key))
+    {
+        return Some(LookupHit { id: li.id.clone(), item: li.item.clone() });
+    }
+    // THE ASYMMETRY THIS CLOSES, reported from a real session 2026-08-19: the
+    // write gate refuses a second register whose key differs "give or take
+    // case and punctuation" - it says so in the refusal - while this door
+    // compared the two spellings byte for byte. So a key the store itself
+    // treats as taken could not be asked for under the spelling someone
+    // remembered, and the answer was a flat "not found" about a register that
+    // is right there. Both sides now read a key the same way; an exact
+    // spelling still wins above, so nothing that resolved before resolves
+    // differently.
+    let wanted = model::store::normalize_for_comparison(key);
+    items
         .into_iter()
-        .find(|li| li.item.kind == Kind::Lookup && li.item.key.as_deref() == Some(key))
+        .find(|li| {
+            li.item.kind == Kind::Lookup
+                && li
+                    .item
+                    .key
+                    .as_deref()
+                    .is_some_and(|k| model::store::normalize_for_comparison(k) == wanted)
+        })
         .map(|li| LookupHit { id: li.id, item: li.item })
 }
 
@@ -1309,6 +1332,23 @@ mod tests {
     }
 
     #[test]
+    /// THE ASYMMETRY THIS CLOSES, from a real session 2026-08-19: the write
+    /// gate refuses a second register whose key differs only in case or
+    /// punctuation, while this door compared byte for byte - so a key the
+    /// store itself calls taken answered "not found".
+    #[test]
+    fn by_key_finds_a_register_whose_key_differs_only_in_case_or_punctuation() {
+        let mut store = EventStore::in_memory().unwrap();
+        let mut reg = item("uitgaven", Kind::Lookup, "2026-08-01 koffie 3,20", None);
+        reg.key = Some("Uitgaven 2026-08".to_string());
+        store::declare(&mut store, "s", "l", "t", &reg).unwrap();
+
+        assert!(by_key(&store, "Uitgaven 2026-08").is_some(), "the exact spelling still works");
+        assert!(by_key(&store, "uitgaven-2026-08").is_some(), "and so does the one the gate calls the same");
+        assert!(by_key(&store, "uitgaven 2026 08").is_some());
+        assert!(by_key(&store, "uitgaven-2026-09").is_none(), "a different key stays a different key");
+    }
+
     fn by_key_never_matches_an_unknown_key() {
         let db = EventStore::in_memory().unwrap();
         assert!(by_key(&db, "does-not-exist").is_none());

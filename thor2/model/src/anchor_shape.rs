@@ -113,10 +113,31 @@ fn has_env_template(v: &str) -> bool {
 /// see `unmatchable`'s own doc comment for why that boundary is drawn here
 /// and where it can be wrong, in both directions.
 fn is_route_like(v: &str) -> bool {
+    if is_a_root_directory(v) {
+        return false;
+    }
     match v.strip_prefix('/') {
         Some(rest) => !rest.contains('/') && !rest.contains('\\'),
         None => false,
     }
+}
+
+/// The handful of top-level directories that exist on every unix-shaped
+/// machine, Git Bash on Windows included.
+///
+/// THE DEFECT THIS CLOSES, found 2026-08-19 while repairing a real rule: "do
+/// not write intermediate files to /tmp" could not be anchored at `/tmp` at
+/// all, because the route heuristic reads a single leading slash with nothing
+/// after it as a web route and refuses it as a place. `/tmp` is not a route on
+/// any machine this runs on; neither are the others below. A closed list, not
+/// a guess: anything outside it keeps the old reading.
+fn is_a_root_directory(v: &str) -> bool {
+    const ROOTS: &[&str] = &[
+        "/tmp", "/var", "/etc", "/usr", "/opt", "/home", "/root", "/srv", "/mnt", "/media", "/dev",
+        "/proc", "/bin", "/sbin", "/lib",
+    ];
+    let trimmed = v.trim_end_matches('/');
+    ROOTS.iter().any(|r| trimmed.eq_ignore_ascii_case(r))
 }
 
 /// The final path-separator-delimited segment carries a `.` that is neither
@@ -204,6 +225,19 @@ mod tests {
     #[test]
     fn a_percent_style_env_template_is_unmatchable() {
         assert_eq!(unmatchable(r"%LOCALAPPDATA%\thor\guard-rulebook.json"), Some(UnmatchableAnchor::EnvTemplate));
+    }
+
+    /// A real directory that happens to look like a route. The rule this
+    /// comes from - do not write intermediate files to /tmp - could not be
+    /// anchored where it belongs until this exception existed.
+    #[test]
+    fn a_top_level_directory_is_a_place_not_a_route() {
+        assert_eq!(unmatchable("/tmp"), None);
+        assert_eq!(unmatchable("/var"), None);
+        assert_eq!(unmatchable("/etc/"), None);
+        // and everything else with that shape is still a route
+        assert_eq!(unmatchable("/admin"), Some(UnmatchableAnchor::Route));
+        assert_eq!(unmatchable("/preview"), Some(UnmatchableAnchor::Route));
     }
 
     #[test]
@@ -307,13 +341,16 @@ mod tests {
     // accident.
 
     #[test]
-    fn a_single_segment_posix_absolute_path_is_a_known_gap_refused_as_a_route() {
-        // "/etc" is a real, resolvable Linux absolute path with nothing
-        // after it - lexically indistinguishable from a single-segment
-        // route, the same boundary stale_anchors.rs's own classify()
-        // already draws (its posix-absolute class requires a FURTHER
-        // separator). Refused here, not accepted.
-        assert_eq!(unmatchable("/etc"), Some(UnmatchableAnchor::Route));
+    fn a_single_segment_posix_absolute_path_outside_the_known_roots_is_still_a_route() {
+        // The gap this used to pin was total: every single-segment absolute
+        // path, "/etc" and "/tmp" included, was refused as a route, so a rule
+        // about the temp directory could not be anchored at the temp
+        // directory. Since 2026-08-19 the handful of directories that exist on
+        // every unix-shaped machine are read as places (see
+        // is_a_root_directory); everything else keeps the old reading, because
+        // "/workspace" really is lexically indistinguishable from a route.
+        assert_eq!(unmatchable("/etc"), None);
+        assert_eq!(unmatchable("/workspace"), Some(UnmatchableAnchor::Route));
     }
 
     #[test]

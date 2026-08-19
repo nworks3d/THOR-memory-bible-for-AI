@@ -149,6 +149,13 @@ pub fn select(candidates: &[LiveItem], input: &ServeInput) -> Vec<RankedItem> {
             //    general rule still reaches you at the moment it is about; the
             //    specific one has only this one chance.
             .then_with(|| anchored_at_a_place(&b.item).cmp(&anchored_at_a_place(&a.item)))
+            // 2b. AND AMONG PLACES, THE EXACT ONE FIRST. Since a directory
+            //     anchor reaches the files inside it (see
+            //     `normalize::target_matches`), one rule about a whole tree
+            //     could otherwise sit in front of the rule about the very file
+            //     being touched. The broad one still reaches you; the precise
+            //     one has only this place.
+            .then_with(|| at_this_exact_place(&b.item, input).cmp(&at_this_exact_place(&a.item, input)))
             // 3. Then weight, as before, among items equally close.
             .then_with(|| severity_rank(a.item.severity).cmp(&severity_rank(b.item.severity)))
             .then_with(|| {
@@ -165,6 +172,21 @@ pub fn select(candidates: &[LiveItem], input: &ServeInput) -> Vec<RankedItem> {
 /// ordering, so nothing lighter can ever take its place - see `select`.
 fn irreversible(item: &Item) -> bool {
     item.severity != Some(Severity::Irreversible)
+}
+
+/// Is this item anchored at the very thing being touched, rather than at a
+/// directory somewhere above it? Both reach you; this decides which one is
+/// read first when only a few fit.
+fn at_this_exact_place(item: &Item, input: &ServeInput) -> bool {
+    item.bindings.iter().any(|b| match b {
+        Binding::Target { kind: TargetKind::Path, value } => input.targets.iter().any(|(k, v)| {
+            *k == TargetKind::Path && model::normalize::normalize_target(value) == model::normalize::normalize_target(v)
+        }),
+        Binding::Target { kind: TargetKind::Dir, value } => input.targets.iter().any(|(_, v)| {
+            model::normalize::normalize_target(value) == model::normalize::normalize_target(v)
+        }),
+        _ => false,
+    })
 }
 
 /// Is this item bound to a PLACE - a file or a directory - rather than

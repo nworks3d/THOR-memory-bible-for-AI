@@ -672,11 +672,16 @@ pub fn capacity(store: &EventStore, item: &Item) -> anyhow::Result<Capacity> {
     let all_dir = !pinned
         && bindings.iter().all(|b| matches!(b, Binding::Target { kind: crate::item::TargetKind::Dir, .. }));
     if all_dir {
+        // Note, not a refusal: since 2026-08-19 a directory anchor DOES reach
+        // the files inside it (`normalize::target_matches`), so this is about
+        // breadth, not about silence. It used to say such an item could never
+        // be shown at all, which was true of the matcher as it stood and is
+        // the defect that fix closes.
         return Ok(Capacity::Crowded(
-            "every binding on this item is a DIRECTORY, which no automatic serving surface can \
-             reach: a file touch offers the path, never its parent directory, so this item will \
-             never be shown as advice. It can still refuse a write inside that directory. If you \
-             meant it to be read rather than only enforced, bind it to the exact file it is about."
+            "every binding on this item is a DIRECTORY, so it reaches every file inside that \
+             directory. That is broad on purpose and it is read AFTER anything anchored at the \
+             exact file being touched. If this fact is really about one file or one command, bind \
+             it there and it will be read first."
                 .to_string(),
         ));
     }
@@ -1558,7 +1563,7 @@ mod tests {
     /// meet. Two independent reviews found it the same evening, both by
     /// reading `input.rs` rather than the comment that claimed otherwise.
     #[test]
-    fn a_directory_bound_rival_does_not_crowd_a_file_inside_it() {
+    fn a_directory_bound_rival_now_shares_the_pool_of_a_file_inside_it() {
         let mut store = EventStore::in_memory().unwrap();
         for i in 0..crate::item::MAX_ITEMS + 2 {
             let mut heavy = sample_with(&format!("dir-{i}"), DISTINCT[i % DISTINCT.len()]);
@@ -1569,16 +1574,26 @@ mod tests {
         let mut light = sample_with("newcomer", "a webhook retry backs off before it gives up entirely");
         light.bindings = vec![Binding::Target { kind: TargetKind::Path, value: "src/deep/mod.rs".to_string() }];
         light.severity = Some(Severity::HouseStyle);
-        declare(&mut store, "s", "l", "t", &light)
-            .expect("a directory anchor is not in the pool a file touch assembles, so it crowds nothing");
+
+        // BEFORE 2026-08-19 this write went through, because a directory
+        // anchor could not reach a file inside it at all - which also meant
+        // those six rules were silent at every file they were written for. Now
+        // they do reach it, so they are real rivals and the count says so. The
+        // refusal names them, and a heavier or more precise binding is the way
+        // past it.
+        let refused = declare(&mut store, "s", "l", "t", &light)
+            .expect_err("six heavier rivals at that place is exactly what crowding means");
+        let said = format!("{refused:?}");
+        assert!(said.contains("src/deep/mod.rs"), "the place it could not get into: {said}");
+        assert!(said.contains("dir-0"), "and who is holding it: {said}");
     }
 
-    /// A note, never a refusal: "only ever refuses" is a legitimate thing for
-    /// a rule to be. But it has to be SAID, because the crowding count cannot
-    /// see it - a directory pool holding three items reads as roomy while
-    /// being unreachable by every automatic surface.
+    /// A note, never a refusal: a directory anchor is a legitimate thing to
+    /// write. But its breadth has to be SAID, because a rule about a whole
+    /// tree reads like a rule about the file you are touching, and is served
+    /// after one.
     #[test]
-    fn a_directory_only_item_is_told_it_will_never_be_shown_as_advice() {
+    fn a_directory_only_item_is_told_how_broadly_it_reaches() {
         let mut store = EventStore::in_memory().unwrap();
         let mut item = sample_with("dir-only", "a webhook retry backs off before it gives up entirely");
         item.bindings = vec![Binding::Target { kind: TargetKind::Dir, value: "src/deep".to_string() }];
@@ -1586,8 +1601,8 @@ mod tests {
         match capacity(&store, &item).unwrap() {
             Capacity::Crowded(note) => {
                 assert!(note.contains("DIRECTORY"), "{note}");
-                assert!(note.contains("never be shown"), "{note}");
-                assert!(note.contains("can still refuse"), "it must not read as useless: {note}");
+                assert!(note.contains("every file inside that directory"), "how far it reaches: {note}");
+                assert!(note.contains("read AFTER"), "and where that puts it in the order: {note}");
             }
             other => panic!("a directory-only item must be warned about, got {other:?}"),
         }

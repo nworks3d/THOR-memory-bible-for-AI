@@ -622,12 +622,15 @@ mod tests {
     }
 
     #[test]
-    fn a_single_segment_posix_absolute_path_is_still_the_documented_gap_classified_as_route_like() {
-        // The known, deliberate boundary both this file's own doc comment
-        // and `model::anchor_shape::unmatchable`'s doc comment name
-        // explicitly: "/etc" is lexically identical to a single-segment
-        // route, so it sorts here, never into posix-absolute.
-        assert_eq!(classify("/etc"), AnchorClass::RouteLike);
+    fn a_single_segment_posix_absolute_path_outside_the_known_roots_is_still_route_like() {
+        // The boundary moved on 2026-08-19: the handful of directories that
+        // exist on every unix-shaped machine are places now, because a rule
+        // about the temp directory could not be anchored at the temp
+        // directory (see `model::anchor_shape::is_a_root_directory`).
+        // Everything else keeps the old reading - "/workspace" really is
+        // lexically identical to a single-segment route.
+        assert_ne!(classify("/etc"), AnchorClass::RouteLike);
+        assert_eq!(classify("/workspace"), AnchorClass::RouteLike);
     }
 
     #[test]

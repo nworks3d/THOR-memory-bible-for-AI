@@ -1783,6 +1783,20 @@ impl ThorMcpServer {
             return queued;
         }
         self.blocking(move |s| {
+            // A VERDICT ON SOMETHING THAT IS GONE IS NOT A VERDICT. Measured
+            // 2026-08-19: doctor named four items owed a judgement, all four
+            // retracted, and marking one moved the counter to three. So the
+            // debt could be paid with the dead, which makes the number
+            // worthless - and the question itself ("did it belong where it
+            // fired") has no honest answer for an item nobody serves any more.
+            if !serve::live::live_items(s).iter().any(|li| li.id == args.id) {
+                return Err(format!(
+                    "'{}' is not live - it was retracted or archived, so it fires nowhere and there is nothing \
+                     to judge. Nothing was recorded. If it should fire again, that is a fresh remember; if you \
+                     meant a different item, check the id in the block you were served.",
+                    args.id
+                ));
+            }
             let now = serve::time::now_iso8601();
             let written = if args.noise {
                 serve::mark::record_noise(s, SESSION_ID, LINEAGE_ID, ACTOR, &now, &args.id)
@@ -4059,6 +4073,28 @@ mod tests {
         assert!(reply.contains("profiel"), "{reply}");
     }
 
+    /// THE DEFECT THIS CLOSES, measured 2026-08-19: doctor named four items
+    /// owed a judgement, all four retracted, and marking one moved the
+    /// counter. A debt payable with the dead is not a debt.
+    #[tokio::test]
+    async fn a_verdict_on_a_retracted_item_is_refused_and_records_nothing() {
+        let srv = server_knowing(&["eten"]);
+        let mut doomed = blank_report("weg-ermee");
+        doomed.project = Some("eten".to_string());
+        assert!(srv.remember(Parameters(doomed)).await.starts_with("stored"));
+        assert!(srv
+            .retract(Parameters(RetractArgs {
+                id: "weg-ermee".to_string(),
+                reason: "toch niet waar gebleken".to_string(),
+            }))
+            .await
+            .starts_with("retracted"));
+
+        let reply = srv.mark(Parameters(MarkArgs { id: "weg-ermee".to_string(), noise: true })).await;
+        assert!(reply.contains("not live"), "{reply}");
+        assert!(reply.contains("Nothing was recorded"), "{reply}");
+    }
+
     /// The agent door has to be able to CORRECT what it filed, or the only
     /// way to fix a typo is a second entry saying the same thing better -
     /// which is how a shelf stops being worth reading.
@@ -4222,6 +4258,27 @@ mod tests {
             }))
             .await;
         assert!(reply.starts_with("filed"), "{reply}");
+    }
+
+    /// A verdict on something that is gone is not a verdict: the debt could
+    /// be paid with the dead, which is what made the count worthless.
+    #[tokio::test]
+    async fn marking_a_retracted_item_is_refused_and_records_nothing() {
+        let srv = server_knowing(&["eten"]);
+        let mut args = blank_report("weg-hiermee");
+        args.project = Some("eten".to_string());
+        assert!(srv.remember(Parameters(args)).await.starts_with("stored"));
+        assert!(srv
+            .retract(Parameters(RetractArgs {
+                id: "weg-hiermee".to_string(),
+                reason: "wrong from the start".to_string(),
+            }))
+            .await
+            .starts_with("retracted"));
+
+        let reply = srv.mark(Parameters(MarkArgs { id: "weg-hiermee".to_string(), noise: true })).await;
+        assert!(reply.contains("not live"), "{reply}");
+        assert!(reply.contains("Nothing was recorded"), "{reply}");
     }
 
     /// The way through when nothing fits: the agent asked, the owner named it,

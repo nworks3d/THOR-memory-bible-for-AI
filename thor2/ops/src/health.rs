@@ -511,11 +511,17 @@ pub fn unjudged_line(db: &Path) -> String {
         .filter(|li| li.item.bindings.iter().any(|b| matches!(b, model::item::Binding::Always)))
         .map(|li| li.id)
         .collect();
-    let heavy = served
-        .iter()
-        .filter(|(id, n)| **n >= HEAVY && !judged.contains(*id) && !pinned.contains(*id))
-        .count();
-    let total_unjudged = served.keys().filter(|id| !judged.contains(*id) && !pinned.contains(*id)).count();
+    // ONLY WHAT IS STILL LIVE, the same rule the Stop-time ask already
+    // applies. These counts are folded from event kinds, which keep every
+    // serving an item ever had - including the ones it had before somebody
+    // retracted it. Counting those made doctor name four items owed a
+    // judgement that were all retracted (2026-08-19), and marking one of them
+    // moved the number: a debt payable with the dead is not a debt.
+    let alive: std::collections::HashSet<String> =
+        serve::live::live_items(&store).into_iter().map(|li| li.id).collect();
+    let owed = |id: &String| alive.contains(id) && !judged.contains(id) && !pinned.contains(id);
+    let heavy = served.iter().filter(|(id, n)| **n >= HEAVY && owed(*id)).count();
+    let total_unjudged = served.keys().filter(|id| owed(*id)).count();
     if total_unjudged == 0 {
         return "unjudged: every item that has ever fired has been judged at least once".to_string();
     }
@@ -1100,6 +1106,35 @@ mod tests {
             falsifier: Some("this fixture rule turns out to be wrong".to_string()),
             check: None,
         }
+    }
+
+    /// THE DEFECT THIS CLOSES, reported from a real session 2026-08-19:
+    /// doctor named four items owed a judgement and all four were retracted,
+    /// so the debt could be settled with the dead and the number meant
+    /// nothing. The Stop-time ask already dropped them; this line did not.
+    #[test]
+    fn a_retracted_item_is_no_longer_counted_as_owing_a_judgement() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("thor.db");
+        {
+            let mut store = EventStore::new(&db).unwrap();
+            let mut item = rule("gone");
+            item.bindings = vec![Binding::Target { kind: TargetKind::Path, value: "src/main.rs".to_string() }];
+            // A source-file anchor needs a project - a global one would fire in
+            // every repository that happens to hold a file by that name.
+            item.project = Some("a-project".to_string());
+            store::declare(&mut store, "s", "l", "t", &item).unwrap();
+            for _ in 0..50 {
+                serve::deliver::record_delivery(&mut store, "s", "l", "t", "now", &["gone".to_string()]);
+            }
+            store::retract(&mut store, "s", "l", "t", "gone", "wrong from the start").unwrap();
+        }
+        let line = unjudged_line(&db);
+        assert!(
+            line.contains("every item that has ever fired has been judged")
+                || !line.contains("1 trigger-bound"),
+            "a retracted item owes nothing: {line}"
+        );
     }
 
     #[test]

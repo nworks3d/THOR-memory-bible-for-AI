@@ -713,7 +713,7 @@ fn shape_problems(item: &Item, bare_answer_allowed: bool, symbol_only_allowed: b
                     "answer one question: is there a text whose presence MEANS the mistake is happening? \
                      If yes, add a check with that literal - forbidden for a command or for any file, \
                      absent for one named file. If no (an authorised action looks identical to an \
-                     unauthorised one), put '{}<why not>' in its tags - the reason is the answer, and a \
+                     unauthorised one), put '{}<why not>' in its tags - one plain phrase of 20 to 120 characters, no \n                     comma and no line break, because it travels as a tag. The reason is the answer, and a \
                      bare '{}' no longer counts.",
                     crate::store::NO_LITERAL_REASON_PREFIX,
                     crate::store::NO_LITERAL_TAG

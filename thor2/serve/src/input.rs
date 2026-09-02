@@ -121,6 +121,365 @@ pub fn hosts_in_command(command: &str) -> Vec<String> {
     out
 }
 
+// ------------------------------------------------------- the shell write hole
+//
+// MEASURED: a rule anchored at a file with a `contains` or `absent` check
+// refuses an Edit/Write of that file, but `rm file`, `truncate -s 0 file`,
+// `sed -i ... file`, `echo x > file`, `tee file`, `mv other file` and
+// `cp other file` from Bash walk straight past it - a shell write is a
+// write, and until now only Edit/Write ever counted as one.
+// `shell_write_targets` below is what `serve::absent_guard`'s command guard
+// (`serve/src/bin/serve.rs`'s `command_guard_block`) feeds through the SAME
+// file-based checks a real Edit/Write already goes through, so the same
+// rule refuses both.
+
+/// One shell-lite token: an ordinary WORD, or one of the OPERATORS this
+/// function cares about (`;`, `&&`, `||`, `|`, `>`, `>>`) - a distinction
+/// `shell_tokens` above has no need of (it only ever recovers words, and
+/// trims `<`/`>` away as edge punctuation) and `shell_write_targets` cannot
+/// do without: a filename that merely SITS next to a redirect must never be
+/// read as the redirect's own target, and only keeping the operator as its
+/// own token tells the two apart.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ShTok {
+    Word(String),
+    Op(&'static str),
+}
+
+fn flush_word(word: &mut String, out: &mut Vec<ShTok>) {
+    if !word.is_empty() {
+        out.push(ShTok::Word(std::mem::take(word)));
+    }
+}
+
+/// Split `command` into shell-lite tokens: a quoted region (single or double
+/// quotes) becomes ONE word token with its quotes stripped, even across
+/// internal spaces - the one thing `shell_tokens` above cannot do, because it
+/// starts from `str::split_whitespace`, which has already torn a quoted path
+/// with a space into pieces before any quote logic could run. `;`, `&&`,
+/// `||`, `|`, `>>` and `>` are recognised as their OWN tokens even with no
+/// surrounding whitespace ("f>out" -> "f", ">", "out"), which is what lets a
+/// redirect be told apart from a filename that merely touches one. `<` is a
+/// silent word boundary (this function never reads input redirection, only
+/// output), and a lone `&` (background) is dropped the same way. Not a shell
+/// parser, the same declared scope `shell_tokens` above carries: no variable
+/// expansion, no globbing, no nested quoting, no backslash escapes inside a
+/// quote - only as much structure as telling an operator from a word needs.
+fn sh_tokenize(command: &str) -> Vec<ShTok> {
+    let mut out = Vec::new();
+    let mut chars = command.chars().peekable();
+    let mut word = String::new();
+    while let Some(c) = chars.next() {
+        match c {
+            '\'' | '"' => {
+                let quote = c;
+                for qc in chars.by_ref() {
+                    if qc == quote {
+                        break;
+                    }
+                    word.push(qc);
+                }
+            }
+            c if c.is_whitespace() => flush_word(&mut word, &mut out),
+            '<' => flush_word(&mut word, &mut out),
+            ';' => {
+                flush_word(&mut word, &mut out);
+                out.push(ShTok::Op(";"));
+            }
+            '|' => {
+                flush_word(&mut word, &mut out);
+                if chars.peek() == Some(&'|') {
+                    chars.next();
+                    out.push(ShTok::Op("||"));
+                } else {
+                    out.push(ShTok::Op("|"));
+                }
+            }
+            '&' => {
+                flush_word(&mut word, &mut out);
+                if chars.peek() == Some(&'&') {
+                    chars.next();
+                    out.push(ShTok::Op("&&"));
+                }
+                // A lone '&' backgrounds the command and names no path
+                // either way, so it just ends whatever came before it.
+            }
+            '>' => {
+                flush_word(&mut word, &mut out);
+                if chars.peek() == Some(&'>') {
+                    chars.next();
+                    out.push(ShTok::Op(">>"));
+                } else {
+                    out.push(ShTok::Op(">"));
+                }
+            }
+            _ => word.push(c),
+        }
+    }
+    flush_word(&mut word, &mut out);
+    out
+}
+
+/// `toks`, cut at every top-level `;`, `&&`, `||` and `|` - a compound or
+/// piped command is one write per stage, never one write for the whole line
+/// (`cat a.txt | tee b.txt` writes `b.txt`, not `a.txt`).
+fn split_segments(toks: &[ShTok]) -> Vec<Vec<ShTok>> {
+    let mut segments = Vec::new();
+    let mut current = Vec::new();
+    for t in toks {
+        match t {
+            ShTok::Op(";") | ShTok::Op("&&") | ShTok::Op("||") | ShTok::Op("|") => {
+                segments.push(std::mem::take(&mut current));
+            }
+            _ => current.push(t.clone()),
+        }
+    }
+    segments.push(current);
+    segments
+}
+
+/// The wrapper-shells whose `-c`/`-lc`/`-Command` argument is itself a real
+/// command to analyse, never the wrapper's own literal words. Matched
+/// case-insensitively against the SAME normalised leading word
+/// `absent_guard::strip_invocation_wrapper` already computes (directory and
+/// `.exe` suffix stripped), so `/bin/sh`, `bash.exe` and a bare `pwsh` are
+/// all recognised the same way that function already recognises any other
+/// command's own name.
+const SHELL_WRAPPER_NAMES: &[&str] = &["sh", "bash", "zsh", "dash", "ksh", "powershell", "pwsh"];
+
+/// If `command` invokes one of the known wrapper shells with a `-c`/`-lc`/
+/// `-Command` flag, the quoted argument that follows - the REAL command a
+/// caller meant to run, which is what `shell_write_targets` must actually
+/// see. `None` for anything else, including a wrapper invoked WITHOUT that
+/// flag (an interactive-shell shape this project never receives from a tool
+/// call) or one where the flag carries no following word.
+fn unwrap_shell_c(command: &str) -> Option<String> {
+    let normalised = crate::absent_guard::strip_invocation_wrapper(command);
+    let head = normalised.split_whitespace().next()?;
+    if !SHELL_WRAPPER_NAMES.contains(&head.to_lowercase().as_str()) {
+        return None;
+    }
+    let toks = sh_tokenize(command);
+    let flag_idx = toks.iter().position(|t| match t {
+        ShTok::Word(w) => w == "-c" || w == "-lc" || w.eq_ignore_ascii_case("-command"),
+        ShTok::Op(_) => false,
+    })?;
+    match toks.get(flag_idx + 1) {
+        Some(ShTok::Word(inner)) => Some(inner.clone()),
+        _ => None,
+    }
+}
+
+/// A candidate argument names a real path, never a flag or a glob - the two
+/// filters every verb-specific reader below shares. GLOBS ARE IGNORED
+/// deliberately: a glob names nothing until the shell expands it, and this
+/// function never runs a shell, so there is no way to know which real files
+/// a pattern like `*.log` would touch - guessing and refusing on that guess
+/// would refuse honest work the glob may not even reach the guarded file at
+/// all.
+fn is_path_arg(w: &str) -> bool {
+    !w.starts_with('-') && !w.contains('*') && !w.contains('?')
+}
+
+/// What actually happens to the file a shell write touches - never a bare
+/// "written", because a rule anchored there needs to know WHICH proof still
+/// applies: a `Contains` check has nothing left to hold once the file is
+/// gone or emptied, while a location prohibition cares only that the path
+/// was touched at all.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ShellWriteEffect {
+    /// `rm`/`git rm`: the file stops existing.
+    Removed,
+    /// `truncate -s 0`, or a bare `> f` / `: > f` with nothing feeding it:
+    /// the file still exists, but every byte it held is gone.
+    Emptied,
+    /// `sed -i`, `tee`, a `>`/`>>` redirection with a real producer in front
+    /// of it, or a `mv`/`cp` destination: the file's content changes, but
+    /// it is not necessarily reduced to nothing.
+    Rewritten,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ShellWrite {
+    pub path: String,
+    pub effect: ShellWriteEffect,
+}
+
+const MAX_UNWRAP_DEPTH: usize = 8;
+
+/// Every real WRITE a shell command performs directly, bypassing the
+/// Edit/Write tool entirely, paired with what actually happens to the file -
+/// see this module's own "the shell write hole" section above for the
+/// measurement this closes, and `ShellWriteEffect`'s own doc comment for why
+/// the effect is never collapsed to a bare "written".
+///
+/// FLAGS ARE SKIPPED (a token starting with `-` is never read as a path -
+/// `rm -rf` names one flag and zero files on its own). GLOBS ARE IGNORED
+/// (see `is_path_arg`'s own doc comment for why guessing would cost more
+/// than it catches). A QUOTED PATH WITH A SPACE is read whole
+/// (`sh_tokenize`).
+///
+/// `sh -c "..."`, `bash -lc "..."` and `powershell -Command "..."` are
+/// unwrapped FIRST (`unwrap_shell_c`): the write this function must see is
+/// whatever the wrapped string actually runs, never the wrapper's own
+/// words - a Bash tool call routed through one of these would otherwise
+/// name no file at all. Capped at `MAX_UNWRAP_DEPTH`, the same defensive
+/// stance `serve/src/bin/serve.rs`'s own `MAX_TOOL_INPUT_WALK_DEPTH` takes
+/// for a payload this project does not control the shape of: a missed case
+/// past the cap is acceptable, an unbounded recursive walk is not.
+pub fn shell_write_targets(command: &str) -> Vec<ShellWrite> {
+    shell_write_targets_at_depth(command, 0)
+}
+
+fn shell_write_targets_at_depth(command: &str, depth: usize) -> Vec<ShellWrite> {
+    if depth < MAX_UNWRAP_DEPTH {
+        if let Some(inner) = unwrap_shell_c(command) {
+            return shell_write_targets_at_depth(&inner, depth + 1);
+        }
+    }
+    let toks = sh_tokenize(command);
+    let mut out = Vec::new();
+    for segment in split_segments(&toks) {
+        collect_segment_writes(&segment, &mut out);
+    }
+    out
+}
+
+/// The size `truncate -s <n>` was given, and the file it names, if any -
+/// `-s 0` and `-s0` both spell the same flag. `-s 0` (and only `-s 0`)
+/// empties the file; any other size still rewrites it (it may grow, or
+/// shrink to something other than nothing), so only the zero case is ever
+/// reported as `Emptied`.
+fn collect_truncate(rest: &[&str], out: &mut Vec<ShellWrite>) {
+    let mut size: Option<&str> = None;
+    let mut file: Option<&str> = None;
+    let mut i = 0;
+    while i < rest.len() {
+        let w = rest[i];
+        if w == "-s" {
+            size = rest.get(i + 1).copied();
+            i += 2;
+            continue;
+        }
+        if let Some(v) = w.strip_prefix("-s") {
+            if !v.is_empty() {
+                size = Some(v);
+            }
+            i += 1;
+            continue;
+        }
+        if is_path_arg(w) {
+            file = Some(w);
+        }
+        i += 1;
+    }
+    if let Some(f) = file {
+        let effect = if size == Some("0") { ShellWriteEffect::Emptied } else { ShellWriteEffect::Rewritten };
+        out.push(ShellWrite { path: f.to_string(), effect });
+    }
+}
+
+/// `sed -i`'s own target files: the first non-flag argument is the SCRIPT
+/// ('s/a/b/'), never a file - a glob character there is the script's own
+/// regex syntax, not a filesystem glob, so only the arguments AFTER it are
+/// ever read as paths. With fewer than two non-flag arguments (a script with
+/// no file named, reading stdin, or a shape this cannot tell apart from
+/// that), nothing is reported rather than guessed at.
+fn collect_sed_i(rest: &[&str], out: &mut Vec<ShellWrite>) {
+    let non_flags: Vec<&str> = rest.iter().copied().filter(|w| !w.starts_with('-')).collect();
+    if non_flags.len() < 2 {
+        return;
+    }
+    for w in &non_flags[1..] {
+        if is_path_arg(w) {
+            out.push(ShellWrite { path: (*w).to_string(), effect: ShellWriteEffect::Rewritten });
+        }
+    }
+}
+
+/// The `>`/`>>` redirection in `segment`, if any: the LAST one (a
+/// double-redirect is vanishingly unlikely, and the last is also the one a
+/// real shell would actually leave the stream pointed at). Everything before
+/// it is the "producer"; a bare `:` there is the shell no-op idiom for
+/// "truncate this file, run nothing", so it counts as no producer at all -
+/// `: > f` and a bare `> f` both EMPTY the file, while any real command in
+/// front of the `>` (`echo x`, `printf ...`) REWRITES it, and `>>` always
+/// rewrites regardless, since append can never simply empty a file.
+fn collect_redirect(segment: &[ShTok], out: &mut Vec<ShellWrite>) {
+    let mut redirect: Option<(bool, usize)> = None;
+    for (i, t) in segment.iter().enumerate() {
+        match t {
+            ShTok::Op(">") => redirect = Some((false, i)),
+            ShTok::Op(">>") => redirect = Some((true, i)),
+            _ => {}
+        }
+    }
+    let Some((is_append, idx)) = redirect else { return };
+    let target = segment[idx + 1..].iter().find_map(|t| match t {
+        ShTok::Word(w) => Some(w.as_str()),
+        ShTok::Op(_) => None,
+    });
+    let Some(target) = target else { return };
+    if !is_path_arg(target) {
+        return;
+    }
+    let has_producer = segment[..idx].iter().any(|t| matches!(t, ShTok::Word(w) if w != ":"));
+    let effect = if is_append || has_producer { ShellWriteEffect::Rewritten } else { ShellWriteEffect::Emptied };
+    out.push(ShellWrite { path: target.to_string(), effect });
+}
+
+/// One segment's own writes: the verb-shaped ones (`rm`, `git rm`,
+/// `truncate -s 0`, `sed -i`, `tee`, `mv`/`cp`'s own destination) PLUS
+/// whatever `>`/`>>` redirection the segment carries - checked independently
+/// of each other (never `else`), so a segment like `tee f > log` (unusual,
+/// but not impossible) reports BOTH targets rather than one silently
+/// winning.
+fn collect_segment_writes(segment: &[ShTok], out: &mut Vec<ShellWrite>) {
+    let words: Vec<&str> = segment
+        .iter()
+        .filter_map(|t| match t {
+            ShTok::Word(w) => Some(w.as_str()),
+            ShTok::Op(_) => None,
+        })
+        .collect();
+
+    match words.as_slice() {
+        ["rm", rest @ ..] => {
+            for w in rest {
+                if is_path_arg(w) {
+                    out.push(ShellWrite { path: (*w).to_string(), effect: ShellWriteEffect::Removed });
+                }
+            }
+        }
+        ["git", "rm", rest @ ..] => {
+            for w in rest {
+                if is_path_arg(w) {
+                    out.push(ShellWrite { path: (*w).to_string(), effect: ShellWriteEffect::Removed });
+                }
+            }
+        }
+        ["truncate", rest @ ..] => collect_truncate(rest, out),
+        ["sed", rest @ ..] if rest.iter().any(|w| w.starts_with("-i") || w.starts_with("--in-place")) => {
+            collect_sed_i(rest, out)
+        }
+        ["tee", rest @ ..] => {
+            for w in rest {
+                if is_path_arg(w) {
+                    out.push(ShellWrite { path: (*w).to_string(), effect: ShellWriteEffect::Rewritten });
+                }
+            }
+        }
+        ["mv", rest @ ..] | ["cp", rest @ ..] => {
+            if let Some(dest) = rest.iter().rev().find(|w| is_path_arg(w)) {
+                out.push(ShellWrite { path: (*dest).to_string(), effect: ShellWriteEffect::Rewritten });
+            }
+        }
+        _ => {}
+    }
+
+    collect_redirect(segment, out);
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct ServeInput {
     pub moments: Vec<Action>,
@@ -321,5 +680,132 @@ mod tests {
             "a host anchor must be reachable from a command: {:?}",
             input.targets
         );
+    }
+
+    // ------------------------------------------------- shell_write_targets
+    //
+    // THE MEASURED HOLE: `rm file`, `truncate -s 0 file`, `sed -i ... file`,
+    // `echo x > file`, `tee file`, `mv other file` and `cp other file` from
+    // Bash walk straight past a rule anchored at that exact file, because
+    // only Edit/Write ever counted as a write. Each case below is the one
+    // real shape a Bash tool call takes for it.
+
+    fn removed(path: &str) -> ShellWrite {
+        ShellWrite { path: path.to_string(), effect: ShellWriteEffect::Removed }
+    }
+    fn emptied(path: &str) -> ShellWrite {
+        ShellWrite { path: path.to_string(), effect: ShellWriteEffect::Emptied }
+    }
+    fn rewritten(path: &str) -> ShellWrite {
+        ShellWrite { path: path.to_string(), effect: ShellWriteEffect::Rewritten }
+    }
+
+    #[test]
+    fn rm_names_every_argument_as_removed() {
+        assert_eq!(shell_write_targets("rm a b"), vec![removed("a"), removed("b")]);
+    }
+
+    #[test]
+    fn rm_skips_its_own_flags() {
+        assert_eq!(shell_write_targets("rm -rf dir"), vec![removed("dir")]);
+    }
+
+    #[test]
+    fn truncate_s_zero_empties_the_file() {
+        assert_eq!(shell_write_targets("truncate -s 0 f"), vec![emptied("f")]);
+    }
+
+    #[test]
+    fn truncate_a_nonzero_size_rewrites_rather_than_empties() {
+        assert_eq!(shell_write_targets("truncate -s 100 f"), vec![rewritten("f")]);
+    }
+
+    #[test]
+    fn sed_in_place_rewrites_the_file_and_never_its_own_script() {
+        assert_eq!(shell_write_targets("sed -i 's/a/b/' f"), vec![rewritten("f")]);
+    }
+
+    #[test]
+    fn a_bare_redirect_with_a_producer_rewrites_the_file() {
+        assert_eq!(shell_write_targets("echo x > f"), vec![rewritten("f")]);
+    }
+
+    #[test]
+    fn an_append_redirect_always_rewrites_even_with_a_producer() {
+        assert_eq!(shell_write_targets("cat a >> f"), vec![rewritten("f")]);
+    }
+
+    #[test]
+    fn a_redirect_with_no_producer_empties_the_file() {
+        assert_eq!(shell_write_targets("> f"), vec![emptied("f")]);
+        assert_eq!(shell_write_targets(": > f"), vec![emptied("f")], "the shell no-op idiom names no producer either");
+    }
+
+    #[test]
+    fn tee_rewrites_the_file_it_names() {
+        assert_eq!(shell_write_targets("tee f"), vec![rewritten("f")]);
+    }
+
+    #[test]
+    fn a_piped_tee_is_still_found_in_its_own_segment() {
+        assert_eq!(shell_write_targets("cat notes.md | tee f"), vec![rewritten("f")]);
+    }
+
+    #[test]
+    fn mv_names_only_the_destination_as_rewritten() {
+        assert_eq!(shell_write_targets("mv a b"), vec![rewritten("b")]);
+    }
+
+    #[test]
+    fn cp_names_only_the_destination_as_rewritten() {
+        assert_eq!(shell_write_targets("cp a b"), vec![rewritten("b")]);
+    }
+
+    #[test]
+    fn git_rm_is_removed_the_same_as_a_bare_rm() {
+        assert_eq!(shell_write_targets("git rm f"), vec![removed("f")]);
+    }
+
+    #[test]
+    fn a_quoted_path_with_a_space_is_read_whole() {
+        assert_eq!(shell_write_targets("rm \"my file.txt\""), vec![removed("my file.txt")]);
+    }
+
+    #[test]
+    fn a_glob_is_ignored_rather_than_guessed_at() {
+        assert_eq!(
+            shell_write_targets("rm *.log"),
+            Vec::<ShellWrite>::new(),
+            "a glob names nothing until the shell expands it"
+        );
+    }
+
+    #[test]
+    fn a_sh_c_wrapper_is_unwrapped_to_the_real_command() {
+        assert_eq!(shell_write_targets("sh -c \"rm file.txt\""), shell_write_targets("rm file.txt"));
+        assert_eq!(shell_write_targets("sh -c \"rm file.txt\""), vec![removed("file.txt")]);
+    }
+
+    #[test]
+    fn a_bash_lc_wrapper_is_also_unwrapped() {
+        assert_eq!(shell_write_targets("bash -lc \"rm file.txt\""), vec![removed("file.txt")]);
+    }
+
+    #[test]
+    fn a_powershell_command_wrapper_is_unwrapped_even_if_the_inner_shape_is_unrecognised() {
+        // Unwrapping succeeds; the inner text just is not one of the POSIX
+        // verbs this function knows, which is an acceptable missed case, not
+        // a wrong answer - see `shell_write_targets`'s own doc comment.
+        assert_eq!(shell_write_targets("powershell -Command \"Remove-Item file.txt\""), Vec::<ShellWrite>::new());
+    }
+
+    #[test]
+    fn a_plain_read_yields_nothing() {
+        assert_eq!(shell_write_targets("cat f"), Vec::<ShellWrite>::new());
+    }
+
+    #[test]
+    fn a_status_check_yields_nothing() {
+        assert_eq!(shell_write_targets("git status"), Vec::<ShellWrite>::new());
     }
 }

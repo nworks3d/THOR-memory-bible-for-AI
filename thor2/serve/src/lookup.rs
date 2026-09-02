@@ -1331,7 +1331,6 @@ mod tests {
         assert_eq!(hit.id, "l2");
     }
 
-    #[test]
     /// THE ASYMMETRY THIS CLOSES, from a real session 2026-08-19: the write
     /// gate refuses a second register whose key differs only in case or
     /// punctuation, while this door compared byte for byte - so a key the
@@ -1349,6 +1348,7 @@ mod tests {
         assert!(by_key(&store, "uitgaven-2026-09").is_none(), "a different key stays a different key");
     }
 
+    #[test]
     fn by_key_never_matches_an_unknown_key() {
         let db = EventStore::in_memory().unwrap();
         assert!(by_key(&db, "does-not-exist").is_none());

@@ -872,9 +872,45 @@ fn hook_once(db_path: &Path) -> Option<HookOutput> {
                 })));
             }
 
+            // THE CONDITIONAL GUARD, and the only arm that catches an
+            // OMISSION. Every arm above asks whether some text is present;
+            // this one asks whether a call that already said A also said B.
+            // It reads the call's own input rather than a file, because the
+            // thing it is about - a field that was left out - exists nowhere
+            // else. Runs after both arms above so an actual forbidden
+            // fragment, which is the more specific complaint, still wins.
+            if let Some(reason) = requires_guard_block(&store, tool_name, tool_input) {
+                return Some(HookOutput::Decision(serde_json::json!({
+                    "decision": "block",
+                    "reason": reason,
+                })));
+            }
+
             let mut input = ServeInput { project: session_project.clone(), ..Default::default() };
             if let Some(command) = absent_guard::proposed_command(tool_input) {
                 input.add_command(command);
+            } else {
+                // THE TOOL-NAME REACH THIS CLOSES. MEASURED: a Rule bound to
+                // Target command "Agent"/"Artifact"/"SendUserFile" was only
+                // ever matched inside the requires guard
+                // (`requires_guard_block`, which already reads the bare tool
+                // name as its own reach) - this surface built `input` from a
+                // Bash-style "command" field alone, so such a rule was never
+                // SERVED when the tool it names was actually called, and
+                // nine pinned rules had to stay on Always only to be seen at
+                // all. A tool call with no "command" field (every non-shell
+                // tool: Agent, Read, Write, Artifact, ...) now offers its own
+                // bare NAME the same way a shell command offers its own text,
+                // so a Command anchor naming a tool reaches that tool's own
+                // call - `add_command` gives it the identical moment/target/
+                // context derivation every other command anchor already
+                // gets, and a forbidden-literal check against a bare tool
+                // name stays harmless: this is the informational surface
+                // (`serve::serve`, rendered as context) - the hard guard
+                // (`command_guard_block`) still reads only a real "command"
+                // field via `absent_guard::proposed_command`, completely
+                // unaffected by this branch.
+                input.add_command(tool_name);
             }
             if let Some(file_path) = file_path {
                 input.add_file(file_path);
@@ -1770,6 +1806,128 @@ fn record_absent_guard_staleness(
     }
 }
 
+/// The conditional guard: a live Always-bound Rule/Orientation carrying a
+/// `Check::Requires` blocks a call whose own input contains the trigger and
+/// not the requirement.
+///
+/// WHAT IT READS. Every VALUE in `tool_input`, flattened to one string -
+/// never the field names, so a rule cannot accidentally match the shape of
+/// the payload instead of what the caller wrote (the same stance the answer
+/// guard already takes). That makes it work for any tool: a script, a
+/// prompt, a command, an argument list.
+///
+/// Any failure - no input, no matching item, no check of this form - falls
+/// through to `None`, the same "any error is silence" doctrine every other
+/// guard here follows.
+fn requires_guard_block(store: &EventStore, tool: &str, tool_input: Option<&Value>) -> Option<String> {
+    let content = tool_input_values(tool_input?);
+    if content.is_empty() {
+        return None;
+    }
+    // Every live item, not just the Always pool: a conditional rule about one
+    // tool hangs on a Command target, and narrowing the pool first would drop
+    // exactly those. `find_requires_violation` decides the reach - against
+    // the real command text when this call carries one (a Bash/PowerShell-
+    // style "command" field), the tool name otherwise, exactly the way the
+    // sibling command guard (`command_guard_block` below) already resolves
+    // its own target text.
+    let candidates = serve::live::live_items(store);
+    absent_guard::find_requires_violation(&candidates, tool, absent_guard::proposed_command(tool_input), &content)
+}
+
+/// How deep `tool_input_values` will recurse into a nested array/object
+/// before it gives up and stops descending. `input` is the model's own tool
+/// call, not something this project controls the shape of, so an unbounded
+/// walk over one nested deep enough (deliberately or not) is a stack
+/// overflow waiting to happen - the same "never trust a payload's own shape
+/// to stay reasonable" stance `model::check::run`'s own file-size limit
+/// takes for an unbounded read.
+const MAX_TOOL_INPUT_WALK_DEPTH: usize = 32;
+
+/// Every string VALUE inside a tool input, joined with newlines. Field names
+/// are deliberately left out: a rule must match what the caller wrote, not
+/// the shape of the payload it travelled in. Recursion is capped at
+/// `MAX_TOOL_INPUT_WALK_DEPTH`: anything nested deeper is silently left out
+/// of the flattened text rather than walked - the same "a missed case is
+/// acceptable, a crash is not" stance this whole guard file takes throughout.
+fn tool_input_values(input: &Value) -> String {
+    fn walk(v: &Value, out: &mut Vec<String>, depth: usize) {
+        if depth > MAX_TOOL_INPUT_WALK_DEPTH {
+            return;
+        }
+        match v {
+            Value::String(s) => out.push(s.clone()),
+            Value::Number(n) => out.push(n.to_string()),
+            Value::Bool(b) => out.push(b.to_string()),
+            Value::Array(items) => items.iter().for_each(|i| walk(i, out, depth + 1)),
+            Value::Object(map) => map.values().for_each(|i| walk(i, out, depth + 1)),
+            Value::Null => {}
+        }
+    }
+    let mut out = Vec::new();
+    walk(input, &mut out, 0);
+    out.join("\n")
+}
+
+#[cfg(test)]
+mod tool_input_values_tests {
+    use super::*;
+
+    /// A `serde_json::Value` nested `depth` arrays deep, with `leaf` as the
+    /// innermost value - built so `MAX_TOOL_INPUT_WALK_DEPTH`'s own tests
+    /// below can pick an exact depth relative to the cap, rather than
+    /// guessing at a real payload's shape.
+    fn nested(depth: usize, leaf: &str) -> Value {
+        let mut v = serde_json::json!(leaf);
+        for _ in 0..depth {
+            v = serde_json::json!([v]);
+        }
+        v
+    }
+
+    #[test]
+    fn nested_values_are_flattened_regardless_of_shape() {
+        let input = serde_json::json!({
+            "a": "one",
+            "b": {"c": "two", "d": ["three", "four"]},
+            "e": 5,
+            "f": true,
+            "g": null,
+        });
+        let flat = tool_input_values(&input);
+        for expected in ["one", "two", "three", "four", "5", "true"] {
+            assert!(flat.contains(expected), "missing {expected:?} in {flat:?}");
+        }
+        assert!(!flat.contains("null"), "Null must contribute nothing: {flat:?}");
+    }
+
+    #[test]
+    fn a_value_exactly_at_the_depth_cap_is_still_reached() {
+        let input = nested(MAX_TOOL_INPUT_WALK_DEPTH, "reachable");
+        assert!(tool_input_values(&input).contains("reachable"));
+    }
+
+    /// THE CRASH THIS PREVENTS: `input` is the model's own tool call, not a
+    /// shape this project controls, so an unbounded recursive walk over one
+    /// nested deep enough is a stack overflow waiting to happen. Proven at
+    /// the exact boundary rather than at some very large depth: constructing
+    /// (and later dropping) a `serde_json::Value` nested tens of thousands of
+    /// levels deep is itself a known way to overflow the stack, in the
+    /// ordinary recursive `Drop` every such tree type gets - a risk that has
+    /// nothing to do with `tool_input_values` and would make a "very deep"
+    /// version of this test dangerous in exactly the way this fix exists to
+    /// avoid. One level past the cap is enough to prove the walk stops
+    /// there, without going anywhere near that unrelated risk.
+    #[test]
+    fn a_value_one_level_past_the_depth_cap_is_left_out_rather_than_reached() {
+        let input = nested(MAX_TOOL_INPUT_WALK_DEPTH + 1, "too-deep");
+        assert!(
+            !tool_input_values(&input).contains("too-deep"),
+            "a value past the cap must be left out, not walked into"
+        );
+    }
+}
+
 /// The command guard: the Absent-check guard's THIRD anchor shape (see
 /// `serve::absent_guard`'s own top-of-file doc comment, "THE COMMAND
 /// guard") - a live Rule/Orientation bound to a `Command` target, carrying a
@@ -1789,6 +1947,19 @@ fn record_absent_guard_staleness(
 /// same "any error, anywhere, is silence" doctrine `absent_guard_block`
 /// itself already follows. Never emits a permission decision of "allow"
 /// either, mirroring every other guard in this file.
+///
+/// ALSO THE SHELL WRITE HOLE'S OWN GUARD, checked FIRST, before any of the
+/// above: `serve::input::shell_write_targets` reads `rm`/`git rm`/
+/// `truncate -s 0`/`sed -i`/`tee`/a `>`/`>>` redirection/`mv`/`cp`'s own
+/// destination out of the SAME command string, and every path it finds is
+/// fed through `absent_guard::find_location_violation` (and, for a write
+/// that empties or removes the file, `find_missing_required`) exactly as if
+/// it were the `file_path` of a real Edit/Write - because a rule anchored at
+/// a file must refuse a write to it however that write actually arrived.
+/// Same fail-open stance as everything else in this function: a shell write
+/// that reaches no rule falls straight through to the command-anchored
+/// checks below at no measurable cost, since `shell_write_targets` itself
+/// touches neither the store nor the filesystem.
 fn command_guard_block(
     store: &EventStore,
     db_path: &Path,
@@ -1797,6 +1968,58 @@ fn command_guard_block(
     root: Option<&Path>,
 ) -> Option<String> {
     let command = absent_guard::proposed_command(tool_input)?;
+
+    // THE SHELL WRITE HOLE. MEASURED: a rule anchored at a file with a
+    // `contains` or `absent` check refuses an Edit/Write of that file, but
+    // `rm file`, `truncate -s 0 file`, `sed -i ... file`, `echo x > file`,
+    // `tee file`, `mv other file` and `cp other file` from Bash walk
+    // straight past it - a shell write is a write. Checked BEFORE the
+    // command-anchored rule system below (`find_command_violation`): a
+    // location prohibition or a lost required literal is a stronger, more
+    // specific complaint than a forbidden-literal-in-the-command-string
+    // check, mirroring `absent_guard_block`'s own location-before-content
+    // ordering. `shell_write_targets` itself is pure string parsing - for
+    // the common case (no rm/mv/cp/sed/tee/truncate/redirect in the
+    // command) it returns immediately and this loop never opens the store
+    // at all, so a shell write that reaches no rule costs nothing
+    // measurable.
+    for write in serve::input::shell_write_targets(command) {
+        let mut location_input = ServeInput::default();
+        location_input.add_target(TargetKind::Path, &write.path);
+        location_input.add_target(TargetKind::Dir, &write.path);
+        let location_candidates = serve::live::candidates_for(store, &location_input);
+
+        // Location first (a place out of bounds is out of bounds whatever
+        // the write does to it), then - only for Removed/Emptied, where the
+        // resulting content is KNOWN to be empty, never guessed at - a
+        // `Contains` check whose required literal that emptiness would
+        // erase. Rewritten is deliberately never fed to `find_missing_
+        // required`: unlike an Edit, this project cannot know what a
+        // `sed`/`tee`/redirect-with-a-producer actually leaves behind
+        // without running it, and guessing would risk the false refusal
+        // this whole guard file refuses to make anywhere else.
+        let shell_reason = absent_guard::find_location_violation(&location_candidates, &write.path, root).or_else(
+            || {
+                matches!(
+                    write.effect,
+                    serve::input::ShellWriteEffect::Removed | serve::input::ShellWriteEffect::Emptied
+                )
+                .then(|| absent_guard::find_missing_required(&location_candidates, &write.path, "", root))
+                .flatten()
+            },
+        );
+        let Some(shell_reason) = shell_reason else { continue };
+
+        let verb = match write.effect {
+            serve::input::ShellWriteEffect::Removed => "removed",
+            serve::input::ShellWriteEffect::Emptied => "emptied",
+            serve::input::ShellWriteEffect::Rewritten => "rewritten",
+        };
+        if let Some(id) = absent_guard::rule_id_of(&shell_reason) {
+            record_gate(db_path, session_id, true, id, command);
+        }
+        return Some(format!("{shell_reason} The command `{command}` would have {verb} {}. Nothing was done.", write.path));
+    }
 
     let mut input = ServeInput::default();
     input.add_target(TargetKind::Command, command);

@@ -550,9 +550,24 @@ impl EventStore {
         // read had already done moments earlier. Read-only tuning: changes
         // nothing about what any query returns.
         conn.execute_batch("PRAGMA cache_size = -20000")?;
+        // Cap how large the WAL is allowed to stay after a checkpoint fully
+        // reclaims it (64 MiB - generous for this store's write volume, far
+        // below the 3.4 GB one was measured to reach with no cap at all).
+        // `journal_size_limit` is a per-connection setting, not one WAL mode
+        // persists to the database file, so every constructor that can leave
+        // a checkpoint to run sets it again rather than relying on an earlier
+        // connection having done so.
+        conn.execute_batch("PRAGMA journal_size_limit = 67108864")?;
         Self::init_schema(&conn)?;
         Self::sync_fts(&conn)?;
         Self::ensure_item_binding_projection(&conn)?;
+        // Best-effort reclaim on every open: PASSIVE never blocks a reader or
+        // writer and never turns a healthy open into a failed one (it just
+        // checkpoints fewer frames, or none, under contention), so ordinary
+        // use gets a chance to walk the WAL back down without a background
+        // thread or timer. Errors are deliberately not propagated - a
+        // checkpoint is a nicety, never a precondition for opening the store.
+        let _ = conn.execute_batch("PRAGMA wal_checkpoint(PASSIVE)");
         Ok(EventStore { conn })
     }
 
@@ -582,6 +597,13 @@ impl EventStore {
                 | OpenFlags::SQLITE_OPEN_NO_MUTEX,
         )?;
         conn.busy_timeout(Duration::from_secs(5))?;
+        // Same cap `new()` sets, and the same reason: a per-connection
+        // setting, not one WAL mode remembers on its own. Setting it changes
+        // nothing about what is in the store - only how big its -wal
+        // companion is allowed to stay the next time anything checkpoints -
+        // so it holds within this constructor's own "never changes what is
+        // in it" guarantee.
+        conn.execute_batch("PRAGMA journal_size_limit = 67108864")?;
         Ok(EventStore { conn })
     }
 
@@ -625,7 +647,7 @@ impl EventStore {
             -- Recall projection (M1): a contentless FTS5 index over body_ch,
             -- keyed by the event seq (rowid). Written in the SAME transaction as
             -- the event append (see insert_event), so the index can never lag the
-            -- log. `thor fsck` (verify_fts_projection) asserts the index ROW SET
+            -- log. `verify` (verify_fts_projection) asserts the index ROW SET
             -- equals the log; sync_fts heals a cold-open row-count mismatch (a
             -- pre-M1 store or aborted backfill). Per-row text is not separately
             -- audited (contentless index), but it cannot drift from the code path.
@@ -899,22 +921,85 @@ impl EventStore {
     /// count (e.g. a store written by a pre-M1 binary that had no FTS table, or
     /// an aborted backfill). Cheap no-op when they already match. Append keeps
     /// them in lockstep in-transaction; this only heals a cold-open mismatch.
+    ///
+    /// TWO BUGS FOUND LIVE (2026-09-02) in the previous shape of this
+    /// function, on a store 73k rows behind: it kept a `Rows` cursor over
+    /// `event` open for the whole reinsert loop while writing `event_fts` one
+    /// row at a time on the SAME connection - SQLite will not actually commit
+    /// a write statement while a sibling statement on the same connection is
+    /// still active, so the "per row" inserts never autocommitted
+    /// individually, the whole rebuild ran as one very long-held write lock,
+    /// and it pinned the WAL against checkpointing for as long as that cursor
+    /// stayed open. And the mismatch check above was never exclusive across
+    /// processes: `new()` runs on every `model show`, every `serve
+    /// hook`/`why`/`scope`, so a second caller that also saw a mismatch
+    /// before the first one committed just restarted the same DELETE-ALL,
+    /// and the index could livelock forever under concurrent callers instead
+    /// of converging - measured as the event/event_fts gap swinging between
+    /// roughly 500 and 60000 rows sample to sample while several `serve`
+    /// processes ran, instead of climbing smoothly to completion.
+    ///
+    /// Fixed by making the heal ONE set-based transaction with no statement
+    /// left open across it (either it fully lands, closing the mismatch for
+    /// every later open, or it fully rolls back to the exact pre-heal state
+    /// for the next caller to retry - never a half-rebuilt state that forces
+    /// every caller to repeat the whole thing), and by rechecking the counts
+    /// once the write lock is actually held: a second caller that raced the
+    /// first one in now finds nothing left to do instead of redoing the same
+    /// rebuild for no reason. When `event_fts` holds no orphan rows (every
+    /// indexed rowid still names a real event - the ordinary "just behind"
+    /// case) only the missing tail is inserted, one set-based statement, not
+    /// a delete-and-replace of rows that were already correct; a genuine
+    /// disagreement (an orphan rowid: a restore, a pre-M1 store, tampering)
+    /// still gets the full delete-all-and-rebuild `rebuild_fts` also uses.
+    ///
+    /// A THIRD case surfaced from a straggler running the OLD binary above:
+    /// a contentless FTS5 table does not reject an INSERT that repeats an
+    /// already-indexed rowid, so a straggler process finishing its own stale
+    /// heal AFTER this one already landed can leave `event_fts` with MORE
+    /// rows than `event` while every rowid it holds is still perfectly
+    /// real - `indexed > events` with ZERO orphans. The incremental branch
+    /// only adds a seq that is NOT YET present, so it cannot remove that
+    /// extra copy, and would otherwise leave the mismatch to be
+    /// re-detected, and re-no-op'd, on every later open forever. Rechecking
+    /// the count AFTER the incremental insert (instead of trusting the
+    /// orphan test alone to decide "done") closes that: any disagreement
+    /// still standing, from either cause, falls through to the same full
+    /// delete-all-and-rebuild.
     fn sync_fts(conn: &Connection) -> SqlResult<()> {
         let events: i64 = conn.query_row("SELECT COUNT(*) FROM event", [], |r| r.get(0))?;
         let indexed: i64 = conn.query_row("SELECT COUNT(*) FROM event_fts", [], |r| r.get(0))?;
         if events == indexed {
             return Ok(());
         }
-        conn.execute("INSERT INTO event_fts(event_fts) VALUES('delete-all')", [])?;
-        let mut stmt = conn.prepare("SELECT seq, body_ch FROM event ORDER BY seq")?;
-        let rows = stmt.query_map([], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?)))?;
-        for row in rows {
-            let (seq, body_ch) = row?;
-            conn.execute(
-                "INSERT INTO event_fts(rowid, body_ch) VALUES (?, ?)",
-                params![seq, &body_ch],
-            )?;
+        let tx = conn.unchecked_transaction()?;
+        let events: i64 = tx.query_row("SELECT COUNT(*) FROM event", [], |r| r.get(0))?;
+        let mut indexed: i64 = tx.query_row("SELECT COUNT(*) FROM event_fts", [], |r| r.get(0))?;
+        if events == indexed {
+            return Ok(()); // someone else's heal landed while we waited for the write lock
         }
+        let orphans: i64 = tx.query_row(
+            "SELECT COUNT(*) FROM event_fts WHERE rowid NOT IN (SELECT seq FROM event)",
+            [],
+            |r| r.get(0),
+        )?;
+        if orphans == 0 {
+            tx.execute(
+                "INSERT INTO event_fts(rowid, body_ch)
+                 SELECT seq, body_ch FROM event WHERE seq NOT IN (SELECT rowid FROM event_fts)",
+                [],
+            )?;
+            indexed = tx.query_row("SELECT COUNT(*) FROM event_fts", [], |r| r.get(0))?;
+        }
+        if indexed != events {
+            // Either a genuine orphan was present above, or (the duplicate-
+            // rowid case) the incremental catch-up changed nothing: fall
+            // back to the full rebuild rather than commit a heal that left
+            // the mismatch standing.
+            tx.execute("INSERT INTO event_fts(event_fts) VALUES('delete-all')", [])?;
+            tx.execute("INSERT INTO event_fts(rowid, body_ch) SELECT seq, body_ch FROM event", [])?;
+        }
+        tx.commit()?;
         Ok(())
     }
 
@@ -1222,7 +1307,7 @@ impl EventStore {
     /// Rebuild the heads projection from the log, in one transaction. The
     /// explicit form of what the next append would do anyway - for a store
     /// upgraded from a pre-M2 binary that wants the fast path before its
-    /// first write (`thor fsck --rebuild-heads`).
+    /// first write (`verify <path-to-thor.db> --rebuild-heads`).
     pub fn rebuild_heads_projection(&mut self) -> anyhow::Result<i64> {
         let tx = self
             .conn
@@ -1854,7 +1939,7 @@ pub fn verify_fts_projection(conn: &Connection) -> Result<(), String> {
 /// form) behaves identically here - claiming otherwise would be theatre.
 ///
 /// The damage is repairable without touching history: the index is a projection
-/// of an append-only log, so rebuilding it loses nothing. `thor fsck --rebuild-fts`
+/// of an append-only log, so rebuilding it loses nothing. `verify <path> --rebuild-fts`
 /// does exactly that. It is deliberately NOT automatic: sync_fts returns early
 /// when the counts match (which is the state after this kind of damage), and a
 /// silent rewrite of an index at the moment the disk under it is suspect is the
@@ -1977,11 +2062,150 @@ mod fts_integrity_tests {
         assert!(verify_fts_integrity(&store.conn).is_ok(), "repaired");
         assert!(verify_fts_projection(&store.conn).is_ok(), "and still consistent");
     }
+
+    /// The ordinary shape of drift: `event_fts` holds a valid SUBSET of
+    /// `event` (a cold open after a burst of writes, or a store upgraded
+    /// from a pre-M1 binary), no orphan rowid anywhere. `sync_fts` must take
+    /// the cheap incremental path here - one set-based catch-up insert, not
+    /// a delete-and-replace of rows that were already correct.
+    #[test]
+    fn sync_fts_catches_up_a_missing_tail_with_no_orphans() {
+        let store = seeded(50);
+        // A contentless FTS5 table refuses a plain DELETE ("cannot DELETE
+        // from contentless fts5 table"), so "behind" has to be simulated the
+        // same way a real gap arises: rebuild from only a PREFIX of event.
+        store.conn.execute("INSERT INTO event_fts(event_fts) VALUES('delete-all')", []).unwrap();
+        store
+            .conn
+            .execute("INSERT INTO event_fts(rowid, body_ch) SELECT seq, body_ch FROM event WHERE seq <= 30", [])
+            .unwrap();
+        assert!(verify_fts_projection(&store.conn).is_err(), "fixture sanity: now behind");
+        assert_eq!(
+            store.conn.query_row("SELECT COUNT(*) FROM event_fts WHERE rowid NOT IN (SELECT seq FROM event)", [], |r| r.get::<_, i64>(0)).unwrap(),
+            0,
+            "fixture sanity: behind, not wrong - no orphan yet"
+        );
+
+        EventStore::sync_fts(&store.conn).unwrap();
+
+        assert!(verify_fts_projection(&store.conn).is_ok(), "the missing tail must be caught up");
+        assert!(verify_fts_integrity(&store.conn).is_ok());
+    }
+
+    /// The genuinely-wrong shape of drift: an orphan rowid in `event_fts`
+    /// that names no real event (a restore, a pre-M1 store, tampering).
+    /// `sync_fts` must fall back to the full delete-all-and-rebuild here -
+    /// the incremental catch-up alone could never remove a row that should
+    /// not exist.
+    #[test]
+    fn sync_fts_falls_back_to_a_full_rebuild_when_the_index_holds_an_orphan() {
+        let store = seeded(30);
+        store
+            .conn
+            .execute("INSERT INTO event_fts(rowid, body_ch) VALUES (999999, 'orphan text')", [])
+            .unwrap();
+        assert!(verify_fts_projection(&store.conn).is_err(), "fixture sanity: orphan present");
+
+        EventStore::sync_fts(&store.conn).unwrap();
+
+        assert!(
+            verify_fts_projection(&store.conn).is_ok(),
+            "the orphan must be gone and every real row present"
+        );
+        let indexed: i64 = store.conn.query_row("SELECT COUNT(*) FROM event_fts", [], |r| r.get(0)).unwrap();
+        assert_eq!(indexed, 30, "exactly the real rows, no more");
+    }
+
+    /// The THIRD case the fallback above guards against: an old straggler
+    /// process re-committing an already-indexed rowid after this heal has
+    /// already run (contentless FTS5 does not reject an INSERT that repeats
+    /// an existing rowid - see `sync_fts`'s own doc comment).
+    ///
+    /// Verified here rather than assumed. On this crate's bundled SQLite
+    /// (3.45.0) that re-insert turns out to be a SAFE, atomic replace, not a
+    /// duplication: `event_fts_docsize` (the shadow table FTS5 keeps one row
+    /// per indexed rowid in) declares `id INTEGER PRIMARY KEY`, a real
+    /// uniqueness constraint - a raw duplicate INSERT straight against that
+    /// shadow table fails with "UNIQUE constraint failed", confirmed by hand
+    /// against this exact store. So `event_fts` can never actually end up
+    /// with MORE rows than distinct valid rowids on this build: a same-rowid
+    /// re-insert changes what that rowid indexes, never how many rows exist.
+    /// `orphans == 0` therefore already implies `indexed <= events` here, and
+    /// the recheck above is defense in depth - a different SQLite/FTS5
+    /// build, or any other route to the same drift, is still caught by it -
+    /// rather than a branch this test can force open on THIS build. What it
+    /// verifies instead is the thing production actually needs true: seeding
+    /// a duplicate rowid, the exact straggler shape, must never leave the
+    /// store inconsistent.
+    #[test]
+    fn sync_fts_stays_consistent_when_a_rowid_is_indexed_twice() {
+        let store = seeded(30);
+        // Simulate the straggler: re-insert a rowid that is ALREADY indexed,
+        // with DIFFERENT text than the original - a naive duplicate-posting
+        // bug would show up as a second, distinct entry, not an identical one.
+        store
+            .conn
+            .execute(
+                "INSERT INTO event_fts(rowid, body_ch) VALUES (1, 'straggler replay text')",
+                [],
+            )
+            .unwrap();
+        let indexed_before: i64 =
+            store.conn.query_row("SELECT COUNT(*) FROM event_fts", [], |r| r.get(0)).unwrap();
+        assert_eq!(indexed_before, 30, "fixture sanity: the re-insert must not have inflated the count");
+
+        EventStore::sync_fts(&store.conn).unwrap();
+
+        let indexed_after: i64 =
+            store.conn.query_row("SELECT COUNT(*) FROM event_fts", [], |r| r.get(0)).unwrap();
+        assert_eq!(indexed_after, 30, "counts must still match after sync");
+        assert!(verify_fts_projection(&store.conn).is_ok());
+        assert!(verify_fts_integrity(&store.conn).is_ok());
+    }
+
+    /// The documented contract for the common case: once `event` and
+    /// `event_fts` already agree (true right after construction, since every
+    /// constructor calls this once), a further call is a cheap no-op that
+    /// changes nothing - never a spurious rebuild.
+    #[test]
+    fn sync_fts_is_a_noop_once_already_current() {
+        let store = seeded(20);
+        assert!(verify_fts_projection(&store.conn).is_ok(), "fixture sanity: already in sync");
+
+        EventStore::sync_fts(&store.conn).unwrap();
+
+        let indexed: i64 = store.conn.query_row("SELECT COUNT(*) FROM event_fts", [], |r| r.get(0)).unwrap();
+        assert_eq!(indexed, 20, "unchanged");
+        assert!(verify_fts_projection(&store.conn).is_ok());
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Both file-backed constructors must cap how large the WAL is allowed
+    /// to stay after a checkpoint reclaims it - `journal_size_limit` is a
+    /// per-connection setting SQLite does not persist to the database file,
+    /// so it has to be set again on every open, not just the one that
+    /// created the store (measured live: a WAL that reached 3.4 GB against a
+    /// 75 MB store because nothing ever capped it).
+    #[test]
+    fn new_and_open_existing_both_cap_the_wal_journal_size() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("cap.db");
+        let expect_cap = |conn: &Connection, who: &str| {
+            let limit: i64 = conn.query_row("PRAGMA journal_size_limit", [], |r| r.get(0)).unwrap();
+            assert_eq!(limit, 67_108_864, "{who} must set the 64 MiB journal_size_limit cap");
+        };
+
+        let store = EventStore::new(&db_path).unwrap();
+        expect_cap(&store.conn, "new()");
+        drop(store);
+
+        let store = EventStore::open_existing(&db_path).unwrap();
+        expect_cap(&store.conn, "open_existing()");
+    }
 
     /// The projection tables must equal the cas fold after EVERY append,
     /// across the full torture set of fold arms: fast-forward, stale branch,
@@ -2113,6 +2337,47 @@ mod tests {
         assert!(store.heads_projection_current(), "append after bypass rebuilds");
         assert!(store.verify_heads_projection().unwrap().is_empty());
         assert!(store.projected_is_head("P:mem-a", "bypass-hash"));
+    }
+
+    /// `rebuild_heads_projection`'s own use case: a store copied over from
+    /// before the heads projection existed - head_state, entity_meta and the
+    /// tip_seq marker never populated, the log itself untouched (the same
+    /// fixture technique
+    /// `ensure_item_binding_projection_backfills_a_store_that_predates_the_table`
+    /// uses for the item_binding table) - must rebuild to an exact match for
+    /// the from-scratch fold, verified here rather than assumed.
+    #[test]
+    fn rebuild_heads_projection_repairs_a_store_wiped_back_to_pre_m2() {
+        let mut store = EventStore::in_memory().unwrap();
+        for i in 0..20 {
+            store
+                .append_event("s", "l", "t", EventKind::FactCreated, &format!("e{i}"), None, &format!("v{i}"))
+                .unwrap();
+        }
+        let expected_tip = store.get_all_events().unwrap().len() as i64;
+        assert!(store.heads_projection_current(), "fixture sanity: current right after append");
+
+        // Simulate "the projection predates this store": wipe head_state,
+        // entity_meta and the tip_seq marker, exactly what copying a pre-M2
+        // store to this binary looks like (the log itself is untouched).
+        store.conn().execute("DELETE FROM head_state", []).unwrap();
+        store.conn().execute("DELETE FROM entity_meta", []).unwrap();
+        store.conn().execute("DELETE FROM projection_meta WHERE k = 'tip_seq'", []).unwrap();
+        assert!(!store.heads_projection_current(), "fixture sanity: now looks unbuilt");
+
+        let tip = store.rebuild_heads_projection().unwrap();
+
+        assert_eq!(tip, expected_tip, "tip lands on the last seq in the log");
+        assert!(store.heads_projection_current(), "must be current after the rebuild");
+        assert!(
+            store.verify_heads_projection().unwrap().is_empty(),
+            "rebuilt projection must equal the from-scratch fold exactly"
+        );
+        assert_eq!(
+            store.projected_head_count("e0"),
+            1,
+            "and the heads themselves must be right, not just 'current'"
+        );
     }
 
     /// projected_head_events serves every current head as its full event row

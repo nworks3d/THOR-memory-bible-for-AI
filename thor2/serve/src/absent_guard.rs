@@ -529,7 +529,7 @@ fn absent_literals(check: &Check) -> Option<(&str, &[String])> {
     match check {
         Check::Absent { path, literal } => Some((path.as_str(), std::slice::from_ref(literal))),
         Check::AbsentAll { path, literals } => Some((path.as_str(), literals.as_slice())),
-        Check::PathExists { .. } | Check::Contains { .. } | Check::Forbidden { .. } => None,
+        Check::PathExists { .. } | Check::Contains { .. } | Check::Forbidden { .. } | Check::Requires { .. } => None,
     }
 }
 
@@ -656,7 +656,11 @@ pub fn find_violation(ranked: &[RankedItem], file_path: &str, content: &str, roo
 fn required_literal(check: &Check) -> Option<(&str, &str)> {
     match check {
         Check::Contains { path, literal } => Some((path.as_str(), literal.as_str())),
-        Check::PathExists { .. } | Check::Absent { .. } | Check::AbsentAll { .. } | Check::Forbidden { .. } => None,
+        Check::PathExists { .. }
+        | Check::Absent { .. }
+        | Check::AbsentAll { .. }
+        | Check::Forbidden { .. }
+        | Check::Requires { .. } => None,
     }
 }
 
@@ -722,8 +726,104 @@ pub fn find_missing_required(
 fn forbidden_literals(check: &Check) -> Option<&[String]> {
     match check {
         Check::Forbidden { literals } => Some(literals.as_slice()),
-        Check::PathExists { .. } | Check::Contains { .. } | Check::Absent { .. } | Check::AbsentAll { .. } => None,
+        Check::PathExists { .. }
+        | Check::Contains { .. }
+        | Check::Absent { .. }
+        | Check::AbsentAll { .. }
+        | Check::Requires { .. } => None,
     }
+}
+
+/// The trigger and the requirement a `Check::Requires` carries.
+fn requires_pair(check: &Check) -> Option<(&str, &[String])> {
+    match check {
+        Check::Requires { when, required } => Some((when.as_str(), required.as_slice())),
+        _ => None,
+    }
+}
+
+/// The block reason for the first live item, reached through a `Command`
+/// target, whose `Requires` check is TRIGGERED by this call and whose
+/// requirement is missing from it.
+///
+/// `tool` is the bare tool name; `command` is the real command string when
+/// the call carries one (a Bash/PowerShell-style "command" field read via
+/// `proposed_command`), `None` otherwise. `content` is every value the
+/// call's own input carries, flattened (`tool_input_values`) - used ONLY for
+/// the requirement side below, never for the trigger.
+///
+/// THE REACH IS A `Command` TARGET, and ONLY a `Command` target. Always used
+/// to be a second reach here, and it is gone: `gate::declare`/`revise` now
+/// refuse a `Requires` check on an Always-bound item outright (ground 23),
+/// so a live store should never hold one - and this function does not
+/// special-case Always even defensively, because `command_bindings` below
+/// only ever returns a `Command`-kind target in the first place.
+///
+/// THE TRIGGER IS THE REACH, AND NOTHING ELSE COMPARES IT TO THE CALL.
+/// `when` used to be checked a SECOND time here, against the exact same
+/// text the reach itself already matched (`command_anchor_names(when,
+/// target)`) - and that second comparison is what quietly killed a second
+/// binding on the same item. MEASURED on the owner's own store:
+/// `zwerm-noemt-altijd-een-model` is bound to TWO commands, "Agent" and
+/// "Workflow", with `when: "Agent"`. Splitting it into two rules (one
+/// trigger each) is not an escape either - the near-duplicate gate refuses
+/// a second rule whose text says the same thing. So a call through the
+/// "Workflow" binding reached this function (the binding matched), then
+/// failed the second `when`-against-"Workflow" comparison and passed
+/// through unwatched - silently, because the item's own text never changed
+/// and nothing about it looked broken.
+///
+/// The fix removes the second comparison rather than patching it: the
+/// bindings already say exactly which calls this rule watches (that is
+/// what ground 23 forces `Requires` onto a `Command` target for in the
+/// first place), so ANY one of them reaching is the whole trigger. `when`
+/// is still read here (`requires_pair`) but only because that is the
+/// shared shape `Check::Requires` carries - it plays no part in deciding
+/// reach any more (see `model::gate`'s own ground 24, which is what keeps
+/// the STORED `when` honest instead: it must equal one of the item's own
+/// bindings, a write-time check, never a serve-time one). The message below
+/// quotes the binding that actually matched, never `when`, so it can never
+/// claim a call tripped a spelling it did not.
+///
+/// Matching used to be `content.contains(when)` before ANY of this: a
+/// weaker defect than the one above, but still worth remembering.
+/// "reagent(" tripped "agent(", a Grep call searching FOR the trigger text
+/// tripped it on its own pattern (`a_grep_for_the_trigger_text_is_never_
+/// refused` below reproduces this verbatim), and a comment merely mentioning
+/// the trigger tripped it under an Always binding (no longer even
+/// constructible - see ground 23).
+///
+/// The requirement side stays lenient on purpose: satisfied as soon as any
+/// of `required` appears ANYWHERE in the call's flattened input values,
+/// never narrowed to the field the trigger matched - a missed case here
+/// costs far less than a false refusal, the rule this whole project holds to
+/// throughout.
+pub fn find_requires_violation(items: &[LiveItem], tool: &str, command: Option<&str>, content: &str) -> Option<String> {
+    let target = command.unwrap_or(tool);
+    for candidate in items {
+        if !candidate.item.kind.can_fire() {
+            continue;
+        }
+        let Some(anchor) =
+            command_bindings(&candidate.item).into_iter().find(|anchor| command_anchor_names(anchor, target))
+        else {
+            continue;
+        };
+        let Some(check) = candidate.item.check.as_ref() else { continue };
+        let Some((_when, required)) = requires_pair(check) else { continue };
+        if required.iter().any(|r| content.contains(r.as_str())) {
+            continue;
+        }
+        let answers: Vec<String> = required.iter().map(|r| format!("{r:?}")).collect();
+        return Some(format!(
+            "[THOR] rule {} applies here: this call trips {anchor:?} and says none of {}. {} \
+             Nothing was done. Add one and run the call again.",
+            candidate.id,
+            answers.join(" or "),
+            candidate.item.text
+        ));
+    }
+    None
 }
 
 /// The block reason for the first live item among `items` carrying a
@@ -1075,7 +1175,14 @@ fn command_bindings(item: &Item) -> Vec<&str> {
 /// the middle rather than at the front. Making an anchor match anywhere is a
 /// real widening, and this project has twice measured what unvalidated
 /// widening costs, so it needs a blind hold-out first, not an argument.
-fn strip_invocation_wrapper(command: &str) -> String {
+///
+/// `pub(crate)` for a second caller: `serve::input::shell_write_targets`
+/// reuses this SAME normalisation to recognise `sh -c "..."`, `bash -lc
+/// "..."` and `powershell -Command "..."` as wrapper invocations before it
+/// scans the string a wrapper carries, rather than growing a second,
+/// independently-maintained idea of what counts as "the same command
+/// underneath the typing".
+pub(crate) fn strip_invocation_wrapper(command: &str) -> String {
     let mut words: Vec<&str> = command.split_whitespace().collect();
     while let Some(first) = words.first() {
         if *first == "sudo" || (first.contains('=') && !first.starts_with('-')) {
@@ -1574,6 +1681,311 @@ pub fn record_stale_text(
 
 #[cfg(test)]
 mod tests {
+
+    /// `when: "Workflow"` on purpose, not the "agent(" this fixture used to
+    /// carry: reach is decided entirely by the item's own Command BINDING
+    /// (`command_anchor_names`) now - `when` is never compared to the call
+    /// at all any more - so a fixture meant to exercise a Command-bound
+    /// reach needs its BINDING to actually name a tool or command; "agent("
+    /// never could, and every test below that still needs that exact
+    /// literal (the false-block shape it was originally reported in) builds
+    /// its own item inline instead. `when` is kept equal to the binding
+    /// here only because a real stored item must satisfy that too
+    /// (`model::gate`'s own ground 24) - this fixture is never run through
+    /// the gate, but there is no reason to build one that could not pass it.
+    fn conditional_item(binding: model::item::Binding) -> Vec<LiveItem> {
+        let item = model::item::Item {
+            id: "cheap-swarm".to_string(),
+            kind: model::item::Kind::Rule,
+            text: "name a model on every agent you spawn".to_string(),
+            bindings: vec![binding],
+            severity: None,
+            project: None,
+            tags: vec![],
+            expires: None,
+            key: None,
+            falsifier: Some("a swarm without that field turns out to be cheap anyway".to_string()),
+            check: Some(model::item::Check::Requires {
+                when: "Workflow".to_string(),
+                required: vec!["model".to_string()],
+            }),
+        };
+        vec![LiveItem { id: item.id.clone(), item }]
+    }
+
+    /// THE FALSE BLOCK THIS PREVENTED, and the shape it took: bound Always,
+    /// this item used to be reached by EVERY call, held back only by a
+    /// content-substring match on the trigger - the very match that let
+    /// "reagent(" trip "agent(" and let a comment merely mentioning the
+    /// trigger trip it too. Always is no longer a reach for this check kind
+    /// at all - the gate now refuses declaring one outright (`gate::declare`
+    /// ground 23) - and this proves the guard agrees on its own terms, for a
+    /// store that somehow still held one anyway: no call reaches it, however
+    /// loudly the content matches what the trigger used to be.
+    #[test]
+    fn a_conditional_check_bound_always_reaches_nothing() {
+        let items = conditional_item(model::item::Binding::Always);
+        assert!(find_requires_violation(&items, "Workflow", None, "await agent('do it')").is_none());
+        assert!(find_requires_violation(
+            &items,
+            "Bash",
+            Some("echo \"a comment mentioning Workflow\""),
+            "echo \"a comment mentioning Workflow\""
+        )
+        .is_none());
+    }
+
+    /// THE FALSE BLOCK THIS PREVENTS, and it happened the hour this form was
+    /// built: bound Always, the rule refused the very message asking someone
+    /// to WRITE such a call, because the old trigger read the call's own
+    /// free-text content. Bound to the tool it is about instead, content
+    /// plays no part in the trigger at all any more - only the call's own
+    /// tool/command identity does, so the SAME words on a DIFFERENT tool
+    /// never trip it, whatever they say.
+    #[test]
+    fn a_conditional_check_bound_to_a_tool_leaves_every_other_call_alone() {
+        let items = conditional_item(model::item::Binding::Target {
+            kind: model::item::TargetKind::Command,
+            value: "Workflow".to_string(),
+        });
+        assert!(
+            find_requires_violation(&items, "Workflow", None, "a script with nothing named").is_some(),
+            "on its own tool it still refuses"
+        );
+        assert!(
+            find_requires_violation(&items, "Workflow", None, "a script naming a model").is_none(),
+            "naming it is the way through"
+        );
+        assert!(
+            find_requires_violation(&items, "Task", None, "a message about Workflow, not a Workflow call")
+                .is_none(),
+            "a different tool is none of its business, whatever the text says"
+        );
+    }
+
+    /// THE SILENCE THIS PREVENTS: reach used to be decided against the bare
+    /// TOOL NAME only, so a multi-word BINDING like "git commit" could never
+    /// match ("Bash" never equals "git commit", whatever the call actually
+    /// ran). Reach is decided against the REAL command string when the call
+    /// carries one, exactly like the sibling command guard
+    /// (`find_command_violation`) already does - a PREFIX match, so the
+    /// binding "git commit" reaches `git commit -m x` and stays quiet on a
+    /// mere mention of it (`echo "remember to git commit later"`).
+    #[test]
+    fn a_multi_word_command_binding_matches_the_real_invocation_not_the_bare_tool_name() {
+        let item = model::item::Item {
+            id: "no-commit-without-issue".to_string(),
+            kind: model::item::Kind::Rule,
+            text: "every commit names the issue it closes".to_string(),
+            bindings: vec![model::item::Binding::Target {
+                kind: model::item::TargetKind::Command,
+                value: "git commit".to_string(),
+            }],
+            severity: None,
+            project: None,
+            tags: vec![],
+            expires: None,
+            key: None,
+            falsifier: Some("a commit with no issue: line turns out fine anyway".to_string()),
+            check: Some(model::item::Check::Requires {
+                when: "git commit".to_string(),
+                required: vec!["issue:".to_string()],
+            }),
+        };
+        let items = vec![LiveItem { id: item.id.clone(), item }];
+
+        assert!(
+            find_requires_violation(&items, "Bash", Some("git commit -m \"x\""), "git commit -m \"x\"").is_some(),
+            "the real invocation trips it when the requirement is missing"
+        );
+        assert!(
+            find_requires_violation(
+                &items,
+                "Bash",
+                Some("git commit -m \"x issue: 42\""),
+                "git commit -m \"x issue: 42\""
+            )
+            .is_none(),
+            "naming it is the way through"
+        );
+        assert!(
+            find_requires_violation(
+                &items,
+                "Bash",
+                Some("echo \"remember to git commit later\""),
+                "echo \"remember to git commit later\""
+            )
+            .is_none(),
+            "mentioning the subcommand is not running it"
+        );
+    }
+
+    /// THE FALSE BLOCK THIS PREVENTS, reproduced verbatim from the report: a
+    /// Grep call searching FOR the trigger text used to trip the rule,
+    /// because the old trigger was `content.contains(when)` and a search
+    /// pattern is exactly that content. The trigger is now the CALL itself -
+    /// its own tool or command - never a substring of what it carries: Grep
+    /// names no command and is not the tool this rule is bound to, so it is
+    /// never even a candidate, whatever its pattern says.
+    #[test]
+    fn a_grep_for_the_trigger_text_is_never_refused() {
+        let items = conditional_item(model::item::Binding::Target {
+            kind: model::item::TargetKind::Command,
+            value: "Workflow".to_string(),
+        });
+        assert!(find_requires_violation(&items, "Grep", None, "Workflow").is_none());
+    }
+
+    /// THE REAL RULE ALREADY ON THE OWNER'S OWN MACHINE, proven at the guard
+    /// itself rather than by installing anything or touching the real store:
+    /// `zwerm-noemt-altijd-een-model` is bound to TWO command targets
+    /// ("Agent" and "Workflow"), triggered by "Agent" alone, and requires one
+    /// of several cheap models. It must still refuse an Agent call naming no
+    /// model and pass one that names haiku.
+    #[test]
+    fn the_real_stored_cheap_model_rule_still_refuses_and_still_passes() {
+        let item = model::item::Item {
+            id: "zwerm-noemt-altijd-een-model".to_string(),
+            kind: model::item::Kind::Rule,
+            text: "name a cheap model (haiku or sonnet) on every agent or workflow you spawn".to_string(),
+            bindings: vec![
+                model::item::Binding::Target { kind: model::item::TargetKind::Command, value: "Agent".to_string() },
+                model::item::Binding::Target {
+                    kind: model::item::TargetKind::Command,
+                    value: "Workflow".to_string(),
+                },
+            ],
+            severity: None,
+            project: None,
+            tags: vec![],
+            expires: None,
+            key: None,
+            falsifier: Some("a swarm without that field turns out to be cheap anyway".to_string()),
+            check: Some(model::item::Check::Requires {
+                when: "Agent".to_string(),
+                required: vec!["haiku".to_string(), "sonnet".to_string()],
+            }),
+        };
+        let items = vec![LiveItem { id: item.id.clone(), item }];
+
+        assert!(
+            find_requires_violation(&items, "Agent", None, "vat deze drie bestanden samen").is_some(),
+            "an Agent call naming no model is still refused"
+        );
+        assert!(
+            find_requires_violation(&items, "Agent", None, "vat samen\nhaiku").is_none(),
+            "an Agent call naming haiku still passes"
+        );
+    }
+
+    /// THE DEFECT THIS CLOSES. Before this function stopped comparing `when`
+    /// against the call a second time, this exact item's "Workflow" binding
+    /// was dead: it reached this function (the binding matched), then
+    /// failed `command_anchor_names("Agent", "Workflow ...")` and passed
+    /// through unwatched - forever, since nothing about the item ever
+    /// changed. Reach is now decided by the bindings alone, so BOTH tools
+    /// this rule is bound to must refuse a call naming no model, not only
+    /// the one spelled in `when`.
+    #[test]
+    fn the_workflow_binding_is_no_longer_dead_even_though_when_only_names_agent() {
+        let item = model::item::Item {
+            id: "zwerm-noemt-altijd-een-model".to_string(),
+            kind: model::item::Kind::Rule,
+            text: "name a cheap model (haiku or sonnet) on every agent or workflow you spawn".to_string(),
+            bindings: vec![
+                model::item::Binding::Target { kind: model::item::TargetKind::Command, value: "Agent".to_string() },
+                model::item::Binding::Target {
+                    kind: model::item::TargetKind::Command,
+                    value: "Workflow".to_string(),
+                },
+            ],
+            severity: None,
+            project: None,
+            tags: vec![],
+            expires: None,
+            key: None,
+            falsifier: Some("a swarm without that field turns out to be cheap anyway".to_string()),
+            check: Some(model::item::Check::Requires {
+                when: "Agent".to_string(),
+                required: vec!["haiku".to_string(), "sonnet".to_string()],
+            }),
+        };
+        let items = vec![LiveItem { id: item.id.clone(), item }];
+
+        assert!(
+            find_requires_violation(&items, "Workflow", None, "vat deze drie bestanden samen").is_some(),
+            "a Workflow call naming no model must be refused too - the binding is what reaches, `when` no longer narrows it"
+        );
+        assert!(
+            find_requires_violation(&items, "Workflow", None, "vat samen\nsonnet").is_none(),
+            "and a Workflow call that does name one still passes"
+        );
+        // The message names the binding that actually matched, not `when` -
+        // a Workflow call must never be told it "trips 'Agent'".
+        let reason = find_requires_violation(&items, "Workflow", None, "vat deze drie bestanden samen").unwrap();
+        assert!(reason.contains("Workflow"), "{reason}");
+    }
+
+    /// THE DOOR THE BLIND TEST FOUND, 2026-09-01: a cheap agent asked for a
+    /// swarm reached for the direct tool, not for a script, so a rule aimed
+    /// at the script form watched the wrong door and three agents went out on
+    /// the expensive model. The trigger now also fires on the tool's own
+    /// name, and the requirement holds several right answers, because "name a
+    /// model" is satisfied by any of the cheap ones.
+    #[test]
+    fn a_conditional_check_can_watch_a_tool_and_accept_any_of_several_answers() {
+        let item = model::item::Item {
+            id: "cheap-swarm".to_string(),
+            kind: model::item::Kind::Rule,
+            text: "name a cheap model on every agent you spawn".to_string(),
+            bindings: vec![model::item::Binding::Target {
+                kind: model::item::TargetKind::Command,
+                value: "Agent".to_string(),
+            }],
+            severity: None,
+            project: None,
+            tags: vec![],
+            expires: None,
+            key: None,
+            falsifier: Some("a swarm without that field turns out to be cheap anyway".to_string()),
+            check: Some(model::item::Check::Requires {
+                when: "Agent".to_string(),
+                required: vec!["haiku".to_string(), "sonnet".to_string()],
+            }),
+        };
+        let items = vec![LiveItem { id: item.id.clone(), item }];
+
+        assert!(
+            find_requires_violation(&items, "Agent", None, "vat deze drie bestanden samen").is_some(),
+            "the tool name alone trips it, because a direct call carries no fragment of its own"
+        );
+        assert!(
+            find_requires_violation(&items, "Agent", None, "vat samen
+haiku").is_none(),
+            "the first answer satisfies it"
+        );
+        assert!(
+            find_requires_violation(&items, "Agent", None, "vat samen
+sonnet").is_none(),
+            "and so does the second"
+        );
+        assert!(
+            find_requires_violation(&items, "Bash", None, "Agent noemen in een commando").is_none(),
+            "another tool is none of its business, whatever the text says"
+        );
+    }
+
+    /// A path anchor carries no reach here: this form is about a CALL, and a
+    /// rule that cannot say which calls it means would refuse all of them.
+    #[test]
+    fn a_conditional_check_anchored_at_a_file_reaches_nothing() {
+        let items = conditional_item(model::item::Binding::Target {
+            kind: model::item::TargetKind::Path,
+            value: "src/main.rs".to_string(),
+        });
+        assert!(find_requires_violation(&items, "Workflow", None, "await agent('do it')").is_none());
+    }
+
 
     /// THE DEFECT THIS PREVENTS, and it went to the heart of what this system
     /// claims to be. The block marker used to be keyed on the file alone, so

@@ -348,7 +348,82 @@ fn check_check(check: &Check) -> Result<(), Refusal> {
             check_literal_list(literals, "an absent_all check")
         }
         Check::Forbidden { literals } => check_literal_list(literals, "a forbidden check"),
+        Check::Requires { when, required } => check_requires(when, required),
     }
+}
+
+/// GROUND 22 for a `Check::Requires` (see `declare`): the same structural
+/// rules `gate::build_check` already enforces when the four flat MCP/CLI
+/// arguments build one (see its own "conditional pair" tests) - re-proven
+/// HERE, unconditionally, because `build_check` is a convenience for ONE
+/// caller (the MCP/CLI translation layer), while `check_check` is what runs
+/// for every `Item` that ever reaches `declare`/`revise`, however it was
+/// built. Before this, an `Item` constructed directly - a test fixture, a
+/// future caller that never goes through `build_check` - could carry a
+/// `Requires` with an empty trigger, no requirements at all, or a
+/// requirement identical to its own trigger, and the gate said nothing.
+///
+/// Deliberately NOT `check_literal_list`: that shared helper also applies
+/// `proves_something` (ground 18's "too short and too ordinary" bar), which
+/// is the right bar for a literal whose PRESENCE blocks a write - it is not
+/// the right bar for one whose presence is what the CALLER must say to pass.
+/// A short, plain word ("ok", "haiku") is a perfectly good answer to require;
+/// refusing it here would be a false refusal ground 18 was never meant to
+/// cause. So this checks only the three things that are actually broken
+/// regardless of what the words look like: an empty `when` names no call to
+/// watch; an empty `required` list, or an empty entry inside one, can never
+/// be satisfied by omission - and an empty ENTRY is worse than merely unmet,
+/// since it is trivially a substring of anything (`content.contains("")` is
+/// always true), so the whole check would be satisfied by every call,
+/// whatever it says; `required` naming its own trigger is refused for the
+/// reason `build_check`'s own test names it - a call that trips the trigger
+/// would satisfy such a requirement by tripping it, so the check could never
+/// actually refuse anything.
+fn check_requires(when: &str, required: &[String]) -> Result<(), Refusal> {
+    if when.trim().is_empty() {
+        return Err(Refusal::new(
+            "a requires check has an empty or whitespace-only trigger",
+            "name the command or tool this rule is about in when, or drop the check entirely",
+        ));
+    }
+    if required.is_empty() {
+        return Err(Refusal::new(
+            "a requires check names nothing it requires",
+            "name at least one thing the call must also say in required, or drop the check entirely",
+        ));
+    }
+    if let Some(empty_at) = required.iter().position(|r| r.is_empty()) {
+        return Err(Refusal::new(
+            format!("a requires check's required list has an empty entry at position {empty_at}"),
+            "give every entry in required a real, non-empty string, or remove the empty one",
+        ));
+    }
+    if required.iter().any(|r| r == when) {
+        return Err(Refusal::new(
+            "a requires check names its own trigger as one of its required answers",
+            "a call that trips the trigger would satisfy it by doing so, so this could never refuse \
+             anything - name a different literal in required, or drop the check entirely",
+        ));
+    }
+    Ok(())
+}
+
+/// Whether `when` and `binding` name the SAME command/tool trigger: split on
+/// whitespace, compared case-insensitively, word for word - EXACT equality
+/// of the whole sequence, never a prefix. Used only by GROUND 24 below, to
+/// decide whether a `Requires` check's own stored trigger literally names
+/// one of the item's own `Command` bindings. Deliberately not the same
+/// question `serve::absent_guard::command_anchor_names` answers (whether an
+/// anchor matches a real, argument-bearing invocation, which is a PREFIX
+/// match) - see ground 24's own doc comment for why the two must not be
+/// confused.
+fn same_trigger_words(when: &str, binding: &str) -> bool {
+    let when_words: Vec<String> = when.split_whitespace().map(str::to_lowercase).collect();
+    if when_words.is_empty() {
+        return false;
+    }
+    let binding_words: Vec<String> = binding.split_whitespace().map(str::to_lowercase).collect();
+    when_words == binding_words
 }
 
 // GROUND 7 WAS HERE, AND THE DATA KILLED IT (2026-08-02).
@@ -636,11 +711,49 @@ fn no_literal_reason_problem(reason: &str) -> Option<Refusal> {
     None
 }
 
-/// `bare_answer_allowed` and `symbol_only_allowed` are the two things about an
-/// item this cannot see for itself: whether the bare `no-literal` it carries,
-/// and whether the symbol-only anchor it has, were already there. Only `revise`
-/// knows, and only `revise` passes true.
-fn shape_problems(item: &Item, bare_answer_allowed: bool, symbol_only_allowed: bool) -> Vec<Refusal> {
+/// Every `Action` variant nothing in `serve`'s real runtime path ever
+/// produces, so a Moment binding to one is silent forever.
+///
+/// `intent::from_command`/`from_path` cover the rest between them (see
+/// their own doc comments for exactly which), and `serve/src/bin/serve.rs`'s
+/// hook adds `Remember` explicitly (`is_remember_moment`). `intent::
+/// from_draft` is the one producer with NO caller anywhere in `serve`
+/// outside its own tests - confirmed by reading the whole workspace for
+/// `from_draft`, not assumed - so the two actions it alone would ever
+/// produce, `Answer` and `ClaimDone`, are schema-valid and utterly silent:
+/// the memory accepts a Moment binding to either one, and the owner
+/// believes the rule is live.
+///
+/// `model` cannot see `serve`'s call graph to prove this for itself - this
+/// list is a STATEMENT about that graph, kept here because the write gate is
+/// the one place cheap enough to check on every write. It must be kept in
+/// step by hand if `serve` ever grows a caller for `from_draft`, or loses
+/// one for `from_command`/`from_path`.
+const DEAD_MOMENTS: &[Action] = &[Action::Answer, Action::ClaimDone];
+
+/// `pub`: `ops::health`'s own doctor line (listing live items whose ONLY
+/// bindings are dead moments, so the owner can re-bind what the write gate
+/// only ever protects going forward) reads this SAME definition rather than
+/// keeping its own copy of the list - one decision, never two that could
+/// silently drift apart.
+pub fn is_dead_moment(action: Action) -> bool {
+    DEAD_MOMENTS.contains(&action)
+}
+
+/// `bare_answer_allowed` and `symbol_only_allowed` are two of the three things
+/// about an item this cannot see for itself: whether the bare `no-literal` it
+/// carries, and whether the symbol-only anchor it has, were already there.
+/// `carried_bindings` is the third and is richer than a bool - GROUND 25
+/// below needs to know WHICH bindings were already there, not just whether
+/// some single shape was. Only `revise` knows any of the three, and only
+/// `revise` passes something other than the "nothing was already there"
+/// default (`false`/`false`/`None`).
+fn shape_problems(
+    item: &Item,
+    bare_answer_allowed: bool,
+    symbol_only_allowed: bool,
+    carried_bindings: Option<&[Binding]>,
+) -> Vec<Refusal> {
     let mut problems = Vec::new();
     if item.kind == Kind::Rule && item.bindings.is_empty() {
         problems.push(Refusal::new(
@@ -748,6 +861,29 @@ fn shape_problems(item: &Item, bare_answer_allowed: bool, symbol_only_allowed: b
             ));
         }
     }
+    // GROUND 25: a NEW Moment binding to an action nothing in `serve` ever
+    // produces would never fire - see `DEAD_MOMENTS`'s own doc comment for
+    // which ones and why (measured: `intent::from_draft`, the one producer
+    // of `Answer`/`ClaimDone`, has no caller anywhere in `serve` outside its
+    // own tests). Refused only when the binding is genuinely new: an item
+    // that already carried it before this call (a revise correcting
+    // something else about the item) stays correctable, the same
+    // grandfather ground 20 already gives an existing symbol-only anchor -
+    // locking an item out of every future correction would be worse than
+    // the silence this ground exists to stop growing.
+    for binding in &item.bindings {
+        let Binding::Moment(action) = binding else { continue };
+        if !is_dead_moment(*action) {
+            continue;
+        }
+        if carried_bindings.is_some_and(|carried| carried.contains(binding)) {
+            continue;
+        }
+        problems.push(Refusal::new(
+            format!("this item binds to the moment {action:?}, but nothing in serve ever fires it"),
+            "bind it to Always, a command or a file instead - a Moment binding only ever reaches you through a producer that actually runs, and this one has none",
+        ));
+    }
     problems
 }
 
@@ -759,9 +895,11 @@ fn combined(problems: Vec<Refusal>) -> Refusal {
     // problem sentences verbatim. That is load-bearing:
     // `serve::migrate::classify_refusal` labels a refusal by matching fixed
     // template wording in `problem`, so hiding the sentences in `fix` would
-    // silently reclassify every multi-problem item as unrecognised. Only the
-    // three independent shape grounds reach here, and none of them interpolates
-    // a user-supplied value, so this cannot leak a path or a host into a label.
+    // silently reclassify every multi-problem item as unrecognised. Only
+    // `shape_problems`'s own independent grounds reach here, and none of
+    // them interpolates a user-supplied value (ground 25's `{action:?}` is
+    // a closed enum's own Debug spelling, never arbitrary text), so this
+    // cannot leak a path or a host into a label.
     let problems_text: Vec<String> =
         problems.iter().enumerate().map(|(i, r)| format!("({}) {}", i + 1, r.problem)).collect();
     let fixes_text: Vec<String> =
@@ -783,7 +921,7 @@ fn combined(problems: Vec<Refusal>) -> Refusal {
 pub const NO_SCOPE_PROBLEM: &str = "this is archive material with no scope, so it joins the unscoped pile: it belongs to no collection, and opening one will never show it";
 
 pub fn declare(item: &Item) -> Result<(), Refusal> {
-    declare_inner(item, false, false, false)
+    declare_inner(item, false, false, false, None)
 }
 
 fn declare_inner(
@@ -791,8 +929,9 @@ fn declare_inner(
     bare_answer_allowed: bool,
     symbol_only_allowed: bool,
     unscoped_allowed: bool,
+    carried_bindings: Option<&[Binding]>,
 ) -> Result<(), Refusal> {
-    let problems = shape_problems(item, bare_answer_allowed, symbol_only_allowed);
+    let problems = shape_problems(item, bare_answer_allowed, symbol_only_allowed, carried_bindings);
     match problems.len() {
         0 => {}
         1 => return Err(problems.into_iter().next().expect("length checked")),
@@ -945,6 +1084,77 @@ fn declare_inner(
     if let Some(check) = &item.check {
         check_check(check)?;
     }
+    // GROUND 23: a `requires` check bound Always has no command or tool for
+    // its own trigger to compare against.
+    //
+    // Until this ground existed, Always was a second reach for this check
+    // kind, narrowed by matching the trigger against the call's OWN WORDS -
+    // and that narrowing is exactly what let a Grep call searching for the
+    // trigger text trip the very rule watching for it, and a comment merely
+    // mentioning the trigger trip it too (see `serve::absent_guard::
+    // find_requires_violation`'s own doc comment for both, reproduced as
+    // tests). The fix removed that content match entirely: reach and trigger
+    // are now decided the SAME way a Command anchor already is, against the
+    // real command or the tool's own name - and Always names neither. Bound
+    // Always, this check would either never fire (nothing left to narrow
+    // with) or fire on every single call, and neither is a rule anyone meant
+    // to write, so the shape is refused outright rather than silently built.
+    if matches!(item.check, Some(Check::Requires { .. }))
+        && item.bindings.iter().any(|b| matches!(b, Binding::Always))
+    {
+        return Err(Refusal::new(
+            "a requires check is bound Always, but Always names no command or tool for its trigger to compare against",
+            "bind it to the command or tool it is about instead - a Target of kind Command naming the exact command or subcommand, or (for a tool with no sub-command of its own) the tool's own bare name",
+        ));
+    }
+    // GROUND 24: a `requires` check's own trigger must equal one of the
+    // item's OWN Command bindings, or it names a phantom.
+    //
+    // Ground 23 just above already forces every `Requires` check onto a
+    // Command binding, and the serve-time guard (`serve::absent_guard::
+    // find_requires_violation`) now decides REACH entirely from those
+    // bindings - `when` is never compared against a real call at all any
+    // more (see that function's own doc comment). MEASURED on the owner's
+    // own store before that fix: `zwerm-noemt-altijd-een-model` is bound to
+    // TWO commands ("Agent" and "Workflow") but triggered by "Agent" alone;
+    // back when the guard still compared `when` against the call a SECOND
+    // time, only the "Agent" spelling could ever pass that comparison, so
+    // the "Workflow" binding was reachable in name only - a call through it
+    // was never actually watched. Splitting the rule into two, one trigger
+    // each, is not the way out either: the near-duplicate gate refuses a
+    // second rule whose text says the same thing.
+    //
+    // The guard no longer has that second comparison to get wrong, but the
+    // STORED trigger can still say something the item is not bound to at
+    // all, which is its own kind of lie: `when` is read by a person deciding
+    // whether this rule applies, and a trigger naming a binding the item
+    // does not carry points them at a call this rule will never actually
+    // see. So this ground keeps the trigger honest instead: it must equal
+    // one of the item's own Command bindings, compared the same NORMALISED
+    // way `serve::absent_guard::command_anchor_names` already tokenises its
+    // own (looser, prefix) comparison - split on whitespace, lowercased -
+    // but this is EXACT equality of the whole word sequence, never a prefix:
+    // the question here is "does the trigger literally name one of the
+    // bindings", never "would it match a real invocation of one" (that
+    // looser question stays the guard's own, at serve time). A rule that
+    // needs a narrower trigger binds to the narrower command instead (e.g.
+    // "git commit", not "git") and sets the trigger to match it.
+    //
+    // Reimplemented here rather than shared: `model` cannot depend on
+    // `serve` (the dependency the other three crates all take runs the
+    // opposite way - see `serve/Cargo.toml`), so `same_trigger_words` below
+    // is its own small comparison, not a call into `command_anchor_names`.
+    if let Some(Check::Requires { when, .. }) = &item.check {
+        let names_a_binding = item.bindings.iter().any(|b| {
+            matches!(b, Binding::Target { kind: TargetKind::Command, value } if same_trigger_words(when, value))
+        });
+        if !names_a_binding {
+            return Err(Refusal::new(
+                format!("a requires check's trigger '{when}' does not name any of this item's own Command bindings"),
+                "the trigger must name one of the commands or tools this rule is bound to; a rule that needs a narrower trigger binds to the narrower command instead (e.g. 'git commit', not 'git') and sets the trigger to match it",
+            ));
+        }
+    }
     if item.kind == Kind::Lookup && item.key.is_none() {
         return Err(Refusal::new(
             "a Lookup has no key",
@@ -990,7 +1200,13 @@ pub fn revise(existing: &Item, updated: &Item) -> Result<(), Refusal> {
     // freezing them until someone files them would make fixing a typo or an
     // expiry impossible - the backlog this ground exists to stop growing.
     let carried_unscoped = existing.project.as_deref().map(str::trim).unwrap_or("").is_empty();
-    declare_inner(updated, carried_bare, carried_symbol_only, carried_unscoped)?;
+    // The same concession for ground 25: a dead-moment binding the item
+    // ALREADY carried stays correctable - only a NEWLY added one is
+    // refused. `existing.bindings` itself is the grandfather list here
+    // (never a filtered-down "just the dead ones"): ground 25 only ever
+    // checks membership of one exact binding at a time, so handing it
+    // everything already there costs nothing and needs no separate filter.
+    declare_inner(updated, carried_bare, carried_symbol_only, carried_unscoped, Some(&existing.bindings))?;
     if !existing.bindings.is_empty() && updated.bindings.is_empty() {
         return Err(dropped_field("bindings"));
     }
@@ -1182,6 +1398,44 @@ pub fn build_check(
     // `Check::Forbidden`'s own doc comment), so it is handled here, before
     // the "check_path is required" rule just below that exists only for the
     // four path-carrying kinds.
+    if kind == "requires" {
+        if let Some(path) = path {
+            return Err(format!(
+                "check_kind 'requires' was given a check_path ('{path}'), but it carries no path: it \
+                 reads what a call is about to write or run, not a file on disk - drop check_path"
+            ));
+        }
+        if literal.is_some() {
+            return Err(
+                "check_kind 'requires' was given check_literal, but it takes check_literals with \
+                 at least two entries: the trigger first, then every answer that satisfies it"
+                    .to_string(),
+            );
+        }
+        if literals.len() < 2 {
+            return Err(format!(
+                "check_kind 'requires' needs at least two literals and was given {} - the first is \
+                 the trigger, which must name one of this item's own Command bindings (the exact \
+                 command/subcommand or tool this rule is about, never Always - see ground 24), and \
+                 every one after it is an answer that satisfies it",
+                literals.len()
+            ));
+        }
+        let when = literals[0].trim().to_string();
+        let required: Vec<String> =
+            literals[1..].iter().map(|l| l.trim().to_string()).filter(|l| !l.is_empty()).collect();
+        if when.is_empty() || required.is_empty() {
+            return Err("check_kind 'requires' was given an empty literal".to_string());
+        }
+        if required.iter().any(|r| *r == when) {
+            return Err(
+                "check_kind 'requires' was given the trigger as one of its own answers, which can \
+                 never refuse anything - a call that trips the trigger would satisfy it by doing so"
+                    .to_string(),
+            );
+        }
+        return Ok(Some(Check::Requires { when, required }));
+    }
     if kind == "forbidden" {
         if let Some(path) = path {
             return Err(format!(
@@ -1542,6 +1796,9 @@ pub fn check_warnings(check: &Check) -> Vec<Warning> {
     let mut out = Vec::new();
     match check {
         Check::PathExists { .. } => {}
+        // Nothing to warn about: there is no path to overlap with, and both
+        // literals are the caller's own words about the call it is making.
+        Check::Requires { .. } => {}
         Check::Contains { path, literal } | Check::Absent { path, literal } => {
             out.extend(short_literal_warning(literal));
             out.extend(filename_overlap_warning(path, literal));
@@ -3151,6 +3408,299 @@ mod tests {
         assert!(revise(&existing, &updated).is_ok());
     }
 
+    // -------------------------------------------------------- ground 22
+    //
+    // `Check::Requires`'s own structural rules, re-proven at `declare`/
+    // `revise` regardless of how the item was built - `build_check`'s own
+    // "conditional pair" tests already prove these for the MCP/CLI
+    // translation layer; these prove the SAME three things hold for an
+    // `Item` built directly, the gap `check_check` used to leave wide open
+    // (`Check::Requires { .. } => Ok(())`).
+
+    #[test]
+    fn a_requires_check_with_an_empty_trigger_is_refused() {
+        let mut item = base(Kind::Rule);
+        item.bindings = vec![Binding::Target { kind: TargetKind::Command, value: "git commit".to_string() }];
+        item.check = Some(Check::Requires { when: "   ".to_string(), required: vec!["issue:".to_string()] });
+        let err = declare(&item).unwrap_err();
+        assert!(err.problem.contains("trigger"), "names what is wrong: {}", err.problem);
+    }
+
+    #[test]
+    fn a_requires_check_with_no_required_answers_is_refused() {
+        let mut item = base(Kind::Rule);
+        item.bindings = vec![Binding::Target { kind: TargetKind::Command, value: "git commit".to_string() }];
+        item.check = Some(Check::Requires { when: "git commit".to_string(), required: vec![] });
+        let err = declare(&item).unwrap_err();
+        assert!(err.problem.contains("nothing it requires"), "names what is wrong: {}", err.problem);
+    }
+
+    #[test]
+    fn a_requires_check_with_an_empty_required_entry_is_refused() {
+        // Worse than merely unmet: an empty entry is trivially a substring of
+        // any content, so the whole check would be satisfied by every call.
+        let mut item = base(Kind::Rule);
+        item.bindings = vec![Binding::Target { kind: TargetKind::Command, value: "git commit".to_string() }];
+        item.check = Some(Check::Requires {
+            when: "git commit".to_string(),
+            required: vec!["issue:".to_string(), "".to_string()],
+        });
+        let err = declare(&item).unwrap_err();
+        assert!(err.problem.contains("empty entry"), "names what is wrong: {}", err.problem);
+    }
+
+    #[test]
+    fn a_requires_check_naming_its_own_trigger_as_a_required_answer_is_refused() {
+        let mut item = base(Kind::Rule);
+        item.bindings = vec![Binding::Target { kind: TargetKind::Command, value: "git commit".to_string() }];
+        item.check =
+            Some(Check::Requires { when: "git commit".to_string(), required: vec!["git commit".to_string()] });
+        let err = declare(&item).unwrap_err();
+        assert!(err.problem.contains("own trigger"), "names what is wrong: {}", err.problem);
+    }
+
+    #[test]
+    fn a_short_plain_required_answer_is_not_refused_for_being_short() {
+        // THE DEFECT THIS AVOIDS: ground 18's "too short and too ordinary"
+        // bar exists for a literal whose PRESENCE blocks a write - it is the
+        // wrong bar for one whose presence is what the caller must say to
+        // pass, and this ground deliberately does not apply it (see
+        // `check_requires`'s own doc comment). "ok" must still be accepted.
+        let mut item = base(Kind::Rule);
+        item.bindings = vec![Binding::Target { kind: TargetKind::Command, value: "git commit".to_string() }];
+        item.check = Some(Check::Requires { when: "git commit".to_string(), required: vec!["ok".to_string()] });
+        assert!(declare(&item).is_ok());
+    }
+
+    #[test]
+    fn a_well_formed_requires_check_bound_to_a_command_is_accepted() {
+        let mut item = base(Kind::Rule);
+        item.bindings = vec![Binding::Target { kind: TargetKind::Command, value: "git commit".to_string() }];
+        item.check = Some(Check::Requires {
+            when: "git commit".to_string(),
+            required: vec!["issue:".to_string(), "no-issue".to_string()],
+        });
+        assert!(declare(&item).is_ok());
+    }
+
+    // -------------------------------------------------------- ground 23
+    //
+    // THE FALSE BLOCK THIS PREVENTS, and it happened the hour this form was
+    // built: a rule triggered by "agent(" and bound Always refused the very
+    // message ASKING someone to write such a call, because Always used to be
+    // narrowed by matching the trigger against the call's own words - a
+    // match now removed entirely (see `serve::absent_guard::
+    // find_requires_violation`'s own doc comment, and its
+    // `a_grep_for_the_trigger_text_is_never_refused` test). Bound Always, a
+    // `Requires` check has nothing left to narrow with, so the gate refuses
+    // the shape outright rather than silently building either a check that
+    // can never fire or one that fires on everything.
+
+    #[test]
+    fn a_requires_check_bound_always_is_refused() {
+        let mut item = base(Kind::Rule);
+        item.bindings = vec![Binding::Always];
+        item.check = Some(Check::Requires { when: "Agent".to_string(), required: vec!["haiku".to_string()] });
+        let err = declare(&item).unwrap_err();
+        assert!(err.problem.contains("Always"), "names what is wrong: {}", err.problem);
+        assert!(err.fix.contains("command or tool"), "points at the fix: {}", err.fix);
+    }
+
+    /// The way out is exactly what the refusal says: a Command target, not
+    /// Always.
+    #[test]
+    fn a_requires_check_moved_off_always_onto_a_command_is_accepted() {
+        let mut item = base(Kind::Rule);
+        item.bindings = vec![Binding::Always];
+        item.check = Some(Check::Requires { when: "Agent".to_string(), required: vec!["haiku".to_string()] });
+        assert!(declare(&item).is_err());
+
+        item.bindings = vec![Binding::Target { kind: TargetKind::Command, value: "Agent".to_string() }];
+        assert!(declare(&item).is_ok(), "the same check, bound to the command it is about, is not refused");
+    }
+
+    /// `pin` (adding Always to an existing item, via `model::store::revise`)
+    /// goes through this same gate function, so a Command-bound Requires
+    /// item cannot be pinned either - proven here at the one place both
+    /// `pin` and a hand-written revise share.
+    #[test]
+    fn pinning_a_command_bound_requires_item_is_refused() {
+        let mut existing = base(Kind::Rule);
+        existing.bindings = vec![Binding::Target { kind: TargetKind::Command, value: "Agent".to_string() }];
+        existing.check = Some(Check::Requires { when: "Agent".to_string(), required: vec!["haiku".to_string()] });
+
+        let mut updated = existing.clone();
+        updated.bindings.push(Binding::Always);
+        let err = revise(&existing, &updated).unwrap_err();
+        assert!(err.problem.contains("Always"), "{}", err.problem);
+    }
+
+    /// THE REAL RULE ALREADY ON THE OWNER'S OWN MACHINE, preserved rather
+    /// than probed against the real store: bound to TWO command targets
+    /// ("Agent" and "Workflow"), triggered by "Agent" alone, requiring one of
+    /// several cheap models. Not a fixture invented for this ground - this is
+    /// the shape `zwerm-noemt-altijd-een-model` is actually stored in, proven
+    /// here to still declare cleanly under the new semantics.
+    #[test]
+    fn the_real_stored_cheap_model_rule_still_declares() {
+        let mut item = base(Kind::Rule);
+        item.text = "name a cheap model (haiku or sonnet) on every agent or workflow you spawn".to_string();
+        item.bindings = vec![
+            Binding::Target { kind: TargetKind::Command, value: "Agent".to_string() },
+            Binding::Target { kind: TargetKind::Command, value: "Workflow".to_string() },
+        ];
+        item.check = Some(Check::Requires {
+            when: "Agent".to_string(),
+            required: vec!["haiku".to_string(), "sonnet".to_string()],
+        });
+        assert!(declare(&item).is_ok(), "the rule already on the owner's machine must still declare");
+    }
+
+    // -------------------------------------------------------- ground 24
+    //
+    // THE DEAD BINDING THIS CLOSES, measured on the owner's real store
+    // before `serve::absent_guard::find_requires_violation` stopped
+    // comparing `when` against the call a second time:
+    // `zwerm-noemt-altijd-een-model` bound to TWO commands ("Agent" and
+    // "Workflow"), triggered by "Agent" alone - so a call through the
+    // "Workflow" binding matched the REACH, then silently failed the old
+    // second comparison and passed through unwatched. The guard no longer
+    // has that comparison to get wrong; this ground instead keeps the
+    // STORED trigger honest, so a reader (or any future code that reads
+    // `when` again) is never pointed at a binding this item does not carry.
+
+    #[test]
+    fn a_requires_check_whose_trigger_names_no_binding_at_all_is_refused() {
+        let mut item = base(Kind::Rule);
+        item.bindings = vec![Binding::Target { kind: TargetKind::Command, value: "git commit".to_string() }];
+        item.check = Some(Check::Requires { when: "git push".to_string(), required: vec!["issue:".to_string()] });
+        let err = declare(&item).unwrap_err();
+        assert!(err.problem.contains("git push"), "names the orphan trigger: {}", err.problem);
+        assert!(err.fix.contains("commands or tools this rule is bound to"), "{}", err.fix);
+    }
+
+    /// THE FLIP FROM THE OLD DESIGN. Before `find_requires_violation` moved
+    /// REACH onto the bindings alone, this exact shape (a broader binding,
+    /// a narrower trigger) was the documented way to keep a trigger tight
+    /// without a second rule. It is refused now: the trigger and the
+    /// binding must be the SAME words, never one a prefix of the other -
+    /// the fix the message itself names is to bind the narrower command
+    /// directly ("git commit"), not to keep "git" and hope the trigger
+    /// narrows it.
+    #[test]
+    fn a_binding_that_is_only_a_prefix_of_the_trigger_is_refused() {
+        let mut item = base(Kind::Rule);
+        item.bindings = vec![Binding::Target { kind: TargetKind::Command, value: "git".to_string() }];
+        item.check = Some(Check::Requires { when: "git commit".to_string(), required: vec!["issue:".to_string()] });
+        let err = declare(&item).unwrap_err();
+        assert!(err.problem.contains("git commit"), "{}", err.problem);
+        assert!(err.fix.contains("git commit"), "names the exact fix: bind the narrower command: {}", err.fix);
+    }
+
+    #[test]
+    fn a_trigger_equal_to_its_single_binding_is_accepted() {
+        let mut item = base(Kind::Rule);
+        item.bindings = vec![Binding::Target { kind: TargetKind::Command, value: "Agent".to_string() }];
+        item.check = Some(Check::Requires { when: "Agent".to_string(), required: vec!["haiku".to_string()] });
+        assert!(declare(&item).is_ok());
+    }
+
+    /// The shape the whole ground exists for: `when` naming only ONE of
+    /// several bindings is not a dead binding any more, it is the ordinary
+    /// way to store this rule - `the_real_stored_cheap_model_rule_still_
+    /// declares` above already proves the full real-world item; this pins
+    /// the minimal case right beside the ground that allows it.
+    #[test]
+    fn a_trigger_equal_to_one_of_several_bindings_is_accepted() {
+        let mut item = base(Kind::Rule);
+        item.bindings = vec![
+            Binding::Target { kind: TargetKind::Command, value: "Agent".to_string() },
+            Binding::Target { kind: TargetKind::Command, value: "Workflow".to_string() },
+        ];
+        item.check = Some(Check::Requires { when: "Agent".to_string(), required: vec!["haiku".to_string()] });
+        assert!(declare(&item).is_ok(), "naming only one of several bindings is not a dead binding any more");
+    }
+
+    /// "Normalised the way the guard normalises" means case-insensitively,
+    /// the same as `serve::absent_guard::command_anchor_names` itself
+    /// lowercases both sides before comparing words.
+    #[test]
+    fn a_trigger_matching_a_binding_only_by_case_is_accepted() {
+        let mut item = base(Kind::Rule);
+        item.bindings = vec![Binding::Target { kind: TargetKind::Command, value: "Agent".to_string() }];
+        item.check = Some(Check::Requires { when: "AGENT".to_string(), required: vec!["haiku".to_string()] });
+        assert!(declare(&item).is_ok());
+    }
+
+    // -------------------------------------------------------- ground 25
+    //
+    // THE SILENCE THIS CLOSES: `intent::from_draft` is the only producer of
+    // `Action::Answer`/`Action::ClaimDone`, and nothing in `serve` calls it
+    // outside its own tests (confirmed by reading the whole workspace for
+    // `from_draft`) - so a Moment binding to either one is schema-valid,
+    // stores cleanly, and never fires. The owner believes the rule is live;
+    // it is not.
+
+    #[test]
+    fn declaring_a_new_moment_binding_to_answer_is_refused() {
+        let mut item = base(Kind::Rule);
+        item.bindings = vec![Binding::Moment(intent::Action::Answer)];
+        let err = declare(&item).unwrap_err();
+        assert!(err.problem.contains("Answer"), "names the dead moment: {}", err.problem);
+        assert!(err.fix.contains("bind it to Always, a command or a file instead"), "{}", err.fix);
+    }
+
+    #[test]
+    fn declaring_a_new_moment_binding_to_claim_done_is_refused() {
+        let mut item = base(Kind::Rule);
+        item.bindings = vec![Binding::Moment(intent::Action::ClaimDone)];
+        let err = declare(&item).unwrap_err();
+        assert!(err.problem.contains("ClaimDone"), "{}", err.problem);
+    }
+
+    /// The sanity check the other two tests need: an ordinary, LIVE moment
+    /// (produced by `intent::from_command`, a real caller in `serve`) is
+    /// never touched by this ground.
+    #[test]
+    fn a_moment_binding_to_a_live_action_is_unaffected() {
+        let mut item = base(Kind::Rule);
+        item.bindings = vec![Binding::Moment(intent::Action::Push)];
+        assert!(declare(&item).is_ok());
+    }
+
+    /// THE GRANDFATHER: an item that ALREADY carried a dead-moment binding
+    /// before this call stays correctable - only a NEWLY added one is
+    /// refused, the same concession ground 20 already gives an existing
+    /// symbol-only anchor. Built directly rather than through `declare`
+    /// (which would refuse creating this shape in the first place): a real
+    /// store can still hold one from before this ground existed, and
+    /// `revise` has to let it be fixed for something ELSE without first
+    /// solving a problem the writer may not even be trying to fix.
+    #[test]
+    fn a_dead_moment_binding_already_carried_by_the_existing_item_is_not_refused_on_revise() {
+        let mut existing = base(Kind::Rule);
+        existing.bindings = vec![Binding::Moment(intent::Action::Answer)];
+        let mut updated = existing.clone();
+        updated.text = "a slightly corrected version of the same fact".to_string();
+        assert!(
+            revise(&existing, &updated).is_ok(),
+            "correcting something else must not require solving the dead binding first"
+        );
+    }
+
+    /// The other half: ADDING a dead-moment binding during a revise (even
+    /// alongside one that was already there) is refused exactly like a
+    /// fresh declare - the grandfather covers what was already true of the
+    /// item, never a fresh mistake introduced by this very call.
+    #[test]
+    fn adding_a_dead_moment_binding_during_a_revise_is_still_refused() {
+        let existing = base(Kind::Rule);
+        let mut updated = existing.clone();
+        updated.bindings = vec![Binding::Moment(intent::Action::ClaimDone)];
+        let err = revise(&existing, &updated).unwrap_err();
+        assert!(err.problem.contains("ClaimDone"), "{}", err.problem);
+    }
+
     // ------------------------------------------------------ cleared_fields
     //
     // THE DEFECT THIS CLOSES (task report, 2026-08-06): ground 9 above is
@@ -3550,6 +4100,70 @@ mod tests {
         // the correct, accepted shape.
         let check = build_check(Some("forbidden"), None, None, vec!["TODO".to_string()]).unwrap();
         assert_eq!(check, Some(Check::Forbidden { literals: vec!["TODO".to_string()] }));
+    }
+
+    /// THE CASE THIS FORM WAS BUILT FOR, measured 2026-08-31: a swarm was
+    /// spawned without the field naming a cheap model, twenty-four times over,
+    /// and no check could see it - forgetting leaves no fragment to catch.
+    #[test]
+    fn build_check_accepts_a_conditional_pair() {
+        let check = build_check(
+            Some("requires"),
+            None,
+            None,
+            vec!["agent(".to_string(), "model:".to_string()],
+        )
+        .unwrap();
+        assert_eq!(
+            check,
+            Some(Check::Requires { when: "agent(".to_string(), required: vec!["model:".to_string()] })
+        );
+    }
+
+    #[test]
+    fn a_conditional_check_needs_a_trigger_and_at_least_one_answer() {
+        assert!(build_check(Some("requires"), None, None, vec!["agent(".to_string()]).is_err());
+        // and several answers are the point: "name a model" is satisfied by
+        // any of the cheap ones, so a rule accepting only one would refuse
+        // the other.
+        let many = build_check(
+            Some("requires"),
+            None,
+            None,
+            vec!["Agent".to_string(), "haiku".to_string(), "sonnet".to_string()],
+        )
+        .unwrap();
+        assert_eq!(
+            many,
+            Some(Check::Requires {
+                when: "Agent".to_string(),
+                required: vec!["haiku".to_string(), "sonnet".to_string()]
+            })
+        );
+    }
+
+    /// The same word twice can never refuse anything: the trigger would
+    /// always satisfy its own requirement.
+    #[test]
+    fn a_conditional_check_refuses_the_same_literal_twice() {
+        assert!(build_check(
+            Some("requires"),
+            None,
+            None,
+            vec!["agent(".to_string(), "agent(".to_string()]
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn a_conditional_check_carries_no_path() {
+        assert!(build_check(
+            Some("requires"),
+            Some("src/main.rs".to_string()),
+            None,
+            vec!["a".to_string(), "b".to_string()]
+        )
+        .is_err());
     }
 
     #[test]

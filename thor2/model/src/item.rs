@@ -163,6 +163,61 @@ pub enum Check {
     /// Never empty, for the same reason `AbsentAll`'s list is never empty -
     /// see `gate::check_check`.
     Forbidden { literals: Vec<String> },
+    /// CONDITIONAL, and the only form that catches an OMISSION.
+    ///
+    /// Every form above asks whether some text is present or absent. That
+    /// cannot see a forgotten field: forgetting leaves no fragment to look
+    /// for. Banning the thing itself would work and would also refuse every
+    /// honest use of it - by this system's own doctrine the most expensive
+    /// outcome there is.
+    ///
+    /// So this one carries a TRIGGER and a set of REQUIREMENTS: REACH is
+    /// decided entirely by this item's own `Command` bindings (`gate::
+    /// declare`'s ground 23 forces every `Requires` check onto one, never
+    /// `Always`) - when a call matches ANY of them, at least one of
+    /// `required` must appear in it too, or the call is refused. `when` is
+    /// never compared against the call itself: it names WHICH of the
+    /// item's own bindings is the trigger being described, and the write
+    /// gate (ground 24) requires it to equal one of them, so a reader is
+    /// never pointed at a binding this item does not actually carry. The
+    /// set is what was forgotten.
+    ///
+    /// The set, rather than one word, is the other half of the same measured
+    /// case: "name a model" is satisfied by any of the cheap ones, and a rule
+    /// that accepted only one of them would refuse the other.
+    ///
+    /// THE CASE IT WAS BUILT FROM, measured 2026-08-31: twenty-four agents
+    /// were spawned for title work, every one of them on the session's
+    /// expensive model, because the field naming a cheap one was simply left
+    /// out. The rule saying to name it had existed for weeks.
+    Requires {
+        when: String,
+        /// Reads a bare string as well as a list, so an item written before
+        /// the set existed still loads. A store that stops being readable by
+        /// a newer build is the one failure this format may never have - and
+        /// it happened the same hour, on the first item ever written with
+        /// this form.
+        #[serde(deserialize_with = "one_or_many")]
+        required: Vec<String>,
+    },
+}
+
+/// One string or a list of them, both read as a list. See
+/// `Check::Requires::required` for why this exists.
+fn one_or_many<'de, D>(d: D) -> Result<Vec<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum OneOrMany {
+        One(String),
+        Many(Vec<String>),
+    }
+    Ok(match OneOrMany::deserialize(d)? {
+        OneOrMany::One(s) => vec![s],
+        OneOrMany::Many(v) => v,
+    })
 }
 
 /// A typed memory item. Field order below IS the canonical JSON field order:
@@ -557,6 +612,10 @@ mod tests {
             Check::Absent { path: "README.md".to_string(), literal: "TODO".to_string() },
             Check::AbsentAll { path: "README.md".to_string(), literals: vec!["TODO".to_string(), "FIXME".to_string()] },
             Check::Forbidden { literals: vec!["TODO".to_string(), "FIXME".to_string()] },
+            Check::Requires {
+                when: "git commit".to_string(),
+                required: vec!["issue:".to_string(), "no-issue".to_string()],
+            },
         ] {
             let json = serde_json::to_string(&check).unwrap();
             let back: Check = serde_json::from_str(&json).unwrap();
@@ -681,6 +740,68 @@ mod tests {
         let json = serde_json::to_string(&item).unwrap();
         let golden = r#"{"id":"golden-lookup-1","kind":"lookup","text":"the release checklist lives in RELEASE.md","bindings":[{"target":{"kind":"path","value":"RELEASE.md"}}],"severity":"house_style","project":"thor2","tags":["release","process"],"expires":null,"key":"release-checklist","falsifier":"the release checklist moves out of RELEASE.md","check":{"absent_all":{"path":"RELEASE.md","literals":["TODO","FIXME"]}}}"#;
         assert_eq!(json, golden, "the canonical body for an item carrying AbsentAll drifted from the golden literal: {json}");
+    }
+
+    /// THE COMPATIBILITY THIS KEEPS, and it broke within the hour: the first
+    /// item ever written with a conditional check carried a bare string where
+    /// the set now lives, and a newer build could no longer read it - not the
+    /// item, and therefore not the whole entity. A store must never stop
+    /// being readable by the build that follows it.
+    #[test]
+    fn a_conditional_check_written_before_the_set_existed_still_loads() {
+        let old = r#"{"requires":{"when":"agent(","required":"model"}}"#;
+        let check: Check = serde_json::from_str(old).expect("the older shape must still parse");
+        assert_eq!(
+            check,
+            Check::Requires { when: "agent(".to_string(), required: vec!["model".to_string()] }
+        );
+
+        let new = r#"{"requires":{"when":"Agent","required":["haiku","sonnet"]}}"#;
+        let check: Check = serde_json::from_str(new).unwrap();
+        assert_eq!(
+            check,
+            Check::Requires {
+                when: "Agent".to_string(),
+                required: vec!["haiku".to_string(), "sonnet".to_string()]
+            }
+        );
+    }
+
+    #[test]
+    fn requires_serialises_its_pair_as_when_and_a_required_array_in_declared_order() {
+        let check = Check::Requires {
+            when: "git commit".to_string(),
+            required: vec!["issue:".to_string(), "no-issue".to_string()],
+        };
+        let json = serde_json::to_string(&check).unwrap();
+        assert_eq!(json, r#"{"requires":{"when":"git commit","required":["issue:","no-issue"]}}"#);
+    }
+
+    #[test]
+    fn a_fully_populated_item_carrying_requires_serialises_byte_for_byte_as_a_golden_literal() {
+        // The Requires counterpart to `a_fully_populated_item_carrying_
+        // forbidden_serialises_byte_for_byte_as_a_golden_literal` above: pins
+        // the WHOLE canonical body, byte for byte, against a hand-written
+        // literal, so a future change to `Requires`'s own field order or
+        // shape is caught here rather than silently changing what gets
+        // hashed into the log for every item that comes to carry one.
+        let mut item = Item {
+            id: "golden-lookup-1".to_string(),
+            kind: Kind::Lookup,
+            text: "the release checklist lives in RELEASE.md".to_string(),
+            bindings: vec![Binding::Target { kind: TargetKind::Path, value: "RELEASE.md".to_string() }],
+            severity: Some(Severity::HouseStyle),
+            project: Some("thor2".to_string()),
+            tags: vec!["release".to_string(), "process".to_string()],
+            expires: None,
+            key: Some("release-checklist".to_string()),
+            falsifier: Some("the release checklist moves out of RELEASE.md".to_string()),
+            check: None,
+        };
+        item.check = Some(Check::Requires { when: "git commit".to_string(), required: vec!["issue:".to_string()] });
+        let json = serde_json::to_string(&item).unwrap();
+        let golden = r#"{"id":"golden-lookup-1","kind":"lookup","text":"the release checklist lives in RELEASE.md","bindings":[{"target":{"kind":"path","value":"RELEASE.md"}}],"severity":"house_style","project":"thor2","tags":["release","process"],"expires":null,"key":"release-checklist","falsifier":"the release checklist moves out of RELEASE.md","check":{"requires":{"when":"git commit","required":["issue:"]}}}"#;
+        assert_eq!(json, golden, "the canonical body for an item carrying Requires drifted from the golden literal: {json}");
     }
 
     // -------------------------------------------- check field - Forbidden variant

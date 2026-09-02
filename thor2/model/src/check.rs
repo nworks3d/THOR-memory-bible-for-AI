@@ -68,7 +68,9 @@ pub fn named_path(check: &Check) -> Option<&str> {
         Check::Contains { path, .. } => Some(path),
         Check::Absent { path, .. } => Some(path),
         Check::AbsentAll { path, .. } => Some(path),
-        Check::Forbidden { .. } => None,
+        // Neither of these names a file: one forbids text wherever it is
+        // written, the other reads the call itself.
+        Check::Forbidden { .. } | Check::Requires { .. } => None,
     }
 }
 
@@ -212,6 +214,19 @@ fn read_bounded_utf8(path: &Path) -> Option<String> {
 /// doc comment) means for a condition with no external state left to be
 /// false about.
 pub fn run(check: &Check, root: &Path) -> Outcome {
+    // `named_path` returns `None` for both `Requires` and `Forbidden` - "no
+    // file names this" - but that is where the two stop meaning the same
+    // thing. `Forbidden` has no external state at all, so `Holds` is the
+    // only answer that could ever be correct (see the doc comment on that
+    // early return, and on the `Forbidden` match arm below). `Requires`
+    // reads the CALL, which `run` never sees - it does not lack something to
+    // prove wrong, it lacks any way to try, so `CannotRun` is the honest
+    // answer, decided HERE rather than by falling through to the generic
+    // "no path" default below (which would silently read it as `Holds`,
+    // the wrong one of the two).
+    if matches!(check, Check::Requires { .. }) {
+        return Outcome::CannotRun;
+    }
     let Some(path) = named_path(check) else {
         return Outcome::Holds;
     };
@@ -222,6 +237,13 @@ pub fn run(check: &Check, root: &Path) -> Outcome {
         return Outcome::CannotRun;
     }
     match check {
+        // Unreachable in practice - the early return at the top of this
+        // function already answers for Requires, before `path` above is
+        // even resolved - but a real, correct arm rather than a panic, for
+        // the same reason the Forbidden arm below is: exhaustive by
+        // construction, and still the right answer even if some future
+        // change ever let a Requires value reach this far.
+        Check::Requires { .. } => Outcome::CannotRun,
         Check::PathExists { .. } => {
             // Existence is exactly what this variant measures: a path that
             // is not there is a real, decided "no" - `Fails`, never
@@ -731,6 +753,34 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let check = Check::Forbidden { literals: vec!["TODO".to_string()] };
         assert_eq!(run(&check, dir.path()), Outcome::Holds);
+    }
+
+    // ------------------------------------------------------------- Requires
+    //
+    // Unlike Forbidden, a Requires check names no path but is NOT
+    // unconditionally true - it reads the call, which this runner never
+    // sees, so it must report CannotRun (proves nothing either way), never
+    // Holds. Each test below is named after the exact property it pins shut.
+
+    #[test]
+    fn a_requires_check_cannot_run_it_has_no_call_to_read() {
+        let dir = tempfile::tempdir().unwrap();
+        let check =
+            Check::Requires { when: "git commit".to_string(), required: vec!["issue:".to_string()] };
+        assert_eq!(run(&check, dir.path()), Outcome::CannotRun);
+    }
+
+    #[test]
+    fn a_requires_check_cannot_run_even_against_a_root_that_does_not_exist() {
+        // Mirrors `a_forbidden_check_holds_even_against_a_root_that_does_not_
+        // exist`: proves the early return does not depend on `root` at all,
+        // by handing it a directory that was never created.
+        let outer = tempfile::tempdir().unwrap();
+        let missing_root = outer.path().join("this-directory-was-never-created");
+        assert!(!missing_root.exists(), "sanity: the root really does not exist");
+
+        let check = Check::Requires { when: "Agent".to_string(), required: vec!["haiku".to_string()] };
+        assert_eq!(run(&check, &missing_root), Outcome::CannotRun);
     }
 
     #[test]

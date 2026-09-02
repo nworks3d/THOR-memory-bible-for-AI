@@ -221,6 +221,12 @@ pub fn proof_line(db: &Path) -> String {
             Some(model::item::Check::Absent { .. })
             | Some(model::item::Check::AbsentAll { .. })
             | Some(model::item::Check::Forbidden { .. }) => blocks_nothing += 1,
+            // A conditional check refuses a CALL that forgot something. Its
+            // reach is the Always binding, like Forbidden's, and it is the
+            // one form whose requirement is an absence rather than a word
+            // to catch - so it counts as teeth exactly when it can fire.
+            Some(model::item::Check::Requires { .. }) if refuses => forbidding += 1,
+            Some(model::item::Check::Requires { .. }) => blocks_nothing += 1,
             Some(model::item::Check::Contains { .. }) => protecting += 1,
             Some(model::item::Check::PathExists { path }) => {
                 let bar = i.item.severity == Some(model::item::Severity::Irreversible)
@@ -604,6 +610,83 @@ pub fn orphan_projects_line(db: &Path, checkouts: Option<&Path>) -> String {
     )
 }
 
+/// The write-ahead log's own sidecar path: SQLite spells it `<db>-wal`,
+/// literally appended to the whole file name (never `.with_extension`, which
+/// would replace `.db` instead of extending it).
+fn wal_sidecar_path(db: &Path) -> std::path::PathBuf {
+    let mut name = db.as_os_str().to_os_string();
+    name.push("-wal");
+    std::path::PathBuf::from(name)
+}
+
+/// The `-wal` sidecar's raw size in bytes, `None` when it does not exist.
+/// Nothing but a `stat` - see `wal_line_from_size`'s doc comment for why
+/// `report` has to call this before it opens any connection to `db`, rather
+/// than leaving `wal_line_from_size` to read the file for itself.
+fn wal_raw_size(db: &Path) -> Option<u64> {
+    std::fs::metadata(wal_sidecar_path(db)).ok().map(|m| m.len())
+}
+
+/// Whether the write-ahead log has grown past anything a landing checkpoint
+/// would ever leave behind, given an ALREADY-MEASURED `wal_size` - `None`
+/// when there was nothing to measure or it has not grown past the bar, so
+/// this stays silent for the ordinary case of a WAL that grows and shrinks
+/// all the time by design.
+///
+/// WHY THIS TAKES `wal_size` AS A PARAMETER INSTEAD OF READING THE FILE
+/// ITSELF. THE DEFECT THIS CLOSES, measured directly by a black-box
+/// verification: a 500 MB `-wal` beside a copy of the store produced no wal
+/// line at all, and the file was gone afterwards. The cause was ordering -
+/// `report` used to call this function AFTER `store_line` had already opened
+/// and closed the report's own connection to `db`, and when that connection
+/// is the only one on the store (exactly the single-session case a new user
+/// is in, on their very first `doctor` run), SQLite is free to checkpoint
+/// and shrink the WAL back down to the `journal_size_limit` cap the moment
+/// the connection closes (see `EventStore::new`/`open_existing`) - and it
+/// discards a `-wal` file with an invalid header the moment a connection
+/// opens at all, which is what a hand-built fixture (or any WAL left by a
+/// different process) looks like to it. Either way, by the time the old code
+/// read `std::fs::metadata` for itself, the evidence it meant to report on
+/// was already gone. `report` now takes this measurement as the very first
+/// thing it does, before `store_line` or anything else touches `db`, and
+/// hands the result in here - the emitted line still lands in the same
+/// position in the report as before, only the MEASUREMENT moved earlier.
+///
+/// BOTH CONDITIONS below, on purpose - bigger than the store AND at least 64
+/// MB. The size comparison alone would flag a brand new, still-tiny store
+/// the moment its WAL is merely bigger than an almost-empty database file: a
+/// comparison that is honest about the RATIO and dishonest about the
+/// STAKES. The 64 MB floor is what keeps silence the right answer for
+/// exactly that case, so a fresh small store never nags.
+fn wal_line_from_size(wal_size: Option<u64>, db: &Path) -> Option<String> {
+    const MB: u64 = 1024 * 1024;
+    const WAL_FLOOR_BYTES: u64 = 64 * MB;
+    let wal_size = wal_size?;
+    if wal_size < WAL_FLOOR_BYTES {
+        return None;
+    }
+    let db_size = std::fs::metadata(db).ok()?.len();
+    if wal_size <= db_size {
+        return None;
+    }
+    Some(format!(
+        "wal: the write-ahead log is {:.1} MB, bigger than the {:.1} MB store itself - a checkpoint is not \
+         landing; a long-running reader or a repair loop is holding it open",
+        wal_size as f64 / MB as f64,
+        db_size as f64 / MB as f64
+    ))
+}
+
+/// Same computation as `wal_line_from_size`, but measures the WAL itself
+/// first - for a standalone caller that is not `report` and has not already
+/// taken that measurement before opening a connection of its own. `report`
+/// must NOT use this: see `wal_line_from_size`'s doc comment for why the
+/// measurement has to happen before any connection to `db` is opened, which
+/// this function has no way to guarantee on a caller's behalf.
+pub fn wal_line(db: &Path) -> Option<String> {
+    wal_line_from_size(wal_raw_size(db), db)
+}
+
 /// The whole report: one line per component, in a fixed order, so a person
 /// (or a script) can read it top to bottom without guessing what is missing.
 /// How many items are eligible at one of their own triggers and never shown
@@ -763,6 +846,14 @@ fn can_refuse(item: &model::item::Item) -> bool {
     match &item.check {
         Some(model::item::Check::Absent { .. }) | Some(model::item::Check::AbsentAll { .. }) => true,
         Some(model::item::Check::Forbidden { .. }) => always || command,
+        // A `requires` check reaches wherever its Command target says (see
+        // `absent_guard::find_requires_violation`) - never through Always,
+        // which the gate refuses outright for this check kind (ground 23):
+        // there is no content match left to narrow it with, so an
+        // Always-bound one would either never fire or fire on everything,
+        // and neither is a shape the store can hold any more. `command`
+        // alone decides it here.
+        Some(model::item::Check::Requires { .. }) => command,
         _ => false,
     }
 }
@@ -973,6 +1064,55 @@ pub fn crowding_line(db: &Path, checkouts: Option<&Path>, full: bool) -> String 
     out.join("\n")
 }
 
+/// How many live items are bound ONLY to a moment nothing in `serve` ever
+/// fires - the shape `model::gate::declare`'s ground 25 now refuses to ADD,
+/// but a real store can still hold from before that ground existed: the
+/// write gate protects only NEW writes, and says nothing about what is
+/// already on disk.
+///
+/// WHY THIS LINE EXISTS. Ground 25 stops the bleeding going forward, but by
+/// itself it is invisible to anyone who does not already know to look for
+/// the shape it refuses - and an item bound only to `Answer`/`ClaimDone`
+/// (`intent::from_draft`'s own two products, with no caller anywhere in
+/// `serve` outside its own tests) fires exactly as silently as it did
+/// before the ground shipped. This turns that silence into a worklist: the
+/// owner still has to decide what each one should re-bind to (that needs
+/// judgement this report cannot supply), but he can no longer be unaware
+/// that they exist.
+pub fn dead_moment_bindings_line(db: &Path) -> String {
+    const NAMED_AT_MOST: usize = 10;
+    let Ok(store) = EventStore::open_existing(db) else {
+        return "dead moments: store unreadable, not checked".to_string();
+    };
+    let live = serve::live::live_items(&store);
+    let dead: Vec<&str> = live
+        .iter()
+        .filter(|li| li.item.kind.can_fire())
+        .filter(|li| !li.item.bindings.is_empty())
+        .filter(|li| {
+            li.item.bindings.iter().all(|b| {
+                matches!(b, model::item::Binding::Moment(action) if model::gate::is_dead_moment(*action))
+            })
+        })
+        .map(|li| li.id.as_str())
+        .collect();
+    if dead.is_empty() {
+        return "dead moments: none - every live item's bindings can actually fire".to_string();
+    }
+    let mut out = format!(
+        "dead moments: {} live item(s) bound ONLY to a moment nothing in serve ever fires (answer/claim_done) - \
+         re-bind each one with revise, to Always, a command or a file",
+        dead.len()
+    );
+    for id in dead.iter().take(NAMED_AT_MOST) {
+        out.push_str(&format!("\n  dead moment: {id}"));
+    }
+    if dead.len() > NAMED_AT_MOST {
+        out.push_str(&format!("\n  dead moment: and {} more, not named here", dead.len() - NAMED_AT_MOST));
+    }
+    out
+}
+
 pub fn report(
     db: &Path,
     index_db: Option<&Path>,
@@ -982,8 +1122,21 @@ pub fn report(
     checkouts: Option<&Path>,
     full: bool,
 ) -> Vec<String> {
-    vec![
-        store_line(db),
+    // Measured before ANYTHING else in this function, including `store_line`
+    // right below - see `wal_line_from_size`'s doc comment for why that
+    // ordering is load-bearing rather than stylistic: `store_line` opens and
+    // closes this report's own connection to `db`, and that is enough for
+    // SQLite to have reclaimed or discarded the `-wal` file by the time a
+    // measurement taken any later would read it.
+    let wal_size = wal_raw_size(db);
+
+    let mut lines = vec![store_line(db)];
+    // Silent unless the WAL has actually outgrown its own store - see
+    // `wal_line_from_size`'s own doc comment for why that is the right
+    // default rather than a "wal: fine" line on every ordinary run.
+    lines.extend(wal_line_from_size(wal_size, db));
+    lines.push(dead_moment_bindings_line(db));
+    lines.extend([
         code_index_line(index_db, repo),
         replica_line(db, replica),
         falsifier_line(db),
@@ -996,7 +1149,8 @@ pub fn report(
         unjudged_line(db),
         semantic_line(model_dir),
         orphan_projects_line(db, checkouts),
-    ]
+    ]);
+    lines
 }
 
 /// The three-way answer `--gate` needs. See `gate_verdict` for exactly what
@@ -1108,6 +1262,21 @@ mod tests {
         }
     }
 
+    /// Write `item` straight to the log, bypassing `store::declare`'s own
+    /// gate entirely - the same escape hatch `serve`'s own `teeth_debt`
+    /// tests use (`legacy_unanswered`) for a shape the write gate no longer
+    /// allows to be CREATED, but a real store can still HOLD from before
+    /// that ground existed. `can_refuse` (and the report lines it feeds)
+    /// have to read whatever a store actually contains, gate-legal or not -
+    /// this is how a test proves that reading stays correct on a shape
+    /// `model::gate::declare` would now refuse outright.
+    fn legacy_declare(store: &mut EventStore, item: &Item) {
+        let body = serde_json::to_string(item).unwrap();
+        store
+            .append_event("legacy", &item.id, "migration", thor_core::event_store::EventKind::FactCreated, &item.id, None, &body)
+            .unwrap();
+    }
+
     /// THE DEFECT THIS CLOSES, reported from a real session 2026-08-19:
     /// doctor named four items owed a judgement and all four were retracted,
     /// so the debt could be settled with the dead and the number meant
@@ -1199,6 +1368,55 @@ mod tests {
             }];
             cannot.check = Some(model::item::Check::Forbidden { literals: vec!["\u{2014}".to_string()] });
             store::declare(&mut s, "s", "l", "a", &cannot).unwrap();
+        }
+        let line = proof_line(&db);
+        assert!(line.contains("1 can refuse a write that introduces"), "{line}");
+        assert!(line.contains("1 block nothing at all"), "{line}");
+    }
+
+    /// The `Requires` counterpart to the `Forbidden` test just above: reach
+    /// is a `Command` target, never Always - the gate refuses declaring a
+    /// `Requires` check bound Always outright (`gate::declare` ground 23), so
+    /// `can_refuse` must count it exactly the way `absent_guard::
+    /// find_requires_violation` decides reach: through a Command target, and
+    /// nothing else.
+    ///
+    /// THE "CANNOT" ITEM IS LEGACY ON PURPOSE. Ground 24 (`gate::declare`)
+    /// now also requires a `Requires` check's own trigger to name one of the
+    /// item's OWN Command bindings - which makes a Path-bound `Requires`
+    /// item like this one impossible to CREATE through `declare` any more
+    /// (there is no Command binding for any trigger to name). A real store
+    /// can still hold one from before that ground existed, and `can_refuse`
+    /// has to read it correctly regardless, so this fixture is written
+    /// straight to the log (`legacy_declare`) rather than through the gate.
+    #[test]
+    fn a_requires_check_bound_to_a_command_is_counted_as_blocking_an_unbound_one_is_not() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("t.db");
+        {
+            let mut s = EventStore::new(&db).unwrap();
+
+            let mut reaches = rule("requires-bound-to-a-command");
+            reaches.bindings = vec![model::item::Binding::Target {
+                kind: model::item::TargetKind::Command,
+                value: "Agent".to_string(),
+            }];
+            reaches.check = Some(model::item::Check::Requires {
+                when: "Agent".to_string(),
+                required: vec!["haiku".to_string(), "sonnet".to_string()],
+            });
+            store::declare(&mut s, "s", "l", "a", &reaches).unwrap();
+
+            let mut cannot = rule("requires-bound-to-a-path");
+            cannot.text = "a webhook retry backs off before it gives up entirely".to_string();
+            cannot.project = Some("fixture-project".to_string());
+            cannot.bindings = vec![model::item::Binding::Target {
+                kind: model::item::TargetKind::Path,
+                value: "server/lib/mail.js".to_string(),
+            }];
+            cannot.check =
+                Some(model::item::Check::Requires { when: "Agent".to_string(), required: vec!["haiku".to_string()] });
+            legacy_declare(&mut s, &cannot);
         }
         let line = proof_line(&db);
         assert!(line.contains("1 can refuse a write that introduces"), "{line}");
@@ -1417,25 +1635,30 @@ mod tests {
         let db = dir.path().join("t.db");
         EventStore::new(&db).unwrap();
         let lines = report(&db, None, None, None, None, None, false);
-        assert_eq!(lines.len(), 13);
+        // 14, not 13: `wal_line` stays silent on a fresh store (see its own
+        // doc comment - it never contributes a line unless the WAL has
+        // actually outgrown both the 64 MB floor and the store itself), but
+        // `dead_moment_bindings_line` always says something, "none" included.
+        assert_eq!(lines.len(), 14);
         assert!(lines[0].starts_with("memory store:"));
-        assert!(lines[1].starts_with("code index:"));
-        assert!(lines[2].starts_with("replica:"));
-        assert!(lines[3].starts_with("falsifiers:"));
-        assert!(lines[4].starts_with("provable rules:"));
+        assert!(lines[1].starts_with("dead moments:"));
+        assert!(lines[2].starts_with("code index:"));
+        assert!(lines[3].starts_with("replica:"));
+        assert!(lines[4].starts_with("falsifiers:"));
+        assert!(lines[5].starts_with("provable rules:"));
         // Straight after the coverage number, on purpose: one says how many
         // rules COULD refuse, the next says how often one DID. Read apart
         // they mislead in opposite directions.
-        assert!(lines[5].starts_with("gate:"));
+        assert!(lines[6].starts_with("gate:"));
         // Next to the gate on purpose: one says how often it fired, the next
         // two say where it has no teeth and what nothing ever re-reads.
-        assert!(lines[6].starts_with("teeth:"));
-        assert!(lines[7].starts_with("pinned:"));
-        assert!(lines[8].starts_with("decay:"));
-        assert!(lines[9].starts_with("crowding:"));
-        assert!(lines[10].starts_with("unjudged:"));
-        assert!(lines[11].starts_with("semantic search:"));
-        assert!(lines[12].starts_with("project keys:"));
+        assert!(lines[7].starts_with("teeth:"));
+        assert!(lines[8].starts_with("pinned:"));
+        assert!(lines[9].starts_with("decay:"));
+        assert!(lines[10].starts_with("crowding:"));
+        assert!(lines[11].starts_with("unjudged:"));
+        assert!(lines[12].starts_with("semantic search:"));
+        assert!(lines[13].starts_with("project keys:"));
     }
 
     /// THE DEFECT THIS PREVENTS: a health line that goes quiet exactly when it
@@ -1726,5 +1949,193 @@ mod tests {
             store::declare(&mut s, "s", "l", "a", &item).unwrap();
         }
         assert_eq!(gate_verdict(&db, Some(&checkouts), None), GateVerdict::Clean);
+    }
+
+    // ------------------------------------------------------------- wal_line
+    //
+    // THE DEFECT THIS CLOSES, measured directly: thor.db sat at 75 MB while
+    // thor.db-wal sat at 3.4 GB, after weeks of a repair storm nobody could
+    // see - store_line reads the store, never the WAL sidecar beside it.
+    // `File::set_len` builds the oversized fixture without actually writing
+    // the bytes (a sparse file), so these stay fast.
+
+    fn write_sized(path: &Path, bytes: u64) {
+        let file = std::fs::File::create(path).unwrap();
+        file.set_len(bytes).unwrap();
+    }
+
+    #[test]
+    fn a_small_wal_is_silent() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("thor.db");
+        write_sized(&db, 1024);
+        write_sized(&wal_sidecar_path(&db), 1024);
+        assert_eq!(wal_line(&db), None, "an ordinary WAL that grows and shrinks by design must never nag");
+    }
+
+    #[test]
+    fn a_wal_bigger_than_the_store_but_under_the_64mb_floor_is_still_silent() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("thor.db");
+        write_sized(&db, 100);
+        write_sized(&wal_sidecar_path(&db), 10 * 1024 * 1024);
+        assert_eq!(
+            wal_line(&db),
+            None,
+            "a fresh small store must never nag, even when its WAL is already bigger than it"
+        );
+    }
+
+    #[test]
+    fn a_wal_past_both_the_store_size_and_the_floor_reports_in_mb() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("thor.db");
+        write_sized(&db, 5 * 1024 * 1024);
+        write_sized(&wal_sidecar_path(&db), 70 * 1024 * 1024);
+        let line = wal_line(&db).expect("a WAL bigger than the store and past 64 MB must report");
+        assert!(line.starts_with("wal:"), "{line}");
+        assert!(line.contains("70.0 MB"), "{line}");
+        assert!(line.contains("5.0 MB"), "{line}");
+        assert!(line.contains("checkpoint"), "must say what a grown WAL means: {line}");
+    }
+
+    #[test]
+    fn a_missing_wal_is_silent() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("thor.db");
+        write_sized(&db, 1024);
+        assert_eq!(wal_line(&db), None, "no -wal file at all is not a finding");
+    }
+
+    /// THE DEFECT THIS CLOSES, found by a black-box verification: `report`
+    /// used to measure the `-wal` file only after `store_line` had already
+    /// opened and closed the report's own connection to the store, and on a
+    /// single-session store - exactly what a new user has on their very
+    /// first `doctor` run - that connection closing is enough for SQLite to
+    /// reclaim or discard the `-wal` file. Measured directly: a 500 MB
+    /// `-wal` beside a copy of the store produced no wal line at all, and
+    /// the file was gone afterwards. This reproduces the same shape through
+    /// `report` itself (not `wal_line` directly, which never opened a
+    /// connection and so never showed the defect) to prove the fix holds at
+    /// the level where the bug actually lived.
+    #[test]
+    fn report_still_sees_a_grown_wal_after_its_own_connection_has_come_and_gone() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("thor.db");
+        {
+            EventStore::new(&db).unwrap();
+        }
+        write_sized(&wal_sidecar_path(&db), 500 * 1024 * 1024);
+        let lines = report(&db, None, None, None, None, None, false);
+        assert!(
+            lines.iter().any(|l| l.starts_with("wal:")),
+            "a 500 MB WAL must still be reported even though report() itself opens and closes a \
+             connection to the store before this line is produced: {lines:#?}"
+        );
+    }
+
+    /// The companion case: pre-measuring the WAL up front must not turn an
+    /// ordinary, harmless WAL into a false alarm - the size that gets stashed
+    /// before `store_line` runs still has to clear the same floor and ratio
+    /// checks as before.
+    #[test]
+    fn report_stays_silent_about_an_ordinary_small_wal() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("thor.db");
+        {
+            EventStore::new(&db).unwrap();
+        }
+        write_sized(&wal_sidecar_path(&db), 1024);
+        let lines = report(&db, None, None, None, None, None, false);
+        assert!(!lines.iter().any(|l| l.starts_with("wal:")), "an ordinary small WAL must never nag: {lines:#?}");
+    }
+
+    // ------------------------------------------------- dead_moment_bindings_line
+    //
+    // THE SILENCE THIS SURFACES: `model::gate::declare`'s ground 25 refuses
+    // a NEW binding to `Action::Answer`/`Action::ClaimDone` (nothing in
+    // `serve` fires either - `intent::from_draft` is their only producer and
+    // has no caller outside its own tests), but that gate protects only new
+    // writes. A real store can still hold an item written before ground 25
+    // existed, and `legacy_declare` (this module's own escape hatch, see its
+    // doc comment) is how these fixtures get built without the gate
+    // refusing the very shape they exist to reproduce.
+
+    fn dead_moment_only(id: &str) -> Item {
+        Item {
+            id: id.to_string(),
+            kind: Kind::Rule,
+            text: "always open a reply with a plain-language summary".to_string(),
+            bindings: vec![Binding::Moment(intent::Action::Answer)],
+            severity: None,
+            project: None,
+            tags: vec![],
+            expires: None,
+            key: None,
+            falsifier: Some("a reply opens with nothing of the sort and turns out fine anyway".to_string()),
+            check: None,
+        }
+    }
+
+    #[test]
+    fn dead_moment_bindings_line_is_none_on_a_store_with_nothing_dead() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("t.db");
+        let mut store = EventStore::new(&db).unwrap();
+        store::declare(&mut store, "s", "l", "a", &rule("live-one")).unwrap();
+
+        let line = dead_moment_bindings_line(&db);
+        assert!(line.contains("none"), "{line}");
+    }
+
+    #[test]
+    fn dead_moment_bindings_line_names_an_item_bound_only_to_a_dead_moment() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("t.db");
+        let mut store = EventStore::new(&db).unwrap();
+        legacy_declare(&mut store, &dead_moment_only("stuck-on-answer"));
+
+        let line = dead_moment_bindings_line(&db);
+        assert!(line.contains("1 live item"), "{line}");
+        assert!(line.contains("stuck-on-answer"), "{line}");
+        assert!(line.contains("revise"), "must say what to do about it: {line}");
+    }
+
+    /// THE "ONLY" IN THE SPEC. A dead moment sitting ALONGSIDE a binding
+    /// that really can fire is not this line's business - the item is not
+    /// silent, it just has one useless way in among others.
+    #[test]
+    fn dead_moment_bindings_line_ignores_an_item_with_a_live_binding_alongside_the_dead_one() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("t.db");
+        let mut store = EventStore::new(&db).unwrap();
+        let mut mixed = dead_moment_only("mixed-bindings");
+        mixed.bindings = vec![Binding::Moment(intent::Action::Answer), Binding::Always];
+        legacy_declare(&mut store, &mixed);
+
+        let line = dead_moment_bindings_line(&db);
+        assert!(line.contains("none"), "a mixed binding still has a way to fire: {line}");
+    }
+
+    #[test]
+    fn dead_moment_bindings_line_caps_names_at_ten_and_says_how_many_more() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("t.db");
+        let mut store = EventStore::new(&db).unwrap();
+        // Zero-padded so id order (lexicographic - `live_items` is id-ordered,
+        // never insertion order) is also numeric order: "dead-10" would
+        // otherwise sort before "dead-2" and break the cap assertion below.
+        for i in 0..12 {
+            legacy_declare(&mut store, &dead_moment_only(&format!("dead-{i:02}")));
+        }
+
+        let line = dead_moment_bindings_line(&db);
+        assert!(line.contains("12 live item"), "{line}");
+        for i in 0..10 {
+            assert!(line.contains(&format!("dead-{i:02}")), "the whole batch is named: {line}");
+        }
+        assert!(!line.contains("dead-10"), "and it stops at the cap: {line}");
+        assert!(!line.contains("dead-11"), "{line}");
+        assert!(line.contains("2 more"), "silence about the rest would read as done: {line}");
     }
 }

@@ -17,15 +17,15 @@ struct Cli {
     /// for the shared secret when given.
     #[arg(long)]
     to: Option<String>,
-    /// Override the semantic embedding model's directory (feature
-    /// `semantic`). Omitted = the per-user default (see
-    /// `serve::semantic_paths::default_model_dir`).
     /// A directory whose immediate subdirectories are checkouts. Each one is
     /// resolved, and any project key held by an item that no checkout answers
     /// to is reported - the class of defect that is otherwise invisible from
     /// every surface (see `ops::health::orphan_projects_line`).
     #[arg(long)]
     checkouts: Option<PathBuf>,
+    /// Override the semantic embedding model's directory (feature
+    /// `semantic`). Omitted = the per-user default (see
+    /// `serve::semantic_paths::default_model_dir`).
     #[arg(long = "model-dir")]
     model_dir: Option<PathBuf>,
     /// Turn this report into a gate: exit 1 when something gate-worthy was

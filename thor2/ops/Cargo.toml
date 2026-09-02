@@ -49,3 +49,8 @@ path = "src/bin/backup.rs"
 [dev-dependencies]
 tempfile = "3"
 model = { path = "../model" }
+# Only the health-check test fixtures build a `Binding::Moment(Action::...)`
+# directly (the production `dead_moment_bindings_line` never names `intent`
+# itself - it reads `model::item::Binding::Moment`'s own field type and asks
+# `model::gate::is_dead_moment` about it), so this stays a dev-dependency.
+intent = { path = "../intent" }

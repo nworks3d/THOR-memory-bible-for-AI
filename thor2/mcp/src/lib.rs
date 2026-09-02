@@ -675,7 +675,7 @@ pub struct RememberArgs {
     /// thing that ever names when one has gone stale.
     #[serde(default)]
     pub falsifier: Option<String>,
-    /// One of: path_exists, contains, absent, absent_all, forbidden. A
+    /// One of: path_exists, contains, absent, absent_all, forbidden, requires. 'requires' is the conditional one and the only form that catches something FORGOTTEN: give check_literals at least two entries, the trigger first and then every answer that satisfies it, and a call that trips the trigger without any of them is refused. Use it when banning the action itself would refuse honest work. Bind it to the command or tool it is about (a Command target naming the exact command or subcommand, or - for a tool with no sub-command of its own - the tool's own bare name) - never to always, which is refused outright because it names no command or tool for a trigger to compare against. The trigger names one of the commands or tools this rule is bound to; naming anything else is refused too. A
     /// machine-runnable check this item can prove itself against, alongside
     /// (never instead of) falsifier - see model::check::run. Only a
     /// Rule/Orientation may carry one. This is the ONLY kind of rule this
@@ -718,7 +718,13 @@ pub struct RememberArgs {
     #[serde(default)]
     pub check_literals: Vec<String>,
     /// Action names this item fires on (repeatable), e.g. ["push"]. Only a
-    /// Rule/Orientation may bind to a moment.
+    /// Rule/Orientation may bind to a moment. The ones that actually fire:
+    /// publish, commit, push, deploy, delete, send, spend, credentials,
+    /// install, configure and prod_data (all derived from a real command or
+    /// file path - see intent::from_command/from_path), plus remember (this
+    /// memory's own write/correct call). answer and claim_done are refused
+    /// on a NEW binding: nothing produces either one today, so a rule bound
+    /// only to it would store cleanly and never fire.
     #[serde(default)]
     pub moments: Vec<String>,
     /// Exact targets this item fires on (repeatable). Only a Rule/Orientation
@@ -787,9 +793,15 @@ pub struct ReviseArgs {
     /// Omit to keep the current project; pass "" to make it global.
     #[serde(default)]
     pub project: Option<String>,
-    /// Replaces the whole tag list. Omit to keep the current tags. An empty
-    /// list is REFUSED if the item already carried tags - nothing may vanish
-    /// silently on a revise; say so with a real (possibly shorter) list.
+    /// Replaces the whole tag list. Omit to keep the current tags; pass an
+    /// empty list to clear them on purpose - the same "omit keeps, empty
+    /// clears" convention as severity/project/expires/key/falsifier above,
+    /// just spelled with a list instead of an empty string: `None` (the
+    /// field left out of the call) reads as "unmentioned", `Some(vec![])`
+    /// (the field given, empty) reads as "clear it", and `Some(real_list)`
+    /// replaces the whole set. Unlike those string fields, an empty JSON
+    /// array survives the MCP call layer exactly like a non-empty one, so
+    /// no whitespace-only-string workaround is needed here.
     #[serde(default)]
     pub tags: Option<Vec<String>>,
     /// Omit to keep the current expiry; pass "" to clear it.
@@ -802,7 +814,7 @@ pub struct ReviseArgs {
     /// Orientation left with none is refused, same as at creation).
     #[serde(default)]
     pub falsifier: Option<String>,
-    /// One of: path_exists, contains, absent, absent_all, forbidden. Omit
+    /// One of: path_exists, contains, absent, absent_all, forbidden, requires. 'requires' is the conditional one and the only form that catches something FORGOTTEN: give check_literals at least two entries, the trigger first and then every answer that satisfies it, and a call that trips the trigger without any of them is refused. Use it when banning the action itself would refuse honest work. Bind it to the command or tool it is about (a Command target naming the exact command or subcommand, or - for a tool with no sub-command of its own - the tool's own bare name) - never to always, which is refused outright because it names no command or tool for a trigger to compare against. The trigger names one of the commands or tools this rule is bound to; naming anything else is refused too. Omit
     /// ALL FOUR (check_kind, check_path, check_literal, check_literals) to
     /// keep the item's current check untouched; pass check_kind as "" to
     /// clear it (refused if check_path, check_literal or check_literals is
@@ -835,7 +847,10 @@ pub struct ReviseArgs {
     pub check_literals: Vec<String>,
     /// Replaces the moment bindings. Give this, `targets`, and/or `always`
     /// TOGETHER to replace the WHOLE binding list in one call - when none of
-    /// the three are given, the existing bindings are kept untouched.
+    /// the three are given, the existing bindings are kept untouched. See
+    /// RememberArgs' own note on which moments actually fire - a NEW answer/
+    /// claim_done binding is refused here too, though one the item already
+    /// carried stays correctable.
     #[serde(default)]
     pub moments: Option<Vec<String>>,
     /// Replaces the target bindings - see `moments`' own note on how the
@@ -1264,7 +1279,7 @@ impl ThorMcpServer {
         }
     }
 
-    #[tool(description = "Declare a NEW memory item (Rule/Orientation/Report/Lookup/Chunk), through the write gate (model::store::declare). A Rule/Orientation with no binding, no falsifier, or over 300 characters is REFUSED with the exact reason and what to fix instead - that is the gate doing its job, not a failure of this tool, and nothing is written when it fires. Call lookup first so you revise an existing item instead of storing a near-duplicate. A Report/Chunk MUST carry a project - that is its scope, the collection it is filed under (recipes, books read, a training log, expenses) - and one with no scope is REFUSED, because it would belong to no collection and opening one would never show it. So before storing anything of the owner's own life, call lookup with NO arguments to see which scopes exist and pick the one it belongs to; the refusal lists them too if you get there first. If none fits, ASK the owner whether this needs a new scope and what to call it - never invent a scope name on his behalf, and never file something under a scope it does not belong to just to get past the gate. A Rule/Orientation may still be global (no project): a standing rule that holds in every project is what that is for. Optionally set check_kind plus either check_literal or check_literals (check_kind one of path_exists/contains/absent/absent_all/forbidden) to give a Rule or Orientation a machine-runnable proof of its own currency, alongside its required prose falsifier, never instead of it: a rule whose check currently HOLDS is the only kind of rule this memory ever uses to block a write outright (see serve's write guard); prose alone can inform, but can never block. path_exists/contains/absent/absent_all also need check_path, the exact file the check inspects; forbidden takes no check_path at all. Use check_kind absent_all with check_literals (a set) when ONE rule forbids SEVERAL literals together in one specific file; use check_kind forbidden with check_literals instead when the rule forbids something self-contained with nothing to anchor to (e.g. a typography rule banning six different punctuation characters wherever they are written is one forbidden item with a six-entry set, never six near-identical items each banning one, and never absent_all anchored to one directory as a formality - that only proves the rule current for that directory, leaving it silently not firing anywhere else it was meant to apply). A forbidden check reaches wherever its BINDING says, and there are exactly two bindings that carry a reach it can honour: always (every file write) and a command target (that one command, matched with sudo, a full path and a .exe suffix all taken off first). That second form is how a COMMAND prohibition - never run this exact thing - becomes a real refusal instead of prose: give the item a command target and a forbidden check whose literal is the dangerous fragment, and give it NO always binding unless writing those same words in a file is also forbidden, or the rule will refuse the documentation that describes it. A forbidden check on any other binding passes this gate, looks like the strongest form, and can never fire.")]
+    #[tool(description = "Declare a NEW memory item (Rule/Orientation/Report/Lookup/Chunk), through the write gate (model::store::declare). A Rule/Orientation with no binding, no falsifier, or over 300 characters is REFUSED with the exact reason and what to fix instead - that is the gate doing its job, not a failure of this tool, and nothing is written when it fires. Call lookup first so you revise an existing item instead of storing a near-duplicate. A Report/Chunk MUST carry a project - that is its scope, the collection it is filed under (recipes, books read, a training log, expenses) - and one with no scope is REFUSED, because it would belong to no collection and opening one would never show it. So before storing anything of the owner's own life, call lookup with NO arguments to see which scopes exist and pick the one it belongs to; the refusal lists them too if you get there first. If none fits, ASK the owner whether this needs a new scope and what to call it - never invent a scope name on his behalf, and never file something under a scope it does not belong to just to get past the gate. A Rule/Orientation may still be global (no project): a standing rule that holds in every project is what that is for. Optionally set check_kind plus either check_literal or check_literals (check_kind one of path_exists/contains/absent/absent_all/forbidden/requires) to give a Rule or Orientation a machine-runnable proof of its own currency, alongside its required prose falsifier, never instead of it: a rule whose check currently HOLDS is the only kind of rule this memory ever uses to block a write outright (see serve's write guard); prose alone can inform, but can never block. path_exists/contains/absent/absent_all also need check_path, the exact file the check inspects; forbidden takes no check_path at all. Use check_kind absent_all with check_literals (a set) when ONE rule forbids SEVERAL literals together in one specific file; use check_kind forbidden with check_literals instead when the rule forbids something self-contained with nothing to anchor to (e.g. a typography rule banning six different punctuation characters wherever they are written is one forbidden item with a six-entry set, never six near-identical items each banning one, and never absent_all anchored to one directory as a formality - that only proves the rule current for that directory, leaving it silently not firing anywhere else it was meant to apply). A forbidden check reaches wherever its BINDING says, and there are exactly two bindings that carry a reach it can honour: always (every file write) and a command target (that one command, matched with sudo, a full path and a .exe suffix all taken off first). That second form is how a COMMAND prohibition - never run this exact thing - becomes a real refusal instead of prose: give the item a command target and a forbidden check whose literal is the dangerous fragment, and give it NO always binding unless writing those same words in a file is also forbidden, or the rule will refuse the documentation that describes it. A forbidden check on any other binding passes this gate, looks like the strongest form, and can never fire.")]
     async fn remember(&self, Parameters(args): Parameters<RememberArgs>) -> String {
         if let Some(queued) = self.capture("remember", &args) {
             return queued;
@@ -1403,6 +1418,23 @@ impl ThorMcpServer {
                 Some(f) => Some(f.to_string()),
             };
             let falsifier_cleared = is_clear(args.falsifier.as_deref());
+            // Same "omit keeps, empty clears" convention as the five string
+            // fields above, but `tags` is a LIST: `Option<Vec<String>>`
+            // already tells "omitted" (`None`) apart from "given, but
+            // deliberately empty" (`Some(vec![])`) without any string-trim
+            // heuristic, because an empty JSON array survives the MCP call
+            // layer exactly like a non-empty one - the transport quirk
+            // `is_clear` works around for a bare empty string never applied
+            // to a list. `model::gate::ClearedFields` (the six-field signal
+            // `severity`/`project`/`expires`/`key`/`falsifier`/`check` use to
+            // tell ground 9 a deliberate clear apart from a silent drop)
+            // deliberately has no `tags` member - see that type's own doc
+            // comment - so this stays a purely local MCP-layer signal: the
+            // caller's intent is already fully captured in `args.tags`
+            // itself, and `gate_existing` below is blanked by hand the same
+            // way `ClearedFields::baseline` blanks its own six fields, for
+            // the one field that type does not cover.
+            let tags_cleared = matches!(args.tags.as_deref(), Some(t) if t.is_empty());
             // Same convention as every flat MCP check field: omitting
             // check_kind/check_path/check_literal/check_literals ALL FOUR
             // keeps the existing check untouched (mirrors `bindings` above -
@@ -1478,7 +1510,21 @@ impl ThorMcpServer {
                 falsifier: falsifier_cleared,
                 check: check_cleared,
             };
-            let gate_existing = cleared.baseline(&existing);
+            let mut gate_existing = cleared.baseline(&existing);
+            // `ClearedFields::baseline` above only knows the six fields it
+            // was built for. `tags` never joined that type (see
+            // `tags_cleared`'s own comment), so its baseline is blanked
+            // right here instead, by the same reasoning: ground 9 in
+            // `model::gate::revise` sees only `gate_existing`/`updated`, and
+            // `store::revise` uses `gate_existing` for nothing but that one
+            // comparison - the persisted body always comes from `updated`
+            // (see `model::store::revise`'s own body) - so blanking `tags`
+            // on a value that is never written keeps the check honest
+            // without needing the model crate to know this call asked for a
+            // deliberate clear.
+            if tags_cleared {
+                gate_existing.tags = Vec::new();
+            }
             // Same door as remember: a correction must not be able to swap a
             // working lock for one that fires nothing.
             if let Err(why) = refuse_an_unproven_check(&updated) {
@@ -1498,8 +1544,19 @@ impl ThorMcpServer {
             }
             match model::store::revise(s, SESSION_ID, LINEAGE_ID, ACTOR, &gate_existing, &updated) {
                 Ok(event) => {
+                    // A deliberate clear is the one revise outcome that is
+                    // easy to mistake for a no-op reply - "revised" alone
+                    // does not say whether the tags actually went away, so
+                    // a caller who cleared the last tag on purpose gets it
+                    // named here rather than having to `get` the item back
+                    // to confirm the list is really empty now.
+                    let success = if tags_cleared {
+                        format!("revised '{}' (event seq {}, tags cleared)", updated.id, event.seq)
+                    } else {
+                        format!("revised '{}' (event seq {})", updated.id, event.seq)
+                    };
                     Ok(with_warnings(
-                        format!("revised '{}' (event seq {})", updated.id, event.seq),
+                        success,
                         &updated,
                         revise_root.as_deref().map(|p| p.as_path()),
                         Some(s),
@@ -2357,13 +2414,27 @@ mod tests {
 
     #[tokio::test]
     async fn a_refused_revise_that_drops_a_field_is_loud_and_writes_nothing() {
+        // `tags` used to be the fixture field for this test, but it now
+        // carries the same "omit keeps, empty clears" convention as
+        // severity/project/expires/key/falsifier/check - see the
+        // tags-clearing tests below - so an explicit empty list is a
+        // deliberate clear, not a silent drop, and there is no longer any
+        // way to reach ground 9 through `tags` from this crate at all.
+        // `bindings` is the one field left with no legitimate clear (an
+        // item with zero bindings can never fire, so there is nothing a
+        // deliberate empty would even mean), so this test moved onto it.
+        //
+        // The fixture is an Orientation, not a Rule: `gate::declare`'s own
+        // "a Rule with no binding can never fire" ground would refuse a
+        // bindings-empty RULE before ground 9 ever got a turn, proving the
+        // wrong ground fired.
         let srv = server();
-        let mut args = base_remember("drop-tags-1");
+        let mut args = base_remember("drop-bindings-1");
+        args.kind = "orientation".to_string();
         // Ground 9 is what this test is about, so keep ground 11 out of it: a
         // heavy rule that loses its no-literal tag is refused for the teeth
-        // question first, and the tags message never gets a turn.
+        // question first, and the bindings message never gets a turn.
         args.severity = Some("house_style".to_string());
-        args.tags = vec!["safety".to_string()];
         let stored = srv.remember(Parameters(args)).await;
         assert!(stored.starts_with("stored"), "fixture setup must succeed: {stored}");
 
@@ -2372,11 +2443,11 @@ mod tests {
             append: None,
             replace_from: None,
             replace_to: None,
-            id: "drop-tags-1".to_string(),
+            id: "drop-bindings-1".to_string(),
             text: None,
             severity: None,
             project: None,
-            tags: Some(vec![]), // ground 9: existing had tags, this drops them
+            tags: None,
             expires: None,
             key: None,
             falsifier: None,
@@ -2384,13 +2455,17 @@ mod tests {
             check_path: None,
             check_literal: None,
             check_literals: vec![],
-            moments: None,
-            targets: None,
-            always: None,
+            // Naming any one of the three replaces the WHOLE binding list
+            // (see `moments`' own doc comment on `ReviseArgs`) - all three
+            // empty/false drops the fixture's only binding (Always),
+            // exactly the ground-9 shape this test is about.
+            moments: Some(vec![]),
+            targets: Some(vec![]),
+            always: Some(false),
         };
         let reply = srv.revise(Parameters(revise_args)).await;
         assert!(reply.contains("REFUSED"), "expected a loud refusal, got: {reply}");
-        assert!(reply.contains("tags"), "expected the reason to name the dropped field: {reply}");
+        assert!(reply.contains("binding"), "expected the reason to name the dropped field: {reply}");
 
         let events = srv.store.lock().unwrap().get_all_events().unwrap();
         assert_eq!(events.len(), 1, "a refused revise must append nothing beyond the original declare");
@@ -3731,18 +3806,23 @@ mod tests {
     /// `ClearedFields::baseline` in `gate.rs`'s own `cleared_fields` tests -
     /// see `clearing_one_field_does_not_excuse_an_unnamed_field_from_also_
     /// vanishing` there. This test instead pins the ordinary, most likely
-    /// accidental-drop shape AT THIS CRATE'S OWN BOUNDARY: a tags-clearing
-    /// attempt (which carries no "empty clears it" convention at all - an
-    /// empty list is always refused, on purpose) must still be refused
-    /// exactly as it was before ClearedFields existed, proving the fix
-    /// widened the door for exactly six fields and no others.
+    /// accidental-drop shape AT THIS CRATE'S OWN BOUNDARY: a bindings-drop
+    /// (the one field left with no "empty clears it" convention at all - an
+    /// empty binding list is always refused, on purpose, same as `tags` used
+    /// to be before it got one - see the tags-clearing tests below) must
+    /// still be refused exactly as before, proving a deliberate clear of one
+    /// field never widens the door for a different, unnamed field.
+    ///
+    /// The fixture is an Orientation, not a Rule, for the same reason the
+    /// sibling test above uses one: a Rule with zero bindings is refused by
+    /// `gate::declare`'s own ground before ground 9 ever gets a turn.
     #[tokio::test]
-    async fn clearing_severity_in_the_same_revise_that_drops_tags_still_refuses_the_tags_drop() {
+    async fn clearing_severity_in_the_same_revise_that_drops_bindings_still_refuses_the_bindings_drop() {
         let srv = server();
-        let mut args = base_remember("clear-severity-keep-tags-refusal-1");
+        let mut args = base_remember("clear-severity-keep-bindings-refusal-1");
+        args.kind = "orientation".to_string();
         // Same reason as the sibling test above: a light rule isolates ground 9.
         args.severity = Some("house_style".to_string());
-        args.tags = vec!["safety".to_string()];
         assert!(srv.remember(Parameters(args)).await.starts_with("stored"));
 
         let revise_args = ReviseArgs {
@@ -3750,11 +3830,79 @@ mod tests {
             append: None,
             replace_from: None,
             replace_to: None,
-            id: "clear-severity-keep-tags-refusal-1".to_string(),
+            id: "clear-severity-keep-bindings-refusal-1".to_string(),
             text: None,
             severity: Some("".to_string()), // deliberate, legitimate clear
             project: None,
-            tags: Some(vec![]),             // never had a clear convention - still a silent drop
+            tags: None,
+            expires: None,
+            key: None,
+            falsifier: None,
+            check_kind: None,
+            check_path: None,
+            check_literal: None,
+            check_literals: vec![],
+            // Never had a clear convention - still a silent drop (see the
+            // sibling test above on why naming any one of the three empties
+            // all three).
+            moments: Some(vec![]),
+            targets: Some(vec![]),
+            always: Some(false),
+        };
+        let reply = srv.revise(Parameters(revise_args)).await;
+        assert!(reply.contains("REFUSED"), "expected the bindings drop to still be refused, got: {reply}");
+        assert!(reply.contains("binding"), "expected the reason to name the dropped field: {reply}");
+
+        let get_reply =
+            srv.get(Parameters(GetArgs { id: "clear-severity-keep-bindings-refusal-1".to_string() })).await;
+        let item: Item = serde_json::from_str(&get_reply).unwrap();
+        assert_eq!(item.severity, Some(ItemSeverity::HouseStyle), "a refused revise must change nothing");
+        assert!(!item.bindings.is_empty(), "a refused revise must change nothing, bindings included");
+    }
+
+    // -------------------------------------------------------------- tags
+    //
+    // THE DEFECT THESE CLOSE: an item whose only tag was stale could never
+    // have that tag removed through `revise` - `tags: []` was refused
+    // unconditionally by ground 9 (see the two tests above on why `tags`
+    // used to sit right beside `bindings`), even though `Option<Vec<String>>`
+    // already tells "omitted" apart from "given, but empty" without any
+    // help from the model crate. `tags_cleared` (in `revise` itself) is the
+    // fix; each test below pins one leg of the resulting convention.
+
+    #[tokio::test]
+    async fn revise_that_omits_tags_keeps_the_current_tags() {
+        let srv = server();
+        let mut args = base_remember("keep-tags-1");
+        // Ground 11 (`gate::shape_problems`) asks a Rule the "no-literal"
+        // question whenever it is heavy (irreversible/costly severity) OR
+        // its own text names something concrete, unless it carries a check
+        // or already answered the question in its tags. House style plus
+        // base_remember's plain default text ("never force-push to main",
+        // which names nothing concrete on its own - see that fixture's own
+        // comment) keeps BOTH halves of that OR false, so this fixture's
+        // tags can be anything this test wants them to be, not specifically
+        // the no-literal reason base_remember sets.
+        args.severity = Some("house_style".to_string());
+        args.tags = vec!["safety".to_string(), "ci".to_string()];
+        assert!(srv.remember(Parameters(args)).await.starts_with("stored"));
+
+        let revise_args = ReviseArgs {
+            new_collection_named_by_owner: None,
+            append: None,
+            replace_from: None,
+            replace_to: None,
+            id: "keep-tags-1".to_string(),
+            // Same edit `revise_updates_text_and_keeps_untouched_fields`
+            // uses: plain prose, nothing that reads as a command, flag or
+            // path - ground 11 (see `gate::shape_problems`) reruns on the
+            // REVISED text too, and a literal-looking edit here would
+            // refuse this call for an unrelated reason, not the one this
+            // test is about.
+            text: Some("never force-push to main, ever".to_string()),
+            severity: None,
+            project: None,
+            tags: None, // omitted - must keep the current tags untouched
             expires: None,
             key: None,
             falsifier: None,
@@ -3767,13 +3915,101 @@ mod tests {
             always: None,
         };
         let reply = srv.revise(Parameters(revise_args)).await;
-        assert!(reply.contains("REFUSED"), "expected the tags drop to still be refused, got: {reply}");
-        assert!(reply.contains("tags"), "expected the reason to name the dropped field: {reply}");
+        assert!(reply.starts_with("revised"), "{reply}");
 
-        let get_reply = srv.get(Parameters(GetArgs { id: "clear-severity-keep-tags-refusal-1".to_string() })).await;
+        let get_reply = srv.get(Parameters(GetArgs { id: "keep-tags-1".to_string() })).await;
         let item: Item = serde_json::from_str(&get_reply).unwrap();
-        assert_eq!(item.tags, vec!["safety".to_string()], "a refused revise must change nothing, severity included");
-        assert_eq!(item.severity, Some(ItemSeverity::HouseStyle), "a refused revise must change nothing");
+        assert_eq!(
+            item.tags,
+            vec!["safety".to_string(), "ci".to_string()],
+            "an omitted tags field must keep the current tags"
+        );
+    }
+
+    #[tokio::test]
+    async fn revise_clearing_a_populated_tags_list_succeeds_and_the_reply_says_so() {
+        let srv = server();
+        let mut args = base_remember("clear-tags-1");
+        // See the sibling test above on why this needs to be house_style,
+        // not just a lighter tag: ground 11 keys on severity OR a literal
+        // in the text, and this fixture's tags replace base_remember's own
+        // no-literal answer.
+        args.severity = Some("house_style".to_string());
+        args.tags = vec!["safety".to_string(), "ci".to_string()];
+        assert!(srv.remember(Parameters(args)).await.starts_with("stored"));
+
+        let revise_args = ReviseArgs {
+            new_collection_named_by_owner: None,
+            append: None,
+            replace_from: None,
+            replace_to: None,
+            id: "clear-tags-1".to_string(),
+            text: None,
+            severity: None,
+            project: None,
+            tags: Some(vec![]), // deliberate clear, per the documented convention
+            expires: None,
+            key: None,
+            falsifier: None,
+            check_kind: None,
+            check_path: None,
+            check_literal: None,
+            check_literals: vec![],
+            moments: None,
+            targets: None,
+            always: None,
+        };
+        let reply = srv.revise(Parameters(revise_args)).await;
+        assert!(reply.starts_with("revised"), "expected a deliberate clear to succeed, got: {reply}");
+        assert!(reply.contains("tags cleared"), "expected the reply to say tags were cleared, got: {reply}");
+
+        let get_reply = srv.get(Parameters(GetArgs { id: "clear-tags-1".to_string() })).await;
+        let item: Item = serde_json::from_str(&get_reply).unwrap();
+        assert!(item.tags.is_empty(), "a deliberate clear must actually clear the tags, got: {:?}", item.tags);
+    }
+
+    #[tokio::test]
+    async fn revise_with_a_new_tags_list_replaces_the_whole_set() {
+        let srv = server();
+        let mut args = base_remember("replace-tags-1");
+        // See the first tags test above on why this needs to be house_style.
+        args.severity = Some("house_style".to_string());
+        args.tags = vec!["safety".to_string()];
+        assert!(srv.remember(Parameters(args)).await.starts_with("stored"));
+
+        let revise_args = ReviseArgs {
+            new_collection_named_by_owner: None,
+            append: None,
+            replace_from: None,
+            replace_to: None,
+            id: "replace-tags-1".to_string(),
+            text: None,
+            severity: None,
+            project: None,
+            tags: Some(vec!["reviewed".to_string(), "ci".to_string()]),
+            expires: None,
+            key: None,
+            falsifier: None,
+            check_kind: None,
+            check_path: None,
+            check_literal: None,
+            check_literals: vec![],
+            moments: None,
+            targets: None,
+            always: None,
+        };
+        let reply = srv.revise(Parameters(revise_args)).await;
+        assert!(reply.starts_with("revised"), "{reply}");
+        // A replace is not a clear, so the reply must not claim one.
+        assert!(!reply.contains("tags cleared"), "a replace is not a clear: {reply}");
+
+        let get_reply = srv.get(Parameters(GetArgs { id: "replace-tags-1".to_string() })).await;
+        let item: Item = serde_json::from_str(&get_reply).unwrap();
+        assert_eq!(
+            item.tags,
+            vec!["reviewed".to_string(), "ci".to_string()],
+            "a new list must replace the whole set, old tags included"
+        );
     }
 
     // ----------------------------------------------------------- pin/unpin

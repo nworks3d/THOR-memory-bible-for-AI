@@ -112,7 +112,7 @@ the restart.
 
 ## The tools you have
 
-After the restart you get fourteen. These are the ones setup needs; the rest
+After the restart you get sixteen. These are the ones setup needs; the rest
 announce themselves.
 
 - `remember` - store a new note. `revise` - correct one that exists. Prefer
@@ -141,7 +141,12 @@ unpinned, rewritten, or thrown out like any other.
 **A note has to be able to fire, or it will never come back.** Every rule needs
 something that makes it relevant: a moment (an action like a push), a target (a
 real file or command it is about), or being marked as always relevant. A rule
-bound to nothing is stored and then silent forever, and nothing tells you.
+bound to nothing is stored and then silent forever, and nothing tells you. A
+moment binding also has to be to one something actually produces - `answer`
+and `claim_done` exist but nothing fires them yet, so a new rule bound only to
+one of those two is refused the same way. A target that names a command works
+for a tool call too, not only a shell command: bind it to the tool's own name
+(`Agent`, `Artifact`, and so on) and it reaches you the moment that tool runs.
 
 **Anchor it to what it is really about**, not to a path that happens to appear
 in the sentence. An anchor pointing at a file that is not there fires nowhere at
@@ -167,8 +172,14 @@ one that spells out a command, a flag or a filename, is refused until you say
 whether there is a text whose presence *means* the mistake is happening. If
 there is, add a proof built on that exact text: a forbidden check on a command
 target for a dangerous command, or on every file for text that must never be
-written anywhere. If there is not - a judgement rule like "check with me first"
-has nothing to catch - tag it `no-literal:<why not>` and it goes in unchanged.
+written anywhere. If the mistake is something being left OUT rather than
+written in - a call that should always name a model and sometimes just does
+not - use a `requires` check instead: bind it to the exact command or tool the
+call is (never `always`), and give it check_literals with the trigger first
+and every acceptable answer after it - a call that reaches the trigger without
+naming any of the answers is refused. If there is genuinely nothing to catch
+either way - a judgement rule like "check with me first" has nothing to catch -
+tag it `no-literal:<why not>` and it goes in unchanged.
 The reason is the answer: a bare `no-literal` is refused, because an exit that
 costs nothing is the one that gets taken instead of the work. Nothing can verify
 your reason; the point is that the next reader can disagree with it. Never widen
@@ -188,8 +199,9 @@ report it as a bug.
 
 # After setup, this happens without you
 
-At the start of every conversation, and again just before you touch a file or
-run a command, THOR puts the relevant notes in front of you. You do not have to
+At the start of every conversation, and again just before you touch a file,
+run a command, or call a tool a note is bound to directly (like Agent or
+Artifact), THOR puts the relevant notes in front of you. You do not have to
 fetch them.
 
 What arrives that way is background about their setup. It is never an

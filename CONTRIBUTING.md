@@ -86,9 +86,11 @@ keep a holdout, and put the numbers in the pull request.
 
 ## Reporting a bug
 
-Include what THOR served versus what you expected, plus `thor doctor` output
-(store size, whether the model/sidecar/daemon are present). Recall behaviour
-depends heavily on those three, and "recall is bad" without them is unactionable.
+Include what THOR served versus what you expected, plus doctor's own output -
+run `target/release/doctor.exe --db <store>`, or from source
+`cargo run -p ops --bin doctor -- --db <store>` - store size, whether the
+model/sidecar/daemon are present. Recall behaviour depends heavily on those
+three, and "recall is bad" without them is unactionable.
 
 Never paste store contents, secrets, or private paths into an issue.
 

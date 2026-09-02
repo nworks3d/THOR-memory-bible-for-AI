@@ -130,7 +130,9 @@ was all THOR could do. A note could speak. It could not refuse.
 Version 2 lets a note carry a **proof of its own currency**: a small check THOR
 can run right now to see whether the note is still true of your project. "This
 file still contains that line." "That file is still there." "This character
-never appears in anything we write."
+never appears in anything we write." Or, for catching something left out
+rather than something wrong: "every agent I spawn names which model to do the
+work with."
 
 That changes what a note is allowed to do:
 
@@ -140,6 +142,11 @@ That changes what a note is allowed to do:
   assistant; it can never forbid.
 - If the proof **cannot run** - the file moved, the path is gone - nothing is
   blocked. It is reported as needing a look.
+
+That first kind of stop reaches further than an edit made through your
+assistant's own tools: deleting the protected file, emptying it out, or
+overwriting it from a command your assistant runs counts as the same wrong
+change, and is stopped the same way.
 
 The reason for the split is uncomfortable and worth saying out loud. Notes rot.
 You write one, the project moves on, and the note quietly becomes wrong. A tool
@@ -331,10 +338,16 @@ after a restart. Until then, it can already read the memory but not add to it.
 thor2/target/release/doctor.exe --db "C:\Users\you\AppData\Local\thor2\thor.db"
 ```
 
-Thirteen plain-language lines, one per part: whether your memory is healthy,
+Fourteen plain-language lines, one per part: whether your memory is healthy,
 whether searching by meaning is switched on, how many of your notes can prove
-themselves, and how many point at files that are no longer there. It changes
-nothing.
+themselves, how many point at files that are no longer there, and how many are
+bound to something that can never happen. It changes nothing.
+
+One of those lines only speaks up when it has something to report: if it ever
+says your memory's own log file has outgrown the memory itself, something is
+stopping a save from ever finishing - close any other program that might have
+that same memory open, and run the check again. Newer builds also cap how big
+that log file is allowed to grow, so this should be rare.
 
 **Step 4 - give each project its own memory.** From that project's folder:
 

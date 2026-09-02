@@ -52,7 +52,7 @@ place; the number says a real rebuild happened, not that a new project started.
 | `core` | the append-only event log the whole thing is built on. |
 | `intent` | reads what an agent is about to do and turns it into a moment a rule can bind to. |
 | `serve` | everything the agent sees: session start, the pre-tool gate, the write guard, lookup. |
-| `mcp` | the fourteen tools an agent calls: remember, revise, retract, recall, lookup, and the three code tools. |
+| `mcp` | the sixteen tools an agent calls: six write and state operations (remember, revise, retract, mark, pin, unpin), five read operations (get, history, status, resolve, lookup), three code analysis tools (search_code, where_used, outline), and two library tools (library, shelve). |
 | `codeindex` | a map of every symbol in your source, rebuilt from the code itself. It is what answers "who calls this" and "what breaks if I change it". |
 | `ops` | install, doctor, backup, sync. |
 
@@ -95,14 +95,17 @@ found on their own - the per-user `settings.json` for the hooks and
 anything touches them, nothing this tool did not put there is ever removed, and
 a second run reports everything as already present and writes nothing.
 
-A store it just created also gets a set of pinned notes on how to write a fact
-that comes back: anchoring, correcting instead of duplicating, what a refusal
-is, that words inform while only a proof forbids, saying what actually happened,
-and answering whether a rule can refuse. They go in through
-`model::store::declare`, the same gate every other write uses, and a refusal is
-reported rather than worked around - a memory whose own gate rejects the notes
-it ships with is worth seeing. An EXISTING store is never seeded, so upgrading
-never pushes anything into someone's real notes.
+A store it just created also gets ten pinned notes on how to write a fact that
+comes back: anchoring it to what it is really about, correcting instead of
+duplicating, giving a new project its own scope in one command, keeping life
+and work in separate places, never inventing a place to file something,
+keeping one entry to one thing, what a refusal actually is, that words inform
+while only a proof forbids, saying what actually happened, and answering
+whether a rule can refuse. They go in through `model::store::declare`, the
+same gate every other write uses, and a refusal is reported rather than worked
+around - a memory whose own gate rejects the notes it ships with is worth
+seeing. An EXISTING store is never seeded, so upgrading never pushes anything
+into someone's real notes.
 
 The two written files default to Claude Code's own per-user locations - not a
 guess, but the one documented place each lives, printed before it is used and
@@ -135,9 +138,35 @@ target/release/doctor.exe --db "<store>"
 ```
 
 It tells you whether the store is healthy, whether searching by meaning is on,
-how many rules carry a runnable proof, how many anchors point at nothing, and
-how many rules still lack a falsifier. It works on a store with nothing in it
-yet, which is what a first run looks like.
+how many rules carry a runnable proof, how many anchors point at nothing, how
+many rules still lack a falsifier, and how many live items are bound only to a
+moment that nothing in `serve` actually fires - `answer` and `claim_done` are
+the two that exist in the schema but nothing produces yet. It works on a store
+with nothing in it yet, which is what a first run looks like.
+
+One line only speaks up when there is something to say: `wal`, the size of the
+store's own write-ahead log. It stays silent for the ordinary case of a log
+that grows and shrinks as you use the store, and reports only once the log has
+grown past both 64 MB and the size of the store itself - which means a
+checkpoint is not landing, because something (a long-running reader, a stuck
+repair) is holding the log open. If you see it: close anything else that has
+the store open, make sure nothing is stuck mid-repair, and open the store
+again - opening it also caps how large the log is allowed to grow back to once
+a checkpoint does land, so this should not recur.
+
+`verify` is the slower, deeper check beside `doctor`: read-only, it replays
+the whole event log and confirms the hash chain, the derived heads projection
+and the search index all still agree with a from-scratch fold.
+
+```bash
+target/release/verify.exe "<store>"
+```
+
+A step that fails is reported and left alone. Add `--rebuild-fts` or
+`--rebuild-heads` to have that one step rebuilt from the log and re-checked -
+both are safe regardless of what caused the drift, because each is a
+projection the append-only log can always reproduce losslessly, and neither
+flag does anything unless the matching step actually failed.
 
 ## Writing to it from somewhere else
 
@@ -206,6 +235,20 @@ by hand and only by hand, which is the design rather than a shortcoming: each
 proof is a judgement about one rule, and attaching them wholesale is exactly
 how the noise gets back in.
 
+Doctor's `teeth` line asks the same question of the narrower, heavier subset:
+rules marked `costly` or `irreversible`. It also only ever gives you a count,
+and a count does not say WHICH of those still cannot refuse anything.
+`teeth_census`, an example under `serve`, walks the identical live store and
+prints one line per heavy rule - its id, its text, whether it already has an
+answer - so you get the actual worklist instead of just the number:
+
+```bash
+TEETH_CENSUS_DB="<store>" cargo run -p serve --example teeth_census -- --unanswered
+```
+
+Leave off `--unanswered` to see every heavy rule, answered or not; with it,
+you see only the ones still worth a look.
+
 There is a second gate that keeps the number from rotting once you start
 using it. Adding a fact to a target that already holds one whose own proof
 has gone false is refused, and the refusal names what to settle. It is
@@ -221,11 +264,41 @@ sentence naming what would prove it wrong), and it has to fit in 300 characters.
 The gate refuses anything else and tells you exactly what to fix. That refusal
 is the gate working, not a bug.
 
+A moment binding only works for a moment something actually produces: `push`,
+`commit`, `deploy` and the rest that `intent` derives from a real command or
+file, plus `remember` itself. `answer` and `claim_done` exist in the schema but
+nothing fires them yet, so binding a NEW rule only to one of those two is
+refused; a rule that already carried one from before this was enforced stays
+correctable for anything else about it.
+
+A target binding can also name a tool directly - `Agent`, `Artifact`,
+`SendUserFile` and so on, not only a shell command string - and now reaches you
+at the moment that tool itself is called, the same way a shell command reaches
+you when it runs.
+
 If you want the rule to be able to block rather than just inform, give it a
 check as well: `contains` and `absent` for text that must stay in or out of a
 named file, `absent_all` for a set of literals in one file, `path_exists` for a
 file that must be there, and `forbidden` for something self-contained that has
 no file to anchor to at all, like a punctuation character that is banned
-wherever it might be written.
+wherever it might be written. A check anchored to a file also catches a shell
+command that deletes it, empties it out, or overwrites it (`rm`, `truncate`,
+`sed -i`, `tee`, a redirect, `mv`/`cp` onto it) and not only a direct Edit or
+Write - though a glob in the command is never expanded to guess which files it
+might touch.
+
+`requires` is the odd one out: every check above asks whether some text is
+present or absent, which cannot see a forgotten field - forgetting leaves no
+fragment to look for. It carries a trigger plus a set of acceptable answers (in
+`check_literals`, trigger first): once a call reaches one of the item's own
+Command bindings, at least one answer has to appear in it too, or the call is
+refused. It only ever binds to a Command target naming the exact command or
+tool it is about, never `always` (which names nothing for a trigger to compare
+against), and the trigger itself has to equal one of those bindings. For
+example: a rule bound to the commands `Agent` and `Workflow`, with literals
+`["Agent", "haiku", "sonnet", "opus"]` - an `Agent` call naming none of the
+three cheap models is refused, and so is a `Workflow` call, because the rule
+watches both bindings it is bound to, not only the one spelled out as the
+trigger.
 
 The store is the source. Every document, this one included, is a mirror of it.

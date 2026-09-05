@@ -494,8 +494,13 @@ pub fn declare(
     // CONTRACT R1's own refusal class, unpaid until 2026-08-08: an item that
     // cannot reach a block is cover that looks real and never fires. Only the
     // provable half refuses here; the rest comes back as a note on the write
-    // (see `capacity`).
-    if let Capacity::DeadOnArrival(refusal) = capacity(store, &item).map_err(WriteError::Store)? {
+    // (see `capacity`). `Full` is the same provable half extended to a single
+    // Path/Dir/Command binding that is already at capacity on its own - see
+    // `full_reliable_anchor` for why that count is reliable where a Moment's
+    // is not.
+    if let Capacity::DeadOnArrival(refusal) | Capacity::Full(refusal) =
+        capacity(store, &item).map_err(WriteError::Store)?
+    {
         return Err(WriteError::Refused(refusal));
     }
     let body = canonical_body(&item).map_err(WriteError::Serialize)?;
@@ -528,7 +533,9 @@ pub fn revise(
     // The same capacity refusal `declare` makes. Without this the gate was
     // one door wide: declare refused an item that could never be shown, and
     // revise walked the identical binding in through the back.
-    if let Capacity::DeadOnArrival(refusal) = capacity(store, &updated).map_err(WriteError::Store)? {
+    if let Capacity::DeadOnArrival(refusal) | Capacity::Full(refusal) =
+        capacity(store, &updated).map_err(WriteError::Store)?
+    {
         return Err(WriteError::Refused(refusal));
     }
     let body = canonical_body(&updated).map_err(WriteError::Serialize)?;
@@ -546,6 +553,15 @@ pub enum Capacity {
     /// Every binding is already full of rivals it can never outrank. The item
     /// would be stored, fire nowhere, and nothing would say so.
     DeadOnArrival(Refusal),
+    /// A Path, Dir or Command binding - a place `pool_rivals` can count
+    /// completely - already holds `item::MAX_ITEMS` live rivals, AT ANY
+    /// WEIGHT. Distinct from `DeadOnArrival`: that variant means the item can
+    /// never reach ANY block on ANY binding it carries; this one means ONE
+    /// binding it names is already spoken for, regardless of what its other
+    /// bindings might do. Both refuse the write the same way - see
+    /// `full_reliable_anchor` for why counting every rival, not only the
+    /// equal-or-heavier ones, is what closes the silent-displacement gap.
+    Full(Refusal),
     /// A binding is full of rivals at the same weight or heavier. Whether
     /// this item is seen then depends on closeness at some future moment,
     /// which nobody can decide now - so it is said, not enforced.
@@ -641,6 +657,17 @@ fn pool_rivals<'a>(
 /// No new constant: the line is `item::MAX_ITEMS`, the number of places a
 /// block actually has. A configurable capacity would be exactly the
 /// compensating knob CONTRACT R9 calls a reported design failure.
+///
+/// A THIRD ANSWER SITS BETWEEN THOSE TWO, since a crowding tightening made
+/// 2026-09: a Path/Dir/Command binding's sitting rivals are a place
+/// `pool_rivals` counts completely (see `full_reliable_anchor`), so a write
+/// that would put this item on one already holding `item::MAX_ITEMS` of them
+/// - at ANY weight, not only equal-or-heavier - is refused too, before the
+/// two answers above are even asked. A Moment binding still only ever gets
+/// the warning: the facts that would truly collide with it live at whatever
+/// file or command the moment next fires on, a set this function cannot
+/// enumerate before that happens, and refusing on a guess is how a gate
+/// teaches people to route around it.
 pub fn capacity(store: &EventStore, item: &Item) -> anyhow::Result<Capacity> {
     let bindings: Vec<&Binding> =
         item.bindings.iter().filter(|b| !matches!(b, Binding::Always)).collect();
@@ -652,6 +679,10 @@ pub fn capacity(store: &EventStore, item: &Item) -> anyhow::Result<Capacity> {
     } else {
         live_items_from_fold(store)?
     };
+
+    if let Some(refusal) = full_reliable_anchor(&candidates, item, &bindings) {
+        return Ok(Capacity::Full(refusal));
+    }
 
     // A Dir target reaches NO automatic serving surface. `ServeInput::add_file`
     // adds a Path target only, and `normalize::target_matches` refuses a kind
@@ -747,6 +778,107 @@ fn describe(binding: &Binding) -> String {
         Binding::Always => "the pinned layer".to_string(),
         Binding::Moment(a) => format!("the moment '{}'", a.as_str()),
         Binding::Target { kind, value } => format!("the target {kind:?}:{value}"),
+    }
+}
+
+/// Refuses a write that would put `item` on a Path, Dir or Command binding
+/// already holding `item::MAX_ITEMS` live rivals, counting every rival AT ANY
+/// WEIGHT rather than only the equal-or-heavier ones `capacity`'s own
+/// hopeless/crowded pass below counts.
+///
+/// WHY A SEPARATE, UNWEIGHTED COUNT. The pass below only ever compares a
+/// candidate against rivals ranked at least as heavy as itself, because that
+/// is the comparison a REFUSAL can prove (a lighter newcomer cannot outrank
+/// heavier sitting rivals) or a WARNING has to hedge (an equal-weight rival
+/// might still lose on closeness at some future moment). Neither one ever
+/// looks at a rival LIGHTER than the newcomer, so a heavier arrival landing
+/// on a place already sitting at capacity with lighter facts sailed through
+/// both checks and silently bumped the lightest one - the gap a real session's
+/// hygiene pass fell into, leaving a displaced fact behind with no refusal and
+/// no note. Counting every rival regardless of weight closes it: a place at
+/// capacity is refused whether the arrival outranks its neighbours or not,
+/// and which sitting fact would give way is left to the agent to decide, not
+/// guessed at here.
+///
+/// WHY Path/Dir/Command AND NOTHING ELSE. Those are the bindings whose
+/// sitting rivals `pool_rivals` enumerates completely: `rank::select` mixes a
+/// Moment's pool INTO a Target's at real delivery (a file touch fires both
+/// what is anchored there and what a matching Moment reaches), never the
+/// other way, so the count below is a true lower bound on what will compete
+/// at that exact anchor regardless of what else the store holds - refusing on
+/// it can never be an over-refusal. A Moment binding has no such floor: the
+/// facts that would actually collide with it live at whatever file or
+/// command the moment next fires on, a set that is not enumerable before it
+/// happens, so it keeps the existing note rather than gaining a refusal (see
+/// `capacity`'s own doc comment). Symbol, Project, Route and Host stay on
+/// that same note for now: Symbol reaches through `serve::prompt`'s own
+/// pool-free surface rather than a place this count can see, and Project and
+/// Route carry no live delivery path this workspace has measured the way
+/// Path/Dir/Command's has been - widening the refusal to them without that
+/// measurement would be exactly the shaky enforcement this doctrine refuses
+/// to ship.
+///
+/// NEVER REFUSES A BINDING THE ITEM ALREADY STOOD ON. `candidates` still
+/// carries this item's own previous live version on a `revise`, so a fold
+/// that revises the survivor to carry a retracted item's point BEFORE
+/// retracting it - the order this function's own refusal recommends - must
+/// not itself be refused for standing exactly where it already stood; only a
+/// binding new to this write is judged.
+fn full_reliable_anchor(candidates: &[(String, Item)], item: &Item, bindings: &[&Binding]) -> Option<Refusal> {
+    let previously_bound: &[Binding] = candidates
+        .iter()
+        .find(|(id, _)| *id == item.id)
+        .map(|(_, prev)| prev.bindings.as_slice())
+        .unwrap_or(&[]);
+
+    for binding in bindings {
+        let Binding::Target { kind, .. } = binding else { continue };
+        if !matches!(
+            kind,
+            crate::item::TargetKind::Path | crate::item::TargetKind::Dir | crate::item::TargetKind::Command
+        ) {
+            continue;
+        }
+        if previously_bound.contains(binding) {
+            continue;
+        }
+        let rivals = pool_rivals(candidates, item, binding);
+        if rivals.len() < crate::item::MAX_ITEMS {
+            continue;
+        }
+        let named = rivals
+            .iter()
+            .map(|(id, other)| format!("'{id}' ({}): {}", severity_word(other.severity), other.text))
+            .collect::<Vec<_>>()
+            .join("; ");
+        return Some(Refusal {
+            problem: format!(
+                "{} already holds {} live fact(s) for the {} place(s) a block ever has, so this \
+                 write guarantees a displacement - its own, or one of theirs: {named}",
+                describe(binding),
+                rivals.len(),
+                crate::item::MAX_ITEMS
+            ),
+            fix: "no crowding, no loose ends: fold, move or archive one of them first, then this \
+                  write goes through untouched. Fold means revise one of them to carry this point \
+                  too and retract the rest; move means re-anchor the sitting fact to the narrower \
+                  file, directory or command it is really about; archive means retract whichever \
+                  one is dated or its subject is gone. A full place is not fixed by adding another \
+                  claimant."
+                .to_string(),
+        });
+    }
+    None
+}
+
+/// A severity, in the same words `Severity::from_str` accepts back - so a
+/// refusal never invents a vocabulary the writer cannot also type.
+fn severity_word(severity: Option<crate::item::Severity>) -> &'static str {
+    match severity {
+        Some(crate::item::Severity::Irreversible) => "irreversible",
+        Some(crate::item::Severity::Costly) => "costly",
+        Some(crate::item::Severity::HouseStyle) => "house_style",
+        None => "no severity",
     }
 }
 
@@ -1562,10 +1694,18 @@ mod tests {
     /// safe direction: it refuses an honest write for rivals it will never
     /// meet. Two independent reviews found it the same evening, both by
     /// reading `input.rs` rather than the comment that claimed otherwise.
+    ///
+    /// FOUR RIVALS, NOT SIX. This fixture used to over-provision the Dir
+    /// anchor on purpose, to prove a refusal survives more rivals than the cap
+    /// needs. Since `full_reliable_anchor` now refuses a FIFTH Dir-bound
+    /// arrival at the very same anchor too - the same "no crowding" rule this
+    /// test is not about - the fixture can no longer be built past the cap
+    /// through the front door, so it stops at exactly `MAX_ITEMS`, which is
+    /// still every bit as full.
     #[test]
     fn a_directory_bound_rival_now_shares_the_pool_of_a_file_inside_it() {
         let mut store = EventStore::in_memory().unwrap();
-        for i in 0..crate::item::MAX_ITEMS + 2 {
+        for i in 0..crate::item::MAX_ITEMS {
             let mut heavy = sample_with(&format!("dir-{i}"), DISTINCT[i % DISTINCT.len()]);
             heavy.bindings = vec![Binding::Target { kind: TargetKind::Dir, value: "src/deep".to_string() }];
             heavy.severity = Some(Severity::Irreversible);
@@ -1577,12 +1717,12 @@ mod tests {
 
         // BEFORE 2026-08-19 this write went through, because a directory
         // anchor could not reach a file inside it at all - which also meant
-        // those six rules were silent at every file they were written for. Now
-        // they do reach it, so they are real rivals and the count says so. The
-        // refusal names them, and a heavier or more precise binding is the way
-        // past it.
+        // those four rules were silent at every file they were written for.
+        // Now they do reach it, so they are real rivals and the count says
+        // so. The refusal names them, and a heavier or more precise binding
+        // is the way past it.
         let refused = declare(&mut store, "s", "l", "t", &light)
-            .expect_err("six heavier rivals at that place is exactly what crowding means");
+            .expect_err("four heavier rivals at a place with four seats is exactly what crowding means");
         let said = format!("{refused:?}");
         assert!(said.contains("src/deep/mod.rs"), "the place it could not get into: {said}");
         assert!(said.contains("dir-0"), "and who is holding it: {said}");
@@ -1637,6 +1777,143 @@ mod tests {
         another.bindings = vec![Binding::Always];
         another.severity = Some(Severity::HouseStyle);
         declare(&mut store, "s", "l", "t", &another).expect("a pin never competes for a place");
+    }
+
+    fn path_bound(id: &str, nth: usize, path: &str, severity: Option<Severity>) -> Item {
+        let mut item = sample_with(id, DISTINCT[nth % DISTINCT.len()]);
+        item.bindings = vec![Binding::Target { kind: TargetKind::Path, value: path.to_string() }];
+        item.severity = severity;
+        item
+    }
+
+    /// THE DEFECT THIS CLOSES: a big hygiene pass left a displaced fact behind
+    /// because the write gate only ever NOTED a full pool of equals, never
+    /// refused it - an agent could ignore the note and move on. A Path
+    /// binding's sitting rivals are countable exactly the way
+    /// `full_reliable_anchor` requires, so this is now provable, not a guess -
+    /// see that function's own doc comment for why a Moment binding still
+    /// only gets the note (`a_full_pool_of_equals_is_a_note_and_never_a_refusal`
+    /// above proves that half is unchanged).
+    #[test]
+    fn a_fifth_equal_weight_fact_on_a_full_path_anchor_is_refused() {
+        let mut store = EventStore::in_memory().unwrap();
+        for i in 0..crate::item::MAX_ITEMS {
+            let sitting = path_bound(&format!("sit-{i}"), i, "src/shared/config.rs", Some(Severity::Costly));
+            declare(&mut store, "s", "l", "t", &sitting).expect("fixture must store");
+        }
+        let newcomer = path_bound("newcomer", 8, "src/shared/config.rs", Some(Severity::Costly));
+        let err = declare(&mut store, "s", "l", "t", &newcomer).expect_err("the anchor already holds the cap");
+        let msg = format!("{err}");
+        assert!(msg.contains("src/shared/config.rs"), "names the place: {msg}");
+        assert!(msg.contains("sit-0"), "names a sitting fact so the agent can choose: {msg}");
+        assert!(msg.contains("fold"), "says how to make room: {msg}");
+        assert!(msg.contains("no crowding, no loose ends"), "names the rule by its own words: {msg}");
+    }
+
+    /// The other half of the same defect: a HEAVIER newcomer is not a free
+    /// pass either. Neither the hopeless check (needs rivals STRICTLY
+    /// heavier) nor the equal-or-heavier note (needs rivals AT LEAST as
+    /// heavy) ever looks at a rival LIGHTER than the newcomer, so before this
+    /// fix a heavier arrival on a full anchor of lighter facts sailed through
+    /// both unmentioned, silently bumping the lightest one.
+    #[test]
+    fn a_heavier_fact_on_a_full_path_anchor_is_also_refused() {
+        let mut store = EventStore::in_memory().unwrap();
+        for i in 0..crate::item::MAX_ITEMS {
+            let sitting = path_bound(&format!("light-{i}"), i, "src/shared/legacy.rs", Some(Severity::HouseStyle));
+            declare(&mut store, "s", "l", "t", &sitting).expect("fixture must store");
+        }
+        let newcomer = path_bound("heavy-newcomer", 8, "src/shared/legacy.rs", Some(Severity::Irreversible));
+        let err = declare(&mut store, "s", "l", "t", &newcomer)
+            .expect_err("a heavier arrival must not silently displace a lighter sitting fact");
+        assert!(format!("{err}").contains("light-0"), "{err}");
+    }
+
+    /// A place under the cap is exactly as free as it looks - three sitting
+    /// facts leave a fourth seat open, no fold or archive required.
+    #[test]
+    fn a_path_anchor_with_room_accepts_one_more() {
+        let mut store = EventStore::in_memory().unwrap();
+        for i in 0..crate::item::MAX_ITEMS - 1 {
+            let sitting = path_bound(&format!("room-{i}"), i, "src/shared/roomy.rs", Some(Severity::Costly));
+            declare(&mut store, "s", "l", "t", &sitting).expect("fixture must store");
+        }
+        let newcomer = path_bound("fits", 8, "src/shared/roomy.rs", Some(Severity::Costly));
+        declare(&mut store, "s", "l", "t", &newcomer).expect("three sitting facts leave a fourth seat open");
+    }
+
+    /// The scope is "Path, Dir or Command", not "Path alone" - a Command
+    /// anchor at capacity is counted and refused the same way.
+    #[test]
+    fn a_command_anchor_at_capacity_is_also_refused() {
+        let mut store = EventStore::in_memory().unwrap();
+        for i in 0..crate::item::MAX_ITEMS {
+            let mut sitting = sample_with(&format!("cmd-{i}"), DISTINCT[i % DISTINCT.len()]);
+            sitting.bindings =
+                vec![Binding::Target { kind: TargetKind::Command, value: "terraform apply".to_string() }];
+            declare(&mut store, "s", "l", "t", &sitting).expect("fixture must store");
+        }
+        let mut newcomer = sample_with("cmd-newcomer", "a webhook retry backs off before it gives up entirely");
+        newcomer.bindings = vec![Binding::Target { kind: TargetKind::Command, value: "terraform apply".to_string() }];
+        declare(&mut store, "s", "l", "t", &newcomer).expect_err("a full Command anchor refuses too");
+    }
+
+    /// Clearing room first, then writing, is exactly the order the refusal's
+    /// own fix text asks for - retracting one sitting fact is enough on its
+    /// own for the write that was refused a moment ago to go through
+    /// untouched.
+    #[test]
+    fn retracting_a_sitting_fact_clears_room_for_the_next_write() {
+        let mut store = EventStore::in_memory().unwrap();
+        for i in 0..crate::item::MAX_ITEMS {
+            let sitting = path_bound(&format!("sit-{i}"), i, "src/shared/queue.rs", Some(Severity::Costly));
+            declare(&mut store, "s", "l", "t", &sitting).expect("fixture must store");
+        }
+        let newcomer = path_bound("newcomer", 8, "src/shared/queue.rs", Some(Severity::Costly));
+        declare(&mut store, "s", "l", "t", &newcomer).expect_err("fixture sanity: the anchor starts full");
+
+        retract(&mut store, "s", "l", "t", "sit-0", "folded into sit-1").unwrap();
+        declare(&mut store, "s", "l", "t", &newcomer).expect("one retraction is enough room");
+    }
+
+    /// The fold order the refusal itself recommends - revise the survivor to
+    /// carry the point BEFORE retracting the one it absorbs - must not be
+    /// refused for standing exactly where it already stood: `full_reliable_
+    /// anchor` only judges a binding new to this write, never one the item
+    /// already carried, so the survivor can be revised while the anchor is
+    /// still at capacity.
+    #[test]
+    fn revising_a_sitting_fact_in_place_on_a_full_anchor_is_not_refused() {
+        let mut store = EventStore::in_memory().unwrap();
+        for i in 0..crate::item::MAX_ITEMS {
+            let sitting = path_bound(&format!("sit-{i}"), i, "src/shared/worker.rs", Some(Severity::Costly));
+            declare(&mut store, "s", "l", "t", &sitting).expect("fixture must store");
+        }
+        let existing = show(&store, "sit-0").unwrap();
+        let mut folded = existing.clone();
+        folded.text = format!("{} - and also covers the point sit-1 made", existing.text);
+        revise(&mut store, "s", "l", "t", &existing, &folded)
+            .expect("revising a sitting fact in place must not be refused for a crowd it did not add to");
+    }
+
+    /// A revise that ADDS a Path/Dir/Command binding the item did not already
+    /// carry is a genuinely new arrival at that anchor, and `revise` judges it
+    /// exactly like `declare` would.
+    #[test]
+    fn revise_adding_a_new_binding_onto_a_full_anchor_is_refused() {
+        let mut store = EventStore::in_memory().unwrap();
+        for i in 0..crate::item::MAX_ITEMS {
+            let sitting = path_bound(&format!("sit-{i}"), i, "src/shared/gateway.rs", Some(Severity::Costly));
+            declare(&mut store, "s", "l", "t", &sitting).expect("fixture must store");
+        }
+        let elsewhere = path_bound("elsewhere", 8, "src/shared/other.rs", Some(Severity::Costly));
+        declare(&mut store, "s", "l", "t", &elsewhere).expect("fixture must store");
+
+        let existing = show(&store, "elsewhere").unwrap();
+        let mut widened = existing.clone();
+        widened.bindings.push(Binding::Target { kind: TargetKind::Path, value: "src/shared/gateway.rs".to_string() });
+        revise(&mut store, "s", "l", "t", &existing, &widened)
+            .expect_err("adding a binding to a full anchor is a new arrival there, judged as one");
     }
 
     /// The promise archiving makes: the words survive, the claim to fire does

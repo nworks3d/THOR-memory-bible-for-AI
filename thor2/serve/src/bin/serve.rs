@@ -1351,6 +1351,15 @@ fn crowding_debt(
         if item.tags.iter().any(|t| t == model::store::CROWDED_ON_PURPOSE_TAG) {
             continue;
         }
+        // `full_reliable_anchor` (inside `capacity`) never refuses a binding
+        // an item already stands on - see its own doc comment - and by the
+        // time this reads `item` back with `show`, it already IS the live
+        // occupant of every binding it carries. So `capacity` here always
+        // falls through to this same `Crowded` note, exactly as before a
+        // Path/Dir/Command anchor could ever be refused outright: a fresh
+        // declare/revise cannot land a NEW one on a full anchor any more
+        // (refused at the door instead), but a legacy or bypassed write that
+        // already holds one is read correctly all the same.
         let Ok(model::store::Capacity::Crowded(note)) = model::store::capacity(store, &item) else {
             continue;
         };
@@ -2413,14 +2422,26 @@ mod judgement_debt_tests {
         }
     }
 
-    /// THE DEFECT THIS PREVENTS. `capacity` counts rivals of the same weight or
-    /// heavier and calls the pool full - correct as a deliberately pessimistic
-    /// WRITE-time warning, wrong as the debt's verdict. Equal weight outranks
-    /// nothing; closeness settles those ties at serve time. Measured 2026-08-13
-    /// on a fact that had just been folded INTO the shown four and was still
-    /// asked about every turn, with the `crowded-on-purpose` tag as the only
-    /// offered exit - so answering it honestly meant recording a decision that
-    /// was false.
+    /// THE DEFECT THIS PREVENTS. `capacity` used to count only rivals of the
+    /// same weight or heavier and call the pool full - correct as a
+    /// deliberately pessimistic WRITE-time warning, wrong as the debt's
+    /// verdict, because equal weight outranks nothing and closeness settles
+    /// those ties at serve time. Measured 2026-08-13 on a fact that had just
+    /// been folded INTO the shown four and was still asked about every turn,
+    /// with the `crowded-on-purpose` tag as the only offered exit - so
+    /// answering it honestly meant recording a decision that was false.
+    ///
+    /// WRITTEN DIRECTLY TO THE LOG, NOT THROUGH `declare`, since a crowding
+    /// tightening made 2026-09: a fresh declare onto a Path anchor already
+    /// holding `MAX_ITEMS` rivals is now refused outright regardless of
+    /// weight (`model::store::full_reliable_anchor`), so this exact shape -
+    /// a fifth equal-weight rival sharing one Path - can no longer arise from
+    /// a normal write; `model::store::tests::
+    /// a_fifth_equal_weight_fact_on_a_full_path_anchor_is_refused` is that
+    /// proof. It can still arise in a store written before that rule existed,
+    /// or synced from a client that predates it, and `crowding_debt` has to
+    /// read whatever such a store actually holds correctly regardless of how
+    /// it got there - which is the one thing this test is still about.
     #[test]
     fn a_crowded_estimate_settles_itself_when_the_item_really_reaches_the_block() {
         let dir = tempfile::tempdir().unwrap();
@@ -2431,15 +2452,51 @@ mod judgement_debt_tests {
         // Same weight and same pool, so the estimate still calls it full - but
         // its text shares words with the path, which is what wins the tie.
         let mine = path_newcomer("mine", "p", "the server app entry point stays free of route handlers");
-        model::store::declare(&mut store, "mcp", "mcp", "t", &mine).unwrap();
-
+        // Checked BEFORE `mine` exists anywhere in the store: `capacity` never
+        // refuses a binding an item already stood on (see `full_reliable_
+        // anchor`'s own doc comment), so asking after the direct append below
+        // would find `mine`'s own live entry already holding this exact
+        // binding and wrongly read as a harmless revise-in-place.
         assert!(
-            matches!(model::store::capacity(&store, &mine), Ok(model::store::Capacity::Crowded(_))),
+            matches!(model::store::capacity(&store, &mine), Ok(model::store::Capacity::Full(_))),
             "fixture sanity: the write-time estimate must still call this pool full"
         );
+        let body = serde_json::to_string(&mine).unwrap();
+        store
+            .append_event(
+                "legacy",
+                "mine",
+                "migration",
+                thor_core::event_store::EventKind::FactCreated,
+                "mine",
+                None,
+                &body,
+            )
+            .unwrap();
+
         assert!(
             crowding_debt(&store, &db, "now", None).is_none(),
             "an item the real ranker does show must not be asked about as though it were invisible"
+        );
+    }
+
+    /// The new half: going forward, this exact shape is refused at the door
+    /// instead of quietly landing and waiting for the Stop-hook to notice.
+    #[test]
+    fn a_fifth_equal_weight_path_write_is_now_refused_before_it_ever_reaches_the_debt() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("t.db");
+        let mut store = EventStore::new(&db).unwrap();
+        crowd_a_path(&mut store, "p");
+        record_session_watermark(&db, "now");
+        let mine = path_newcomer("mine", "p", "the server app entry point stays free of route handlers");
+
+        let err = model::store::declare(&mut store, "mcp", "mcp", "t", &mine)
+            .expect_err("a fifth rival on a full Path anchor is refused, not merely noted");
+        assert!(format!("{err}").contains("pathholder-0"), "{err}");
+        assert!(
+            crowding_debt(&store, &db, "now", None).is_none(),
+            "the refused write never landed, so this session owes no debt for it"
         );
     }
 

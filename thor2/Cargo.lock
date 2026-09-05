@@ -446,7 +446,7 @@ checksum = "c8d4a3bb8b1e0c1050499d1815f5ab16d04f0959b233085fb31653fbfc9d98f9"
 
 [[package]]
 name = "codeindex"
-version = "2.2.0"
+version = "2.2.1"
 dependencies = [
  "rusqlite",
  "tempfile",
@@ -1542,7 +1542,7 @@ dependencies = [
 
 [[package]]
 name = "intent"
-version = "2.2.0"
+version = "2.2.1"
 dependencies = [
  "regex",
  "serde",
@@ -1637,7 +1637,7 @@ checksum = "b6d2cec3eae94f9f509c767b45932f1ada8350c4bdb85af2fcab4a3c14807981"
 
 [[package]]
 name = "library"
-version = "2.2.0"
+version = "2.2.1"
 dependencies = [
  "rusqlite",
  "serde_json",
@@ -1747,7 +1747,7 @@ dependencies = [
 
 [[package]]
 name = "mcp"
-version = "2.2.0"
+version = "2.2.1"
 dependencies = [
  "anyhow",
  "axum",
@@ -1805,7 +1805,7 @@ dependencies = [
 
 [[package]]
 name = "model"
-version = "2.2.0"
+version = "2.2.1"
 dependencies = [
  "anyhow",
  "clap",
@@ -2066,7 +2066,7 @@ dependencies = [
 
 [[package]]
 name = "ops"
-version = "2.2.0"
+version = "2.2.1"
 dependencies = [
  "anyhow",
  "axum",
@@ -2845,7 +2845,7 @@ dependencies = [
 
 [[package]]
 name = "serve"
-version = "2.2.0"
+version = "2.2.1"
 dependencies = [
  "anyhow",
  "clap",
@@ -3094,7 +3094,7 @@ dependencies = [
 
 [[package]]
 name = "thor-core"
-version = "2.2.0"
+version = "2.2.1"
 dependencies = [
  "anyhow",
  "rusqlite",

@@ -229,7 +229,10 @@ at the right moment and hope. Version 2 is the same memory with a spine.
   compete. Version 2 counts that competition, tells you when you have just
   stored something onto a spot too crowded to ever show it, names what is
   holding the place, and refuses the write outright when every spot the note
-  could take is already full of heavier ones. Version 1 accepted it and said
+  could take is already full of heavier ones. A note tied to one file, folder
+  or command is refused the moment that single place already holds as many as
+  it can ever show - lighter rivals count too, so a heavier note can no longer
+  bump a lighter one out of sight unnoticed. Version 1 accepted it and said
   nothing, which is how a memory fills up with advice nobody will ever see.
 
 ## New in 2.1: a second memory, for everything that is not code

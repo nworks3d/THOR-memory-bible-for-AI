@@ -286,10 +286,12 @@ curl -fsSL https://raw.githubusercontent.com/nworks3d/THOR-memory-bible-for-AI/m
 ```
 
 No administrator rights, and nothing is installed outside your own user folder.
-It touches two files of yours, your assistant's settings and the list of tools
-it may use, and backs up both before it does. Rather read the script before you
-run it? Open that same link in a browser first. There is no macOS build yet, so
-on a Mac take the route below.
+**The automated setup targets Claude Code today.** It touches two of its files -
+Claude Code's own settings and the list of tools it may use - and backs up both
+before it does. Rather read the script before you run it? Open that same link
+in a browser first. There is no macOS build yet, so on a Mac take the route
+below. Using a different assistant? See
+[Using it from another assistant](#using-it-from-another-assistant) below.
 
 **Or build it yourself.** You need a Rust toolchain. Nothing else: no key to
 get, no model to download first, no account.
@@ -367,6 +369,42 @@ every note already filed under the old one.
 
 If you are the assistant doing the setup, [AGENTS.md](AGENTS.md) is the
 walkthrough for the steps above.
+
+## Using it from another assistant
+
+The automated setup above is for Claude Code specifically. Any other assistant
+that can be pointed at an external tool server can still use THOR, through the
+container published alongside every release instead of a local build.
+
+A generic client config, the shape most tool-calling assistants expect:
+
+```json
+{
+  "mcpServers": {
+    "thor": {
+      "command": "docker",
+      "args": [
+        "run", "-i", "--rm",
+        "-v", "thor-data:/data",
+        "ghcr.io/nworks3d/thor-mcp:2.3.0",
+        "mcp", "--db", "/data/thor.db"
+      ]
+    }
+  }
+}
+```
+
+### Run it as a container
+
+```bash
+docker run -i --rm -v thor-data:/data ghcr.io/nworks3d/thor-mcp:2.3.0 mcp --db /data/thor.db
+```
+
+The container does not build a fresh memory by itself - point `-v` at a folder
+or named volume that already holds a `thor.db` (a copy of the one your own
+build created, say). `-i` keeps input open, which is what talking to it over
+stdio needs; drop `--rm` if you would rather keep the stopped container around
+than have it clean up after itself.
 
 ## Stay in one conversation
 
@@ -453,6 +491,38 @@ THOR was measured head to head against another memory tool for months, and those
 numbers are not here any more. Not because they were bad - they were good - but
 because a score measured on someone else's notes tells you about them, not about
 you. The tool is here. The verdict is yours.
+
+## The sixteen tools
+
+What your assistant actually calls, grouped the same way the memory itself is
+split in two.
+
+**Code lane** - projects, rules, how to work:
+
+- `remember` - store a new rule, note, report or lookup entry
+- `revise` - correct one that already exists, instead of a near-duplicate
+- `retract` - remove one that turned out wrong (a reason is required; nothing
+  is deleted)
+- `resolve` - settle two versions of the same fact that diverged apart
+- `pin` - make an existing note a standing rule, served at every session start
+- `unpin` - stop it being one
+- `get` - show one item whole, by id
+- `lookup` - search everything - every project, by scope, by key, or by free
+  text
+- `history` - walk one item's whole past, oldest first
+- `mark` - judge whether something you were served actually helped
+- `status` - how much of the memory can actually stop a mistake, and how much
+  has gone stale
+- `search_code` - search the project's own indexed source code
+- `where_used` - find every place one function, struct or variable is defined
+  and used
+- `outline` - see everything one file declares, in line order
+
+**Library lane** - recipes, books, training, expenses, kept apart from the
+code lane:
+
+- `library` - read a shelf's index, one entry, or search across shelves
+- `shelve` - file a new entry, or correct one that already exists
 
 ## Documentation
 

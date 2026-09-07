@@ -102,7 +102,12 @@ pub fn resolve_project(start_dir: &Path) -> Option<String> {
 /// Harmless until the moment surface started scoping by project earlier the
 /// same day, exactly like the `project: "global"` case. A correct filter over
 /// an identity nobody translated deletes whatever the identity names.
-const MARKER_FILE_NAMES: &[&str] = &[MARKER_FILE_NAME, ".thor"];
+///
+/// Public so `ops::health`'s own `--checkouts` inference (walking ancestors
+/// for "is this directory a repo" - a THOR marker or a `.git` entry) can ask
+/// the same two names this module already treats as authoritative, instead
+/// of keeping a second, driftable copy of the list.
+pub const MARKER_FILE_NAMES: &[&str] = &[MARKER_FILE_NAME, ".thor"];
 
 /// The first marker file's first non-blank line, trimmed - `None` when none
 /// is present, unreadable, or empty/whitespace-only (an empty marker names

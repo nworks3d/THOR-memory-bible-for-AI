@@ -19,8 +19,8 @@
 //! figure above (the same treatment the bullet, the header and the withheld
 //! note already get: none of those are summed into it either).
 
+use crate::input::ServeInput;
 use crate::rank::RankedItem;
-use intent::Action;
 
 /// Re-exported, not redeclared. The write gate has to ask "would this item
 /// ever be shown", which needs this number, and `model` cannot read it from
@@ -103,14 +103,14 @@ pub fn cap(ranked: Vec<RankedItem>) -> Selection {
 /// reason (same one `session_start::render` gives for its own block): a
 /// surface that pushes at a reader stays minimal, a surface a reader asks
 /// carries everything.
-pub fn render_text(selection: &Selection, moments: &[Action]) -> Option<String> {
+pub fn render_text(selection: &Selection, input: &ServeInput) -> Option<String> {
     if selection.shown.is_empty() {
         return None;
     }
-    let head = if moments.is_empty() {
+    let head = if input.moments.is_empty() {
         "Before you do this:".to_string()
     } else {
-        let names = moments.iter().map(|a| a.as_str()).collect::<Vec<_>>().join(", ");
+        let names = input.moments.iter().map(|a| a.as_str()).collect::<Vec<_>>().join(", ");
         format!("Before you do this - {names}:")
     };
     let mut lines: Vec<String> = vec![FRAMING_LINE.to_string(), head];
@@ -125,11 +125,66 @@ pub fn render_text(selection: &Selection, moments: &[Action]) -> Option<String> 
     }
     if selection.withheld > 0 {
         lines.push(format!(
-            "({} more item(s) apply here - run `serve why` to see them.)",
-            selection.withheld
+            "({} more item(s) apply here - run `{}` to see them.)",
+            selection.withheld,
+            why_invocation(input)
         ));
     }
     Some(lines.join("\n"))
+}
+
+/// The exact `serve why ...` a reader can run to re-ask this block's own
+/// question - built from the SAME raw command/file text `ServeInput::
+/// add_command`/`add_file` kept (`input.command`/`input.file`), never
+/// reconstructed from the derived `targets`/`context` (see their own doc
+/// comments on `ServeInput` for why those are the wrong source: a command
+/// mixes in every file and host it names, and neither field is shaped like
+/// one flag's value).
+///
+/// THE DEFECT THIS CLOSES. Both the injected context and the Stop-hook used
+/// to say "run `serve why`" - no flag, no file, no command - so following it
+/// verbatim re-asked an EMPTY question instead of the one that had just been
+/// answered: `why`'s own argument parsing (`TargetArgs` in `bin/serve.rs`)
+/// never had a bare mode that reproduces "whatever just fired". One session's
+/// own report on trying to guess past it stands as the fixture this function
+/// is now measured against: "the help command for what fires here had a
+/// different flag than the hint said: --file, not a path." The two branches
+/// below are exactly `TargetArgs`'s own `--file`/`--command` flags (`why <path>`
+/// now also accepted as `--file`'s own positional shorthand - see
+/// `TargetArgs::path`'s doc comment in `bin/serve.rs`), proven to stay in
+/// step with the real parser by `serve/tests/why_hint_matches_the_parser.rs`,
+/// which runs the exact string this function builds through the real
+/// compiled binary.
+///
+/// A file wins when both are present (a tool call like Write carries its own
+/// tool name as a command AND the file it touches - see `hook_once`'s
+/// PreToolUse arm) because a file is the shorter, more literal thing a new
+/// user reaches for, and `--command "Write"` alone would ask a stranger
+/// question than the one anyone actually has. Falls back to naming the
+/// detected moment(s) with `--moment` (also real, also accepted) when
+/// NEITHER produced this block - surface 3, a raw prompt resolved by
+/// keyword alone (`prompt::resolve` never calls `add_command`/`add_file`) -
+/// and to the bare command as an honest last resort when even that is empty
+/// (should not occur: a shown item needed at least one binding to match, and
+/// every binding but `Always` implies a moment or a target), which is never
+/// worse than the defect this replaces.
+fn why_invocation(input: &ServeInput) -> String {
+    let mut flags = Vec::new();
+    if let Some(file) = &input.file {
+        flags.push(format!("--file \"{file}\""));
+    } else if let Some(command) = &input.command {
+        flags.push(format!("--command \"{command}\""));
+    }
+    if flags.is_empty() {
+        for action in &input.moments {
+            flags.push(format!("--moment {}", action.as_str()));
+        }
+    }
+    if flags.is_empty() {
+        "serve why".to_string()
+    } else {
+        format!("serve why {}", flags.join(" "))
+    }
 }
 
 #[cfg(test)]
@@ -180,14 +235,14 @@ mod tests {
     fn a_capped_block_always_states_how_many_it_withheld() {
         let items: Vec<RankedItem> = (0..6).map(|i| ranked(&format!("i{i}"), 10)).collect();
         let sel = cap(items);
-        let text = render_text(&sel, &[]).unwrap();
+        let text = render_text(&sel, &ServeInput::default()).unwrap();
         assert!(text.contains("2 more item(s) apply here"), "block: {text}");
     }
 
     #[test]
     fn nothing_shown_renders_no_block() {
         let sel = cap(Vec::new());
-        assert!(render_text(&sel, &[]).is_none());
+        assert!(render_text(&sel, &ServeInput::default()).is_none());
     }
 
     #[test]
@@ -210,14 +265,14 @@ mod tests {
             },
         }];
         let sel = cap(items);
-        let text = render_text(&sel, &[]).unwrap();
+        let text = render_text(&sel, &ServeInput::default()).unwrap();
         assert!(text.contains(&long), "the full 300-char text must appear unmodified");
     }
 
     #[test]
     fn no_moments_gives_a_generic_header() {
         let sel = cap(vec![ranked("i0", 10)]);
-        let text = render_text(&sel, &[]).unwrap();
+        let text = render_text(&sel, &ServeInput::default()).unwrap();
         // The framing line opens every block (see `a_block_always_opens_with_the_framing_line`
         // below); the surface-specific header is the line right after it.
         let second_line = text.lines().nth(1).unwrap_or("");
@@ -227,7 +282,8 @@ mod tests {
     #[test]
     fn moments_are_named_in_the_header() {
         let sel = cap(vec![ranked("i0", 10)]);
-        let text = render_text(&sel, &[intent::Action::Push]).unwrap();
+        let input = ServeInput { moments: vec![intent::Action::Push], ..Default::default() };
+        let text = render_text(&sel, &input).unwrap();
         let second_line = text.lines().nth(1).unwrap_or("");
         assert_eq!(second_line, "Before you do this - push:", "{text}");
     }
@@ -243,7 +299,7 @@ mod tests {
     #[test]
     fn a_block_always_opens_with_the_framing_line() {
         let sel = cap(vec![ranked("i0", 10)]);
-        let text = render_text(&sel, &[]).unwrap();
+        let text = render_text(&sel, &ServeInput::default()).unwrap();
         assert!(
             text.starts_with(FRAMING_LINE),
             "the moment/prompt block must open with the framing line: {text}"
@@ -261,7 +317,7 @@ mod tests {
         let mut item = ranked("i0", 10);
         item.item.falsifier = Some("this stops holding once the store is retired".to_string());
         let sel = cap(vec![item]);
-        let text = render_text(&sel, &[]).unwrap();
+        let text = render_text(&sel, &ServeInput::default()).unwrap();
         assert!(!text.contains("falsified by"), "a pushed surface must not carry it: {text}");
         assert!(
             !text.contains("this stops holding once the store is retired"),
@@ -278,8 +334,8 @@ mod tests {
         let without = ranked("i1", 10);
         assert_eq!(without.item.falsifier, None, "fixture sanity");
 
-        let a = render_text(&cap(vec![with]), &[]).unwrap();
-        let b = render_text(&cap(vec![without]), &[]).unwrap();
+        let a = render_text(&cap(vec![with]), &ServeInput::default()).unwrap();
+        let b = render_text(&cap(vec![without]), &ServeInput::default()).unwrap();
         assert_eq!(a.lines().count(), b.lines().count(), "same shape either way\nA:{a}\nB:{b}");
     }
 
@@ -293,7 +349,7 @@ mod tests {
     #[test]
     fn a_served_item_shows_its_id() {
         let sel = cap(vec![ranked("i0", 10)]);
-        let text = render_text(&sel, &[]).unwrap();
+        let text = render_text(&sel, &ServeInput::default()).unwrap();
         assert!(text.contains("i0"), "the block must carry the item's id: {text}");
     }
 
@@ -307,7 +363,7 @@ mod tests {
     #[test]
     fn the_shown_id_is_in_a_form_that_can_be_passed_straight_to_revise() {
         let sel = cap(vec![ranked("thor2:01ARZ3NDEKTSV4RRFFQ69G5FAV", 10)]);
-        let text = render_text(&sel, &[]).unwrap();
+        let text = render_text(&sel, &ServeInput::default()).unwrap();
         assert!(
             text.contains("[thor2:01ARZ3NDEKTSV4RRFFQ69G5FAV]"),
             "the id must appear whole, inside brackets, exactly as `revise` expects it: {text}"
@@ -330,7 +386,7 @@ mod tests {
         let sel = cap(items);
         assert_eq!(sel.shown.len(), 4, "a long id must not change how many items the same budget selects");
         assert_eq!(sel.withheld, 0);
-        let text = render_text(&sel, &[]).unwrap();
+        let text = render_text(&sel, &ServeInput::default()).unwrap();
         for shown in &sel.shown {
             assert!(
                 text.contains(&shown.item.text),
@@ -338,5 +394,89 @@ mod tests {
                 shown.item.text.chars().count()
             );
         }
+    }
+
+    // ------------------------------------------------- the withheld hint
+    //
+    // THE DEFECT THESE PREVENT: the hint used to read "run `serve why`" with
+    // nothing after it, on every surface, regardless of what had actually
+    // fired - not the flag `why`'s own parser (`TargetArgs` in
+    // `bin/serve.rs`) requires, and not even the file or command that made
+    // the block fire, so following it verbatim re-asked an EMPTY question.
+    // Measured against a session's own report after trying to guess past it:
+    // "the help command for what fires here had a different flag than the
+    // hint said: --file, not a path." `serve/tests/
+    // why_hint_matches_the_parser.rs` proves the flags named here are the
+    // ones the real compiled parser accepts; these are the unit-level half -
+    // the hint text carries the flag at all.
+
+    fn withheld_selection() -> Selection {
+        let items: Vec<RankedItem> = (0..6).map(|i| ranked(&format!("i{i}"), 10)).collect();
+        cap(items)
+    }
+
+    #[test]
+    fn a_file_backed_block_hints_the_file_flag_the_parser_accepts() {
+        let sel = withheld_selection();
+        let input = ServeInput { file: Some("src/main.rs".to_string()), ..Default::default() };
+        let text = render_text(&sel, &input).unwrap();
+        assert!(
+            text.contains("run `serve why --file \"src/main.rs\"` to see them"),
+            "the hint must carry the exact --file invocation: {text}"
+        );
+    }
+
+    #[test]
+    fn a_command_backed_block_hints_the_command_flag_the_parser_accepts() {
+        let sel = withheld_selection();
+        let input = ServeInput { command: Some("git push --force origin main".to_string()), ..Default::default() };
+        let text = render_text(&sel, &input).unwrap();
+        assert!(
+            text.contains("run `serve why --command \"git push --force origin main\"` to see them"),
+            "the hint must carry the exact --command invocation: {text}"
+        );
+    }
+
+    /// A file wins when both are present (the shape a real Write/Edit tool
+    /// call takes: its own tool name as a command, plus the file it
+    /// touches - see `hook_once`'s PreToolUse arm) - the shorter, more
+    /// literal thing a new user reaches for.
+    #[test]
+    fn a_file_wins_over_a_command_when_both_are_present() {
+        let sel = withheld_selection();
+        let input = ServeInput {
+            command: Some("Write".to_string()),
+            file: Some("src/main.rs".to_string()),
+            ..Default::default()
+        };
+        let text = render_text(&sel, &input).unwrap();
+        assert!(text.contains("--file \"src/main.rs\""), "{text}");
+        assert!(!text.contains("--command"), "a file hint must not also name the command: {text}");
+    }
+
+    /// Surface 3 (a raw prompt) never calls `add_command`/`add_file` -
+    /// `prompt::resolve` derives moments and targets directly - so neither
+    /// field is ever set there. The hint still names a real, accepted flag
+    /// (`--moment`) instead of falling back to the empty "serve why" that
+    /// caused this whole defect.
+    #[test]
+    fn a_prompt_only_block_hints_the_moment_flag_when_neither_file_nor_command_apply() {
+        let sel = withheld_selection();
+        let input = ServeInput { moments: vec![intent::Action::Push], ..Default::default() };
+        let text = render_text(&sel, &input).unwrap();
+        assert!(
+            text.contains("run `serve why --moment push` to see them"),
+            "the hint must fall back to a real, accepted flag: {text}"
+        );
+    }
+
+    /// The last-resort case (should not occur on a real shown item, which
+    /// needs at least one binding to have matched) must still be the bare
+    /// command this replaces - never a panic, never a malformed flag.
+    #[test]
+    fn the_bare_fallback_never_panics_with_nothing_to_name() {
+        let sel = withheld_selection();
+        let text = render_text(&sel, &ServeInput::default()).unwrap();
+        assert!(text.contains("run `serve why` to see them"), "{text}");
     }
 }

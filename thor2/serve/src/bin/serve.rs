@@ -182,6 +182,24 @@ enum Command {
 
 #[derive(clap::Args)]
 struct TargetArgs {
+    /// A file about to be touched, named directly with no flag at all - the
+    /// shortest form of `--file` below, and the one a new user reaches for
+    /// first.
+    ///
+    /// THE DEFECT THIS CLOSES. Every hint this binary prints for a withheld
+    /// item (`serve::render::render_text`'s "run `serve why ...`" line) used
+    /// to read "run `serve why`" with nothing after it - not a flag this
+    /// parser accepted, and not even the file or command that made the
+    /// block fire. A session's own report on trying to guess past it: "the
+    /// help command for what fires here had a different flag than the hint
+    /// said: --file, not a path." The hint is now built from this same
+    /// struct (see `render::why_invocation`) and always names `--file`
+    /// explicitly, but this positional stays too, so the shortest thing a
+    /// new user actually types - the bare path, no flag remembered - also
+    /// works. Refused together with `--file` (never silently picking one)
+    /// rather than left to guess which wins.
+    #[arg(value_name = "PATH", conflicts_with = "file")]
+    path: Option<String>,
     /// A command about to run (derives its own moments; also a Command doel).
     #[arg(long)]
     command: Option<String>,
@@ -226,7 +244,10 @@ fn build_input(args: &TargetArgs) -> ServeInput {
     if let Some(command) = &args.command {
         input.add_command(command);
     }
-    if let Some(file) = &args.file {
+    // The bare positional is `--file`'s own shorthand (see `TargetArgs::path`'s
+    // doc comment) - `conflicts_with = "file"` on the parser already refuses
+    // both together, so at most one of the two is ever `Some` here.
+    if let Some(file) = args.file.as_deref().or(args.path.as_deref()) {
         input.add_file(file);
     }
     for (kind, value) in &args.targets {
@@ -785,7 +806,7 @@ fn hook_once(db_path: &Path) -> Option<HookOutput> {
             let decay = DecayContext::load(&store);
             let all = serve::decay::retain_live(serve::rank::select(&candidates, &input), &decay);
             let selection = render::cap(all);
-            let block = render::render_text(&selection, &input.moments)?;
+            let block = render::render_text(&selection, &input)?;
             let ids: Vec<String> = selection.shown.iter().map(|r| r.id.clone()).collect();
             deliver::record_delivery(&mut store, &session_id, &session_id, "hook", &time::now_iso8601(), &ids);
             Some(HookOutput::Context { event_name, block })
@@ -930,7 +951,7 @@ fn hook_once(db_path: &Path) -> Option<HookOutput> {
                 return sink_warning.map(|block| HookOutput::Context { event_name, block });
             }
             let served = serve::serve(&store, &input);
-            let rendered = render::render_text(&served.selection, &input.moments);
+            let rendered = render::render_text(&served.selection, &input);
             let block = match (sink_warning, rendered) {
                 (Some(warning), Some(rendered)) => Some(format!("{warning}\n\n{rendered}")),
                 (Some(warning), None) => Some(warning),
@@ -3231,7 +3252,7 @@ fn cmd_check(db_path: &Path, input: &ServeInput) {
     }
     let store = open_store_or_die(db_path);
     let served = serve::serve(&store, input);
-    match render::render_text(&served.selection, &input.moments) {
+    match render::render_text(&served.selection, input) {
         Some(block) => println!("\n{block}"),
         None => println!("\n(no item governs this)"),
     }
@@ -3307,7 +3328,7 @@ fn cmd_prompt(db_path: &Path, text: &str) {
     let decay = DecayContext::load(&store);
     let all = serve::decay::retain_live(serve::rank::select(&candidates, &input), &decay);
     let selection = render::cap(all);
-    match render::render_text(&selection, &input.moments) {
+    match render::render_text(&selection, &input) {
         Some(block) => println!("{block}"),
         None => println!("(no item governs this)"),
     }

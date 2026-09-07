@@ -114,13 +114,13 @@ fn capture_three_surfaces(db: &EventStore) -> (String, String, String) {
     moment_input.add_moment(Action::Push);
     let moment_all = rank::select(&candidates, &moment_input);
     let moment_selection = render::cap(moment_all);
-    let moment_block = render::render_text(&moment_selection, &moment_input.moments).unwrap_or_default();
+    let moment_block = render::render_text(&moment_selection, &moment_input).unwrap_or_default();
 
     let prompt_text = "please run git push --force origin main right now";
     let prompt_input = prompt::resolve(prompt_text, &candidates);
     let prompt_all = rank::select(&candidates, &prompt_input);
     let prompt_selection = render::cap(prompt_all);
-    let prompt_block = render::render_text(&prompt_selection, &prompt_input.moments).unwrap_or_default();
+    let prompt_block = render::render_text(&prompt_selection, &prompt_input).unwrap_or_default();
 
     (start_block, moment_block, prompt_block)
 }
@@ -336,7 +336,7 @@ fn the_moment_surface_still_fires_for_a_real_action() {
         served.selection.shown.iter().any(|r| r.id == "push-guard"),
         "a real, matching action must still make the moment surface fire"
     );
-    let block = render::render_text(&served.selection, &input.moments).expect("a real match must render a block");
+    let block = render::render_text(&served.selection, &input).expect("a real match must render a block");
     assert!(block.contains("never push without checking first"), "expected the rule's own text in the block: {block}");
 }
 

@@ -494,6 +494,17 @@ pub struct ServeInput {
     /// project could not be resolved, and then only global items are served -
     /// see `project::applies_to` for why that is the safe direction.
     pub project: Option<String>,
+    /// The verbatim string last handed to `add_command`, kept ONLY so
+    /// `render::render_text` can echo back a `serve why --command "..."`
+    /// that re-asks this exact question - `targets`/`context` already hold
+    /// this same text, derived and mixed with other signals, which is right
+    /// for ranking but wrong for a hint that must be copy-pasteable as one
+    /// flag's value. See `render::why_invocation`'s own doc comment for the
+    /// defect this closes.
+    pub command: Option<String>,
+    /// The verbatim string last handed to `add_file`, for the same reason
+    /// `command` above exists.
+    pub file: Option<String>,
 }
 
 impl ServeInput {
@@ -519,6 +530,7 @@ impl ServeInput {
         if command.is_empty() {
             return;
         }
+        self.command = Some(command.to_string());
         self.moments.extend(intent::from_command(command).into_iter().map(|s| s.action));
         self.targets.push((TargetKind::Command, command.to_string()));
         for path in paths_in_command(command) {
@@ -536,6 +548,7 @@ impl ServeInput {
         if path.is_empty() {
             return;
         }
+        self.file = Some(path.to_string());
         self.moments.extend(intent::from_path(path).into_iter().map(|s| s.action));
         self.targets.push((TargetKind::Path, path.to_string()));
         self.push_context(path);
@@ -573,6 +586,11 @@ mod tests {
         assert!(input.moments.contains(&Action::Push));
         assert!(input.targets.contains(&(TargetKind::Command, "git push --force origin main".to_string())));
         assert!(input.context.contains("push"));
+        assert_eq!(
+            input.command.as_deref(),
+            Some("git push --force origin main"),
+            "the verbatim command must be kept for render::why_invocation's own hint"
+        );
     }
 
     #[test]
@@ -581,6 +599,11 @@ mod tests {
         input.add_file("app/.env");
         assert!(input.moments.contains(&Action::Credentials));
         assert!(input.targets.contains(&(TargetKind::Path, "app/.env".to_string())));
+        assert_eq!(
+            input.file.as_deref(),
+            Some("app/.env"),
+            "the verbatim path must be kept for render::why_invocation's own hint"
+        );
     }
 
     #[test]

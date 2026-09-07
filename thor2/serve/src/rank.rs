@@ -232,7 +232,14 @@ mod tests {
     /// itself is never matched by `select` (see `binding_matches`'s own doc
     /// comment) and deliberately has no representation here any more.
     fn input_matching_base() -> ServeInput {
-        ServeInput { moments: vec![Action::Configure], targets: vec![], context: String::new(), project: None }
+        ServeInput {
+            moments: vec![Action::Configure],
+            targets: vec![],
+            context: String::new(),
+            project: None,
+            command: None,
+            file: None,
+        }
     }
 
     // ------------------------------------------------------ project scope
@@ -249,6 +256,8 @@ mod tests {
             targets: vec![],
             context: String::new(),
             project: name.map(str::to_string),
+            command: None,
+            file: None,
         }
     }
 
@@ -364,9 +373,23 @@ mod tests {
     fn a_moment_binding_only_fires_on_its_own_action() {
         let mut c = base("x2", Kind::Orientation);
         c.item.bindings = vec![Binding::Moment(Action::Push)];
-        let miss = ServeInput { moments: vec![Action::Commit], targets: vec![], context: String::new(), project: None };
+        let miss = ServeInput {
+            moments: vec![Action::Commit],
+            targets: vec![],
+            context: String::new(),
+            project: None,
+            command: None,
+            file: None,
+        };
         assert!(select(&[c.clone_for_test()], &miss).is_empty());
-        let hit = ServeInput { moments: vec![Action::Push], targets: vec![], context: String::new(), project: None };
+        let hit = ServeInput {
+            moments: vec![Action::Push],
+            targets: vec![],
+            context: String::new(),
+            project: None,
+            command: None,
+            file: None,
+        };
         assert_eq!(select(&[c], &hit).len(), 1);
     }
 
@@ -383,7 +406,10 @@ mod tests {
         let input = ServeInput {
             moments: vec![],
             targets: vec![(TargetKind::Path, "src/main.rs".to_string())],
-            context: String::new(), project: None,
+            context: String::new(),
+            project: None,
+            command: None,
+            file: None,
         };
         assert_eq!(select(&[c], &input).len(), 1);
     }
@@ -400,7 +426,10 @@ mod tests {
         let input = ServeInput {
             moments: vec![],
             targets: vec![(TargetKind::Path, "swap-binary.ps1".to_string())],
-            context: String::new(), project: None,
+            context: String::new(),
+            project: None,
+            command: None,
+            file: None,
         };
         assert_eq!(select(&[c], &input).len(), 1);
     }
@@ -421,6 +450,8 @@ mod tests {
             targets: vec![(TargetKind::Command, "gh repo edit nworks3d/x --visibility public".to_string())],
             context: String::new(),
             project: None,
+            command: None,
+            file: None,
         };
         assert_eq!(select(&[c.clone_for_test()], &with_args).len(), 1, "the arguments are the normal case");
 
@@ -432,6 +463,8 @@ mod tests {
                 targets: vec![(TargetKind::Command, miss.to_string())],
                 context: String::new(),
                 project: None,
+                command: None,
+                file: None,
             };
             assert!(select(&[c.clone_for_test()], &input).is_empty(), "must not fire on: {miss}");
         }
@@ -444,7 +477,10 @@ mod tests {
         let input = ServeInput {
             moments: vec![],
             targets: vec![(TargetKind::Path, "main.rs".to_string())],
-            context: String::new(), project: None,
+            context: String::new(),
+            project: None,
+            command: None,
+            file: None,
         };
         assert!(select(&[c], &input).is_empty(), "a Command binding must not answer a Path target");
     }
@@ -493,7 +529,10 @@ mod tests {
             // actually about.
             moments: vec![Action::Configure],
             targets: vec![],
-            context: "docker compose -f docker-compose.yml up payment-gateway".to_string(), project: None,
+            context: "docker compose -f docker-compose.yml up payment-gateway".to_string(),
+            project: None,
+            command: None,
+            file: None,
         };
         let hits = select(&[generic, specific], &input);
         assert_eq!(hits[0].id, "s", "the item naming the real command/path must rank first");

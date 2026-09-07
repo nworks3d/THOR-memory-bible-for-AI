@@ -556,6 +556,28 @@ fn payload_is_from_a_subagent(payload: &Value) -> bool {
     payload.get("agent_id").and_then(|v| v.as_str()).is_some_and(|s| !s.is_empty())
 }
 
+/// The owner's own last typed prompt, for `respond::guard_verdict`'s
+/// `list_request_any_of` exemption (FALSE BLOCK A - see
+/// `respond::last_user_prompt`'s own doc comment for the full story).
+/// Unlike the reply text (`last_assistant_message`, read
+/// straight off the Stop payload), Claude Code does not hand the prompt over
+/// the same way - it names the session's transcript file in
+/// `transcript_path` instead, so this reads THAT and hands the raw text to
+/// `respond::last_user_prompt`, the pure parser. Empty string on anything
+/// unreadable (no `transcript_path`, the file is gone or unparseable) -
+/// fail-open, same stance as every other optional signal on this path: the
+/// exemption then simply does not apply, exactly the behaviour this project
+/// had before it existed, never a NEW block.
+fn last_user_prompt_from_payload(payload: &Value) -> String {
+    let Some(path) = payload.get("transcript_path").and_then(|v| v.as_str()) else {
+        return String::new();
+    };
+    let Ok(text) = std::fs::read_to_string(path) else {
+        return String::new();
+    };
+    respond::last_user_prompt(&text).unwrap_or_default()
+}
+
 fn hook_once(db_path: &Path) -> Option<HookOutput> {
     let mut raw = String::new();
     std::io::stdin().read_to_string(&mut raw).ok()?;
@@ -573,8 +595,11 @@ fn hook_once(db_path: &Path) -> Option<HookOutput> {
     // store, because it watches the assistant's reply, not the memory. See
     // `serve::respond` for the whole story of why this surface had to be
     // rebuilt. Reads the assistant's last message straight from the payload
-    // (Claude Code puts it there - no transcript to parse), refuses to
-    // re-fire when a guard already fired this turn (loop safety), and asks
+    // (Claude Code puts it there), and the owner's own last prompt from the
+    // transcript `transcript_path` names (`last_user_prompt_from_payload` -
+    // there is no payload field for that the way there is for the reply;
+    // see that function's own doc comment), refuses to re-fire when a guard
+    // already fired this turn (loop safety), and asks
     // `respond::guard_verdict` for BOTH tiers at once (SPEC-ENFORCEMENT.md
     // 1.1's three verdicts, `respond::GuardVerdict`) instead of the old
     // `respond::block_reason`, which could only ever see BLOCK. A BLOCK
@@ -614,7 +639,8 @@ fn hook_once(db_path: &Path) -> Option<HookOutput> {
                 return None;
             }
             let rulebook_text = std::fs::read_to_string(respond::default_rulebook_path(db_path)).ok();
-            let verdict = respond::guard_verdict(rulebook_text.as_deref(), msg);
+            let last_prompt = last_user_prompt_from_payload(&payload);
+            let verdict = respond::guard_verdict(rulebook_text.as_deref(), msg, &last_prompt);
             let text = verdict.block_reason.or(verdict.warn_reason)?;
             return Some(HookOutput::Warn { event_name, text });
         }
@@ -622,7 +648,8 @@ fn hook_once(db_path: &Path) -> Option<HookOutput> {
             None
         } else {
             let rulebook_text = std::fs::read_to_string(respond::default_rulebook_path(db_path)).ok();
-            let verdict = respond::guard_verdict(rulebook_text.as_deref(), msg);
+            let last_prompt = last_user_prompt_from_payload(&payload);
+            let verdict = respond::guard_verdict(rulebook_text.as_deref(), msg, &last_prompt);
             if let Some(reason) = verdict.block_reason {
                 return Some(HookOutput::Decision(serde_json::json!({
                     "decision": "block",

@@ -17,5 +17,22 @@
     "any_of": ["ik ben geen jurist", "ik ben geen dokter", "geen juridisch advies", "not legal advice", "i am not a lawyer", "raadpleeg een specialist", "consult a professional"],
     "none_of": ["disclaimer", "false positive", "vals alarm", "any_of"],
     "reminder": "Drop the reflexive AI/credential disclaimer and give the substantive answer with conviction. A real, specific, decision-relevant limitation may be stated ONCE as a concrete fact - that is information, not a hedge."
+  },
+  {
+    "id": "answer-is-too-long",
+    "tier": "block",
+    "any_of": [],
+    "none_of": ["\n> ", "```"],
+    "list_request_any_of": ["lijst", "overzicht", "rapport", "list", "overview", "report", "all the"],
+    "min_chars": 1000,
+    "reminder": "This answer is over 1000 characters. Keep it short and in plain language, not just the summary - no ids, no filenames, no test counts, no code names unless asked. Say what happened and what it means, then stop. Quoted material the user asked to see does not count - a reply built around a blockquote is exempt. A list or overview the user explicitly asked for is exempt too, when the reply actually is one, not merely because the prompt asked for one."
+  },
+  {
+    "id": "checked-claim-needs-evidence",
+    "tier": "block",
+    "any_of": ["gecheckt", "gecontroleerd", "geverifieerd", "nagekeken", "verified", "confirmed", "checked against", "gevalideerd"],
+    "none_of": [".py:", ".mjs:", ".cfg:", ".md:", ".js:", ".json:", ".rs:", ".ts:", ".sh:", ".ps1:", "commit ", "regel ", "line ", "niet gecheckt", "not checked", "niet geverifieerd", "not verified", "niet nagekeken", "not looked up", "niet gecontroleerd", "niet gevalideerd", "nog niet gecheckt", "niet bevestigd", "not confirmed", "unverified"],
+    "none_of_patterns": ["commit_sha", "path_line"],
+    "reminder": "You are claiming something was checked or verified without evidence. Name the file with a line number (path:line) or the commit, or say plainly that it was not checked."
   }
 ]

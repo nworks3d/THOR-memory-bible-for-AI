@@ -31,8 +31,10 @@
 //! A guard that watches replies must never itself become the reason a reply
 //! cannot be given.
 
+use regex::Regex;
 use serde_json::Value;
 use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
 
 /// One response rule, parsed from the rulebook JSON.
 #[derive(Debug, Clone)]
@@ -112,6 +114,73 @@ pub fn haystack(message: &str) -> String {
         .map(|line| line.split_whitespace().collect::<Vec<_>>().join(" "))
         .collect::<Vec<_>>()
         .join("\n")
+}
+
+/// The text of the OWNER'S OWN last prompt, read out of a Claude Code
+/// transcript (the JSONL `transcript_path` a Stop payload always names -
+/// `serve/src/bin/serve.rs` reads that file and hands its raw text here;
+/// this function does no I/O of its own, same stance as every other function
+/// in this file). `None` when the transcript is empty, unparseable line by
+/// line, or simply never contains a real user turn - fail-open, because the
+/// only thing that ever reads this (the list/overview exemption on
+/// `OptInRule::list_request_any_of`, see the opt-in section below) treats
+/// "no signal" exactly like "the prompt did not ask for a list": the rule it
+/// guards keeps firing exactly as it did before this function existed.
+///
+/// THE DEFECT THIS PREVENTS (FALSE BLOCK A, reported by the owner from other
+/// sessions, fixed 2026-09-07): the length rule
+/// (`checked-claim-needs-evidence`'s sibling `answer-is-too-long`) blocked a
+/// reply that was a list the owner had explicitly asked for. There was no
+/// way for the guard to see the PROMPT at all - only the reply
+/// (`last_assistant_message`) ever reached it - so a rule about the shape of
+/// the reply could never take the owner's own request into account.
+///
+/// Claude Code's transcript is one JSON object per line. A line the owner
+/// actually typed has `"type":"user"` and a message whose `content` is a
+/// plain STRING. A line with an ARRAY `content` is Claude Code's own shape
+/// for a tool result being fed back as a "user" turn - not the owner
+/// speaking - UNLESS that array itself also carries a plain
+/// `{"type":"text",...}` block (a real prompt that also attaches an image,
+/// say), so an array is read that far and no further. Scanned from the END
+/// and returns the FIRST real prompt found that way, because the guard only
+/// ever cares about the prompt that led to the reply it is judging right
+/// now, not the first message of the whole session. Any line that is not
+/// valid JSON, or carries neither shape, is skipped rather than treated as a
+/// parse failure - one malformed line must never hide every real prompt
+/// before it.
+pub fn last_user_prompt(transcript_jsonl: &str) -> Option<String> {
+    for line in transcript_jsonl.lines().rev() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        let Ok(entry) = serde_json::from_str::<Value>(line) else { continue };
+        if entry.get("type").and_then(|t| t.as_str()) != Some("user") {
+            continue;
+        }
+        let Some(content) = entry.get("message").and_then(|m| m.get("content")) else { continue };
+        if let Some(s) = content.as_str() {
+            if !s.trim().is_empty() {
+                return Some(s.to_string());
+            }
+            continue;
+        }
+        if let Some(blocks) = content.as_array() {
+            let text = blocks
+                .iter()
+                .filter(|b| b.get("type").and_then(|t| t.as_str()) == Some("text"))
+                .filter_map(|b| b.get("text").and_then(|t| t.as_str()))
+                .collect::<Vec<_>>()
+                .join("\n");
+            if !text.trim().is_empty() {
+                return Some(text);
+            }
+            // A content array with no plain text block at all (a pure
+            // tool_result turn) is not something the owner typed - keep
+            // scanning further back rather than stopping here.
+        }
+    }
+    None
 }
 
 /// Whether `rule`'s AND/OR/NOT/min_chars conditions hold against this
@@ -265,12 +334,29 @@ pub struct OptInRule {
     /// Defaults to `Block` when the rulebook carries no `tier` key, or one
     /// this parser does not recognise.
     pub tier: Tier,
+    /// Named STRUCTURAL escapes - recognised by shape, not by literal
+    /// substring - that suppress firing exactly like a `none_of` hit. See
+    /// `pattern_matches` for the recognised names (today: `"commit_sha"`,
+    /// `"path_line"`) and FALSE BLOCK B in this section's own doc comment
+    /// for the defect this exists to fix. An unrecognised name matches
+    /// nothing (fail-soft, same stance as everywhere else in this parser) -
+    /// it never errors and never grants an escape "by accident". Empty
+    /// (every rulebook before this field existed) means no such escape,
+    /// unchanged from today.
+    pub none_of_patterns: Vec<String>,
+    /// Terms whose presence in the OWNER'S OWN LAST PROMPT (never in the
+    /// reply being judged - see `last_user_prompt` above), combined with the
+    /// reply itself actually reading as a list (`is_mostly_list_lines`),
+    /// suppress firing. See FALSE BLOCK A in this section's own doc comment.
+    /// Empty (every rulebook before this field existed) means no such
+    /// exemption, unchanged from today.
+    pub list_request_any_of: Vec<String>,
 }
 
 /// Parse the rulebook into `OptInRule`s: every field `parse_rules` reads,
-/// plus `before` and `tier`. Same fail-open stance as `parse_rules` -
-/// malformed JSON, or an entry missing `reminder`, drops that entry rather
-/// than erroring.
+/// plus `before`, `tier`, `none_of_patterns` and `list_request_any_of`. Same
+/// fail-open stance as `parse_rules` - malformed JSON, or an entry missing
+/// `reminder`, drops that entry rather than erroring.
 pub fn parse_opt_in_rules(text: &str) -> Vec<OptInRule> {
     let Ok(Value::Array(arr)) = serde_json::from_str::<Value>(text) else {
         return vec![];
@@ -281,7 +367,9 @@ pub fn parse_opt_in_rules(text: &str) -> Vec<OptInRule> {
             let before = str_list(r, "before");
             let tier =
                 r.get("tier").and_then(|v| v.as_str()).and_then(Tier::from_json).unwrap_or(Tier::Block);
-            Some(OptInRule { base, before, tier })
+            let none_of_patterns = str_list(r, "none_of_patterns");
+            let list_request_any_of = str_list(r, "list_request_any_of");
+            Some(OptInRule { base, before, tier, none_of_patterns, list_request_any_of })
         })
         .collect()
 }
@@ -309,14 +397,181 @@ fn positionally_escaped(rule: &OptInRule, haystack_lower: &str) -> bool {
     rule.before.iter().any(|t| haystack_lower.find(&t.to_lowercase()).is_some_and(|i| i < trigger_at))
 }
 
+// ------------------------------------------------------- pattern escapes
+//
+// FALSE BLOCK B, reported by the owner from other sessions, fixed
+// 2026-09-07: `checked-claim-needs-evidence` refused an answer that named
+// five real commit shas ("commits a2770f8e (...), be1e8b3b (...), ...") and
+// two real files, because its `none_of` escape is pure literal-substring
+// matching and named the trigger word as "commit " (a trailing space) - this
+// answer said "commits" (plural), so the literal never matched, and none of
+// the ten hand-listed file extensions (`.py:`, `.rs:`, ...) matched either
+// since neither file mentioned was followed by a colon at all. The rule's
+// OWN reminder text already states what should have counted: "Noem het
+// bestand met regelnummer (pad:regel) of de commit" - a file WITH a line
+// number (path:line), or the commit (a sha) - so that is exactly, and only,
+// what these two patterns detect. A bare path with an extension but no line
+// number, or a path merely sitting near an unrelated concrete token (a
+// version number, a quoted identifier), deliberately does NOT count: the
+// rule's own reminder never asked for that, and accepting it would let
+// nearly any answer that names a filename in passing through unverified,
+// which is the opposite of what this rule exists to catch. This is a
+// decision, not an oversight - see this task's own report for the fixture
+// that would have needed it and why it was left out.
+
+/// A commit sha anywhere in the text: 7 to 40 ASCII hex characters (case
+/// insensitive), word-bounded (so this can only ever match a WHOLE token -
+/// a 6-character or a 41+-character run of hex characters never matches at
+/// any length inside it, because `\b` cannot land in the middle of a longer
+/// run of word characters), containing at least one digit AND at least one
+/// letter. The digit+letter mix is checked in plain Rust rather than the
+/// regex itself: the `regex` crate (this workspace's only regex engine,
+/// deliberately - see its own README) has no lookaround, so "at least one of
+/// each" cannot be expressed as part of the pattern; checked this way it is
+/// exact rather than approximated, and needs no lookaround to begin with.
+/// This is what tells "a2770f8e" (a real short sha: five digits, three
+/// letters) apart from an all-digit run (a count, a version, a phone number -
+/// no letters at all) or an all-letter run (an ordinary word - `facade` and
+/// `deedbead` are both valid hex-alphabet words with no digit at all).
+fn commit_sha_regex() -> &'static Regex {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    RE.get_or_init(|| Regex::new(r"(?i)\b[0-9a-f]{7,40}\b").unwrap())
+}
+
+fn contains_commit_sha(haystack_lower: &str) -> bool {
+    commit_sha_regex().find_iter(haystack_lower).any(|m| {
+        let s = m.as_str();
+        s.bytes().any(|b| b.is_ascii_digit()) && s.bytes().any(|b| b.is_ascii_alphabetic())
+    })
+}
+
+/// A `path:line` citation anywhere in the text: one or more path-shaped
+/// characters (letters, digits, `_ . / \ -`), a short alphanumeric
+/// extension, then `:` and a run of digits - `server/public/dashboard.html:42`,
+/// `gate.rs:610`. Deliberately a SHAPE check rather than the fixed,
+/// hand-enumerated extension list `checked-claim-needs-evidence`'s own
+/// `none_of` already carries (`.py:`, `.rs:`, ... ten languages) so a real
+/// citation in any OTHER extension - `.yaml:12`, `.toml:3`, one nobody
+/// thought to list by hand - is recognised too. Additive, not a replacement:
+/// the existing fixed list stays exactly as it was.
+fn path_line_regex() -> &'static Regex {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    RE.get_or_init(|| Regex::new(r"[a-z0-9_./\\-]+\.[a-z0-9]{1,8}:\d+").unwrap())
+}
+
+/// One `none_of_patterns` name resolved against the haystack. An
+/// unrecognised name matches nothing - see `OptInRule::none_of_patterns`'s
+/// own doc comment for why that is fail-soft rather than an error.
+fn pattern_matches(name: &str, haystack_lower: &str) -> bool {
+    match name {
+        "commit_sha" => contains_commit_sha(haystack_lower),
+        "path_line" => path_line_regex().is_match(haystack_lower),
+        _ => false,
+    }
+}
+
+/// Whether any of `rule`'s `none_of_patterns` is present - same suppressing
+/// effect as a literal `none_of` hit, just resolved by shape instead of by
+/// substring. Empty `none_of_patterns` always yields `false`, exactly as if
+/// the field did not exist.
+fn pattern_escaped(rule: &OptInRule, haystack_lower: &str) -> bool {
+    rule.none_of_patterns.iter().any(|name| pattern_matches(name, haystack_lower))
+}
+
+// --------------------------------------------------------- list exemption
+//
+// FALSE BLOCK A, reported by the owner from other sessions, fixed
+// 2026-09-07: `answer-is-too-long` blocked a reply that was a list the owner
+// had explicitly asked for - its only two escapes (a quoted blockquote, a
+// code fence) have nothing to do with an ordinary markdown list, so a long,
+// entirely compliant list had no way to pass. The fix is deliberately
+// narrower than "never block a list": it stands the rule aside only when
+// BOTH (a) the owner's own last prompt asked for one (`list_request_any_of`,
+// matched the same case-insensitive substring way as every other term list
+// in this file - a small explicit word list, never fuzzy, so a rulebook
+// author can see exactly what triggers it) AND (b) the reply itself actually
+// reads as a list. Requiring both matters: the exemption is for the LIST,
+// not for a long prose answer that merely follows a prompt that happened to
+// ask for one - that answer failed to do what was asked and must still be
+// challenged for its length, same as before this field existed.
+
+/// Whether trimmed line `line` opens with a markdown list marker: a bullet
+/// (`-`, `*`, `+`) followed by a space (or nothing but the bullet itself),
+/// or an ordered marker (one or more digits then `.` or `)`) followed by a
+/// space or nothing. KNOWN NOT RECOGNISED, stated plainly rather than
+/// silently missed: a glossary-style `**term**: description` line, a
+/// markdown table row, or a numbered marker using a different closing
+/// punctuation - see this section's own doc comment on the honest scope this
+/// was kept to.
+fn is_list_line(line: &str) -> bool {
+    let t = line.trim();
+    let mut chars = t.chars();
+    match chars.next() {
+        Some('-') | Some('*') | Some('+') => return matches!(chars.next(), Some(' ') | None),
+        _ => {}
+    }
+    let after_digits = t.trim_start_matches(|c: char| c.is_ascii_digit());
+    if after_digits.len() == t.len() {
+        return false; // no leading digit at all
+    }
+    if let Some(rest) = after_digits.strip_prefix('.').or_else(|| after_digits.strip_prefix(')')) {
+        return rest.starts_with(' ') || rest.is_empty();
+    }
+    false
+}
+
+/// Whether `haystack_lower` reads as a LIST: at least three non-blank lines
+/// are list lines (`is_list_line`), and they are the MAJORITY of the
+/// non-blank lines - never fooled by one bullet buried in five paragraphs of
+/// prose, which is presence, not shape. Blank lines are not counted either
+/// way (a blank line between list items is normal list formatting, not
+/// prose diluting it).
+fn is_mostly_list_lines(haystack_lower: &str) -> bool {
+    let mut list_lines = 0usize;
+    let mut total = 0usize;
+    for line in haystack_lower.lines() {
+        if line.trim().is_empty() {
+            continue;
+        }
+        total += 1;
+        if is_list_line(line) {
+            list_lines += 1;
+        }
+    }
+    list_lines >= 3 && list_lines * 2 >= total
+}
+
+/// Whether `rule.list_request_any_of` exempts this match: the prompt asked
+/// for a list (a term is present in `prompt_lower`) AND the reply itself is
+/// mostly list lines. `list_request_any_of` empty, or no prompt text at all
+/// (`prompt_lower` empty - the transcript could not be read, see
+/// `last_user_prompt`'s own doc comment), both mean the constraint never
+/// applies - never an escape, exactly as if the field did not exist.
+fn list_exempted(rule: &OptInRule, prompt_lower: &str, haystack_lower: &str) -> bool {
+    if rule.list_request_any_of.is_empty() || prompt_lower.is_empty() {
+        return false;
+    }
+    let asked_for_a_list = rule.list_request_any_of.iter().any(|t| prompt_lower.contains(&t.to_lowercase()));
+    asked_for_a_list && is_mostly_list_lines(haystack_lower)
+}
+
 /// `evaluate`'s own AND/OR/NOT/min_chars matcher, reused verbatim
-/// (`rule_matches`), plus the positional escape layered on top. Returns
-/// every fired rule's tier and reminder, in rulebook order - the same order
-/// `evaluate` returns its reminders in.
-pub fn evaluate_opt_in(rules: &[OptInRule], haystack_lower: &str) -> Vec<(Tier, String)> {
+/// (`rule_matches`), plus the positional escape, the pattern escape
+/// (`pattern_escaped`) and the list exemption (`list_exempted`) layered on
+/// top. Returns every fired rule's tier and reminder, in rulebook order -
+/// the same order `evaluate` returns its reminders in. `prompt_lower` is the
+/// owner's own last prompt, already lowercased, or an empty string when it
+/// could not be read - `list_exempted` treats that exactly like "the field
+/// is absent", never as a match.
+pub fn evaluate_opt_in(rules: &[OptInRule], haystack_lower: &str, prompt_lower: &str) -> Vec<(Tier, String)> {
     rules
         .iter()
-        .filter(|r| rule_matches(&r.base, haystack_lower) && !positionally_escaped(r, haystack_lower))
+        .filter(|r| {
+            rule_matches(&r.base, haystack_lower)
+                && !positionally_escaped(r, haystack_lower)
+                && !pattern_escaped(r, haystack_lower)
+                && !list_exempted(r, prompt_lower, haystack_lower)
+        })
         .map(|r| (r.tier, r.base.reminder.clone()))
         .collect()
 }
@@ -336,17 +591,22 @@ pub struct GuardVerdict {
     pub warn_reason: Option<String>,
 }
 
-/// `block_reason`'s richer sibling: same two parameters, same fail-open
-/// stance (no rulebook, or zero parseable rules, yields both fields
-/// `None`), but reads a rulebook that may carry `before`/`tier` and keeps a
-/// WARN-tier fire out of the block reason entirely, instead of discarding
-/// the tier and treating every fire alike.
-pub fn guard_verdict(rulebook_text: Option<&str>, message: &str) -> GuardVerdict {
+/// `block_reason`'s richer sibling: same fail-open stance (no rulebook, or
+/// zero parseable rules, yields both fields `None`), but reads a rulebook
+/// that may carry `before`/`tier`/`none_of_patterns`/`list_request_any_of`
+/// and keeps a WARN-tier fire out of the block reason entirely, instead of
+/// discarding the tier and treating every fire alike. `last_user_prompt` is
+/// the owner's own last typed prompt (see the `last_user_prompt` function
+/// above for where a caller reads this from), or an empty string when it is
+/// not available - the ONLY thing that ever reads it, the list exemption,
+/// treats an empty string exactly like "the prompt did not ask for a list".
+pub fn guard_verdict(rulebook_text: Option<&str>, message: &str, last_user_prompt: &str) -> GuardVerdict {
     let rules = rulebook_text.map(parse_opt_in_rules).unwrap_or_default();
     if rules.is_empty() {
         return GuardVerdict { block_reason: None, warn_reason: None };
     }
-    let fired = evaluate_opt_in(&rules, &haystack(message));
+    let prompt_lower = last_user_prompt.to_lowercase();
+    let fired = evaluate_opt_in(&rules, &haystack(message), &prompt_lower);
     let format_tier = |tier: Tier| -> Option<String> {
         let reasons: Vec<&str> = fired.iter().filter(|(t, _)| *t == tier).map(|(_, r)| r.as_str()).collect();
         if reasons.is_empty() {
@@ -458,7 +718,7 @@ mod tests {
     #[test]
     fn a_reply_that_opens_with_a_summary_then_jargon_does_not_trip_the_rule() {
         let msg = format!("TLDR: it works. {}", long_suffix("commit "));
-        assert!(guard_verdict(Some(POSITIONED_RULEBOOK), &msg).block_reason.is_none());
+        assert!(guard_verdict(Some(POSITIONED_RULEBOOK), &msg, "").block_reason.is_none());
     }
 
     /// Same words, reversed order: the jargon now comes first, so the rule
@@ -467,7 +727,7 @@ mod tests {
     #[test]
     fn the_same_words_in_the_other_order_trips_the_rule() {
         let msg = format!("{} TLDR: it works.", long_prefix("commit "));
-        let reason = guard_verdict(Some(POSITIONED_RULEBOOK), &msg).block_reason.expect("must fire");
+        let reason = guard_verdict(Some(POSITIONED_RULEBOOK), &msg, "").block_reason.expect("must fire");
         assert!(reason.contains("before the jargon"), "{reason}");
     }
 
@@ -477,7 +737,7 @@ mod tests {
     #[test]
     fn a_reply_with_no_jargon_at_all_never_trips_the_position_aware_rule() {
         let msg = format!("TLDR: it works. {}", "detail ".repeat(100));
-        assert!(guard_verdict(Some(POSITIONED_RULEBOOK), &msg).block_reason.is_none());
+        assert!(guard_verdict(Some(POSITIONED_RULEBOOK), &msg, "").block_reason.is_none());
     }
 
     /// A rulebook that never mentions `before` at all - every rule the owner
@@ -487,16 +747,16 @@ mod tests {
     #[test]
     fn a_rulebook_without_the_before_field_behaves_exactly_as_before() {
         let blocked = long("the commit fsck run is done, all gepusht");
-        assert_eq!(block_reason(Some(RULEBOOK), &blocked), guard_verdict(Some(RULEBOOK), &blocked).block_reason);
+        assert_eq!(block_reason(Some(RULEBOOK), &blocked), guard_verdict(Some(RULEBOOK), &blocked, "").block_reason);
 
         let compliant = long("TLDR: it works. the commit fsck run is done, all gepusht");
         assert_eq!(
             block_reason(Some(RULEBOOK), &compliant),
-            guard_verdict(Some(RULEBOOK), &compliant).block_reason
+            guard_verdict(Some(RULEBOOK), &compliant, "").block_reason
         );
 
         let short = "commit done, gepusht";
-        assert_eq!(block_reason(Some(RULEBOOK), short), guard_verdict(Some(RULEBOOK), short).block_reason);
+        assert_eq!(block_reason(Some(RULEBOOK), short), guard_verdict(Some(RULEBOOK), short, "").block_reason);
     }
 
     // ------------------------------------------------------------- tier
@@ -517,7 +777,7 @@ mod tests {
     /// then discarded it.
     #[test]
     fn a_warn_tier_rule_never_blocks() {
-        let v = guard_verdict(Some(TIERED_RULEBOOK), "ik zou liever dit anders zien");
+        let v = guard_verdict(Some(TIERED_RULEBOOK), "ik zou liever dit anders zien", "");
         assert!(v.block_reason.is_none(), "{:?}", v.block_reason);
         let warn = v.warn_reason.expect("the warn tier must still say something");
         assert!(warn.contains("preference"), "{warn}");
@@ -525,7 +785,7 @@ mod tests {
 
     #[test]
     fn a_block_tier_rule_still_blocks() {
-        let v = guard_verdict(Some(TIERED_RULEBOOK), "dat nooit meer doen, begrepen?");
+        let v = guard_verdict(Some(TIERED_RULEBOOK), "dat nooit meer doen, begrepen?", "");
         let reason = v.block_reason.expect("a block-tier match must still block");
         assert!(reason.contains("hard rule"), "{reason}");
     }
@@ -537,10 +797,10 @@ mod tests {
     /// absent or misspelled.
     #[test]
     fn an_unknown_or_missing_tier_defaults_to_block() {
-        let missing = guard_verdict(Some(TIERED_RULEBOOK), "a mystery phrase appears here");
+        let missing = guard_verdict(Some(TIERED_RULEBOOK), "a mystery phrase appears here", "");
         assert!(missing.block_reason.is_some(), "no tier key at all must still block");
 
-        let bogus = guard_verdict(Some(TIERED_RULEBOOK), "a bogus phrase appears here");
+        let bogus = guard_verdict(Some(TIERED_RULEBOOK), "a bogus phrase appears here", "");
         assert!(bogus.block_reason.is_some(), "an unrecognised tier value must still block");
     }
 
@@ -551,12 +811,205 @@ mod tests {
     #[test]
     fn block_and_warn_reasons_never_mix() {
         let msg = "ik zou liever dit anders zien, en dat nooit meer doen, begrepen?";
-        let v = guard_verdict(Some(TIERED_RULEBOOK), msg);
+        let v = guard_verdict(Some(TIERED_RULEBOOK), msg, "");
         let block = v.block_reason.expect("block-example must still fire");
         let warn = v.warn_reason.expect("warn-example must still fire");
         assert!(!block.contains("preference"), "{block}");
         assert!(warn.contains("preference"), "{warn}");
         assert!(!warn.contains("hard rule"), "{warn}");
         assert!(block.contains("hard rule"), "{block}");
+    }
+
+    // ------------------------------------------------- FALSE BLOCK B: evidence
+    //
+    // Mirrors the live `checked-claim-needs-evidence` rule closely enough to
+    // be a faithful regression test, without depending on the owner's own
+    // installed rulebook (this crate's tests must stand on their own - same
+    // stance as every other rulebook constant in this file).
+    const EVIDENCE_RULEBOOK: &str = r#"[
+      {"id":"checked-claim-needs-evidence","tier":"block",
+       "any_of":["gecheckt","gecontroleerd","geverifieerd","nagekeken","verified","confirmed","checked against","gevalideerd"],
+       "none_of":[".py:",".mjs:",".cfg:",".md:",".js:",".json:",".rs:",".ts:",".sh:",".ps1:","commit ","regel ","line ","niet gecheckt","not checked","niet geverifieerd","not verified","niet nagekeken","not looked up","niet gecontroleerd","niet gevalideerd","nog niet gecheckt","niet bevestigd","not confirmed","unverified"],
+       "none_of_patterns":["commit_sha","path_line"],
+       "reminder":"Je beweert dat iets gecheckt of geverifieerd is zonder bewijs. Noem het bestand met regelnummer (pad:regel) of de commit, of zeg letterlijk 'niet gecheckt'."}
+    ]"#;
+
+    /// THE EXACT ANSWER that was wrongly blocked (FALSE BLOCK B, reported by
+    /// the owner from other sessions, fixed 2026-09-07): five real commit
+    /// shas named after the plural "commits" (the rule's own escape said
+    /// "commit " - singular, trailing space - so it never matched), and two
+    /// real files with no line number attached. `none_of_patterns` must let
+    /// this through on the shas alone.
+    #[test]
+    fn false_block_b_a_checked_claim_naming_real_commit_shas_now_passes() {
+        let msg = "Business gecheckt met bewijs: git log in de business-repo toont commits a2770f8e \
+                    (plaatkeuze naast filament, met clienttests), be1e8b3b (tab Fleet maintenance plus \
+                    proxy-fix), 0dca539b (1.0.24), 9b3d5132 (onbekende plaat blokkeert dispatch niet), \
+                    faa6d10a (1.0.25); werkmap schoon, server/package.json versie 1.0.25, en \
+                    server/public/dashboard.html bevat de knop btn-nav-fleet. Niets verloren.";
+        let v = guard_verdict(Some(EVIDENCE_RULEBOOK), msg, "");
+        assert!(v.block_reason.is_none(), "{:?}", v.block_reason);
+    }
+
+    /// The other half of the same fix, kept honest: a claim with NO sha and
+    /// no path at all must still block exactly as before - broadening the
+    /// escape must never turn the rule into a no-op.
+    #[test]
+    fn a_bare_checked_claim_with_no_sha_or_path_still_blocks() {
+        let msg = "Ja, dat heb ik gecheckt, het klopt allemaal.";
+        let v = guard_verdict(Some(EVIDENCE_RULEBOOK), msg, "");
+        assert!(v.block_reason.is_some(), "a bare claim with nothing to point at must still block");
+    }
+
+    /// A path WITH a line number, in an extension the rule's own fixed
+    /// `none_of` list never enumerated, must also escape - proving
+    /// `path_line` is a genuine shape check, not a repeat of the fixed list.
+    #[test]
+    fn a_path_line_citation_in_an_unlisted_extension_escapes_the_rule() {
+        let msg = "Gecheckt: config/settings.yaml:42 bevat de verkeerde waarde.";
+        let v = guard_verdict(Some(EVIDENCE_RULEBOOK), msg, "");
+        assert!(v.block_reason.is_none(), "{:?}", v.block_reason);
+    }
+
+    /// An ordinary Dutch/English word that happens to use only hex-alphabet
+    /// letters (a-f) must never be misread as a sha - it carries no digit at
+    /// all, which `contains_commit_sha` requires.
+    #[test]
+    fn an_all_letter_word_is_never_mistaken_for_a_commit_sha() {
+        assert!(!contains_commit_sha("de gevel is af, geen bewijs nodig"));
+        assert!(!contains_commit_sha("facade decade cabbage"));
+    }
+
+    /// A long run of plain digits (a count, a version-ish number) carries no
+    /// LETTER at all, so it must never be mistaken for a sha either.
+    #[test]
+    fn a_pure_digit_run_is_never_mistaken_for_a_commit_sha() {
+        assert!(!contains_commit_sha("er zijn 1234567890 regels gelezen"));
+    }
+
+    #[test]
+    fn a_real_short_sha_is_detected_case_insensitively() {
+        assert!(contains_commit_sha("commits a2770f8e en BE1E8B3B"));
+    }
+
+    // --------------------------------------------------- FALSE BLOCK A: lists
+    const LIST_RULEBOOK: &str = r#"[
+      {"id":"answer-is-too-long","tier":"block",
+       "any_of":[],
+       "none_of":["\n> ","```"],
+       "min_chars":1000,
+       "list_request_any_of":["lijst","overzicht","opsomming","rapport","alle ","welke ","list","overview","report","all the"],
+       "reminder":"This answer is over 1000 characters."}
+    ]"#;
+
+    /// A long, genuinely list-shaped reply: one intro line, forty bullet
+    /// lines. Well past `min_chars`.
+    fn long_list_reply() -> String {
+        let mut s = String::from("Hier is de lijst met alle stappen:\n");
+        for i in 1..=40 {
+            s.push_str(&format!("- stap {i}: doe iets nuttigs met dit onderdeel van de taak\n"));
+        }
+        s
+    }
+
+    /// A long reply with NO list shape at all - plain running prose, also
+    /// well past `min_chars`, used to prove the exemption is for the LIST,
+    /// not merely for "a reply that follows a list-asking prompt".
+    fn long_prose_reply() -> String {
+        format!(
+            "Dit is een lang antwoord zonder enige lijst erin. {}",
+            "Nog wat extra uitleg in doorlopende tekst zonder opsomming. ".repeat(20)
+        )
+    }
+
+    /// THE DEFECT THIS PREVENTS (FALSE BLOCK A): a list the owner explicitly
+    /// asked for was blocked purely for its length. Prompt asks for one
+    /// ("lijst", "alle"), reply genuinely is one - must pass.
+    #[test]
+    fn a_long_list_reply_after_a_prompt_that_asked_for_one_is_not_blocked() {
+        let v = guard_verdict(Some(LIST_RULEBOOK), &long_list_reply(), "Kun je een lijst geven van alle stappen?");
+        assert!(v.block_reason.is_none(), "{:?}", v.block_reason);
+    }
+
+    /// Same long list reply, but the prompt never asked for one - the
+    /// exemption must not fire just because the reply happens to be
+    /// list-shaped; it needs the owner to have asked.
+    #[test]
+    fn the_same_long_list_reply_still_blocks_when_the_prompt_never_asked_for_one() {
+        let v = guard_verdict(Some(LIST_RULEBOOK), &long_list_reply(), "Hoe los ik dit probleem op?");
+        assert!(v.block_reason.is_some(), "no list was ever requested, so the length rule must still apply");
+    }
+
+    /// The prompt DID ask for an overview, but the reply is long prose, not
+    /// a list - the exemption is for the list, so this must still block.
+    /// This is the fixture that proves the check is genuinely about the
+    /// reply's SHAPE, not just about what the prompt said.
+    #[test]
+    fn a_long_prose_reply_still_blocks_even_when_the_prompt_asked_for_an_overview() {
+        let v = guard_verdict(Some(LIST_RULEBOOK), &long_prose_reply(), "Geef je me nog een overzicht van de opties?");
+        assert!(v.block_reason.is_some(), "the reply is prose, not a list, so it must still block");
+    }
+
+    /// Fail-open direction: an empty last prompt (transcript unreadable) is
+    /// treated exactly like "did not ask for a list", never as a match -
+    /// same behaviour this rule had before the field existed.
+    #[test]
+    fn an_empty_last_prompt_never_grants_the_list_exemption() {
+        let v = guard_verdict(Some(LIST_RULEBOOK), &long_list_reply(), "");
+        assert!(v.block_reason.is_some());
+    }
+
+    #[test]
+    fn is_mostly_list_lines_requires_a_genuine_majority_not_mere_presence() {
+        assert!(is_mostly_list_lines(&long_list_reply().to_lowercase()));
+        assert!(!is_mostly_list_lines(&long_prose_reply().to_lowercase()));
+        // One bullet buried in otherwise-prose lines: presence, not shape.
+        let mixed = format!("- one lonely bullet\n{}", "just an ordinary prose line here.\n".repeat(10));
+        assert!(!is_mostly_list_lines(&mixed));
+    }
+
+    // --------------------------------------------------- last_user_prompt
+
+    #[test]
+    fn last_user_prompt_reads_a_plain_string_content_turn() {
+        let jsonl = r#"{"type":"user","message":{"role":"user","content":"eerste vraag"}}
+{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"antwoord"}]}}
+{"type":"user","message":{"role":"user","content":"tweede vraag, de echte"}}"#;
+        assert_eq!(last_user_prompt(jsonl).as_deref(), Some("tweede vraag, de echte"));
+    }
+
+    /// A tool result is ALSO written as a `"type":"user"` turn by Claude
+    /// Code (the Anthropic Messages API shape: a tool result is a "user"
+    /// message). That is not the owner speaking, so it must be skipped in
+    /// favour of the real prompt further back.
+    #[test]
+    fn last_user_prompt_skips_a_pure_tool_result_turn() {
+        let jsonl = r#"{"type":"user","message":{"role":"user","content":"echte vraag van de eigenaar"}}
+{"type":"assistant","message":{"role":"assistant","content":[{"type":"tool_use","name":"Bash"}]}}
+{"type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"x","content":[{"type":"text","text":"stdout hier"}]}]}}"#;
+        assert_eq!(last_user_prompt(jsonl).as_deref(), Some("echte vraag van de eigenaar"));
+    }
+
+    /// An array-shaped `content` that DOES carry a plain text block (a real
+    /// prompt that also attached an image, say) is read that far.
+    #[test]
+    fn last_user_prompt_reads_the_text_block_of_an_array_shaped_turn() {
+        let jsonl = r#"{"type":"user","message":{"role":"user","content":[{"type":"text","text":"wat staat er op deze foto?"},{"type":"image","source":{}}]}}"#;
+        assert_eq!(last_user_prompt(jsonl).as_deref(), Some("wat staat er op deze foto?"));
+    }
+
+    #[test]
+    fn last_user_prompt_skips_malformed_lines_rather_than_giving_up() {
+        let jsonl = "{ not json at all\n{\"type\":\"user\",\"message\":{\"role\":\"user\",\"content\":\"nog steeds leesbaar\"}}";
+        assert_eq!(last_user_prompt(jsonl).as_deref(), Some("nog steeds leesbaar"));
+    }
+
+    #[test]
+    fn last_user_prompt_is_none_for_an_empty_or_userless_transcript() {
+        assert_eq!(last_user_prompt(""), None);
+        assert_eq!(
+            last_user_prompt(r#"{"type":"assistant","message":{"role":"assistant","content":"hoi"}}"#),
+            None
+        );
     }
 }

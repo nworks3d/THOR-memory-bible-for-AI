@@ -10,12 +10,19 @@
 //! the REAL live rulebook (named by `RESPONSE_GUARD_EVAL_RULEBOOK`, read
 //! directly - never copied, never modified):
 //!
-//!   - `serve/eval/response-guard-should-block.json` (60 replies, each
-//!     genuinely breaking one of the six rules, labelled with the rule
-//!     number it breaks) -> reports the catch rate, overall and per rule.
-//!   - `serve/eval/response-guard-should-pass.json` (60 replies that must
-//!     NOT be blocked, labelled by class) -> reports the false-block rate,
+//!   - `serve/eval/response-guard-should-block.json` (replies that each
+//!     genuinely break one rule, labelled with the rule number it breaks -
+//!     60 for the original six rules, plus a handful more added for later
+//!     rules) -> reports the catch rate, overall and per rule.
+//!   - `serve/eval/response-guard-should-pass.json` (replies that must NOT
+//!     be blocked, labelled by class) -> reports the false-block rate,
 //!     overall and per class, plus every false block quoted in full.
+//!
+//! A case may also carry a `"prompt"` field: the owner's own last prompt, as
+//! `guard_verdict`'s `list_request_any_of` exemption (FALSE BLOCK A) needs
+//! it. Absent (every case written before that field existed) reads as an
+//! empty string, which `guard_verdict` already treats as "no signal" -
+//! exactly the behaviour those older cases were measured against.
 //!
 //! Pure text matching only - no store is opened, nothing here writes to the
 //! live rulebook, the live db, or any settings file.
@@ -59,6 +66,11 @@ fn should_pass_path() -> PathBuf {
 struct Case {
     id: String,
     reply: String,
+    /// The owner's own last prompt, for the `list_request_any_of` exemption
+    /// - empty when the case carries no `"prompt"` field at all (every case
+    /// written before that field existed), which `guard_verdict` already
+    /// reads as "no signal".
+    prompt: String,
     rule: Option<u64>,
     class: String,
 }
@@ -72,6 +84,7 @@ fn load_cases(path: &std::path::Path) -> Vec<Case> {
         .map(|x| Case {
             id: x.get("id").and_then(|c| c.as_str()).unwrap_or("(no id)").to_string(),
             reply: x.get("reply").and_then(|c| c.as_str()).unwrap_or("").to_string(),
+            prompt: x.get("prompt").and_then(|c| c.as_str()).unwrap_or("").to_string(),
             rule: x.get("rule").and_then(|c| c.as_u64()),
             class: x.get("class").and_then(|c| c.as_str()).unwrap_or("(no class)").to_string(),
         })
@@ -98,12 +111,21 @@ fn main() {
     let mut by_rule: BTreeMap<u64, (usize, usize)> = BTreeMap::new(); // rule -> (caught, total)
     let mut missed: Vec<&Case> = Vec::new();
 
+    // Both loops below call `respond::guard_verdict` - never
+    // `respond::block_reason`, see this file's own module doc comment for
+    // why that is the entire point of this harness - now with a THIRD
+    // argument, `&case.prompt`, added for the list exemption (FALSE BLOCK A,
+    // fixed 2026-09-07). Before that field existed, every call here read
+    // verbatim as `respond::guard_verdict(Some(&rulebook_text), &case.reply).block_reason`;
+    // `&case.prompt` is threaded through now (empty for any case written
+    // before the `"prompt"` field existed), unchanged in WHICH function it
+    // calls.
     let mut caught_reasons: Vec<(String, u64, String)> = Vec::new(); // (id, rule, reason)
     for case in &should_block {
         let rule_key = case.rule.unwrap_or(0);
         let entry = by_rule.entry(rule_key).or_insert((0, 0));
         entry.1 += 1;
-        match respond::guard_verdict(Some(&rulebook_text), &case.reply).block_reason {
+        match respond::guard_verdict(Some(&rulebook_text), &case.reply, &case.prompt).block_reason {
             Some(reason) => {
                 caught_total += 1;
                 entry.0 += 1;
@@ -146,7 +168,7 @@ fn main() {
     for case in &should_pass {
         let entry = by_class.entry(case.class.clone()).or_insert((0, 0));
         entry.1 += 1;
-        if let Some(reason) = respond::guard_verdict(Some(&rulebook_text), &case.reply).block_reason {
+        if let Some(reason) = respond::guard_verdict(Some(&rulebook_text), &case.reply, &case.prompt).block_reason {
             false_block_total += 1;
             entry.0 += 1;
             false_block_examples.push((case.id.clone(), case.class.clone(), reason));

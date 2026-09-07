@@ -1,7 +1,10 @@
-//! Proves the two capabilities added to `respond.rs` - a positional escape
-//! via `before`, and a `tier` that can resolve to WARN instead of BLOCK -
-//! are genuinely ADDITIVE: a rulebook that carries neither field parses and
-//! evaluates exactly as it did before either existed.
+//! Proves the capabilities added to `respond.rs` - a positional escape via
+//! `before`, a `tier` that can resolve to WARN instead of BLOCK, a
+//! structural `none_of_patterns` escape (commit shas, `path:line` citations -
+//! FALSE BLOCK B), and a `list_request_any_of` exemption gated on the
+//! owner's own prompt (FALSE BLOCK A) - are genuinely ADDITIVE: a rulebook
+//! that carries none of these fields parses and evaluates exactly as it did
+//! before any of them existed.
 //!
 //! WHY THIS USES A FIXTURE AND NOT THE OWNER'S OWN FILE. An earlier version
 //! of this test read the live rulebook at `C:\Users\dev\thor2\` directly,
@@ -47,9 +50,10 @@ fn a_rulebook_without_the_new_fields_parses_to_the_same_count_through_both_paths
     assert_eq!(old.len(), 2, "the fixture must actually parse, or this test proves nothing");
 }
 
-/// A rule that asks for neither new field must get the defaults: no
-/// positional constraint, and BLOCK. Anything else would change what an
-/// existing deployment does the moment the code lands under it.
+/// A rule that asks for none of the opt-in fields must get every default: no
+/// positional constraint, BLOCK, no structural escape, no list exemption.
+/// Anything else would change what an existing deployment does the moment
+/// the code lands under it.
 #[test]
 fn a_rule_asking_for_neither_field_defaults_to_no_position_and_block() {
     let rules = respond::parse_opt_in_rules(RULEBOOK_WITHOUT_THE_NEW_FIELDS);
@@ -57,6 +61,8 @@ fn a_rule_asking_for_neither_field_defaults_to_no_position_and_block() {
     for rule in rules {
         assert!(rule.before.is_empty(), "rule '{}' must default to no positional constraint", rule.base.id);
         assert_eq!(rule.tier, respond::Tier::Block, "rule '{}' must default to Block", rule.base.id);
+        assert!(rule.none_of_patterns.is_empty(), "rule '{}' must default to no pattern escape", rule.base.id);
+        assert!(rule.list_request_any_of.is_empty(), "rule '{}' must default to no list exemption", rule.base.id);
     }
 }
 
@@ -82,7 +88,7 @@ fn an_untouched_rulebook_blocks_identically_through_the_new_path() {
     let mut fired = 0usize;
     for msg in &messages {
         let old = respond::block_reason(Some(text), msg);
-        let verdict = respond::guard_verdict(Some(text), msg);
+        let verdict = respond::guard_verdict(Some(text), msg, "");
         assert_eq!(old, verdict.block_reason, "block verdict diverged for: {msg:?}");
         assert!(verdict.warn_reason.is_none(), "nothing here asks for a warn: {msg:?}");
         if old.is_some() {

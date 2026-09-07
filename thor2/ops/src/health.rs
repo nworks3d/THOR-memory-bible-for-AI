@@ -277,6 +277,106 @@ pub fn proof_line(db: &Path) -> String {
     )
 }
 
+// ------------------------------------------------------ the checkouts root
+//
+// THE DEFECT THIS CLOSES, reported at the end of two separate sessions:
+// "decay and crowding not measured (requires --checkouts)". `decay_line` and
+// `crowding_line` below already say so when `checkouts` is `None` - but that
+// left a new reader to somehow already know the flag exists, and what a
+// working value even looks like, with nothing here to suggest one. Doctor
+// now tries the same thing a person would: the directory holding the repo
+// you are standing in is usually a directory of sibling checkouts, which is
+// exactly what `--checkouts` has always wanted (see `Cli::checkouts`'s own
+// doc comment in `bin/doctor.rs`).
+
+/// The nearest ancestor of `start_dir` (inclusive) that is itself a repo: it
+/// carries a THOR project marker (`serve::project::MARKER_FILE_NAMES`,
+/// checked directly in the directory - never inherited from a parent, same
+/// scope `serve::project::resolve_project` gives a marker) or a `.git` entry,
+/// directory or file (a linked worktree's own shape). `None` all the way to
+/// the filesystem root.
+fn nearest_repo_root(start_dir: &Path) -> Option<std::path::PathBuf> {
+    let mut dir: Option<&Path> = Some(start_dir);
+    while let Some(d) = dir {
+        let has_marker = serve::project::MARKER_FILE_NAMES.iter().any(|name| d.join(name).is_file());
+        let dot_git = d.join(".git");
+        if has_marker || dot_git.is_dir() || dot_git.is_file() {
+            return Some(d.to_path_buf());
+        }
+        dir = d.parent();
+    }
+    None
+}
+
+/// Doctor's own inferred `--checkouts` root when the flag itself is absent:
+/// the PARENT of the repo `start_dir` sits in - the directory whose
+/// immediate children are checkouts, exactly what `--checkouts` has always
+/// asked for. `None` when no ancestor is a repo, or the repo has no parent
+/// to use (sitting at a filesystem root).
+pub fn infer_checkouts_root(start_dir: &Path) -> Option<std::path::PathBuf> {
+    nearest_repo_root(start_dir)?.parent().map(Path::to_path_buf)
+}
+
+/// Where doctor's own effective `--checkouts` root came from this run -
+/// `report`'s/`main`'s own "checkouts root" line names exactly this, once,
+/// so `decay_line`/`crowding_line` never go quiet without saying why.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CheckoutsRoot {
+    /// `--checkouts <path>` was given directly - always wins over inference
+    /// (see `resolve_checkouts_root`): a caller who stated a root outright
+    /// is never second-guessed by a convenience this replaces silence with.
+    Explicit(std::path::PathBuf),
+    /// No flag - `infer_checkouts_root` found one instead.
+    Inferred(std::path::PathBuf),
+    /// Neither a flag nor an inferable repo: decay and crowding go
+    /// unmeasured this run, and the report says so in one plain line rather
+    /// than the previous silence.
+    Unresolved,
+}
+
+impl CheckoutsRoot {
+    /// The path to actually feed `decay_line`/`crowding_line`/
+    /// `orphan_projects_line`/`gate_verdict` - `None` for `Unresolved`,
+    /// which is exactly the `Option<&Path>` those already accept.
+    pub fn as_path(&self) -> Option<&Path> {
+        match self {
+            CheckoutsRoot::Explicit(p) | CheckoutsRoot::Inferred(p) => Some(p),
+            CheckoutsRoot::Unresolved => None,
+        }
+    }
+}
+
+/// Decide the checkouts root doctor actually uses this run: an explicit
+/// `--checkouts` always wins; otherwise fall back to `infer_checkouts_root`
+/// from `start_dir` (doctor's own working directory).
+pub fn resolve_checkouts_root(explicit: Option<&Path>, start_dir: &Path) -> CheckoutsRoot {
+    if let Some(p) = explicit {
+        return CheckoutsRoot::Explicit(p.to_path_buf());
+    }
+    match infer_checkouts_root(start_dir) {
+        Some(p) => CheckoutsRoot::Inferred(p),
+        None => CheckoutsRoot::Unresolved,
+    }
+}
+
+/// The report's own line naming which root fed `decay_line`/`crowding_line`
+/// this run, and that `--checkouts` overrides it - or, when neither an
+/// explicit flag nor an inferable repo gave one, ONE plain line saying so
+/// instead of the silence two sessions in a row ended on.
+pub fn checkouts_root_line(root: &CheckoutsRoot) -> String {
+    match root {
+        CheckoutsRoot::Explicit(p) => format!("checkouts root: {} (from --checkouts)", p.display()),
+        CheckoutsRoot::Inferred(p) => format!(
+            "checkouts root: {} (inferred: the parent of the repo you are standing in; pass --checkouts <dir> to use a different one)",
+            p.display()
+        ),
+        CheckoutsRoot::Unresolved => "checkouts root: none found (not standing inside a git repo or a THOR-marked \
+             directory, and no parent to fall back to) - decay and crowding were NOT measured; pass --checkouts \
+             <dir> (a directory whose immediate subdirectories are checkouts) to measure them"
+            .to_string(),
+    }
+}
+
 /// What has quietly rotted since the last time anyone looked: anchors that
 /// resolve to nothing, and proofs that now come out false.
 ///
@@ -775,18 +875,30 @@ pub fn teeth_line(db: &Path) -> String {
     )
 }
 
-/// What the only maintenance loop in this system never looks at.
+/// What the only maintenance loop in this system almost never looks at.
 ///
-/// WHY THIS LINE EXISTS. A pinned item is excluded from the judgement debt
-/// (pinning is itself a verdict, so "did it belong where it fired" has no
-/// honest answer) and from decay (same reason). It is also served IN FULL at
-/// every session start, uncapped. Both choices are defensible on their own and
-/// together they produce a blind spot nobody had counted: measured
-/// 2026-08-08, 31 pinned items were 48.9% of every serving this store had ever
-/// made, and 23 of them had never been examined by anything.
+/// WHY THIS LINE EXISTS. A pinned item is excluded from decay (pinning is a
+/// PLACEMENT decision - "this fires at every session start" - and decay
+/// checks anchors/proofs, which most pins never carry at all). Until
+/// 2026-09-07 it was ALSO excluded from the judgement debt outright, on the
+/// reasoning that pinning is itself a verdict, so "did it belong where it
+/// fired" has no honest answer - measured never to let go again: 44 of 48
+/// pinned items had never been examined by anything, a permanent blind spot,
+/// not a temporary one. `judgement_debt` (`bin/serve.rs`) now gives each
+/// never-judged pin exactly ONE verdict - the same `mark` call any other
+/// item gets - after which it is treated identically to everything else
+/// (asked again only if it fires `JUDGEMENT_DEBT_AFTER` more times since
+/// that verdict). This line's own count still MEASURES the same blind spot
+/// (a pin is also served IN FULL at every session start, uncapped, so it is
+/// never crowded out of a share of servings), because a pin's first verdict
+/// takes as many sessions to arrive as any other item's does - the exclusion
+/// this line was built to expose is narrower now, not gone: measured
+/// 2026-08-08, 31 pinned items were 48.9% of every serving this store had
+/// ever made, and 23 of them had never been examined by anything.
 ///
-/// No mechanism is proposed here. The number is the point: half of what this
-/// memory says comes from the part of it nothing checks.
+/// No mechanism beyond that one verdict is proposed here. The number is
+/// still the point: a large share of what this memory says comes from the
+/// part of it nothing routinely re-reads.
 pub fn pinned_line(db: &Path) -> String {
     let Ok(store) = EventStore::open_existing(db) else {
         return "pinned: store unreadable, not checked".to_string();
@@ -829,7 +941,7 @@ pub fn pinned_line(db: &Path) -> String {
     let their_servings: usize = pinned.iter().map(|li| served.get(&li.id).copied().unwrap_or(0)).sum();
     let all: usize = served.values().sum();
     format!(
-        "pinned: {} item(s), {never_judged} never examined by anything, together {:.0}% of every serving this store has made - the judgement debt and decay both skip them on purpose, so this share is the part of your memory nothing ever re-reads",
+        "pinned: {} item(s), {never_judged} never examined by anything, together {:.0}% of every serving this store has made - decay skips them on purpose and the judgement debt only asks once per verdict, so this share is the part of your memory almost nothing routinely re-reads",
         pinned.len(),
         100.0 * their_servings as f64 / all.max(1) as f64
     )
@@ -1277,6 +1389,101 @@ mod tests {
             .unwrap();
     }
 
+    // ---------------------------------------------------- checkouts root
+    //
+    // THE DEFECT THESE PREVENT, reported at the end of two separate
+    // sessions: "decay and crowding not measured (requires --checkouts)" -
+    // doctor left its two most important lines unmeasured and gave a new
+    // reader no way to learn the flag even existed. `resolve_checkouts_root`
+    // now tries to infer one from where doctor is actually standing before
+    // ever falling back to silence.
+
+    /// THE EXACT CASE NAMED IN THE TASK: a `.thor` marker names the repo,
+    /// several directories below where doctor is actually invoked from - the
+    /// PARENT of that repo (not the repo itself) is the inferred root, since
+    /// `--checkouts` has always wanted a directory of SIBLING checkouts.
+    #[test]
+    fn a_thor_marker_several_directories_up_infers_its_parent_as_the_root() {
+        let dir = tempfile::tempdir().unwrap();
+        let checkouts = dir.path().join("dev");
+        let repo = checkouts.join("My-Repo");
+        let cwd = repo.join("src").join("deep");
+        std::fs::create_dir_all(&cwd).unwrap();
+        std::fs::write(repo.join(".thor"), "My-Repo\n").unwrap();
+
+        assert_eq!(infer_checkouts_root(&cwd).as_deref(), Some(checkouts.as_path()));
+    }
+
+    /// The other signal `nearest_repo_root` accepts: an ordinary `.git`
+    /// directory, with no THOR marker at all.
+    #[test]
+    fn a_git_root_with_no_thor_marker_also_infers_its_parent() {
+        let dir = tempfile::tempdir().unwrap();
+        let checkouts = dir.path().join("dev");
+        let repo = checkouts.join("Some-Repo");
+        std::fs::create_dir_all(repo.join(".git")).unwrap();
+
+        assert_eq!(infer_checkouts_root(&repo).as_deref(), Some(checkouts.as_path()));
+    }
+
+    /// Neither signal, all the way to the filesystem root: nothing to infer.
+    #[test]
+    fn no_marker_and_no_git_root_infers_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let lonely = dir.path().join("just-a-folder");
+        std::fs::create_dir_all(&lonely).unwrap();
+        assert_eq!(infer_checkouts_root(&lonely), None);
+    }
+
+    /// THE PRECEDENCE RULE: an explicit `--checkouts` is never second-guessed
+    /// by inference, even when inference would have found a DIFFERENT real
+    /// repo right where doctor stands.
+    #[test]
+    fn an_explicit_checkouts_flag_wins_over_inference() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path().join("dev").join("Some-Repo");
+        std::fs::create_dir_all(repo.join(".git")).unwrap();
+        let explicit = dir.path().join("an-explicit-directory");
+        std::fs::create_dir_all(&explicit).unwrap();
+
+        let resolved = resolve_checkouts_root(Some(&explicit), &repo);
+        assert_eq!(resolved, CheckoutsRoot::Explicit(explicit.clone()));
+        assert_eq!(resolved.as_path(), Some(explicit.as_path()));
+    }
+
+    #[test]
+    fn no_flag_and_no_inferable_repo_resolves_to_unresolved() {
+        let dir = tempfile::tempdir().unwrap();
+        let lonely = dir.path().join("just-a-folder");
+        std::fs::create_dir_all(&lonely).unwrap();
+        assert_eq!(resolve_checkouts_root(None, &lonely), CheckoutsRoot::Unresolved);
+    }
+
+    /// THE SILENCE THIS REPLACES: with neither a flag nor an inferable repo,
+    /// the report must say so in one plain line - not go quiet the way two
+    /// sessions in a row found it.
+    #[test]
+    fn the_unresolved_line_says_decay_and_crowding_were_not_measured_and_how_to_fix_it() {
+        let line = checkouts_root_line(&CheckoutsRoot::Unresolved);
+        assert!(line.contains("NOT measured"), "{line}");
+        assert!(line.contains("--checkouts"), "{line}");
+    }
+
+    #[test]
+    fn the_inferred_line_names_the_root_and_that_the_flag_overrides_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let line = checkouts_root_line(&CheckoutsRoot::Inferred(dir.path().to_path_buf()));
+        assert!(line.contains(&dir.path().display().to_string()), "{line}");
+        assert!(line.contains("--checkouts"), "the line must say the flag can override this: {line}");
+    }
+
+    #[test]
+    fn the_explicit_line_names_the_root_given() {
+        let dir = tempfile::tempdir().unwrap();
+        let line = checkouts_root_line(&CheckoutsRoot::Explicit(dir.path().to_path_buf()));
+        assert!(line.contains(&dir.path().display().to_string()), "{line}");
+    }
+
     /// THE DEFECT THIS CLOSES, reported from a real session 2026-08-19:
     /// doctor named four items owed a judgement and all four were retracted,
     /// so the debt could be settled with the dead and the number meant
@@ -1510,12 +1717,16 @@ mod tests {
         assert!(line.contains("the other 1 can only inform"), "{line}");
     }
 
-    /// THE BLIND SPOT THIS REPORTS. A pinned item is skipped by the judgement
-    /// debt and by decay, both on the reasoning that pinning is itself a
-    /// verdict - and it is served in full at every session start. Measured on
-    /// the real store, that made 31 items 48.9% of every serving ever made,
-    /// with 23 of them never examined by anything. Both design choices are
-    /// defensible; the number they produce together had never been counted.
+    /// THE BLIND SPOT THIS REPORTS. A pinned item is skipped by decay outright
+    /// and, until 2026-09-07, was skipped by the judgement debt outright too -
+    /// both on the reasoning that pinning is itself a verdict. It is also
+    /// served in full at every session start. Measured on the real store,
+    /// that made 31 items 48.9% of every serving ever made, with 23 of them
+    /// never examined by anything. The judgement debt now gives each
+    /// never-judged pin exactly one verdict (see `judgement_debt`'s own doc
+    /// comment in `bin/serve.rs`), which narrows this line's own count over
+    /// time as pins get their first look - it does not change what this line
+    /// measures, only how fast the number it reports should shrink.
     #[test]
     fn the_pinned_line_counts_what_no_maintenance_loop_ever_looks_at() {
         let dir = tempfile::tempdir().unwrap();

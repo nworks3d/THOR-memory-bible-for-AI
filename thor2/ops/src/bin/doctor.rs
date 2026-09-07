@@ -21,6 +21,13 @@ struct Cli {
     /// resolved, and any project key held by an item that no checkout answers
     /// to is reported - the class of defect that is otherwise invisible from
     /// every surface (see `ops::health::orphan_projects_line`).
+    ///
+    /// Optional since 2026-09-07: omitted, doctor INFERS one from where it is
+    /// standing (the parent of the nearest repo above the current directory -
+    /// see `ops::health::infer_checkouts_root`) rather than leaving decay and
+    /// crowding unmeasured. This flag always overrides that guess; the report
+    /// itself says which one was actually used (`ops::health::
+    /// checkouts_root_line`).
     #[arg(long)]
     checkouts: Option<PathBuf>,
     /// Override the semantic embedding model's directory (feature
@@ -71,7 +78,18 @@ fn main() -> ExitCode {
         _ => None,
     };
 
-    for line in ops::health::report(&cli.db, cli.index_db.as_deref(), cli.repo.as_deref(), replica, cli.model_dir.as_deref(), cli.checkouts.as_deref(), cli.full) {
+    // THE DEFECT THIS CLOSES, reported at the end of two separate sessions:
+    // "decay and crowding not measured (requires --checkouts)" - doctor left
+    // its two most important lines unmeasured and gave no hint the flag even
+    // existed. An explicit --checkouts still always wins
+    // (`ops::health::resolve_checkouts_root`); this only fills the gap when
+    // it was left out, and the printed line says which happened either way.
+    let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+    let checkouts_root = ops::health::resolve_checkouts_root(cli.checkouts.as_deref(), &cwd);
+    let checkouts = checkouts_root.as_path();
+
+    println!("{}", ops::health::checkouts_root_line(&checkouts_root));
+    for line in ops::health::report(&cli.db, cli.index_db.as_deref(), cli.repo.as_deref(), replica, cli.model_dir.as_deref(), checkouts, cli.full) {
         println!("{line}");
     }
 
@@ -79,8 +97,12 @@ fn main() -> ExitCode {
     // rather than deciding anything new here - see `ops::health::gate_verdict`
     // for which findings count and why. Without --gate, cli.gate is false and
     // control falls straight through to the unchanged ExitCode::SUCCESS below.
+    // Uses the SAME resolved `checkouts` as the report above (inferred or
+    // explicit, never the raw un-resolved flag) so a dead anchor the report
+    // just named under an inferred root can never pass the gate silently for
+    // no reason but this call forgetting to infer it too.
     if cli.gate {
-        match ops::health::gate_verdict(&cli.db, cli.checkouts.as_deref(), cli.project.as_deref()) {
+        match ops::health::gate_verdict(&cli.db, checkouts, cli.project.as_deref()) {
             ops::health::GateVerdict::Failing => return ExitCode::FAILURE,
             ops::health::GateVerdict::Clean | ops::health::GateVerdict::NotAvailable => return ExitCode::SUCCESS,
         }

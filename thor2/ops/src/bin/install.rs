@@ -21,8 +21,8 @@ use std::path::Path;
 use ops::githooks;
 use ops::install::{
     default_data_dir, default_settings_path, default_user_mcp_path, ensure_store, install_hooks,
-    install_tool_server, seed_working_contract, standard_hooks, write_project_marker, HookOutcome,
-    MarkerOutcome, ServerOutcome, StoreOutcome,
+    install_tool_server, seed_response_rulebook, seed_working_contract, standard_hooks, write_project_marker,
+    HookOutcome, MarkerOutcome, RulebookOutcome, ServerOutcome, StoreOutcome,
 };
 use std::path::PathBuf;
 use std::process::ExitCode;
@@ -234,6 +234,23 @@ fn main() -> ExitCode {
             eprintln!("install refused: could not create the memory: {e}");
             return ExitCode::FAILURE;
         }
+    }
+
+    // 1b. The response-guard rulebook beside it: what gives the `Stop` hook
+    // something to actually check. Checked on THIS run regardless of
+    // whether the store above was just created or was already there - a
+    // store from before this rulebook existed has exactly the same missing
+    // file, and deserves the same fix. Never overwrites one already there.
+    match seed_response_rulebook(&db) {
+        Ok(report) => match report.outcome {
+            RulebookOutcome::Written => {
+                println!("+ wrote a starting response-guard rulebook to {}", report.path.display())
+            }
+            RulebookOutcome::AlreadyThere => {
+                println!("= response-guard rulebook already at {} (left untouched)", report.path.display())
+            }
+        },
+        Err(e) => println!("  ! could not write the response-guard rulebook: {e}"),
     }
 
     // 2. The hooks: what lets the memory speak at all.

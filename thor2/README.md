@@ -95,7 +95,7 @@ found on their own - the per-user `settings.json` for the hooks and
 anything touches them, nothing this tool did not put there is ever removed, and
 a second run reports everything as already present and writes nothing.
 
-A store it just created also gets twenty-one pinned notes. Ten are on how to
+A store it just created also gets twenty-two pinned notes. Ten are on how to
 write a fact that comes back: anchoring it to what it is really about,
 correcting instead of duplicating, giving a new project its own scope in one
 command, keeping life and work in separate places, never inventing a place to
@@ -111,11 +111,21 @@ self-review, never blocking a turn on a notification, treating a mid-task
 message as one that will not redirect a running agent, matching a check's
 literal to the target file's own words, reasoning every fix for whoever
 installs this next, and serving a fact as a constraint rather than a command.
-They all go in through `model::store::declare`, the same gate every other
-write uses, and a refusal is reported rather than worked around - a memory
-whose own gate rejects the notes it ships with is worth seeing. An EXISTING
-store is never seeded, so upgrading never pushes anything into someone's real
-notes.
+One more is the odd one out: it walks the owner through his whole first
+session once, before any other work - not only the answer guard - and the
+session is held until it is retracted; retracting it is refused until his
+answers are on record. They all go in through
+`model::store::declare`, the same gate every other write uses, and a refusal
+is reported rather than worked around - a memory whose own gate rejects the
+notes it ships with is worth seeing. An EXISTING store is never seeded, so
+upgrading never pushes anything into someone's real notes.
+
+It also seeds a starting rulebook for the answer guard described below, the
+first time it finds none sitting next to the store: the same five example
+rules, so the `Stop` hook has something to check from the first session
+instead of silently checking nothing. An existing rulebook - the owner's
+own, or one an earlier install already wrote - is left exactly as it is,
+whether the store itself is brand new or not.
 
 The two written files default to Claude Code's own per-user locations - not a
 guess, but the one documented place each lives, printed before it is used and
@@ -138,6 +148,50 @@ and the memory simply never speaks again, with no error anywhere. So the
 installer refuses rather than write such a hook - if the `serve` or `mcp` binary
 it would point at is not present, it stops and says which, at the one moment
 that is cheap to notice.
+
+## The answer guard
+
+The `Stop` hook above is what makes this work: after every reply, before the
+owner sees it, a small check reads the reply back against a short list of
+house rules - open with a plain summary before the jargon, do not ask him to
+check something you can check yourself, back up a "checked" claim with a real
+file or commit - and if one fires, the agent is nudged to fix the reply
+before it goes out. That list lives in one file next to the store,
+`guard-response-rulebook.json`, and `install` writes a working example there
+the first time it finds none (see above).
+
+That example is neutral, not a choice anyone made, so a seeded note walks the
+owner through his whole first session once, before other work: what the
+guard checks, how long a reply may be, which of its five rules he wants, what
+language he wants his own rules written in, and the rest of that first
+session's setup besides (the full list is in `AGENTS.md`). His answers get
+applied where they belong and stored as a record next to the note, and only
+then is the note retracted - the session is held open until both are done,
+and retracting the note without that record is refused rather than allowed
+through. Saying "he is not interested" still counts as an answer and still
+clears it; the point is that something was actually asked and recorded, not
+that a particular answer was given.
+
+To change the settings later by hand, open `guard-response-rulebook.json` and
+edit the rule you want to change, or delete it outright to turn it off. Each
+rule is one entry with:
+
+- `id` - a short name for the rule, for your own reference.
+- `any_of` - words or phrases; the rule is a candidate to fire when a reply
+  contains at least one of them.
+- `none_of` - words or phrases that cancel the rule even when `any_of`
+  matched - the escape hatch for a false alarm.
+- `min_chars` - the reply has to be at least this many characters long
+  before the rule is considered at all.
+- `list_request_any_of` - on the length rule only: if you asked for a list
+  with one of these words and the reply really is one, the length rule
+  stands aside instead of firing on it.
+- `none_of_patterns` - shape-based escapes rather than exact words; the
+  evidence rule uses these to recognise a commit hash or a `file:line`
+  citation however it happens to be written.
+- `tier` - `block` holds the reply back until it is fixed; `warn` only
+  leaves a note behind. Every rule seeded here is `block`.
+- `reminder` - the plain-language nudge the agent sees when the rule fires.
 
 ## Check it
 

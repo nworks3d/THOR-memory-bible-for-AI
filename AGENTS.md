@@ -197,6 +197,58 @@ report it as a bug.
 
 ---
 
+# First session with a new owner
+
+Once install has run and they have restarted, a seeded note -
+`walk-through-the-answer-guard-once` - arrives at the start of every session
+until it is retracted. It exists to make sure this conversation happens once,
+before any other work, and that it covers the whole first session, not only
+the answer guard. Raise each point below in plain language, apply the answer
+as you go, then retract the note.
+
+This is held, not only asked. The session does not end while the note is
+live, and retracting it is refused until the owner's answers are on record as
+`owner-setup-answers` - store what he chose first, then retract; the retract
+itself fails otherwise, with the same reminder. Store it as a plain Report
+with no project: a store this fresh has not named a scope yet, and this one
+item needs none - do not invent a collection for it, and do not ask him to
+name one just to get this write to land. "He is not interested" is itself a
+valid answer to record - write that down plainly and the note clears exactly
+the same way a full set of preferences would.
+
+- **What this is.** In two sentences: this remembers facts about their code
+  and their work so neither of you has to repeat them, and it brings the
+  relevant ones back on its own, at the start of a session or right before a
+  risky step. Say this first, so the rest makes sense.
+- **How replies should read.** Ask how long a reply can get before it is too
+  long, whether they want a short summary line before the detail, and what
+  language they want to be answered in - their own rules can be written in
+  that language even while the code stays English.
+- **Which lanes they want.** Ask whether they want the code-and-work memory
+  only, or also the personal lane for their own life - recipes, books, a
+  training log, and the like. Either way, anything personal goes to the
+  library with `shelve`, never into the code memory with `remember`.
+- **Which starting rules to keep.** The install seeded five example rules
+  into `guard-response-rulebook.json`, next to the store. Ask which they
+  want on, off, or reworded. Each rule in that file is one entry with a
+  plain-language reminder line - edit the reminder to change what it says,
+  or delete the entry to turn the rule off.
+- **Whether they want a project marker.** In each checkout,
+  `install --project <name>` scopes facts to that project so they stop
+  competing with every other project's notes. Skip it and every fact stays
+  global - fine with one project, noisy once there is more than one.
+- **That the memory is theirs to correct.** A changed fact is corrected with
+  `revise`, never stored a second time. A fact that is simply wrong is
+  removed with `retract` and a reason. A true fact that fired in the wrong
+  place is marked as noise with `mark`, instead of being deleted.
+
+Apply each answer where it belongs - a reply-shape rule in the rulebook file,
+a standing preference as a stored fact - then store a short summary of what he
+chose (or that he declined) as `owner-setup-answers`, and only then retract
+`walk-through-the-answer-guard-once` so it never asks again.
+
+---
+
 # After setup, this happens without you
 
 At the start of every conversation, and again just before you touch a file,

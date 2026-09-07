@@ -11,6 +11,7 @@
 //! not put there is never touched, moved, or removed - only appended past.
 
 use serde_json::{json, Value};
+use serve::respond;
 use std::fs;
 use std::path::{Path, PathBuf};
 use thor_core::event_store::EventStore;
@@ -102,6 +103,74 @@ pub fn ensure_store(db: &Path) -> anyhow::Result<StoreOutcome> {
     // comments in `core::event_store`.
     EventStore::new(db)?;
     Ok(StoreOutcome::Created)
+}
+
+/// What happened to the response-guard rulebook on this run.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RulebookOutcome {
+    Written,
+    AlreadyThere,
+}
+
+#[derive(Debug, Clone)]
+pub struct RulebookReport {
+    pub outcome: RulebookOutcome,
+    /// Resolved once here, via `serve::respond::default_rulebook_path`, so a
+    /// caller never has to know that function exists just to print where the
+    /// file went.
+    pub path: PathBuf,
+}
+
+/// The rulebook this installer seeds when none exists yet: byte-identical to
+/// the five rules shipped at the repository root as
+/// `guard-response-rulebook.example.json` (a plain-language TLDR rule, a
+/// no-disclaimers rule, an ask-before-checking rule, a length rule, and an
+/// evidence rule) - baked in at compile time so a copied-out binary carries
+/// it too, with no example file it has to find sitting next to it.
+const RESPONSE_RULEBOOK_TEMPLATE: &str = include_str!("../../guard-response-rulebook.example.json");
+
+/// Give a store a working Response Guard from its first session, without
+/// ever touching a rulebook that is already there.
+///
+/// THE GAP THIS CLOSES. `respond::default_rulebook_path` always resolves to
+/// one fixed place beside the store, and `install` is the one place that
+/// already knows `db` before anything else runs - so where to put this is
+/// never in question here. Without this function, the `Stop` hook
+/// `standard_hooks` wires in is live from the very first run, but reads a
+/// file that is not there: `respond::block_reason` and `respond::guard_verdict`
+/// both fail open on a missing rulebook BY DESIGN (a guard that watches
+/// replies must never itself become the reason a reply cannot be given - see
+/// respond.rs's own doc comment), so it runs on every reply and blocks
+/// nothing, silently, until someone finds the example file in the
+/// repository and copies it over by hand. Measured gap: that is exactly what
+/// a new install did, with nothing anywhere saying so.
+///
+/// Checked on EVERY run, the same as `ensure_store` - never only on a store
+/// this run just created. A store from before this function existed has
+/// exactly the same missing file and deserves the same fix the next time
+/// `install` runs against it, not only on a brand new one.
+///
+/// An existing file - the owner's own tuned rulebook, or one an earlier
+/// install already seeded - is never opened, merged or backed up: there is
+/// nothing to back up FROM when nothing is being overwritten. Same stance as
+/// `ensure_store` toward an existing store: only ever write into an absence.
+/// This is also deliberately a NEUTRAL default, not the owner's own live
+/// rulebook: a new user is meant to end up with working rules, never with
+/// somebody else's wording imposed without being asked - see the seeded note
+/// `walk-through-the-answer-guard-once` in `working_contract` for the other
+/// half of that.
+pub fn seed_response_rulebook(db: &Path) -> anyhow::Result<RulebookReport> {
+    let path = respond::default_rulebook_path(db);
+    if path.exists() {
+        return Ok(RulebookReport { outcome: RulebookOutcome::AlreadyThere, path });
+    }
+    if let Some(parent) = path.parent() {
+        if !parent.as_os_str().is_empty() {
+            fs::create_dir_all(parent)?;
+        }
+    }
+    fs::write(&path, RESPONSE_RULEBOOK_TEMPLATE)?;
+    Ok(RulebookReport { outcome: RulebookOutcome::Written, path })
 }
 
 /// One hook this installer knows how to place: which event fires it, an
@@ -605,6 +674,24 @@ pub fn working_contract() -> Vec<model::item::Item> {
             "A fact phrased as an imperative ('run X', 'delete Y') is served into a blank \
              session and read back as background, never mistaken for an instruction to carry \
              out.",
+        ),
+        // A twenty-second, added 2026-09-07, and the only one here that
+        // clears itself. `install` can now seed a WORKING rulebook (see
+        // `seed_response_rulebook`) so the Response Guard never sits idle on
+        // a fresh store, but the content it seeds is a neutral example, not
+        // a choice anyone actually made - imposing the owner's own tuned
+        // wording on somebody else's memory would be exactly the uninvited
+        // write this whole contract argues against. This is the other half:
+        // ask once, in the owner's own first session, then get out of the
+        // way for good.
+        rule(
+            model::store::SETUP_NOTE_ID,
+            "The owner has not yet been walked through setup: how replies should read, which \
+             lane he wants, and what language his rules use. A first session raises AGENTS.md's \
+             questions, records his answers as 'owner-setup-answers', then retracts this note - \
+             retracting without that record is refused.",
+            "This note is still being served at session start after the owner has already \
+             answered these questions and the answers are applied.",
         ),
     ]
 }
@@ -1266,5 +1353,113 @@ mod tests {
         for s in &again {
             assert!(!s.stored, "{} was stored a second time - the memory now holds it twice", s.id);
         }
+    }
+
+    /// The new starter note rides the same three tests above (they iterate
+    /// `working_contract()` generically), plus this one, targeted: its text
+    /// was deliberately kept free of a backtick, a `--flag`, or a path, so it
+    /// needs no `no-literal:` tag to pass Ground 11 (`model::gate::declare`'s
+    /// "was this rule ever asked whether it can refuse" check). Asserting
+    /// its tags are exactly `working-contract` proves that by construction,
+    /// not by hoping the gate happens to agree.
+    #[test]
+    fn the_answer_guard_note_is_present_and_carries_no_literal_tag() {
+        let items = working_contract();
+        let note = items
+            .iter()
+            .find(|i| i.id == model::store::SETUP_NOTE_ID)
+            .expect("the first-session answer-guard note must be part of the working contract");
+        assert_eq!(note.kind, model::item::Kind::Rule);
+        assert!(note.bindings.contains(&model::item::Binding::Always));
+        assert!(note.falsifier.is_some());
+        assert_eq!(
+            note.tags,
+            vec!["working-contract".to_string()],
+            "a text with no backtick, flag or path needs no no-literal tag"
+        );
+    }
+
+    /// THE GAP THIS CLOSES: a fresh store got the `Stop` hook wired in from
+    /// the very first run, but no rulebook for it to read - `respond::block_reason`
+    /// fails open on a missing file BY DESIGN, so the guard ran on every
+    /// reply and blocked nothing, silently, until someone found the example
+    /// file in the repository and copied it over by hand.
+    #[test]
+    fn seed_response_rulebook_writes_when_absent() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("thor.db");
+        ensure_store(&db).unwrap();
+
+        let report = seed_response_rulebook(&db).unwrap();
+        assert_eq!(report.outcome, RulebookOutcome::Written);
+        assert_eq!(report.path, respond::default_rulebook_path(&db));
+        assert!(report.path.exists());
+        assert_eq!(fs::read_to_string(&report.path).unwrap(), RESPONSE_RULEBOOK_TEMPLATE);
+    }
+
+    /// The defect this guards against: an installer that "helpfully"
+    /// refreshes the rulebook on every run would silently overwrite an
+    /// owner's own tuned rules the next time a binary gets rebuilt.
+    #[test]
+    fn seed_response_rulebook_leaves_an_existing_file_untouched() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("thor.db");
+        ensure_store(&db).unwrap();
+        let path = respond::default_rulebook_path(&db);
+        let owners_own = r#"[{"id":"owners-own-rule","any_of":["x"],"reminder":"mine"}]"#;
+        fs::write(&path, owners_own).unwrap();
+
+        let report = seed_response_rulebook(&db).unwrap();
+        assert_eq!(report.outcome, RulebookOutcome::AlreadyThere);
+        assert_eq!(
+            fs::read_to_string(&path).unwrap(),
+            owners_own,
+            "an existing rulebook must never be overwritten, seeded or not"
+        );
+    }
+
+    /// Required to actually prove the seeded file is usable, not merely
+    /// present: parsed with the guard's own type (`respond::parse_opt_in_rules`),
+    /// never hand-checked as JSON, so a shape only respond.rs itself would
+    /// reject is caught here too.
+    #[test]
+    fn the_seeded_rulebook_parses_with_the_guards_own_rule_type() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("thor.db");
+        ensure_store(&db).unwrap();
+        let report = seed_response_rulebook(&db).unwrap();
+
+        let text = fs::read_to_string(&report.path).unwrap();
+        let rules = respond::parse_opt_in_rules(&text);
+        assert_eq!(rules.len(), 5, "the five shipped rules must all parse");
+
+        let ids: Vec<&str> = rules.iter().map(|r| r.base.id.as_str()).collect();
+        assert_eq!(
+            ids,
+            vec![
+                "no-plain-language-tldr",
+                "ask-user-to-check-or-fetch",
+                "no-reflexive-disclaimers",
+                "answer-is-too-long",
+                "checked-claim-needs-evidence",
+            ]
+        );
+
+        let tldr = rules.iter().find(|r| r.base.id == "no-plain-language-tldr").unwrap();
+        assert_eq!(tldr.base.min_chars, 600);
+        assert!(tldr.base.any_of.contains(&"gepusht".to_string()));
+        assert!(tldr.base.none_of.contains(&"tldr".to_string()));
+
+        let length_rule = rules.iter().find(|r| r.base.id == "answer-is-too-long").unwrap();
+        assert_eq!(length_rule.base.min_chars, 1000);
+        assert!(
+            !length_rule.list_request_any_of.is_empty(),
+            "the length rule must keep its list exemption"
+        );
+
+        let evidence = rules.iter().find(|r| r.base.id == "checked-claim-needs-evidence").unwrap();
+        assert!(evidence.none_of_patterns.contains(&"commit_sha".to_string()));
+        assert!(evidence.none_of_patterns.contains(&"path_line".to_string()));
+        assert!(!evidence.base.reminder.is_empty());
     }
 }

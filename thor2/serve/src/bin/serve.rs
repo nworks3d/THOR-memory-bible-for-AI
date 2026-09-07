@@ -1447,16 +1447,34 @@ const JUDGEMENT_DEBT_BATCH_MAX: usize = 20;
 /// where this store stood for its whole life: four judgements, all on one
 /// day, out of 325 items that had fired.
 ///
-/// A PINNED ITEM IS NEVER ASKED ABOUT. The verdict this collects is "did it
-/// belong where it fired", and for an `Always` binding the owner answered
-/// that himself when he pinned it: it fires at every session start because
-/// he chose that. Asking anyway produces a question with no honest answer -
-/// "useful" is a lie when the rule simply did not come up, and "noise"
-/// overrules his own decision - and a mechanism that asks unanswerable
-/// questions teaches people to answer at random. Nineteen of the first
-/// forty-two owed were of exactly that kind, found by trying to pay one.
-/// What is left fires because a TRIGGER matched, and there the question is
-/// real: the trigger can be wrong.
+/// A PINNED ITEM GETS ONE VERDICT, NOT A STANDING EXEMPTION. This used to
+/// exclude every `Always`-bound item outright: the owner answered "did it
+/// belong where it fired" himself when he pinned it, so asking again looked
+/// unanswerable - "useful" a lie when the rule simply did not come up,
+/// "noise" overruling his own decision. Nineteen of the first forty-two owed
+/// were of exactly that kind, found by trying to pay one, and the blanket
+/// exclusion that followed was measured never to let go again: `doctor`
+/// (`ops::health::pinned_line`) went on to report "48 pinned facts (14% of
+/// all servings) never re-read" and "44 of 48 never reviewed" - every one of
+/// them permanently outside the one mechanism (`mark`, see its own doc
+/// comment above) that ever puts a verdict on a fact at all. A pin records a
+/// PLACEMENT decision ("this fires at every session start"), never a
+/// CONTENT one ("this is still right") - nothing else in the system ever
+/// looks at a pinned item's own text again, which is exactly how a stale or
+/// wrong pin sat unreviewed.
+///
+/// So a pin now gets exactly the same fold everything else does (below),
+/// with no separate carve-out: a NEVER-JUDGED pinned item that has fired
+/// `JUDGEMENT_DEBT_AFTER` times enters `owed` once, same as any trigger-bound
+/// item - answered by the same `mark` call, which resets its count to zero.
+/// After that verdict it is left alone, exactly like any other item, unless
+/// it fires that many times again - at which point asking is no longer
+/// unanswerable in the way the old exclusion assumed: the question has
+/// narrowed from "did the owner mean to pin this" (settled, once, by the
+/// first verdict) to "is this still true, this many servings later" (a real
+/// question about drift, the same one a trigger-bound item is already asked
+/// on every re-crossing). What is left unpinned fires because a TRIGGER
+/// matched, where the question was always real: the trigger can be wrong.
 ///
 /// ASKS ABOUT THE WHOLE OWED SET IN ONE BLOCK, up to
 /// `JUDGEMENT_DEBT_BATCH_MAX`, not one item per Stop. Unpinning a batch of
@@ -1499,15 +1517,14 @@ fn judgement_debt(store: &EventStore, session_id: &str) -> Option<String> {
         return None;
     }
     // Only now, and only when something is actually owed, is the whole live
-    // set folded to drop the pinned ones - the empty case stays a cheap
-    // count over event kinds, which is what every quiet turn pays.
+    // set even fetched - the empty case stays a cheap count over event
+    // kinds, which is what every quiet turn pays. No pinned-exclusion filter
+    // here any more (see this function's own doc comment, "A PINNED ITEM
+    // GETS ONE VERDICT, NOT A STANDING EXEMPTION"): a pin's own `Always`
+    // binding is not read at all in this fold - `served`'s per-id count
+    // already resets to zero on ANY `mark` call regardless of binding, which
+    // is the entire mechanism a pin now shares with every other item.
     let live = serve::live::live_items(store);
-    let pinned: std::collections::HashSet<&String> = live
-        .iter()
-        .filter(|li| li.item.bindings.iter().any(|b| matches!(b, model::item::Binding::Always)))
-        .map(|li| &li.id)
-        .collect();
-    owed.retain(|(id, _)| !pinned.contains(id));
     // And only what is still LIVE. The served/judged counts are folded from
     // event kinds, which keep every serving an item ever had, including the
     // ones it had before somebody retracted it. So a retracted item stayed
@@ -2982,21 +2999,66 @@ mod judgement_debt_tests {
         assert!(asked.contains("drifter"), "{asked}");
     }
 
-    /// THE DEFECT THIS PREVENTS: asking for a verdict that has no honest
-    /// answer. The question is "did it belong where it fired", and for a
-    /// pinned item the owner answered that when he pinned it - so "useful"
-    /// is a lie whenever the rule simply did not come up, and "noise"
-    /// overrules his own decision. Nineteen of the first forty-two owed were
-    /// of exactly that kind, found by trying to pay one.
+    /// THE DEFECT THIS PREVENTS, reported by `doctor`'s own `pinned_line`:
+    /// "48 pinned facts (14% of all servings) never re-read", "44 of 48
+    /// never reviewed" - the OLD blanket exclusion never let a pin's own
+    /// text be looked at again, for as long as the store lived. A
+    /// never-judged pin that has fired `JUDGEMENT_DEBT_AFTER` times now
+    /// enters the debt exactly once, the same as any other item.
     #[test]
-    fn a_pinned_item_is_never_asked_about_however_often_it_fired() {
+    fn an_unjudged_pinned_item_appears_in_the_debt_once() {
         let mut store = EventStore::in_memory().unwrap();
         declare(&mut store, "pinned-one", true);
         serve_it(&mut store, "pinned-one", JUDGEMENT_DEBT_AFTER + 5);
+        let asked = judgement_debt(&store, "s").expect("a never-judged pin must be offered a verdict once");
+        assert!(asked.contains("pinned-one"), "{asked}");
+    }
+
+    /// THE OTHER HALF: once that one verdict is in, a pin is "left alone
+    /// unless it fires 40x elsewhere like any other item" - the exact
+    /// mechanism `a_judged_item_is_asked_about_again_after_it_has_fired_
+    /// that_many_times_since` already proves for a trigger-bound item, now
+    /// proven for a pin too, since neither gets a special case any more.
+    #[test]
+    fn a_judged_pinned_item_does_not_reappear_until_it_fires_that_many_times_again() {
+        let mut store = EventStore::in_memory().unwrap();
+        declare(&mut store, "pinned-two", true);
+        serve_it(&mut store, "pinned-two", JUDGEMENT_DEBT_AFTER);
+        assert!(judgement_debt(&store, "s").is_some(), "fixture sanity: it is owed");
+
+        serve::mark::record_useful(&mut store, "s", "s", "t", "2026-09-07T00:00:00Z", "pinned-two").unwrap();
         assert!(
             judgement_debt(&store, "s").is_none(),
-            "a pinned item fires by the owner's own choice - there is nothing to judge"
+            "a verdict must settle a pin for now, exactly like any other item"
         );
+
+        serve_it(&mut store, "pinned-two", JUDGEMENT_DEBT_AFTER - 1);
+        assert!(judgement_debt(&store, "s").is_none(), "one short of the threshold is not owed yet");
+
+        serve_it(&mut store, "pinned-two", 1);
+        let asked = judgement_debt(&store, "s").expect("forty more firings must earn a second question, pinned or not");
+        assert!(asked.contains("pinned-two"), "{asked}");
+    }
+
+    /// THE CAP STILL HOLDS with pins mixed in: unpinning used to be the one
+    /// way a backlog could arrive all at once (see
+    /// `the_batch_is_capped_and_names_how_many_it_held_back` below); a store
+    /// with many long-unjudged pins is now the same shape, and must be
+    /// spread over turns the same way, never flooded into one block.
+    #[test]
+    fn a_backlog_of_unjudged_pins_is_capped_the_same_as_any_other_backlog() {
+        let mut store = EventStore::in_memory().unwrap();
+        let n = JUDGEMENT_DEBT_BATCH_MAX + 3;
+        for i in 0..n {
+            let id = format!("pinned-owed-{i}");
+            declare(&mut store, &id, true);
+            serve_it(&mut store, &id, JUDGEMENT_DEBT_AFTER);
+        }
+
+        let asked = judgement_debt(&store, "s").expect("a large pinned backlog is still owed");
+        let shown = (0..n).filter(|i| asked.contains(&format!("pinned-owed-{i}"))).count();
+        assert_eq!(shown, JUDGEMENT_DEBT_BATCH_MAX, "the block must show exactly the cap, not more: {asked}");
+        assert!(asked.contains(&format!("{} more", n - JUDGEMENT_DEBT_BATCH_MAX)), "{asked}");
     }
 
     /// And the mechanism is still armed for what fires because a TRIGGER

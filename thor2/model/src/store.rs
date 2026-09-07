@@ -1016,6 +1016,30 @@ pub const CROWDED_ON_PURPOSE_TAG: &str = "crowded-on-purpose";
 /// gate being right about the question and wrong about the vocabulary.
 pub const ANSWER_GUARD_TAG_PREFIX: &str = "answer-guard:";
 
+/// The id of the first-session note `ops::install::working_contract` seeds
+/// (`walk-through-the-answer-guard-once`), and the id an agent files the
+/// owner's own setup answers under once he has actually been asked - see
+/// `OWNER_SETUP_ANSWERS_ID` below. Both constants live here rather than
+/// beside the seed text in `ops`, because `retract` (below) and
+/// `gate::retract` are the places that have to compare an entity id against
+/// them, and `ops` depends on `model`, never the other way round.
+pub const SETUP_NOTE_ID: &str = "walk-through-the-answer-guard-once";
+
+/// See `SETUP_NOTE_ID` above. A Report is the natural kind for it - a
+/// record of what was decided, never served at a gate - but nothing here
+/// requires that: `gate::retract`'s own ground only asks whether ONE LIVE
+/// ITEM answers to this id, any kind, so a store that filed it differently
+/// is still read correctly.
+///
+/// This exact id also carries its own exemption from `gate::declare`'s
+/// ground 21 (archive material needs a scope) and from the MCP collection
+/// gate (`mcp::refuse_a_new_collection`): it may be declared with no
+/// project at all. Neither guard's own doc comment repeats this constant's
+/// purpose, only why the exemption exists - a brand-new store, the one this
+/// id is first written to, has declared no project yet and so holds no
+/// scope this could possibly be filed under.
+pub const OWNER_SETUP_ANSWERS_ID: &str = "owner-setup-answers";
+
 /// Turn a fireable item into archive material: same id, same text, same
 /// history, still fully findable by `lookup` - but it stops claiming to fire.
 ///
@@ -1231,6 +1255,11 @@ fn tombstone_reason(body: &str) -> String {
 /// `reason` is required and not allowed to be blank. A retraction with no
 /// reason is the same silent-decision problem the whole contract is against:
 /// six weeks later nobody can tell a deliberate removal from a mistake.
+///
+/// One id carries a second condition on top of that: `SETUP_NOTE_ID` (the
+/// seeded first-session note) is refused until `OWNER_SETUP_ANSWERS_ID`
+/// exists as a live item - see `gate::retract`'s own doc comment for why.
+/// Every other id is retracted exactly as before.
 pub fn retract(
     store: &mut EventStore,
     session_id: &str,
@@ -1255,6 +1284,12 @@ pub fn retract(
         Err(ReadError::Parse(_)) => {} // unreadable body, still retractable
         Err(e) => return Err(WriteError::Store(anyhow::anyhow!("{e}"))),
     }
+    // The one ground `retract` itself enforces (see `gate::retract`'s own
+    // doc comment). The `entity_id == SETUP_NOTE_ID` guard means the extra
+    // read on the right only ever runs for the one id this could possibly
+    // refuse - every other id costs nothing beyond the comparison.
+    let answers_recorded = entity_id == SETUP_NOTE_ID && show(store, OWNER_SETUP_ANSWERS_ID).is_ok();
+    gate::retract(entity_id, answers_recorded).map_err(WriteError::Refused)?;
     let body = serde_json::json!({ "retracted": entity_id, "reason": reason }).to_string();
     store
         .append_mutate_checked(
@@ -2274,5 +2309,102 @@ mod tests {
         let slow_texts: Vec<&str> = slow.iter().map(|(_, item)| item.text.as_str()).collect();
         assert_eq!(fast_texts, slow_texts, "both paths must carry the identical body for each id");
         assert_eq!(fast[1].1.text, "do the other thing entirely", "p2 must carry the REVISED body, not the original");
+    }
+
+    // ---------------------------------------------- setup note retract ground
+
+    fn owner_setup_answers() -> Item {
+        Item {
+            id: OWNER_SETUP_ANSWERS_ID.to_string(),
+            kind: Kind::Report,
+            text: "reply length: short. language: Dutch. lanes: work only. rules: kept as seeded. \
+                   project scoping: yes, per checkout."
+                .to_string(),
+            bindings: vec![], // ground 6: archive material may carry none
+            severity: None,
+            project: Some("test-project".to_string()), // ground 21: archive material needs a scope
+            tags: vec![],
+            expires: None,
+            key: None,
+            falsifier: None, // ground 10 does not reach a Report
+            check: None,
+        }
+    }
+
+    fn setup_note() -> Item {
+        Item {
+            id: SETUP_NOTE_ID.to_string(),
+            kind: Kind::Rule,
+            text: "walk the owner through setup once, then retract this note".to_string(),
+            bindings: vec![Binding::Always],
+            severity: None,
+            project: None,
+            tags: vec!["working-contract".to_string()],
+            expires: None,
+            key: None,
+            falsifier: Some("this note is still served after the owner already answered".to_string()),
+            check: None,
+        }
+    }
+
+    /// THE DEFECT THIS CLOSES: retracting the seeded note used to cost
+    /// nothing but the words in the reason field - see `gate::retract`'s own
+    /// doc comment. Nothing is written when the gate refuses it.
+    #[test]
+    fn retracting_the_setup_note_with_no_answers_on_record_is_refused() {
+        let mut store = EventStore::in_memory().unwrap();
+        declare(&mut store, "s", "l", "a", &setup_note()).unwrap();
+
+        let err = retract(&mut store, "s", "l", "a", SETUP_NOTE_ID, "done").unwrap_err();
+        assert!(matches!(err, WriteError::Refused(_)), "{err}");
+        assert!(show(&store, SETUP_NOTE_ID).is_ok(), "a refused retract must leave the note live");
+    }
+
+    /// Storing the answers first is exactly what the refusal above asks for
+    /// - once they exist as a live item, the same retract goes through.
+    #[test]
+    fn retracting_the_setup_note_once_answers_are_on_record_succeeds() {
+        let mut store = EventStore::in_memory().unwrap();
+        declare(&mut store, "s", "l", "a", &setup_note()).unwrap();
+        declare(&mut store, "s", "l", "a", &owner_setup_answers()).unwrap();
+
+        retract(&mut store, "s", "l", "a", SETUP_NOTE_ID, "owner walked through setup").unwrap();
+        assert!(matches!(show(&store, SETUP_NOTE_ID).unwrap_err(), ReadError::Retracted(_)));
+    }
+
+    /// A reluctant owner is not trapped: recording "no" is still recording an
+    /// answer, and this is the same code path either way - `retract` never
+    /// inspects the CONTENT of `OWNER_SETUP_ANSWERS_ID`, only that it exists.
+    #[test]
+    fn a_flat_no_recorded_as_the_answer_still_clears_the_note() {
+        let mut store = EventStore::in_memory().unwrap();
+        declare(&mut store, "s", "l", "a", &setup_note()).unwrap();
+        let mut declines = owner_setup_answers();
+        declines.text = "he does not want any of this - no rules, no lanes, nothing kept".to_string();
+        declare(&mut store, "s", "l", "a", &declines).unwrap();
+
+        retract(&mut store, "s", "l", "a", SETUP_NOTE_ID, "owner declined setup").unwrap();
+    }
+
+    /// THE NARROW SCOPE THIS GROUND MUST KEEP: an ordinary retract, on an
+    /// ordinary id, must never even notice this ground exists.
+    #[test]
+    fn retracting_an_unrelated_id_never_needs_the_answers_item() {
+        let mut store = EventStore::in_memory().unwrap();
+        let item = sample();
+        declare(&mut store, "s", "l", "a", &item).unwrap();
+
+        retract(&mut store, "s", "l", "a", &item.id, "no longer true").unwrap();
+    }
+
+    /// A store that never had the seeded note at all (an old install, or one
+    /// that predates this feature) must retract normally - `show` on an
+    /// unknown id already refuses with `NotFound` before this ground is ever
+    /// reached, so there is nothing new here to trip over.
+    #[test]
+    fn a_store_with_no_seeded_note_is_unaffected() {
+        let mut store = EventStore::in_memory().unwrap();
+        let err = retract(&mut store, "s", "l", "a", SETUP_NOTE_ID, "cleanup").unwrap_err();
+        assert!(matches!(err, WriteError::Store(_)), "an id that was never declared is NotFound, not Refused: {err}");
     }
 }

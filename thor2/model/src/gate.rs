@@ -1123,9 +1123,35 @@ fn declare_inner(
     // thing is one place to disagree.
     let filed_by_key = item.kind == Kind::Lookup
         && item.key.as_deref().map(str::trim).is_some_and(|k| !k.is_empty());
+    // A second exemption, narrower still: `crate::store::OWNER_SETUP_ANSWERS_ID`
+    // may be declared with no project at all, and no other id gets this.
+    //
+    // THE DEFECT THIS CLOSES, measured 2026-09-07 in a sandbox on the real
+    // binaries: a freshly installed store carries the seeded first-session
+    // note (`crate::store::SETUP_NOTE_ID`) and nothing else. `serve::
+    // setup_debt` holds every Stop until this exact id exists as a live
+    // item, and ground 27's own `retract` below refuses letting the note go
+    // until it does - both waiting on the one write this ground, unexempted,
+    // refused outright, because a brand-new store has declared no project
+    // yet and therefore holds zero scopes. The write the two guards above
+    // jointly demand was the one write a fresh install could not accept
+    // without first asking the owner to invent a collection name - friction
+    // at the exact moment setup has to be frictionless, and indistinguishable
+    // from this gate contradicting itself.
+    //
+    // This id is not archive material drifting toward the unscoped pile
+    // ground 21 exists to empty: it is the answer to a question THIS TOOL
+    // asked, and it is asked on the one store state - freshly installed,
+    // before the owner has named a single project - where no scope could
+    // possibly exist yet to file it under. Exempting it by id, the same way
+    // a Lookup is exempt by key, costs nothing this ground was built to
+    // prevent: every OTHER Report still needs a scope, and this one item
+    // stays exactly as findable by id and by search as any other.
+    let is_the_setup_answer = item.id == crate::store::OWNER_SETUP_ANSWERS_ID;
     if !item.kind.can_fire()
         && !unscoped_allowed
         && !filed_by_key
+        && !is_the_setup_answer
         && item.project.as_deref().map(str::trim).unwrap_or("").is_empty()
     {
         return Err(Refusal::new(
@@ -1907,6 +1933,71 @@ pub fn warnings(item: &Item) -> Vec<Warning> {
         out.extend(check_warnings(check));
     }
     out
+}
+
+// ---------------------------------------------------------------------------
+// The retract-time gate. `declare`/`revise` above never call this and this
+// never calls them: retracting is a different act, the same way `archive` is
+// (see `store::retract`'s own doc comment) - it gets its own door rather than
+// a ground bolted onto `declare_inner`. Until now that door carried one rule
+// only ("a reason is required"), enforced in `store::retract` itself. This is
+// the first case that needed a real ground behind it too.
+
+/// GROUND 27: retracting the seeded first-session note
+/// (`crate::store::SETUP_NOTE_ID`, seeded by `ops::install::
+/// working_contract`) is refused until the owner's own answers are on
+/// record.
+///
+/// THE DEFECT THIS CLOSES. The note itself already asks, in its own text,
+/// for a first session to walk the owner through AGENTS.md's setup
+/// questions before other work, then retract it - and until now that WAS
+/// the entire enforcement: prose in a Rule's own body, read or skipped
+/// exactly like any other sentence handed to a busy agent, with nothing
+/// downstream able to tell a session that actually asked from one that
+/// just wanted the note gone. This project has measured that exact shape
+/// fail before: the crowding advisory (`serve`'s own Stop-hook debt) sat
+/// unread for months as a note beside a write, until it was given a debt
+/// that holds the turn instead of a sentence that hopes. This ground is the
+/// retract-time half of the identical fix - see `serve::setup_debt` in
+/// `serve/src/bin/serve.rs` for the Stop-hook half that holds the turn
+/// while the note is still live.
+///
+/// `answers_recorded` is the caller's job to establish, never this
+/// function's: `store::retract` reads whether a live item named
+/// `crate::store::OWNER_SETUP_ANSWERS_ID` exists and hands the plain answer
+/// in, so this stays exactly as pure as `declare`/`revise` above - no
+/// store, no I/O, just two constant strings and a bool.
+///
+/// Refuses ONLY `SETUP_NOTE_ID`, and only without recorded answers. Every
+/// other id, and this same id once the answers exist, clears with
+/// `Ok(())` - retract's other rule (a reason is required) is enforced
+/// separately, in `store::retract` itself, unconditionally for every id,
+/// and is not this ground's concern.
+///
+/// "The owner does not want any of this" is answered exactly like any other
+/// answer: write it down as `OWNER_SETUP_ANSWERS_ID` and this clears. The
+/// refusal below says so in as many words - a reluctant owner must never
+/// become the one person this note can never stop asking about.
+pub fn retract(entity_id: &str, answers_recorded: bool) -> Result<(), Refusal> {
+    if entity_id != crate::store::SETUP_NOTE_ID || answers_recorded {
+        return Ok(());
+    }
+    Err(Refusal::new(
+        format!(
+            "'{}' cannot be retracted yet - nothing on record shows the owner was ever walked \
+             through AGENTS.md's \"First session with a new owner\" questions",
+            crate::store::SETUP_NOTE_ID
+        ),
+        format!(
+            "raise those questions with him in plain language (how replies should read, which \
+             lanes he wants, which starting rules to keep, whether he wants a project marker), \
+             apply what he chooses where it belongs, then store what he chose as '{}' - a Report \
+             with no scope is enough, this id needs none, and \"he does not want any of this\" is \
+             itself a valid answer to record. Only then does retracting '{}' go through",
+            crate::store::OWNER_SETUP_ANSWERS_ID,
+            crate::store::SETUP_NOTE_ID
+        ),
+    ))
 }
 
 #[cfg(test)]
@@ -3480,6 +3571,36 @@ mod tests {
         assert!(declare(&item).is_err(), "whitespace must not pass as a scope");
     }
 
+    /// THE ONE EXEMPT ID. See this ground's own doc comment above for the
+    /// defect: without it, the write `serve::setup_debt` and ground 27's own
+    /// `retract` both wait on is the one write a brand-new store - zero
+    /// scopes, by definition - could never accept.
+    #[test]
+    fn the_owner_setup_answers_may_be_declared_with_no_project() {
+        let mut item = base(Kind::Report);
+        item.id = crate::store::OWNER_SETUP_ANSWERS_ID.to_string();
+        item.project = None;
+        item.text = "reply length: short. language: Dutch. lanes: work only.".to_string();
+        assert!(
+            declare(&item).is_ok(),
+            "the one item this gate itself is waiting for must not be refused for lacking the \
+             one thing a brand-new store cannot yet supply"
+        );
+    }
+
+    /// THE NARROW SCOPE THIS EXEMPTION MUST KEEP: the exact id, and nothing
+    /// that merely resembles it. Widening it by so much as a character would
+    /// reopen ground 21's own pile to any Report that shares a prefix.
+    #[test]
+    fn only_the_exact_id_is_exempt_a_lookalike_report_still_needs_a_scope() {
+        let mut item = base(Kind::Report);
+        item.id = "owner-setup-answers-2".to_string();
+        item.project = None;
+        item.text = "Dit lijkt op het antwoorden-item, maar is het niet.".to_string();
+        let refusal = declare(&item).expect_err("only the exact id is exempt");
+        assert_eq!(refusal.problem, NO_SCOPE_PROBLEM, "every other id still meets ground 21: {refusal:?}");
+    }
+
     #[test]
     fn a_global_rule_naming_a_config_file_is_accepted() {
         // Measured false-positive class 1: a machine-level fact about a file
@@ -4721,5 +4842,42 @@ mod tests {
 
         assert!(declare(&item).is_ok(), "a warning must never turn into a refusal");
         assert!(!check_warnings(item.check.as_ref().unwrap()).is_empty(), "the fixture must actually warn");
+    }
+
+    // -------------------------------------------------------- ground 27
+
+    /// GROUND 27. THE DEFECT THIS CLOSES: retracting the seeded first-session
+    /// note used to cost nothing but typing a reason - see `retract`'s own
+    /// doc comment for the shape of failure this closes.
+    #[test]
+    fn retracting_the_setup_note_with_no_recorded_answers_is_refused() {
+        let err =
+            retract(crate::store::SETUP_NOTE_ID, false).expect_err("must be refused with no answers on record");
+        assert!(
+            err.fix.contains(crate::store::OWNER_SETUP_ANSWERS_ID),
+            "the refusal must name where to store the answers: {}",
+            err.fix
+        );
+        assert!(
+            err.fix.to_lowercase().contains("does not want"),
+            "a reluctant owner's answer must be named as valid, not just implied: {}",
+            err.fix
+        );
+    }
+
+    #[test]
+    fn retracting_the_setup_note_with_recorded_answers_clears() {
+        retract(crate::store::SETUP_NOTE_ID, true).expect("must clear once the answers are on record");
+    }
+
+    /// THE NARROW SCOPE THIS GROUND MUST KEEP: it has an opinion about
+    /// exactly one id. Any other id must retract exactly as it always did,
+    /// answers on record or not.
+    #[test]
+    fn retracting_any_other_id_is_never_refused_by_this_ground() {
+        retract("some-unrelated-fact", false)
+            .expect("this ground must only ever speak about the seeded note id");
+        retract("some-unrelated-fact", true)
+            .expect("this ground must only ever speak about the seeded note id");
     }
 }

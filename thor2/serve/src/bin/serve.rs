@@ -675,6 +675,16 @@ fn hook_once(db_path: &Path) -> Option<HookOutput> {
         if payload_is_from_a_subagent(&payload) {
             return warn_text.map(|text| HookOutput::Warn { event_name, text });
         }
+
+        // THE FOURTH DEBT, asked before Lane C and everything below it: while
+        // the seeded first-session note is still live, nothing else this
+        // hook could ask matters yet - see `setup_debt`'s own doc comment.
+        if let Some(reason) = EventStore::open_existing(db_path).ok().and_then(|s| setup_debt(&s)) {
+            return Some(HookOutput::Decision(
+                serde_json::json!({ "decision": "block", "reason": reason }),
+            ));
+        }
+
         if let Some(output) = capture_stop_check(db_path, &session_id) {
             return Some(output);
         }
@@ -1113,6 +1123,59 @@ fn capture_stop_check(db_path: &Path, session_id: &str) -> Option<HookOutput> {
             "reason": reason,
         }))),
     }
+}
+
+/// THE FOURTH DEBT: setup, held while `install`'s own seeded note
+/// (`model::store::SETUP_NOTE_ID`, `ops::install::working_contract`'s
+/// `walk-through-the-answer-guard-once`) is still live.
+///
+/// THE DEFECT THIS CLOSES. That note asks, in its own words, for a first
+/// session to raise AGENTS.md's setup questions before other work and then
+/// retract it - and until now that request WAS the entire enforcement:
+/// prose in a Rule's body, read or skipped exactly like any other sentence a
+/// busy session is handed. This project has measured that shape fail
+/// before: the crowding advisory just below sat unread for months as a note
+/// beside a write, until it grew into the debt that holds the turn instead
+/// of a sentence that hopes. This is the identical fix for the identical
+/// failure - see `model::gate::retract`'s own doc comment for the
+/// retract-time half of it, which refuses letting the note go without
+/// answers on record.
+///
+/// Two conditions clear it, both named in the message below, and they
+/// reduce to checking one thing: `model::gate::retract`'s own ground
+/// refuses retracting the note without a live `model::store::
+/// OWNER_SETUP_ANSWERS_ID` item first, so the note cannot go retracted
+/// while unanswered - the note being LIVE is sufficient on its own to know
+/// both halves are still owed, and the note being GONE is sufficient to
+/// know both are settled.
+///
+/// FIRST among the debts, ahead of Lane C and the three below it: none of
+/// them mean anything to an owner who has not even been told what this
+/// memory is yet, and this is the one turn-holding message a brand new
+/// install can be certain has nothing else competing with it that turn.
+///
+/// NEVER for a subagent - inherited for free from the
+/// `payload_is_from_a_subagent` check in `hook_once` that already stands
+/// between this function and its only call site, the same way the
+/// stale-rule guard's own exemption is (see `stale_guard_stop_check`'s doc
+/// comment): a subagent's Stop has no owner in the room to walk through
+/// anything.
+///
+/// Fails open like every other guard here: no store, no note, any read
+/// error at all reads as nothing to say, never a stuck session.
+fn setup_debt(store: &EventStore) -> Option<String> {
+    model::store::show(store, model::store::SETUP_NOTE_ID).ok()?;
+    Some(format!(
+        "[THOR] This memory was just installed and its owner has not been walked through setup \
+         yet. Before anything else: raise the questions in AGENTS.md's \"First session with a \
+         new owner\" section with him, in plain language, and apply his answers where they \
+         belong. Then store what he chose as '{}' (a Report with no scope is enough - this id \
+         needs none, so do not ask him to name a collection for it) and retract '{}'. \"He does \
+         not want any of this\" is itself a valid answer - write that down and this still \
+         clears. Two things settle it: his answers on record, and the note retracted.",
+        model::store::OWNER_SETUP_ANSWERS_ID,
+        model::store::SETUP_NOTE_ID
+    ))
 }
 
 /// Where this session's watermark lives: the store's tip as it stood when the
@@ -2383,6 +2446,99 @@ mod decay_notice_tests {
             !serve::absent_guard::default_stale_path(&db).exists(),
             "a healthy store must not grow a staleness sidecar out of nowhere"
         );
+    }
+}
+
+#[cfg(test)]
+mod setup_debt_tests {
+    use super::*;
+    use model::item::{Binding, Item, Kind};
+
+    /// The same shape `ops::install::working_contract` seeds the real note
+    /// as - not imported from there (`serve` sits under `ops` in the
+    /// workspace graph, never the other way round), so this is written out
+    /// by hand, but it has to be the identical text: it is what proves this
+    /// specific text passes the gate with no literal for ground 11 to catch.
+    fn setup_note() -> Item {
+        Item {
+            id: model::store::SETUP_NOTE_ID.to_string(),
+            kind: Kind::Rule,
+            text: "walk the owner through setup once, then retract this note".to_string(),
+            bindings: vec![Binding::Always],
+            severity: None,
+            project: None,
+            tags: vec!["working-contract".to_string()],
+            expires: None,
+            key: None,
+            falsifier: Some("this note is still served after the owner already answered".to_string()),
+            check: None,
+        }
+    }
+
+    /// No project on purpose, not just a leftover default: a real first
+    /// session writes this on a store that has never named one yet, and
+    /// `model::gate::declare`'s own ground 21 carries an exemption for this
+    /// exact id so that write still lands - see that ground's doc comment.
+    /// A `Some("test-project")` here would prove nothing about the defect
+    /// this fixture exists to close.
+    fn owner_setup_answers() -> Item {
+        Item {
+            id: model::store::OWNER_SETUP_ANSWERS_ID.to_string(),
+            kind: Kind::Report,
+            text: "reply length: short. language: Dutch. lanes: work only.".to_string(),
+            bindings: vec![],
+            severity: None,
+            project: None,
+            tags: vec![],
+            expires: None,
+            key: None,
+            falsifier: None,
+            check: None,
+        }
+    }
+
+    /// THE DEFECT THIS CLOSES: until now the only thing asking a first
+    /// session to walk the owner through setup was the note's own prose.
+    #[test]
+    fn the_debt_appears_while_the_note_is_live() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("t.db");
+        let mut store = EventStore::new(&db).unwrap();
+        model::store::declare(&mut store, "s", "l", "a", &setup_note()).unwrap();
+
+        let reason = setup_debt(&store).expect("the note is live, so this must hold the turn");
+        assert!(reason.contains("First session with a new owner"), "{reason}");
+        assert!(reason.contains(model::store::OWNER_SETUP_ANSWERS_ID), "{reason}");
+        assert!(reason.contains(model::store::SETUP_NOTE_ID), "{reason}");
+        assert!(reason.to_lowercase().contains("does not want"), "{reason}");
+    }
+
+    /// Once the answers are on record and the note is retracted through the
+    /// real gate (`model::store::retract`, refused otherwise - see
+    /// `model::gate::retract`), this falls silent on its own: it only ever
+    /// asks whether the note is still live.
+    #[test]
+    fn the_debt_is_silent_once_the_note_is_retracted() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("t.db");
+        let mut store = EventStore::new(&db).unwrap();
+        model::store::declare(&mut store, "s", "l", "a", &setup_note()).unwrap();
+        model::store::declare(&mut store, "s", "l", "a", &owner_setup_answers()).unwrap();
+        model::store::retract(&mut store, "s", "l", "a", model::store::SETUP_NOTE_ID, "owner walked through setup")
+            .expect("the gate must accept this retract once the answers are on record");
+
+        assert!(setup_debt(&store).is_none(), "a retracted note must never hold the turn again");
+    }
+
+    /// An old store, or one where setup was long ago finished and the note
+    /// was never even seeded into this particular install: nothing to ask.
+    #[test]
+    fn a_store_that_never_had_the_note_is_unaffected() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("t.db");
+        let store = EventStore::new(&db).unwrap();
+
+        assert!(setup_debt(&store).is_none());
     }
 }
 

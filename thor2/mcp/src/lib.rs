@@ -401,6 +401,16 @@ fn checkout_project(root: Option<&std::path::Path>) -> Option<String> {
 /// when the honest answer is "this is not work knowledge at all". A door that
 /// only listed scopes would push everyday knowledge deeper into the lane it
 /// does not belong in.
+///
+/// ONE ID IS EXEMPT OUTRIGHT: `model::store::OWNER_SETUP_ANSWERS_ID`, the
+/// same id `model::gate::declare`'s own ground 21 never asks for a scope -
+/// see that ground's doc comment for the defect (a brand-new store cannot
+/// name a collection to satisfy the very write setup is waiting on). Checked
+/// here, first, rather than left to fall out of `filed_under` returning
+/// `None` for a project-less item: that fallthrough is real today, but it is
+/// an accident of `filed_under`'s own definition, not a promise about this
+/// id, and this door must never ask for a `new_collection_named_by_owner` on
+/// it regardless of how `filed_under` is written tomorrow.
 fn refuse_a_new_collection(
     item: &model::item::Item,
     store: &thor_core::event_store::EventStore,
@@ -408,6 +418,9 @@ fn refuse_a_new_collection(
     root: Option<&std::path::Path>,
     named_by_owner: Option<&str>,
 ) -> Result<(), String> {
+    if item.id == model::store::OWNER_SETUP_ANSWERS_ID {
+        return Ok(());
+    }
     let Some(wanted) = filed_under(item) else { return Ok(()) };
     let known = serve::lookup::catalog(store);
     if known.scopes.iter().any(|s| s.scope.eq_ignore_ascii_case(&wanted)) {
@@ -4236,6 +4249,41 @@ mod tests {
         let reply = srv.remember(Parameters(register)).await;
         assert!(reply.contains("REFUSED"), "a register opens a collection too: {reply}");
         assert!(reply.contains("profiel"), "{reply}");
+    }
+
+    /// THE DEFECT THIS CLOSES, measured in a sandbox on a freshly installed
+    /// store: the Stop hook (`serve::setup_debt`) holds every turn until
+    /// `model::store::OWNER_SETUP_ANSWERS_ID` exists as a live item, but a
+    /// brand-new store names zero scopes - `server()` below, not
+    /// `server_knowing`, is the point - so the one write setup is waiting on
+    /// is exactly the write both the collection gate and gate ground 21
+    /// would otherwise refuse. Proven through `remember` itself, the real
+    /// tool path an agent actually calls, not only `model::gate::declare`.
+    #[tokio::test]
+    async fn the_owner_setup_answers_land_on_a_store_with_zero_scopes() {
+        let srv = server();
+        let mut args = blank_report(model::store::OWNER_SETUP_ANSWERS_ID);
+        args.project = None;
+        args.text = "reply length: short. language: Dutch. lanes: work only.".to_string();
+        let reply = srv.remember(Parameters(args)).await;
+        assert!(reply.starts_with("stored"), "the setup answer must land on a store with no scopes at all: {reply}");
+    }
+
+    /// THE NARROW SCOPE THIS EXEMPTION MUST KEEP, at the collection gate
+    /// too: any other project-less Report is refused exactly as before, and
+    /// never by way of an invented `new_collection_named_by_owner`.
+    #[tokio::test]
+    async fn any_other_id_with_no_project_is_still_refused_on_a_store_with_zero_scopes() {
+        let srv = server();
+        let mut args = blank_report("some-other-report");
+        args.project = None;
+        let reply = srv.remember(Parameters(args)).await;
+        assert!(reply.contains("REFUSED"), "only the setup answer id is exempt: {reply}");
+        assert!(reply.contains(model::gate::NO_SCOPE_PROBLEM), "ground 21 must still be the one speaking: {reply}");
+        assert!(
+            !reply.contains("new_collection_named_by_owner"),
+            "an empty store refuses through ground 21, never by inviting an invented collection: {reply}"
+        );
     }
 
     /// THE DEFECT THIS CLOSES, measured 2026-08-19: doctor named four items

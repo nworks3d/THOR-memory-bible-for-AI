@@ -144,6 +144,14 @@ moment that nothing in `serve` actually fires - `answer` and `claim_done` are
 the two that exist in the schema but nothing produces yet. It works on a store
 with nothing in it yet, which is what a first run looks like.
 
+Two of those checks - whether an old reference still points at a real file,
+and whether some facts never win a place - need to know where your other
+checkouts live, normally via `--checkouts <dir>`. Leave that flag off and
+doctor now guesses: it looks at the folder just above the repo you ran it
+from. The first line it prints always says which folder it ended up using -
+the one you gave it, its own guess, or, if it could not find either, a plain
+note that those two checks did not run this time and how to make them run.
+
 One line only speaks up when there is something to say: `wal`, the size of the
 store's own write-ahead log. It stays silent for the ordinary case of a log
 that grows and shrinks as you use the store, and reports only once the log has

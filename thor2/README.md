@@ -211,6 +211,13 @@ machine that applies writes is exactly the fork described above:
 mcp --db /srv/thor/thor.db --http 0.0.0.0:5557 --capture-inbox /srv/thor/inbox.jsonl
 ```
 
+This tool-server connector carries no authentication of its own. `--allowed-host`
+limits which `Host` header it will answer, but that is a routing check, not a
+login - anyone who can reach the port and send that header can call every tool.
+Put something in front of it that actually authenticates (a tunnel such as
+Cloudflare Access, or a strict private network) before a phone or a second
+machine reaches it, and never bind it to the open internet directly.
+
 On the main machine, empty the queue before every replication:
 
 ```bash
@@ -223,8 +230,10 @@ anything was lost. That matters more than it looks: the gate runs at the
 authority, so a rule written on a phone can still be refused there, and the
 drain report is the only place that ever says why.
 
-Both halves share the `THOR_SYNC_TOKEN` secret, and there is no other
-protection. Run it on a LAN or a private tunnel, never on the open internet.
+The `sync recv`/`sync drain` pair shares the `THOR_SYNC_TOKEN` secret, and
+there is no other protection on that transport either. Run both transports -
+this one and the tool-server connector above - on a LAN or behind a private
+tunnel, never on the open internet.
 
 ## Run the tests
 

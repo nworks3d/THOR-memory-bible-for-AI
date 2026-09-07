@@ -510,6 +510,102 @@ pub fn working_contract() -> Vec<model::item::Item> {
             "A rule marked irreversible or costly is stored without ever being asked whether it \
              can refuse anything.",
         ),
+        // Eleven more below, all bound Always like the ten above. Not about
+        // WRITING a fact this time - these are the generic honesty,
+        // agent-spawning and memory-hygiene lessons an agent needs on ANY
+        // project, picked from the owner's own standing rules and rewritten
+        // clean of his language, his business and his machines: nothing
+        // here holds only because of who is running it or what it is
+        // running on.
+        rule(
+            "never-fabricate-a-measured-value",
+            "Never invent or fabricate a measured or tuned value - a benchmark, a timing, a \
+             count. Flag it as unknown instead of writing a plausible guess down as if it were \
+             real.",
+            "A fabricated value sits in a report indistinguishable from a real one, and nothing \
+             in the text marks it as guessed.",
+        ),
+        rule(
+            "count-coverage-never-claim-it",
+            "Never claim something is covered everywhere on the strength of memory. Count it \
+             with something that walks the real source, and state the number. A remembered \
+             impression is not a count.",
+            "A coverage claim made from memory matches an exact count of the real source \
+             closely enough that counting stops being worth the trouble.",
+        ),
+        rule(
+            "verify-against-the-real-source",
+            "Verify a requested check against the real file and line, the commit, or a freshly \
+             fetched source, never a summary, a memory, or an assumption. Source unreadable: \
+             say 'not checked', no verdict.",
+            "A claim verified only against a summary or a memory turns out to match the real \
+             source closely enough that the distinction stops mattering.",
+        ),
+        rule(
+            "never-verify-with-the-changed-mechanism",
+            "Never verify a change using the very mechanism the change itself touched - the \
+             measurement would confirm itself. Verify on an independent path, or have someone \
+             else read it against the source.",
+            "A measurement taken through the changed mechanism reproduces independently often \
+             enough that taking a second, independent path stops being worth it.",
+        ),
+        rule(
+            "name-a-model-on-every-agent",
+            "Split independent work across parallel agents, and name an explicit, \
+             cheapest-fitting model on each one rather than letting it inherit the session's \
+             model. Escalate only after a cheap model fails a few tries.",
+            "An agent spawned with no explicit model turns out to run on the cheapest fit \
+             anyway, rather than on whatever the session happens to be using.",
+        ),
+        rule(
+            "mechanical-brief-forbids-subagents-and-review",
+            "A brief for mechanical, well-specified work should say so and explicitly forbid \
+             spawning sub-agents or running a self-review pass - fan-out and review overhead \
+             dominate on work that needs no judgement.",
+            "A mechanical brief that allows sub-agents or a self-review pass turns out no \
+             slower and no noisier than one that forbids them.",
+        ),
+        rule(
+            "never-block-a-turn-on-a-notification",
+            "Never end a turn stuck in a wait loop for a background task's own notification, as \
+             the top-level session or as a sub-agent. Finish the turn instead; the notification \
+             arrives on its own, later.",
+            "A turn spent polling or sleeping for a background notification finishes no later \
+             than one that ended and let the notification arrive by itself.",
+        ),
+        rule(
+            "mid-task-message-does-not-redirect-an-agent",
+            "A message sent to a sub-agent already mid-task does not redirect it - it keeps \
+             working from its original brief. When the scope changes, start a new agent with \
+             the new brief instead.",
+            "A mid-task message changes what a running sub-agent is already doing, rather than \
+             being picked up only once it starts a fresh turn.",
+        ),
+        rule(
+            "check-literal-matches-the-files-language",
+            "A Contains or Absent check's literal must appear in the target file exactly as \
+             that file really writes it - its own language and syntax, never a translation or \
+             paraphrase of what it says.",
+            "A check literal written in a different language or wording from the target file \
+             still matches, because the file happens to say both.",
+        ),
+        rule(
+            "reason-every-fix-for-a-new-user",
+            "Reason every fix to this tool for whoever installs it next, not only for a store \
+             built up over months: a fresh install carries none of that history. Seed the fix, \
+             or build it into the tool itself.",
+            "A fix lands that only works because an existing store already holds something a \
+             fresh install never gets, and nobody asked whether it would.",
+        ),
+        rule(
+            "a-served-fact-is-a-constraint-not-a-command",
+            "A fact served into a blank session or sub-agent is read with no context to tell \
+             FYI from an order. Phrase it as a constraint on what already applies, never as an \
+             imperative telling the reader to act.",
+            "A fact phrased as an imperative ('run X', 'delete Y') is served into a blank \
+             session and read back as background, never mistaken for an instruction to carry \
+             out.",
+        ),
     ]
 }
 

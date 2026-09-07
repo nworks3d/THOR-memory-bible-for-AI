@@ -95,17 +95,27 @@ found on their own - the per-user `settings.json` for the hooks and
 anything touches them, nothing this tool did not put there is ever removed, and
 a second run reports everything as already present and writes nothing.
 
-A store it just created also gets ten pinned notes on how to write a fact that
-comes back: anchoring it to what it is really about, correcting instead of
-duplicating, giving a new project its own scope in one command, keeping life
-and work in separate places, never inventing a place to file something,
-keeping one entry to one thing, what a refusal actually is, that words inform
-while only a proof forbids, saying what actually happened, and answering
-whether a rule can refuse. They go in through `model::store::declare`, the
-same gate every other write uses, and a refusal is reported rather than worked
-around - a memory whose own gate rejects the notes it ships with is worth
-seeing. An EXISTING store is never seeded, so upgrading never pushes anything
-into someone's real notes.
+A store it just created also gets twenty-one pinned notes. Ten are on how to
+write a fact that comes back: anchoring it to what it is really about,
+correcting instead of duplicating, giving a new project its own scope in one
+command, keeping life and work in separate places, never inventing a place to
+file something, keeping one entry to one thing, what a refusal actually is,
+that words inform while only a proof forbids, saying what actually happened,
+and answering whether a rule can refuse. Eleven more are the honesty,
+agent-spawning and memory-hygiene habits that hold on any project regardless
+of who is running it: never fabricating a measured value, counting coverage
+instead of remembering it, verifying a claim against the real source, never
+verifying a change with the mechanism it just touched, naming a model on
+every spawned agent, keeping a mechanical brief free of sub-agents and
+self-review, never blocking a turn on a notification, treating a mid-task
+message as one that will not redirect a running agent, matching a check's
+literal to the target file's own words, reasoning every fix for whoever
+installs this next, and serving a fact as a constraint rather than a command.
+They all go in through `model::store::declare`, the same gate every other
+write uses, and a refusal is reported rather than worked around - a memory
+whose own gate rejects the notes it ships with is worth seeing. An EXISTING
+store is never seeded, so upgrading never pushes anything into someone's real
+notes.
 
 The two written files default to Claude Code's own per-user locations - not a
 guess, but the one documented place each lives, printed before it is used and

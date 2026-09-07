@@ -389,8 +389,9 @@ one has talked itself into a corner - not because it is getting long.
 Worth knowing before you start, because the beginning is the least impressive
 part and it is easy to conclude too early that nothing is happening.
 
-**Day one, it stops nothing.** A fresh memory holds a handful of starting notes
-about how to write notes, and nothing else. The part of THOR that can refuse a
+**Day one, it stops nothing.** A fresh memory holds a handful of starting notes:
+how to write one that comes back, plus the honesty and agent-spawning habits
+that hold on any project. The part of THOR that can refuse a
 wrong change only works on notes that carry a proof, and you have not written
 any yet. So on the first day you get those notes at the start of a conversation
 and a nudge at the end, and no refusals at all. That is not a fault; there is

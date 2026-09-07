@@ -386,7 +386,7 @@ A generic client config, the shape most tool-calling assistants expect:
       "args": [
         "run", "-i", "--rm",
         "-v", "thor-data:/data",
-        "ghcr.io/nworks3d/thor-mcp:2.3.0",
+        "ghcr.io/nworks3d/thor-mcp:2.3.1",
         "mcp", "--db", "/data/thor.db"
       ]
     }
@@ -397,7 +397,7 @@ A generic client config, the shape most tool-calling assistants expect:
 ### Run it as a container
 
 ```bash
-docker run -i --rm -v thor-data:/data ghcr.io/nworks3d/thor-mcp:2.3.0 mcp --db /data/thor.db
+docker run -i --rm -v thor-data:/data ghcr.io/nworks3d/thor-mcp:2.3.1 mcp --db /data/thor.db
 ```
 
 The container does not build a fresh memory by itself - point `-v` at a folder

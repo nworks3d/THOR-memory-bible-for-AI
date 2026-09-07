@@ -283,71 +283,34 @@ fn suggested_check(item: &model::item::Item, root: &std::path::Path) -> Vec<Stri
     Vec::new()
 }
 
-const INSTRUCTIONS: &str = "THOR's agent surface: sixteen tools, no more. TWO SEPARATE MEMORIES \
-live behind them, and picking the wrong one is the mistake to avoid. The CODE lane (remember, revise, \
-retract, lookup, get, history, pin, unpin, mark, resolve, status, search_code, where_used, outline) \
-holds facts about code, projects and how to work; it has a write gate, standing rules that fire on \
-their own, and a hard cap on how much is ever shown at once. The LIBRARY (library to read, shelve to \
-write) holds the owner's everyday knowledge - recipes, books read, a training log, expenses - in its \
-own file, and nothing in it is ever injected, ranked against a rule, or counted toward any cap. \
-Anything about his own life goes to shelve, never to remember. \
-IF THIS SERVER IS A REPLICA (an away-from-the-desk connector) every writing tool answers 'queued for \
-the main machine' instead of writing: the call is applied later on the main machine, where the write \
-gate runs, so it is NOT here yet and will not turn up in lookup here. That is not a failure - do not \
-retry it, and do not fall back to a different tool. A replica has no library to READ, so it will say \
-so plainly; filing still works, because a filing is queued like anything else. \
-retract removes an item \
-that is simply WRONG (a reason is required; nothing is deleted, history still walks it), resolve \
-settles an id that get reports as DIVERGED, history walks one id's whole life oldest first, and \
-search_code, where_used and outline answer the three CODE questions - find text in the source, who defines and uses a symbol, what one file declares - each with the commit the index was read at on every answer. This \
-memory is yours to MAINTAIN, not only to fill: correct with revise, remove with retract, and never \
-store a second copy of something that already exists. remember declares a NEW \
-item (model::store::declare) - a Rule or Orientation needs at least one binding (a Moment, a \
-Target, or Always), a falsifier, and stays under 300 characters; a refusal names the exact reason \
-and what to do instead, and nothing is written when it fires - that is the gate doing its job, not \
-a bug to report. remember and revise both also take an optional check_kind/check_path, plus either \
-check_literal (a single literal) or check_literals (a SET of them) - check_kind one of \
-path_exists/contains/absent/absent_all/forbidden - a machine-runnable proof of the fact's own \
-currency, alongside the required prose falsifier, never instead of it: a rule whose check currently \
-HOLDS is the ONLY kind of rule this memory ever uses to block a write outright; a rule backed by \
-prose alone can inform, but can never block. Use check_kind absent_all with check_literals when ONE \
-rule forbids SEVERAL literals together in one specific file - e.g. a file that must never regain a \
-TODO it was just cleaned of. check_path may also name a DIRECTORY instead of a file, for contains/ \
-absent/absent_all - reaching every regular file DIRECTLY inside it, never a file in a subdirectory: \
-use this when the SAME fact spans more than one file in that directory (e.g. a setting duplicated \
-across two config files that must agree), which needs neither picking just one of them to anchor to \
-nor a path-less forbidden that would also catch honest historical copies elsewhere in the checkout. \
-Use check_kind forbidden with check_literals (never check_path - \
-forbidden takes none) when the SAME kind of set has nothing to anchor to at all - e.g. a typography \
-rule banning six punctuation characters wherever they might be written is ONE forbidden item with a \
-six-entry set, never six near-identical items each banning one, and never absent_all anchored to one \
-directory as a formality (that only proves the rule current for THAT directory, and leaves it \
-silently not firing everywhere else the rule was meant to apply). Prefer forbidden when the rule \
-forbids something self-contained; prefer the anchored forms (absent_all/absent/contains/path_exists) \
-when the rule names a real file that could move or content that could change - that near-duplicate \
-shape either way is exactly what this memory otherwise spends effort consolidating away. revise \
-corrects an EXISTING \
-item (model::store::revise) through \
-the same gate, plus its own rule: omit a parameter to keep its current value, pass an empty string \
-to clear severity/project/expires/key/falsifier (or check_kind, to clear the check), and no field \
-the item already carried may silently disappear. pin adds the Always binding to an existing item \
-(model::store::revise), so it joins the \
-standing rules served at every session start; it is idempotent (pinning an already-pinned item \
-does nothing) and refused when this kind may carry no binding at all. unpin removes the Always \
-binding the same way; it is idempotent too, and refused when that would leave the item with no \
-binding left to ever fire on - never a silent way to create a rule that can no longer fire. get \
-shows one item whole by id. lookup searches every project, archive kinds (Report, \
-Chunk) included, never scoped to 'the current project' the way session start is - call it BEFORE \
-remember so you revise an existing item instead of storing a near-duplicate; pass key for a \
-Lookup item's own exact key instead of query. mark records that an item actually helped - worth \
-doing, and since 2026-08-03 nothing is ever withheld for the lack of it. status reports live \
-counts per kind, how many Rule/Orientation items exist, how many were declared but have never \
-once fired, how many were served repeatedly without ever being marked useful (a count to look \
-at, not a filter), and how many carry no falsifier. There is deliberately NO tool for session \
-start, the moment of action, or the prompt surface: those three fire on their own, from hooks, at \
-the moment they apply - calling them yourself would recreate the single ranked pool THOR 2.0 was \
-built to remove. A refusal from remember, revise, pin or unpin is not an error in this tool; it is \
-the gate telling you exactly what would break and how to fix it.";
+const INSTRUCTIONS: &str = "THOR: sixteen tools, two memories behind them - each tool's own description names its lane. The \
+CODE lane (remember, revise, retract, lookup, get, history, pin, unpin, mark, resolve, status, \
+search_code, where_used, outline) holds facts about code and how to work: a write gate, \
+standing rules that fire on their own, a cap on what is ever shown at once. The LIBRARY lane \
+(library, shelve) holds the owner's everyday knowledge - recipes, books, a training log, \
+expenses - in its own file, never injected, ranked, or capped. Anything about the owner's own \
+life goes to shelve, never remember.\n\nREPLICA MODE: on a replica (a remote connector), every \
+writing tool answers 'queued for the main machine' instead of writing - applied later at the \
+main machine, where the write gate actually runs. Not a failure: do not retry it or fall back \
+to a different tool. The item will not turn up in lookup here yet. A replica has no library to \
+read, and says so; filing still queues the same way.\n\nMAINTAIN, DO NOT ONLY FILL: correct \
+with revise rather than storing a near-duplicate; remove a wrong item with retract (a reason is \
+required; nothing is deleted, history still walks it, oldest first); settle a DIVERGED item \
+(what get reports for more than one current head) with resolve.\n\nCHECKS: remember/revise can \
+attach check_kind (plus check_path and check_literal or check_literals) - a machine-runnable \
+proof of a Rule/Orientation's own currency, alongside the required falsifier, never instead of \
+it. Only a check that is tried and currently HOLDS can block a write; prose alone can inform, \
+never block. Six kinds: path_exists, contains, absent, absent_all (a literal set in one file or \
+directory), forbidden (a literal set with no file at all), requires (a trigger plus every \
+acceptable answer, catching something FORGOTTEN rather than written). Prefer forbidden with \
+nothing to anchor to; prefer the anchored kinds when a real file could move or its content \
+could change.\n\nBINDINGS: a Rule/Orientation needs at least one - a Moment (only what a real \
+command or file actually produces fires: publish, commit, deploy and the rest, plus remember \
+itself; a NEW answer/claim_done binding is refused, since neither fires yet), a Target (an \
+exact path, command or tool - never a glob or bare role name), or Always (what pin/unpin toggle \
+on an existing item).\n\nNOT HERE ON PURPOSE: session start, the moment of action, and the \
+prompt surface are hooks that fire on their own. No tool calls them - one that could would \
+recreate the one ranked pool THOR was built to remove.";
 
 /// One target binding as an MCP argument: a JSON-schema-friendly stand-in for
 /// `model::item::Binding::Target`, since `TargetKind` itself has no direct
@@ -680,35 +643,20 @@ pub struct RememberArgs {
     /// thing that ever names when one has gone stale.
     #[serde(default)]
     pub falsifier: Option<String>,
-    /// One of: path_exists, contains, absent, absent_all, forbidden, requires. 'requires' is the conditional one and the only form that catches something FORGOTTEN: give check_literals at least two entries, the trigger first and then every answer that satisfies it, and a call that trips the trigger without any of them is refused. Use it when banning the action itself would refuse honest work. Bind it to the command or tool it is about (a Command target naming the exact command or subcommand, or - for a tool with no sub-command of its own - the tool's own bare name) - never to always, which is refused outright because it names no command or tool for a trigger to compare against. The trigger names one of the commands or tools this rule is bound to; naming anything else is refused too. A
-    /// machine-runnable check this item can prove itself against, alongside
-    /// (never instead of) falsifier - see model::check::run. Only a
-    /// Rule/Orientation may carry one. This is the ONLY kind of rule this
-    /// memory ever uses to block a write outright, and only while the check
-    /// currently HOLDS (see serve's write guard): a rule backed by prose
-    /// alone can inform, but can never block. Every kind except forbidden
-    /// requires check_path; path_exists refuses check_literal/
-    /// check_literals; contains/absent require check_literal; absent_all
-    /// and forbidden require check_literals instead (see each field's own
-    /// note). Prefer forbidden when the rule forbids something
-    /// self-contained, with nothing to anchor it to (a banned character or
-    /// word, wherever it might be written); prefer absent_all when the rule
-    /// is really about one file that could move, or content that could
-    /// change. Omit check_kind, check_path, check_literal and check_literals
-    /// all four for no check at all.
+    /// One of: path_exists, contains, absent, absent_all, forbidden, requires. An optional
+    /// machine-runnable check, alongside (never instead of) falsifier - only a Rule/Orientation may
+    /// carry one, and only while it currently HOLDS can it block a write. Every kind except
+    /// forbidden needs check_path; path_exists refuses check_literal/check_literals;
+    /// contains/absent/requires need one of them; absent_all/forbidden need check_literals.
+    /// requires catches something FORGOTTEN rather than written - see server instructions. Omit all
+    /// four check_* fields for no check at all.
     #[serde(default)]
     pub check_kind: Option<String>,
-    /// The exact file this check inspects, relative to the root the checker
-    /// runs against - or, for contains/absent/absent_all only, a DIRECTORY
-    /// instead: every regular file DIRECTLY inside it, never a file in a
-    /// subdirectory. Use the directory form when one fact spans more than
-    /// one file in the same directory (e.g. a setting duplicated across two
-    /// config files that must agree) - a single check_kind can then cover
-    /// both, where naming just one file would leave the other unguarded and
-    /// a path-less "forbidden" would over-reach into honest historical
-    /// copies elsewhere in the checkout. Required together with check_kind,
-    /// for every check_kind EXCEPT forbidden - forbidden carries no path at
-    /// all, and is refused if one is given.
+    /// The exact file this check inspects, relative to the checker's root - or, for
+    /// contains/absent/absent_all only, a DIRECTORY: every regular file directly inside it, never
+    /// one in a subdirectory. Use the directory form when one fact spans more than one file there
+    /// (e.g. a setting duplicated across two config files). Required with every check_kind except
+    /// forbidden, which carries no path at all and is refused if one is given.
     #[serde(default)]
     pub check_path: Option<String>,
     /// The exact literal a "contains" or "absent" check_kind looks for.
@@ -716,27 +664,19 @@ pub struct RememberArgs {
     /// required with "contains"/"absent".
     #[serde(default)]
     pub check_literal: Option<String>,
-    /// A SET of literals to forbid together, for check_kind "absent_all" (in
-    /// one specific file) or "forbidden" (everywhere, no file at all) - one
-    /// rule that forbids several things at once (e.g. every punctuation
-    /// character a house typography style bans) is ONE item with a set
-    /// here, never several near-identical items each forbidding one
-    /// literal. Give every literal in the set as its own array entry -
-    /// never joined into one string with a separator, since these literals
-    /// are themselves punctuation and could collide with whatever separator
-    /// was picked. Refused together with check_literal (use exactly one of
-    /// the two); refused empty; refused with any check_kind other than
-    /// "absent_all"/"forbidden".
+    /// A SET of literals to forbid together, for check_kind absent_all (in one file) or forbidden
+    /// (everywhere, no file). One rule forbidding several things at once (e.g. every banned
+    /// punctuation character) is ONE item with a set here, never several near-identical items each
+    /// forbidding one literal. Each literal is its own array entry, never joined into one delimited
+    /// string. Refused together with check_literal, refused empty, and refused with any other
+    /// check_kind.
     #[serde(default)]
     pub check_literals: Vec<String>,
-    /// Action names this item fires on (repeatable), e.g. ["push"]. Only a
-    /// Rule/Orientation may bind to a moment. The ones that actually fire:
-    /// publish, commit, push, deploy, delete, send, spend, credentials,
-    /// install, configure and prod_data (all derived from a real command or
-    /// file path - see intent::from_command/from_path), plus remember (this
-    /// memory's own write/correct call). answer and claim_done are refused
-    /// on a NEW binding: nothing produces either one today, so a rule bound
-    /// only to it would store cleanly and never fire.
+    /// Action names this item fires on (repeatable), e.g. ["push"]. Only a Rule/Orientation may
+    /// bind to a moment. The ones that actually fire are derived from a real command or file path
+    /// (publish, commit, push, deploy and the rest - see intent::from_command/from_path), plus
+    /// remember itself. answer and claim_done are refused on a NEW binding: nothing produces either
+    /// yet, so a rule bound only to one would store cleanly and never fire.
     #[serde(default)]
     pub moments: Vec<String>,
     /// Exact targets this item fires on (repeatable). Only a Rule/Orientation
@@ -748,16 +688,11 @@ pub struct RememberArgs {
     /// session start). Only a Rule/Orientation may set this.
     #[serde(default)]
     pub always: bool,
-    /// THE OWNER JUST NAMED A NEW COLLECTION - repeat that name here, exactly
-    /// as he gave it, and it will be opened.
-    ///
-    /// This is the ONLY way a collection that does not exist yet can be
-    /// written to, and it exists for one flow: nothing that exists fits, you
-    /// showed him the refusal with both lanes in it, you ASKED him, and he
-    /// answered with a name. Never fill this in on your own judgement, never
-    /// to get past a refusal, and never with a name you thought of - the whole
-    /// point is that the naming was his. It must match the project (or the
-    /// register's key) on this same call, or the write is refused anyway.
+    /// THE OWNER JUST NAMED A NEW COLLECTION - repeat that name here exactly as he gave it, and it
+    /// will be opened. The only way an unopened collection can be written to: nothing existing fit,
+    /// you showed him the refusal (it lists both lanes), you asked, and he answered with a name.
+    /// Never fill this in on your own judgement or to get past a refusal. Must match the project
+    /// (or key) on this same call, or the write is refused anyway.
     #[serde(default)]
     pub new_collection_named_by_owner: Option<String>,
 }
@@ -805,15 +740,10 @@ pub struct ReviseArgs {
     /// Omit to keep the current project; pass "" to make it global.
     #[serde(default)]
     pub project: Option<String>,
-    /// Replaces the whole tag list. Omit to keep the current tags; pass an
-    /// empty list to clear them on purpose - the same "omit keeps, empty
-    /// clears" convention as severity/project/expires/key/falsifier above,
-    /// just spelled with a list instead of an empty string: `None` (the
-    /// field left out of the call) reads as "unmentioned", `Some(vec![])`
-    /// (the field given, empty) reads as "clear it", and `Some(real_list)`
-    /// replaces the whole set. Unlike those string fields, an empty JSON
-    /// array survives the MCP call layer exactly like a non-empty one, so
-    /// no whitespace-only-string workaround is needed here.
+    /// Replaces the whole tag list. Omit to keep the current tags; pass an empty list to clear them
+    /// on purpose - the same omit-keeps/empty-clears convention as
+    /// severity/project/expires/key/falsifier, spelled with a list: omitted means unmentioned, an
+    /// empty array means deliberately cleared, a real list replaces the whole set.
     #[serde(default)]
     pub tags: Option<Vec<String>>,
     /// Omit to keep the current expiry; pass "" to clear it.
@@ -826,18 +756,12 @@ pub struct ReviseArgs {
     /// Orientation left with none is refused, same as at creation).
     #[serde(default)]
     pub falsifier: Option<String>,
-    /// One of: path_exists, contains, absent, absent_all, forbidden, requires. 'requires' is the conditional one and the only form that catches something FORGOTTEN: give check_literals at least two entries, the trigger first and then every answer that satisfies it, and a call that trips the trigger without any of them is refused. Use it when banning the action itself would refuse honest work. Bind it to the command or tool it is about (a Command target naming the exact command or subcommand, or - for a tool with no sub-command of its own - the tool's own bare name) - never to always, which is refused outright because it names no command or tool for a trigger to compare against. The trigger names one of the commands or tools this rule is bound to; naming anything else is refused too. Omit
-    /// ALL FOUR (check_kind, check_path, check_literal, check_literals) to
-    /// keep the item's current check untouched; pass check_kind as "" to
-    /// clear it (refused if check_path, check_literal or check_literals is
-    /// also given - clearing takes none of them). Give check_kind, check_path
-    /// (omitted for forbidden - see its own note) and whichever of
-    /// check_literal/check_literals the kind takes, together, to replace the
-    /// check wholesale. See RememberArgs' own note on what a check is for,
-    /// which form to prefer, and the same combination rules (check_path
-    /// required with check_kind except for forbidden; path_exists refuses
-    /// check_literal/check_literals; contains/absent require check_literal;
-    /// absent_all and forbidden require check_literals instead).
+    /// One of: path_exists, contains, absent, absent_all, forbidden, requires. Omit all four
+    /// check_* fields to keep the current check untouched; pass check_kind as "" to clear it
+    /// (refused if check_path/check_literal/check_literals is also given). Give check_kind plus
+    /// whichever of check_path/check_literal/check_literals the kind takes, together, to replace
+    /// the check wholesale - see RememberArgs' own check_kind note for what each kind needs and
+    /// which to prefer.
     #[serde(default)]
     pub check_kind: Option<String>,
     /// See check_kind's own note on the omit/clear/replace convention, and
@@ -850,13 +774,10 @@ pub struct ReviseArgs {
     /// See check_kind's own note on the omit/clear/replace convention.
     #[serde(default)]
     pub check_literal: Option<String>,
-    /// The set form of check_literal, for check_kind "absent_all" or
-    /// "forbidden" - see RememberArgs' own note on why this is a separate
-    /// repeatable field rather than a delimited string. Part of the same
-    /// omit/clear/replace convention as check_kind: an empty list here reads
-    /// the same as never mentioning it, exactly like omitting check_kind/
-    /// check_path/check_literal does, since a list has no separate way to
-    /// say "given, but deliberately empty".
+    /// The set form of check_literal, for check_kind absent_all or forbidden - see RememberArgs'
+    /// own note on why this is a repeatable field rather than a delimited string. Same
+    /// omit/clear/replace convention as check_kind: an empty list here reads the same as omitting
+    /// it, since a list has no separate way to say 'given, but deliberately empty'.
     #[serde(default)]
     pub check_literals: Vec<String>,
     /// Replaces the moment bindings. Give this, `targets`, and/or `always`
@@ -946,13 +867,11 @@ pub struct LibraryArgs {
 pub struct ShelveArgs {
     /// An EXISTING shelf. If none fits, ask the owner - you may not create one.
     pub shelf: String,
-    /// CORRECT AN ENTRY THAT ALREADY EXISTS instead of filing a new one: its
-    /// number, as the shelf listing shows it. The fields you give replace
-    /// what is there, the number stays, and the version you replaced stays
-    /// readable. Use this whenever something you already filed turns out to
-    /// be wrong, badly worded or missing a label - a second entry saying the
-    /// same thing better is how a shelf becomes unreadable. Omit it to file
-    /// something new.
+    /// CORRECT AN ENTRY THAT ALREADY EXISTS instead of filing a new one: its number, as the shelf
+    /// listing shows it. The fields given replace what is there; the number stays, and the version
+    /// replaced stays readable. Use this whenever a filed entry turns out wrong, badly worded or
+    /// missing a label - a second entry saying the same thing better makes a shelf unreadable. Omit
+    /// it to file something new.
     #[serde(default)]
     pub id: Option<i64>,
     /// One line that stands on its own. This is the index. When correcting an
@@ -965,15 +884,11 @@ pub struct ShelveArgs {
     /// Optional labels for filtering inside a shelf.
     #[serde(default)]
     pub labels: Vec<String>,
-    /// WHY THIS LONG BODY IS STILL ONE THING - required past the length where
-    /// an entry is usually several glued together, and ignored below it.
-    ///
-    /// Name the single thing it is ("one pizza dough recipe", "one training
-    /// day, warm-up to last set"), in a real sentence. If you cannot name it
-    /// in one, that is the answer: it is more than one thing, so file it as
-    /// separate entries on the same shelf and give them labels. Do not write
-    /// filler here to get past the question - the whole reason it is asked is
-    /// that nothing else can tell a long recipe from a pile.
+    /// WHY THIS LONG BODY IS STILL ONE THING - required past the length where an entry is usually
+    /// several things glued together, ignored below it. Name the single thing it is (e.g. "one
+    /// pizza dough recipe") in a real sentence. Cannot name it in one? Then it is more than one
+    /// thing - file separate entries on the same shelf with labels instead. Filler here does not
+    /// get a pile past the question.
     #[serde(default)]
     pub one_thing_because: Option<String>,
 }
@@ -1293,7 +1208,7 @@ impl ThorMcpServer {
         }
     }
 
-    #[tool(description = "Declare a NEW memory item (Rule/Orientation/Report/Lookup/Chunk), through the write gate (model::store::declare). A Rule/Orientation with no binding, no falsifier, or over 300 characters is REFUSED with the exact reason and what to fix instead - that is the gate doing its job, not a failure of this tool, and nothing is written when it fires. Call lookup first so you revise an existing item instead of storing a near-duplicate. A Report/Chunk MUST carry a project - that is its scope, the collection it is filed under (recipes, books read, a training log, expenses) - and one with no scope is REFUSED, because it would belong to no collection and opening one would never show it. So before storing anything of the owner's own life, call lookup with NO arguments to see which scopes exist and pick the one it belongs to; the refusal lists them too if you get there first. If none fits, ASK the owner whether this needs a new scope and what to call it - never invent a scope name on his behalf, and never file something under a scope it does not belong to just to get past the gate. A Rule/Orientation may still be global (no project): a standing rule that holds in every project is what that is for. Optionally set check_kind plus either check_literal or check_literals (check_kind one of path_exists/contains/absent/absent_all/forbidden/requires) to give a Rule or Orientation a machine-runnable proof of its own currency, alongside its required prose falsifier, never instead of it: a rule whose check currently HOLDS is the only kind of rule this memory ever uses to block a write outright (see serve's write guard); prose alone can inform, but can never block. path_exists/contains/absent/absent_all also need check_path, the exact file the check inspects; forbidden takes no check_path at all. Use check_kind absent_all with check_literals (a set) when ONE rule forbids SEVERAL literals together in one specific file; use check_kind forbidden with check_literals instead when the rule forbids something self-contained with nothing to anchor to (e.g. a typography rule banning six different punctuation characters wherever they are written is one forbidden item with a six-entry set, never six near-identical items each banning one, and never absent_all anchored to one directory as a formality - that only proves the rule current for that directory, leaving it silently not firing anywhere else it was meant to apply). A forbidden check reaches wherever its BINDING says, and there are exactly two bindings that carry a reach it can honour: always (every file write) and a command target (that one command, matched with sudo, a full path and a .exe suffix all taken off first). That second form is how a COMMAND prohibition - never run this exact thing - becomes a real refusal instead of prose: give the item a command target and a forbidden check whose literal is the dangerous fragment, and give it NO always binding unless writing those same words in a file is also forbidden, or the rule will refuse the documentation that describes it. A forbidden check on any other binding passes this gate, looks like the strongest form, and can never fire.")]
+    #[tool(description = "Code lane: declares a NEW item (Rule, Orientation, Report, Lookup or Chunk) through the write gate. Call lookup first so this corrects an existing item instead of storing a near-duplicate; for anything about the owner's own life use shelve, never this. On a replica this queues instead of writing ('queued for the main machine' is not an error). Refuses, with the exact reason and the fix, when a Rule/Orientation has no binding, no falsifier, or exceeds 300 characters, or when a Report/Chunk names no project scope; nothing is written on a refusal. check_kind/check_path/check_literal(s) optionally attach a machine-runnable proof alongside the falsifier - see server instructions for the six check kinds. Replies with the stored id, kind and event sequence, or the refusal text.")]
     async fn remember(&self, Parameters(args): Parameters<RememberArgs>) -> String {
         if let Some(queued) = self.capture("remember", &args) {
             return queued;
@@ -1353,7 +1268,7 @@ impl ThorMcpServer {
         .await
     }
 
-    #[tool(description = "Correct an EXISTING item by id (model::store::revise): the same write gate as remember, plus its own rule that no field the item already carried may silently vanish - dropping a field you do not mention is REFUSED, not applied quietly. Omit a parameter to keep its current value; pass an empty string on severity/project/expires/key/falsifier to clear it. check_kind/check_path/check_literal/check_literals work together: omit all four to keep the existing check untouched, pass check_kind as \"\" to clear it, or give check_kind plus whichever of check_path/check_literal/check_literals the kind takes, together, to replace it wholesale - see remember's own note on what a check is for (the only kind of rule this memory ever uses to block a write outright, and only while it currently holds), on path_exists/contains/absent/absent_all needing check_path while forbidden needs none, and on when to prefer forbidden's path-less set form over absent_all's anchored one. Prefer this over remember for anything that changed.")]
+    #[tool(description = "Code lane: corrects an EXISTING item by id, through the same write gate as remember, plus one more rule: a field left unmentioned keeps its current value, and none may silently vanish - clear one on purpose with an empty string (severity, project, expires, key, falsifier) or check_kind \"\" (clears the check). On a replica this queues instead of writing ('queued for the main machine' is not an error). Prefer this over remember for anything that already exists and merely changed. Refuses, with the exact reason, on the same grounds as remember, plus a field dropped without being named. Replies with the revised id and event sequence, or the refusal text.")]
     async fn revise(&self, Parameters(args): Parameters<ReviseArgs>) -> String {
         if let Some(queued) = self.capture("revise", &args) {
             return queued;
@@ -1592,7 +1507,7 @@ impl ThorMcpServer {
     /// go through `model::store::revise`, so the write gate still governs
     /// what may carry an `Always` binding (a Report or Chunk carrying any
     /// binding at all is refused there, exactly as it is for `remember`).
-    #[tool(description = "Pin an item: add the Always binding, so it is served in full at every session start (model::store::revise), keeping every other binding and field untouched. Idempotent - pinning an item that is already pinned changes nothing and is not an error. Refused, loudly, by the same write gate as remember/revise when this kind may carry no binding at all (a Report or a Chunk).")]
+    #[tool(description = "Code lane: adds the Always binding to an existing item, so it is served in full at every session start; every other binding and field stays untouched. Use revise instead when anything besides the binding needs to change. Idempotent - pinning an already-pinned item changes nothing and is not an error. On a replica this queues instead of writing ('queued for the main machine' is not an error). Refused, loudly, when the item's kind may carry no binding at all (a Report or Chunk). Replies 'pinned' with the event sequence, 'already pinned', or the refusal text.")]
     async fn pin(&self, Parameters(args): Parameters<PinArgs>) -> String {
         if let Some(queued) = self.capture("pin", &args) {
             return queued;
@@ -1612,7 +1527,7 @@ impl ThorMcpServer {
         .await
     }
 
-    #[tool(description = "Unpin an item: remove the Always binding (model::store::revise), keeping every other binding and field untouched. Idempotent - unpinning an item with no Always binding changes nothing and is not an error. Refused, loudly, when removing Always would leave the item with NO binding at all: a Rule or Orientation with no binding can never fire, so this never silently creates an unfireable item - give it another binding (a Moment or a Target) first, or leave it pinned.")]
+    #[tool(description = "Code lane: removes the Always binding from an existing item; every other binding and field stays untouched. Use revise instead when anything besides the binding needs to change. Idempotent - unpinning an item with no Always binding changes nothing and is not an error. On a replica this queues instead of writing ('queued for the main machine' is not an error). Refused, loudly, when removing Always would leave the item with no binding left to ever fire on - give it a Moment or Target binding first, or leave it pinned. Replies 'unpinned' with the event sequence, 'already unpinned', or the refusal text.")]
     async fn unpin(&self, Parameters(args): Parameters<UnpinArgs>) -> String {
         if let Some(queued) = self.capture("unpin", &args) {
             return queued;
@@ -1642,7 +1557,7 @@ impl ThorMcpServer {
         .await
     }
 
-    #[tool(description = "Show one item whole, by id (model::store::show). Read-only. Reports a plain, honest error - never a blank reply that could look like success - when the id is unknown, DIVERGED (more than one current head; needs a resolve outside this tool set), or its stored body will not parse.")]
+    #[tool(description = "Code lane: shows one item whole, by id. Use lookup instead when the id is not already known. Read-only. Reports a plain, honest error - never a blank reply that could look like success - when the id is unknown, when the item is DIVERGED (more than one current head; read history, then use resolve), or when its stored body will not parse. Replies with the item as formatted JSON, or the error text.")]
     async fn get(&self, Parameters(args): Parameters<GetArgs>) -> String {
         self.blocking(move |s| match model::store::show(s, &args.id) {
             Ok(item) => serde_json::to_string_pretty(&item).map_err(|e| format!("could not render item: {e}")),
@@ -1651,7 +1566,7 @@ impl ThorMcpServer {
         .await
     }
 
-    #[tool(description = "Search THOR's memory (surface 4, OPZOEKEN): every live item, every project, archive kinds (Report/Chunk) fully included - never scoped to 'the current project' the way session start is. FOUR WAYS IN. Call it with NO arguments to get the catalogue: which scopes exist and what each holds - start here whenever you do not already know where something lives. Pass 'scope' alone to open one, listing every item it holds, one line each, complete. Pass 'scope' with 'query' to search inside it. Pass 'query' alone to search everything, or 'key' for the exact key of one Lookup item (everything else is then ignored). A collection - books read, recipes, a diary, expenses - is a SCOPE holding one item per entry, never one item holding every entry: to add to it, remember a new item carrying that scope, never append to an existing one. Call this BEFORE remember, so you revise an existing item instead of storing a near-duplicate. Never an injection surface: nothing found here is ever pushed at you unprompted - you asked for it.")]
+    #[tool(description = "Code lane: searches THOR's memory - every project, archive kinds (Report, Chunk) included - never scoped to only the current project. Call this before remember, so an existing near-duplicate becomes a revise instead. No arguments returns the catalogue of scopes; scope alone lists everything filed there; scope with query narrows a search to it; query alone searches everywhere; key answers only a Lookup item's own exact key (query and scope are then ignored). Read-only, and never an injection surface - nothing here reaches you unprompted. Replies with up to 25 matching lines (id, kind, text) and how many more exist, the catalogue, or a plain 'no matches'.")]
     async fn lookup(&self, Parameters(args): Parameters<LookupArgs>) -> String {
         let vectors = self.vectors.clone();
         #[cfg(feature = "semantic")]
@@ -1754,7 +1669,7 @@ impl ThorMcpServer {
         .await
     }
 
-    #[tool(description = "READ THE LIBRARY: the owner's everyday knowledge - recipes, books read, a training log, expenses - kept completely apart from the code lane. Nothing here is ever injected, ranked against a rule, or counted toward any cap: it is a different file, and you only ever see it because you asked. FOUR WAYS IN. No arguments: the shelves and how much each holds - start here whenever you do not already know where something lives. 'shelf': that shelf's index, one line per entry (add 'label' to narrow a big one). 'id': one entry, whole. 'query' (optionally with 'shelf'): search. A search NEVER answers 'nothing' - if the words miss, it hands back the shelf or the shelf list to read, because the words someone asks with are rarely the words they wrote. So when a question is about the owner's own life rather than about code, come here FIRST and read, instead of concluding the memory is empty.")]
+    #[tool(description = "Library lane: reads the owner's everyday knowledge - recipes, books, a training log, expenses - kept apart from the code lane; nothing here is ever injected, ranked against a rule, or counted toward any cap. Use shelve to write instead. No arguments lists the shelves and how much each holds; shelf lists that shelf's entries (label narrows it); id returns one entry whole; query searches, optionally within shelf. Read-only. A search never answers 'nothing' - it hands back the shelf, or the shelf list, to read instead, since the words asked with are rarely the words written. Replies with the requested listing or entry, or that fallback.")]
     async fn library(&self, Parameters(args): Parameters<LibraryArgs>) -> String {
         const SHOWN: usize = 50;
         let Some(path) = self.library.clone() else {
@@ -1794,7 +1709,7 @@ impl ThorMcpServer {
         }
     }
 
-    #[tool(description = "FILE ONE ENTRY IN THE LIBRARY, OR CORRECT ONE (the everyday lane, never the code lane). Pass 'id' to correct an entry that already exists - same number, old version kept - instead of filing a near-copy beside it. WRITE IT IN THE LANGUAGE THE LIBRARY IS ALREADY WRITTEN IN - open a shelf first and look; this is the owner's personal memory and he searches it in his own words, so a title in another language is a title he will never find. An empty library takes the language the owner is speaking to you in. Never the language you happen to be thinking in. Use this - not remember - for anything about the owner's own life: a recipe, a book he read, a training session, an expense. The title is ONE line and is what a shelf listing shows, so make it stand on its own; the body holds the rest, at any length. YOU CANNOT CREATE A SHELF. If no existing shelf fits, the write is refused and names the shelves that do exist - then ASK the owner whether this needs a new shelf and what to call it, and let him create it. Never invent a shelf, and never file something on a shelf it does not belong to just to get past the refusal: that is how a library stops being worth reading. Growth inside a shelf goes into 'labels', never into more shelves. A near-duplicate of something already on that shelf is refused, pointing at the entry that exists, so read before you write.")]
+    #[tool(description = "Library lane: files one new entry on an EXISTING shelf, or corrects one by id - never the code lane, and it cannot create a shelf. Use remember instead for facts about code or how to work, never for the owner's own life. On a replica this queues instead of writing ('queued for the main machine' is not an error). Refused, naming the shelves that do exist, when none fits (ask the owner what a new one should be called); refused on a near-duplicate of an entry already on that shelf, pointing at it; refused past roughly 600 characters unless one_thing_because names the single thing the entry is. Replies 'filed <id>' or 'revised <id>', or the refusal text.")]
     async fn shelve(&self, Parameters(args): Parameters<ShelveArgs>) -> String {
         if let Some(queued) = self.capture("shelve", &args) {
             return queued;
@@ -1848,7 +1763,7 @@ impl ThorMcpServer {
         }
     }
 
-    #[tool(description = "Judge an item you were served or looked up. Default records that it HELPED (serve::mark::record_useful), which clears the noise recorded BEFORE it - not the noise recorded after: the latest verdict is the one that counts, because a reader is allowed to change their mind about an item that has drifted. Pass noise:true for the opposite - this did not belong where it fired - and two of those SINCE the last mark of usefulness retire it from the injection surfaces while leaving it fully findable via lookup. The noise side is the ONLY thing that retires anything: a serving count decides nothing, because firing often is what relevance looks like (see serve::decay for the day that was measured). Judging as you go is where this is done best.")]
+    #[tool(description = "Code lane: judges an item you were served or looked up. Default records that it HELPED, which clears noise recorded before it (a later noise mark still counts - the newest verdict wins). Pass noise:true for the opposite; two noise marks since the last useful one retire the item from the injection surfaces, though it stays fully findable via lookup. On a replica this queues instead of writing ('queued for the main machine' is not an error). Refused when the item is not live (retracted or archived) - there is nothing to judge. Replies with the verdict recorded, or the refusal text.")]
     async fn mark(&self, Parameters(args): Parameters<MarkArgs>) -> String {
         if let Some(queued) = self.capture("mark", &args) {
             return queued;
@@ -1887,7 +1802,7 @@ impl ThorMcpServer {
         .await
     }
 
-    #[tool(description = "What this memory holds right now (serve::status::store_status): live item counts per kind, how many Rule/Orientation items exist in total, how many of those were declared but have never once fired, how many have been served repeatedly without ever being marked useful (a count to look at - since 2026-08-03 nothing is withheld for it, see serve::decay), and how many carry no falsifier. Read-only, takes no arguments.")]
+    #[tool(description = "Code lane: reports what the memory holds right now - live item counts per kind, how many Rule/Orientation items exist, how many were declared but have never once fired, how many were served repeatedly without ever being marked useful, and how many carry no falsifier. Use get or history instead for one specific item. Read-only, takes no arguments. Replies with one count per line.")]
     async fn status(&self) -> String {
         self.blocking(move |s| {
             let st = serve::status::store_status(s);
@@ -1913,7 +1828,7 @@ impl ThorMcpServer {
         .await
     }
 
-    #[tool(description = "Walk one item's whole life by id (model::store::history), oldest first: every declare, revise and retraction, each with its sequence number, its revision hash and who wrote it. Read-only. Nothing is ever deleted from the log, so this still works for an item that has been retracted - use it to see WHAT a fact used to say and when it changed, before you revise or retract it. An unknown id comes back as an empty history, not an error.")]
+    #[tool(description = "Code lane: walks one item's whole life by id, oldest first - every declare, revise and retraction, each with its sequence number, revision hash and author. Use get instead for only the current version. Read-only; nothing is ever deleted from the log, so this still answers for a retracted item - read it before you revise or retract again. Replies with one line per revision, or the plain 'no history for id X' for an unknown id (not an error).")]
     async fn history(&self, Parameters(args): Parameters<HistoryArgs>) -> String {
         self.blocking(move |s| match model::store::history(s, &args.id) {
             Ok(log) if log.is_empty() => Ok(format!("no history for id '{}'", args.id)),
@@ -1941,7 +1856,7 @@ impl ThorMcpServer {
         .await
     }
 
-    #[tool(description = "Retract an item by id (model::store::retract): it stops being live everywhere - session start, the moment of action, lookup - but NOTHING is deleted, and history still walks it. A reason is REQUIRED and a blank one is refused, because six weeks later nobody can tell a deliberate removal from an accident. Use this when a fact is simply WRONG or gone; use revise when it merely changed. A retraction is a decision: bringing the fact back is a fresh remember, never a revise of the tombstone.")]
+    #[tool(description = "Code lane: removes an item that is simply WRONG or no longer applies - it stops being live everywhere (session start, the moment of action, lookup), but nothing is deleted, and history still walks it. Use revise instead when the item merely changed. A reason is required; a blank one is refused. On a replica this queues instead of writing ('queued for the main machine' is not an error). Bringing the fact back later is a fresh remember, never a revise of the tombstone. Replies 'retracted <id> (<reason>)', or the refusal text.")]
     async fn retract(&self, Parameters(args): Parameters<RetractArgs>) -> String {
         if let Some(queued) = self.capture("retract", &args) {
             return queued;
@@ -1955,7 +1870,7 @@ impl ThorMcpServer {
         .await
     }
 
-    #[tool(description = "Settle an item that has more than one current head (model::store::resolve), which is what `get` reports as DIVERGED - two machines revised the same fact without seeing each other. Name the revision hash that survives in 'keep' and EVERY other current head in 'discard'. The head set is recomputed under the write lock, so a head that appeared while you were deciding makes this fail loudly instead of silently dropping someone else's revision. Read the item's history first; never guess which head is real.")]
+    #[tool(description = "Code lane: settles an item with more than one current head - what get reports as DIVERGED, from two machines revising the same fact apart. Read history first; never guess which head is real. Name the surviving revision hash in keep and every other current head in discard - leaving one out fails rather than silently discarding it. On a replica this queues instead of writing ('queued for the main machine' is not an error). The head set is rechecked under the write lock, so a head that appears mid-decision fails the call loudly instead of being dropped. Replies 'resolved <id> onto <keep>', or the refusal text.")]
     async fn resolve(&self, Parameters(args): Parameters<ResolveArgs>) -> String {
         if let Some(queued) = self.capture("resolve", &args) {
             return queued;
@@ -1977,7 +1892,7 @@ impl ThorMcpServer {
         .await
     }
 
-    #[tool(description = "Who defines and who uses one symbol name (serve::lookup::where_used) - the question to ask BEFORE changing a function, a struct or a variable, because the reference list IS the blast radius. Answers with every definition site and every use site as file and line, plus which commit the index was read at. Resolution is by bare name only: two unrelated things sharing a name come back together, so open the files rather than treating the list as a conclusion.")]
+    #[tool(description = "Code lane: answers who defines and who uses one symbol name - the question to ask before changing a function, struct or variable, since the reference list IS the blast radius. Use outline instead to see everything one file declares. Read-only. Resolution is by bare name only, so two unrelated things sharing a name come back together - open the files rather than treating the list as a conclusion. Replies with every definition and use site as file:line, the indexed commit, and whether the checkout has since moved on.")]
     async fn where_used(&self, Parameters(args): Parameters<WhereUsedArgs>) -> String {
         let Some(code) = self.code.clone() else {
             return NO_CODE_INDEX.to_string();
@@ -2007,7 +1922,7 @@ impl ThorMcpServer {
         }
     }
 
-    #[tool(description = "What one FILE defines, in line order (serve::lookup::outline) - a file's shape without reading the whole thing. Takes a repository-relative path. Says plainly when the index has never seen that path, which is a different answer from 'this file defines nothing' - a file that was added since the last index falls in the first case, and the drift line tells you when that was.")]
+    #[tool(description = "Code lane: lists what one file declares, in line order - its shape without reading the whole thing. Use where_used instead to find every caller of one symbol. Takes a repository-relative path. Read-only. States plainly when the index has never seen that path, which differs from 'this file defines nothing' - a file added since the last index build falls in the first case. Replies with one line per definition (name and line number), or the plain 'not indexed' or 'defines nothing' text.")]
     async fn outline(&self, Parameters(args): Parameters<OutlineArgs>) -> String {
         let Some(code) = self.code.clone() else {
             return NO_CODE_INDEX.to_string();
@@ -2032,7 +1947,7 @@ impl ThorMcpServer {
         }
     }
 
-    #[tool(description = "Search the indexed SOURCE CODE of the current project (serve::lookup::search_code), not the memory: a case-insensitive substring search over the code index, and every answer says which commit the text was read at and whether the working copy has moved on since. Use it to find where something is written, then read the real file - the index is an archive with provenance, never a substitute for opening the file. Answers plainly when no index is configured rather than returning nothing.")]
+    #[tool(description = "Code lane: searches the indexed SOURCE CODE of the current project, not the memory - a case-insensitive substring search. Use lookup instead for facts stored in memory, or where_used for one symbol's callers. Read-only. Every answer names the commit the text was read at and whether the working copy has since moved on - open the real file before trusting a line number. States plainly when no code index is configured, rather than returning an empty result. Replies with up to 10 matching snippets as path:start-end plus text.")]
     async fn search_code(&self, Parameters(args): Parameters<SearchCodeArgs>) -> String {
         let Some(code) = self.code.clone() else {
             return NO_CODE_INDEX.to_string();

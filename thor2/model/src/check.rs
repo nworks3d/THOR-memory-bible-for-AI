@@ -10,10 +10,13 @@
 //! where this stops). It only runs a check and reports what happened.
 //!
 //! Four of the five `Check` forms answer by reading a file relative to
-//! `root`. The fifth, `Check::Forbidden`, carries no path at all and so
-//! never touches the filesystem - `run`'s own doc comment on its early
-//! return explains why `Outcome::Holds` is the only answer that could ever
-//! be correct for it.
+//! `root`. Three of those four - `Contains`, `Absent`, `AbsentAll` - accept a
+//! DIRECTORY there too, meaning every regular file directly inside it, never
+//! a subdirectory - see `read_bounded_targets`'s own doc comment for the gap
+//! this closes and why the reading stops at one level. The fifth form,
+//! `Check::Forbidden`, carries no path at all and so never touches the
+//! filesystem - `run`'s own doc comment on its early return explains why
+//! `Outcome::Holds` is the only answer that could ever be correct for it.
 
 use crate::item::Check;
 use std::path::{Component, Path, PathBuf};
@@ -36,11 +39,13 @@ pub enum Outcome {
     /// did or did not hold the literal.
     Fails,
     /// The check could not be run at all, so it proves nothing either way:
-    /// the file is missing (for `Contains`/`Absent` only - a missing file
-    /// was never actually read, so "does it contain X" has no answer), any
-    /// IO error, the content is not valid UTF-8, the file is over
-    /// `MAX_CHECK_FILE_BYTES`, or the path does not stay inside the
-    /// supplied root.
+    /// the file is missing (for `Contains`/`Absent`/`AbsentAll` only - a
+    /// missing file was never actually read, so "does it contain X" has no
+    /// answer), any IO error, the content is not valid UTF-8, the file is
+    /// over `MAX_CHECK_FILE_BYTES`, the path does not stay inside the
+    /// supplied root, or - when the path names a DIRECTORY instead (see
+    /// `read_bounded_targets`) - any one of the regular files directly
+    /// inside it hits any of those same failure modes.
     CannotRun,
 }
 
@@ -186,6 +191,74 @@ fn read_bounded_utf8(path: &Path) -> Option<String> {
     String::from_utf8(bytes).ok()
 }
 
+/// The content(s) `Contains`/`Absent`/`AbsentAll` must search: the single
+/// file `resolved` names, exactly as before, or - when `resolved` is a
+/// DIRECTORY - the content of every regular file DIRECTLY inside it, one
+/// entry per file, in whatever order `std::fs::read_dir` happens to return
+/// (every caller here only ever asks "does ANY/NONE of these contain the
+/// literal", which does not depend on order). `None` means `CannotRun`,
+/// exactly like `read_bounded_utf8`'s own `None`: one unreadable file inside
+/// the directory (oversized, not UTF-8, an IO error) makes the WHOLE
+/// directory unreadable for this check, never silently skipped and left out
+/// of the answer - a literal hiding in the one file this runner gave up on
+/// would otherwise let `Absent`/`AbsentAll` report a false `Holds`, which is
+/// worse than not running the check at all (see `Outcome`'s own doc
+/// comment).
+///
+/// THE GAP THIS CLOSES. A single check can only ever name one path, but a
+/// real fact routinely spans two files at once - the case this was built
+/// from: a Klipper fan setting that must never regress, duplicated by the
+/// printer's own config format across `calibrate.cfg` and `macros.cfg` in
+/// the same directory. `Absent`/`AbsentAll` could only ever anchor one of
+/// the two, so the other stayed unguarded; `Check::Forbidden` (no path at
+/// all) would have caught the pair, but at the cost of also refusing the
+/// SAME text sitting untouched in a `reference/` copy and an older
+/// `machines/51` mirror elsewhere in the checkout - text that is not a
+/// mistake there, only a historical record. A directory path is the narrow
+/// middle: one check for both files, and nothing outside the one directory
+/// actually named.
+///
+/// NEVER RECURSIVE, on purpose, and this is the whole reason a directory is
+/// not simply walked with a recursive reader. Reaching into a subdirectory
+/// would just as easily reach into a vendored dependency, a build output, or
+/// an archived backup nested underneath the named directory - the same false
+/// block a path-less `Forbidden` check would have caused above, only moved
+/// one level down instead of sideways, never avoided. A subdirectory's own
+/// files get their own check, pointed at them directly, if they ever need
+/// one.
+///
+/// A directory with no regular file directly inside it (empty, or holding
+/// only subdirectories) is a DECIDED answer, never `CannotRun`: there is
+/// nothing here that failed to be read, so `Absent`/`AbsentAll` correctly
+/// `Holds` (no file contains anything) and `Contains` correctly `Fails` (no
+/// file contains the literal either) - see `run`'s own match arms for where
+/// that falls out of this returning `Some(vec![])`.
+fn read_bounded_targets(resolved: &Path) -> Option<Vec<String>> {
+    if resolved.is_dir() {
+        let mut contents = Vec::new();
+        for entry in std::fs::read_dir(resolved).ok()? {
+            let entry = entry.ok()?;
+            // A subdirectory, a symlink (to either shape), or anything else
+            // that is not a plain regular file is simply not "a file
+            // directly inside" this directory: skipped, never recursed into,
+            // and never treated as an unreadable file that would sink the
+            // whole answer to `CannotRun`. Excluding a symlink here also
+            // means this loop needs no root-escape guard of its own: `run`'s
+            // shared containment check already cleared `resolved` itself
+            // before this function is ever called, and a plain regular file
+            // directly inside an already-cleared directory cannot itself be
+            // a reparse point pointing somewhere else.
+            if !entry.file_type().ok()?.is_file() {
+                continue;
+            }
+            contents.push(read_bounded_utf8(&entry.path())?);
+        }
+        Some(contents)
+    } else {
+        read_bounded_utf8(resolved).map(|content| vec![content])
+    }
+}
+
 /// Run `check` against `root`. Never panics, and never reads or reports on
 /// anything outside `root` - a path that tries to escape it comes back as
 /// `Outcome::CannotRun`, the same answer as any other reason this check
@@ -256,9 +329,14 @@ pub fn run(check: &Check, root: &Path) -> Outcome {
                 Outcome::Fails
             }
         }
-        Check::Contains { literal, .. } => match read_bounded_utf8(&resolved) {
-            Some(content) => {
-                if content.contains(literal.as_str()) {
+        Check::Contains { literal, .. } => match read_bounded_targets(&resolved) {
+            Some(contents) => {
+                // Holds as soon as ANY one target contains the literal - the
+                // directory form's honest mirror of `Absent` below, which
+                // Holds only when NONE does. For a single file `contents` is
+                // always exactly one entry, so this is byte-for-byte the same
+                // question the pre-directory code asked.
+                if contents.iter().any(|content| content.contains(literal.as_str())) {
                     Outcome::Holds
                 } else {
                     Outcome::Fails
@@ -266,9 +344,9 @@ pub fn run(check: &Check, root: &Path) -> Outcome {
             }
             None => Outcome::CannotRun,
         },
-        Check::Absent { literal, .. } => match read_bounded_utf8(&resolved) {
-            Some(content) => {
-                if content.contains(literal.as_str()) {
+        Check::Absent { literal, .. } => match read_bounded_targets(&resolved) {
+            Some(contents) => {
+                if contents.iter().any(|content| content.contains(literal.as_str())) {
                     Outcome::Fails
                 } else {
                     Outcome::Holds
@@ -276,13 +354,13 @@ pub fn run(check: &Check, root: &Path) -> Outcome {
             }
             None => Outcome::CannotRun,
         },
-        Check::AbsentAll { literals, .. } => match read_bounded_utf8(&resolved) {
+        Check::AbsentAll { literals, .. } => match read_bounded_targets(&resolved) {
             // Set form of Absent immediately above: Holds only when NONE of
-            // the literals is present, Fails as soon as any single one is -
-            // same CannotRun conditions either way, since both forms share
-            // the identical read_bounded_utf8 step.
-            Some(content) => {
-                if literals.iter().any(|literal| content.contains(literal.as_str())) {
+            // the literals is present in ANY target, Fails as soon as any
+            // single one is - same CannotRun conditions either way, since
+            // every form here shares the identical read_bounded_targets step.
+            Some(contents) => {
+                if contents.iter().any(|content| literals.iter().any(|literal| content.contains(literal.as_str()))) {
                     Outcome::Fails
                 } else {
                     Outcome::Holds
@@ -497,12 +575,177 @@ mod tests {
         assert_eq!(run(&check, dir.path()), Outcome::Holds);
     }
 
+    // ------------------------------------------------ a DIRECTORY check_path
+    //
+    // THE GAP THESE CLOSE: see `read_bounded_targets`'s own doc comment for
+    // the full case this was built from - one literal, two files, in the
+    // same directory, that a single-file `Absent`/`AbsentAll`/`Contains`
+    // could only ever anchor one of. Each test below is named after the
+    // exact behaviour it pins shut.
+    //
+    // THIS RETIRES `a_check_against_a_directory_instead_of_a_file_cannot_
+    // run_and_does_not_panic`, previously here: a `Contains` check against a
+    // directory used to report `CannotRun` unconditionally (a directory was
+    // simply not a file `read_bounded_utf8` could open). Directories now
+    // have real meaning for this form, so that fixture - an empty directory
+    // - has a real, decided answer too: `a_contains_check_against_an_empty_
+    // directory_fails` below is its direct successor, with the new,
+    // intended outcome, `Fails`, never `CannotRun`, because there is no file
+    // here that failed to be read.
+
     #[test]
-    fn a_check_against_a_directory_instead_of_a_file_cannot_run_and_does_not_panic() {
+    fn an_absent_check_holds_against_a_directory_where_no_direct_file_carries_the_literal() {
         let dir = tempfile::tempdir().unwrap();
-        fs::create_dir(dir.path().join("subdir")).unwrap();
-        let check = Check::Contains { path: "subdir".to_string(), literal: "x".to_string() };
-        assert_eq!(run(&check, dir.path()), Outcome::CannotRun);
+        fs::write(dir.path().join("calibrate.cfg"), b"fan_speed: 100").unwrap();
+        fs::write(dir.path().join("macros.cfg"), b"fan_speed: 100").unwrap();
+        let check = Check::Absent { path: ".".to_string(), literal: "fan_speed: 255".to_string() };
+        assert_eq!(run(&check, dir.path()), Outcome::Holds);
+    }
+
+    #[test]
+    fn an_absent_check_fails_against_a_directory_when_any_direct_file_carries_the_literal() {
+        // THE DEFECT THIS PREVENTS: an implementation that only reads ONE
+        // file out of the directory (say, whichever `read_dir` happens to
+        // return first) would miss a violation sitting in any other -
+        // proven here with the offending literal in the SECOND file
+        // created.
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("calibrate.cfg"), b"fan_speed: 100").unwrap();
+        fs::write(dir.path().join("macros.cfg"), b"fan_speed: 255 ; regressed").unwrap();
+        let check = Check::Absent { path: ".".to_string(), literal: "fan_speed: 255".to_string() };
+        assert_eq!(run(&check, dir.path()), Outcome::Fails);
+    }
+
+    #[test]
+    fn a_contains_check_holds_against_a_directory_when_at_least_one_direct_file_carries_the_literal() {
+        // Contains is the mirror image of Absent (see `read_bounded_targets`'s
+        // own doc comment): Holds as soon as ANY direct file has it, not
+        // every one of them.
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("calibrate.cfg"), b"no license header here").unwrap();
+        fs::write(dir.path().join("macros.cfg"), b"Licensed under GPLv3").unwrap();
+        let check = Check::Contains { path: ".".to_string(), literal: "GPLv3".to_string() };
+        assert_eq!(run(&check, dir.path()), Outcome::Holds);
+    }
+
+    #[test]
+    fn a_contains_check_fails_against_a_directory_when_no_direct_file_carries_the_literal() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("calibrate.cfg"), b"no license header here").unwrap();
+        fs::write(dir.path().join("macros.cfg"), b"none here either").unwrap();
+        let check = Check::Contains { path: ".".to_string(), literal: "GPLv3".to_string() };
+        assert_eq!(run(&check, dir.path()), Outcome::Fails);
+    }
+
+    #[test]
+    fn an_absent_all_check_fails_against_a_directory_when_any_direct_file_carries_any_literal() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("calibrate.cfg"), b"plain ascii hyphens only").unwrap();
+        fs::write(dir.path().join("macros.cfg"), "an em dash \u{2014} sneaks in here".as_bytes()).unwrap();
+        let check = Check::AbsentAll {
+            path: ".".to_string(),
+            literals: vec!["\u{2014}".to_string(), "\u{2013}".to_string(), "...".to_string()],
+        };
+        assert_eq!(run(&check, dir.path()), Outcome::Fails);
+    }
+
+    #[test]
+    fn an_absent_all_check_holds_against_a_directory_when_no_direct_file_carries_any_literal() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("calibrate.cfg"), b"plain ascii hyphens only").unwrap();
+        fs::write(dir.path().join("macros.cfg"), b"also plain ascii").unwrap();
+        let check = Check::AbsentAll {
+            path: ".".to_string(),
+            literals: vec!["\u{2014}".to_string(), "\u{2013}".to_string(), "...".to_string()],
+        };
+        assert_eq!(run(&check, dir.path()), Outcome::Holds);
+    }
+
+    #[test]
+    fn a_directory_check_never_recurses_into_a_subdirectory() {
+        // THE DEFECT THIS PREVENTS: a recursive reading would reach into a
+        // vendored dependency, a build output, or an archived backup nested
+        // underneath the named directory - see `read_bounded_targets`'s own
+        // doc comment. The forbidden literal sits only in a NESTED file
+        // here, never a direct one, so Absent must still Holds.
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("calibrate.cfg"), b"fan_speed: 100").unwrap();
+        let nested = dir.path().join("archive");
+        fs::create_dir(&nested).unwrap();
+        fs::write(nested.join("old-calibrate.cfg"), b"fan_speed: 255").unwrap();
+        let check = Check::Absent { path: ".".to_string(), literal: "fan_speed: 255".to_string() };
+        assert_eq!(
+            run(&check, dir.path()),
+            Outcome::Holds,
+            "a literal sitting only in a subdirectory must never be reached"
+        );
+    }
+
+    #[test]
+    fn an_empty_directory_holds_for_absent_and_absent_all() {
+        // Vacuous truth, decided rather than punted: no file at all directly
+        // inside means no file contains the forbidden literal either.
+        let dir = tempfile::tempdir().unwrap();
+        let empty = dir.path().join("empty");
+        fs::create_dir(&empty).unwrap();
+        assert_eq!(
+            run(&Check::Absent { path: "empty".to_string(), literal: "x".to_string() }, dir.path()),
+            Outcome::Holds
+        );
+        assert_eq!(
+            run(&Check::AbsentAll { path: "empty".to_string(), literals: vec!["x".to_string()] }, dir.path()),
+            Outcome::Holds
+        );
+    }
+
+    #[test]
+    fn a_contains_check_against_an_empty_directory_fails() {
+        // The successor to the retired `a_check_against_a_directory_instead_
+        // of_a_file_cannot_run_and_does_not_panic` - see this section's own
+        // banner comment above.
+        let dir = tempfile::tempdir().unwrap();
+        let empty = dir.path().join("empty");
+        fs::create_dir(&empty).unwrap();
+        let check = Check::Contains { path: "empty".to_string(), literal: "x".to_string() };
+        assert_eq!(run(&check, dir.path()), Outcome::Fails);
+    }
+
+    #[test]
+    fn a_directory_check_cannot_run_when_one_direct_file_is_unreadable() {
+        // THE DEFECT THIS PREVENTS: silently skipping a file this runner
+        // could not read (too large, not UTF-8) and answering from the
+        // readable rest would let a violation hide in exactly the file that
+        // was skipped - proven here by putting the offending literal ONLY in
+        // the oversized file, with a perfectly clean, readable file beside it
+        // that alone would report Holds.
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("clean.cfg"), b"fan_speed: 100").unwrap();
+        let oversized = vec![b'a'; (MAX_CHECK_FILE_BYTES + 1) as usize];
+        fs::write(dir.path().join("oversized.cfg"), &oversized).unwrap();
+        let check = Check::Absent { path: ".".to_string(), literal: "fan_speed: 255".to_string() };
+        assert_eq!(
+            run(&check, dir.path()),
+            Outcome::CannotRun,
+            "an unreadable sibling file must never be silently skipped"
+        );
+    }
+
+    #[test]
+    fn a_directory_check_still_respects_the_root_containment_guard() {
+        // The shared guard in `run` runs BEFORE the per-variant match, so it
+        // protects a directory-shaped check_path exactly like every other
+        // form - mirrors `an_absent_all_check_escaping_the_root_with_dot_
+        // dot_cannot_run` above, never a second implementation to keep in
+        // sync.
+        let outer = tempfile::tempdir().unwrap();
+        let secret_dir = outer.path().join("secret");
+        fs::create_dir(&secret_dir).unwrap();
+        fs::write(secret_dir.join("leak.txt"), b"outside the root").unwrap();
+        let root = outer.path().join("root");
+        fs::create_dir(&root).unwrap();
+
+        let check = Check::Absent { path: "../secret".to_string(), literal: "outside".to_string() };
+        assert_eq!(run(&check, &root), Outcome::CannotRun);
     }
 
     // ------------------------------------------------------- root escape

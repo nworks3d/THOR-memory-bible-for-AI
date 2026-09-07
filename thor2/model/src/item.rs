@@ -140,16 +140,27 @@ pub enum Binding {
 pub enum Check {
     /// The named path exists.
     PathExists { path: String },
-    /// The named file still contains this exact literal string.
+    /// The named file still contains this exact literal string - or, when
+    /// `path` names a DIRECTORY instead, at least one regular file directly
+    /// inside it does (never a subdirectory - see `crate::check::run`'s own
+    /// `read_bounded_targets` for the full reasoning and the gap this
+    /// closes: a single check_path could not otherwise cover a fact that
+    /// spans two files in the same directory).
     Contains { path: String, literal: String },
-    /// The named file does not contain this exact literal string.
+    /// The named file does not contain this exact literal string - or, when
+    /// `path` names a DIRECTORY instead, no regular file directly inside it
+    /// does (never a subdirectory - see `crate::check::run`'s own
+    /// `read_bounded_targets`).
     Absent { path: String, literal: String },
     /// The named file contains NONE of these exact literal strings - holds
     /// only when every one of them is absent, fails as soon as any single
     /// one of them is present. The set form of `Absent`, for a rule that
     /// forbids several literals together as one fact. Never empty - see
     /// `gate::check_check`'s own refusal for an empty (or empty-containing)
-    /// list.
+    /// list. Like `Absent`, `path` may also name a DIRECTORY - see
+    /// `crate::check::run`'s own `read_bounded_targets` - in which case this
+    /// holds only when no regular file directly inside it (never a
+    /// subdirectory) contains any of the literals.
     AbsentAll { path: String, literals: Vec<String> },
     /// NONE of these exact literal strings may ever be written, full stop -
     /// no path, because unlike the four forms above, there is no file whose

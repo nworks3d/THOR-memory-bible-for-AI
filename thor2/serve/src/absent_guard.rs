@@ -96,6 +96,19 @@
 //! rule still matches exactly as it did before this half of the module
 //! existed.
 //!
+//! A THIRD shape reaches `find_dir_content_violation` too, never to be
+//! confused with the `Dir`-bound rule just above: `Absent`/`AbsentAll`'s own
+//! check_path may now itself name a directory (see `model::item::
+//! Check::Absent`'s own doc comment on the two shapes one path can carry).
+//! `first_check_path_dir_violation` decides that one, and DELIBERATELY the
+//! opposite way `first_dir_violation` does: NEVER recursive, only a DIRECT
+//! child of the named directory - see `file_is_direct_child_of`'s own doc
+//! comment for why a recursive read here would be the exact false block a
+//! path-less `Forbidden` check would have caused, one level down instead of
+//! sideways. `Check::Contains`'s own "text that must remain" guard
+//! (`find_missing_required` below) gets the identical directory shape, with
+//! its own identity split spelled out in that function's doc comment.
+//!
 //! The LOCATION guard (`find_location_violation`) deliberately does NOT
 //! reuse `rank::select`: that function's own `target_matches` is an
 //! approximate, human-facing comparison (equal once normalised, OR equal by
@@ -692,17 +705,41 @@ pub fn find_missing_required(
     root: Option<&Path>,
 ) -> Option<String> {
     let root = root?;
-    let file_abs = normalize_target(&root.join(file_path).to_string_lossy());
+    let file_abs_path = root.join(file_path);
+    let file_abs = normalize_target(&file_abs_path.to_string_lossy());
     for candidate in items {
         if !candidate.item.kind.can_fire() {
             continue;
         }
         let Some(check) = &candidate.item.check else { continue };
         let Some((check_path, literal)) = required_literal(check) else { continue };
-        if normalize_target(&root.join(check_path).to_string_lossy()) != file_abs {
-            continue;
-        }
-        if model::check::run(check, root) != model::check::Outcome::Holds {
+        let check_path_abs = root.join(check_path);
+        // check_path may now name a DIRECTORY instead of one exact file (see
+        // `model::item::Check::Contains`'s own doc comment on the two
+        // shapes) - decided purely by what is on disk right now, exactly as
+        // `model::check::run` itself decides it. Identity then splits in two:
+        //   - a FILE keeps the original rule exactly, unchanged - check_path
+        //     must equal file_path, and `model::check::run` on the check AS
+        //     STORED answers whether the literal currently sits there.
+        //   - a DIRECTORY narrows scope to a DIRECT child only (never
+        //     recursive - see `file_is_direct_child_of`'s own doc comment),
+        //     and asks whether THAT FILE'S OWN current content holds the
+        //     literal - a synthetic single-file `Contains` (the same trick
+        //     `anchor_is_current` already plays with a synthetic
+        //     `PathExists`), never the directory's aggregate answer. A
+        //     sibling file that never carried the literal must never be
+        //     blamed for a DIFFERENT file's text disappearing.
+        let currently_holds_here = if check_path_abs.is_dir() {
+            file_is_direct_child_of(&check_path_abs, &file_abs_path)
+                && model::check::run(
+                    &Check::Contains { path: file_path.to_string(), literal: literal.to_string() },
+                    root,
+                ) == model::check::Outcome::Holds
+        } else {
+            normalize_target(&check_path_abs.to_string_lossy()) == file_abs
+                && model::check::run(check, root) == model::check::Outcome::Holds
+        };
+        if !currently_holds_here {
             continue;
         }
         if !content.contains(literal) {
@@ -944,6 +981,32 @@ fn path_is_or_contains(anchor_abs: &Path, file_abs: &Path) -> bool {
     file == anchor || file.starts_with(&format!("{anchor}/"))
 }
 
+/// Whether `file_abs` is a file DIRECTLY inside the directory `anchor_abs`
+/// currently names on disk - never a deeper descendant. Compared as
+/// `model::normalize::normalize_target` strings, the SAME comparison
+/// `path_is_or_contains` above uses, for the identical reason: a Windows
+/// separator or case difference between the two can never produce a false
+/// miss.
+///
+/// THE DEFECT THIS PREVENTS. `path_is_or_contains` above is deliberately
+/// RECURSIVE - an existing `Dir`-bound rule is meant to reach every file
+/// anywhere under it (see `first_dir_violation`'s own doc comment) - which is
+/// exactly wrong for a check_path that itself names a directory (see
+/// `model::item::Check::Absent`'s own doc comment on the two shapes one path
+/// can carry): a recursive read there would silently reach into a vendored
+/// or archived subfolder nested inside it and refuse an honest, unrelated
+/// edit - precisely the false block the "P1-5/config" case this feature was
+/// built from was trying to avoid by not using a path-less `Forbidden` check
+/// in the first place (see `model::check::run`'s own `read_bounded_targets`
+/// for that full reasoning). Comparing PARENT directories, never a
+/// string-prefix test, is what keeps "config" from wrongly matching a file
+/// inside "config-old" the same way `path_is_or_contains`'s own trailing "/"
+/// already guards its own prefix check.
+fn file_is_direct_child_of(anchor_abs: &Path, file_abs: &Path) -> bool {
+    let Some(parent) = file_abs.parent() else { return false };
+    normalize_target(&parent.to_string_lossy()) == normalize_target(&anchor_abs.to_string_lossy())
+}
+
 /// The first live location prohibition among `items` whose anchor is
 /// CURRENT (reuses `anchor_is_current` above, never a second currency
 /// check) and whose protected path is or contains `file_path`. `items` is
@@ -1104,8 +1167,78 @@ fn first_dir_violation<'a>(
 /// way, via `Option::or_else`) - never merged into one function, so the
 /// pre-existing `Path` behaviour stays provably exactly what it was.
 pub fn find_dir_content_violation(items: &[LiveItem], file_path: &str, content: &str, root: Option<&Path>) -> Option<String> {
-    let (item, literal) = first_dir_violation(items, file_path, content, root)?;
+    if let Some((item, literal)) = first_dir_violation(items, file_path, content, root) {
+        return Some(block_message(&item.id, &item.item.text, content, literal));
+    }
+    let (item, literal) = first_check_path_dir_violation(items, file_path, content, root)?;
     Some(block_message(&item.id, &item.item.text, content, literal))
+}
+
+// ---------------------------------- the block (check_path itself a directory)
+//
+// A THIRD way an item can be scoped to a directory, never to be confused
+// with `first_dir_violation` just above: there, the DIRECTORY comes from the
+// item's own `Dir` Target binding, and `Absent`/`AbsentAll`'s own check_path
+// is a single file used only to prove currency (see that section's own doc
+// comment) - the match is deliberately RECURSIVE, because a `Dir` binding is
+// meant to reach an entire subtree ("never write intermediate files under
+// /tmp"). Here, the DIRECTORY is the check's own check_path (see
+// `model::item::Check::Absent`'s own doc comment on the two shapes one path
+// can carry), and the match is deliberately NON-recursive - see
+// `file_is_direct_child_of`'s own doc comment for why a recursive read would
+// be exactly the false block this shape exists to avoid.
+//
+// `items` is the SAME `location_candidates` pool `first_dir_violation`
+// already consumes (kind-only Path+Dir narrowed - see `find_dir_content_
+// violation`'s callers in `serve/src/bin/serve.rs`), never a second store
+// read: an item reaches here through WHATEVER Path or Dir binding it
+// carries, and `absent_literals`'s own check_path decides scope entirely on
+// its own, the identical looseness `first_dir_violation` already has (its
+// own doc comment: currency "has never been required to name the same
+// string as the binding that got an item this far").
+
+/// The first live candidate among `items` whose check is a still-current
+/// `Check::Absent`/`Check::AbsentAll` (`absent_literals` + `anchor_is_current`
+/// - the SAME two steps every other arm in this file already uses) whose OWN
+/// check_path currently resolves to a DIRECTORY that DIRECTLY contains
+/// `file_path`, and whose forbidden literal appears in `content` - the
+/// PROPOSED content, never the file on disk.
+///
+/// `check_path_abs.is_dir()` is the ONLY signal this function ever uses to
+/// decide it applies at all: when check_path names an ordinary FILE (or
+/// nothing yet written), this returns `None` for every candidate and leaves
+/// the classic single-file behaviour entirely to `first_violation`/
+/// `first_dir_violation` above - never a second, competing answer for the
+/// same shape.
+fn first_check_path_dir_violation<'a>(
+    items: &'a [LiveItem],
+    file_path: &str,
+    content: &str,
+    root: Option<&Path>,
+) -> Option<(&'a LiveItem, &'a str)> {
+    let root = root?;
+    let file_abs = root.join(file_path);
+    for candidate in items {
+        if !candidate.item.kind.can_fire() {
+            continue;
+        }
+        let Some(check) = &candidate.item.check else { continue };
+        let Some((check_path, literals)) = absent_literals(check) else { continue };
+        if !anchor_is_current(check_path, root) {
+            continue;
+        }
+        let check_path_abs = root.join(check_path);
+        if !check_path_abs.is_dir() {
+            continue;
+        }
+        if !file_is_direct_child_of(&check_path_abs, &file_abs) {
+            continue;
+        }
+        if let Some(literal) = first_present_literal(literals, content) {
+            return Some((candidate, literal));
+        }
+    }
+    None
 }
 
 // -------------------------------------------- the block (command-anchored)
@@ -3074,6 +3207,254 @@ sonnet").is_none(),
         let items = vec![dir_item_with_check("d6", "thor2", "forbidden")];
         let content = "a line carrying the forbidden word";
         assert_eq!(find_dir_content_violation(&items, "thor2/probe-scratch.md", content, None), None);
+    }
+
+    // ------------------------- block, check_path ITSELF a directory (non-recursive)
+    //
+    // A THIRD, distinct anchor shape from `dir_item_with_check` just above:
+    // there, the DIRECTORY comes from the item's own `Dir` Target binding,
+    // and containment is deliberately RECURSIVE (see that fixture's own
+    // tests, "several levels deep"). Here, the check's OWN check_path is the
+    // directory (see `model::item::Check::Absent`'s own doc comment on the
+    // two shapes), and containment is deliberately NON-recursive - see
+    // `file_is_direct_child_of`'s own doc comment for why. THE GAP THIS
+    // CLOSES: a Klipper fan-speed regression duplicated across
+    // `calibrate.cfg` and `macros.cfg` in the same directory, which a
+    // single-file `Absent` could only ever anchor one of and a path-less
+    // `Forbidden` would have over-refused into unrelated `reference/` and
+    // `machines/51` mirrors elsewhere in the checkout.
+
+    /// A live Rule whose check_path IS itself a directory, bound via a
+    /// `Path` Target to an UNRELATED placeholder value rather than a `Dir`
+    /// Target on the same directory - deliberately, so `dir_binding` returns
+    /// `None` for it and `first_dir_violation`'s own (recursive) arm can
+    /// never also match here and mask what this NEW, non-recursive arm
+    /// decides on its own. `location_candidates`, the pool `find_dir_
+    /// content_violation` is actually called with in production (see this
+    /// module's own top-of-file doc comment), reaches an item through ANY
+    /// Path or Dir binding regardless of its value - a `Path` placeholder is
+    /// therefore exactly as reachable there as a `Dir` one would be.
+    fn check_path_dir_item(id: &str, check_path_dir: &str, literal: &str) -> LiveItem {
+        LiveItem {
+            id: id.to_string(),
+            item: Item {
+                id: id.to_string(),
+                kind: Kind::Rule,
+                text: format!("{id}: keep every direct file in this directory clean"),
+                bindings: vec![Binding::Target { kind: TargetKind::Path, value: "placeholder.txt".to_string() }],
+                severity: Some(Severity::HouseStyle),
+                project: None,
+                tags: vec![],
+                expires: None,
+                key: None,
+                falsifier: Some(format!("{id} turns out not to matter")),
+                check: Some(Check::Absent { path: check_path_dir.to_string(), literal: literal.to_string() }),
+            },
+        }
+    }
+
+    #[test]
+    fn a_write_to_a_file_directly_inside_the_check_path_directory_carrying_the_literal_is_blocked() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join("config")).unwrap();
+        let items = vec![check_path_dir_item("fan-speed", "config", "fan_speed: 255")];
+        let content = "fan_speed: 255 ; regressed";
+
+        let reason = find_dir_content_violation(&items, "config/macros.cfg", content, Some(dir.path()))
+            .expect("a direct child of the check_path directory carrying the literal must be blocked");
+        assert!(reason.contains("fan-speed"), "must name the rule id: {reason}");
+        assert!(reason.contains("fan_speed: 255"), "must quote the offending fragment: {reason}");
+    }
+
+    #[test]
+    fn a_write_to_a_file_outside_the_check_path_directory_is_not_blocked() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join("config")).unwrap();
+        std::fs::create_dir(dir.path().join("other")).unwrap();
+        let items = vec![check_path_dir_item("fan-speed", "config", "fan_speed: 255")];
+        let content = "fan_speed: 255 ; regressed";
+
+        assert_eq!(
+            find_dir_content_violation(&items, "other/macros.cfg", content, Some(dir.path())),
+            None,
+            "a file outside the named directory must never be blocked"
+        );
+    }
+
+    #[test]
+    fn a_write_to_a_file_in_a_subdirectory_of_the_check_path_directory_is_not_blocked() {
+        // THE DEFECT THIS PREVENTS: a recursive reading would reach into a
+        // vendored dependency, a build output, or an archived backup nested
+        // underneath the named directory - see `file_is_direct_child_of`'s
+        // own doc comment. Deliberately the OPPOSITE assertion from
+        // `a_dir_anchored_content_rule_blocks_a_file_several_levels_deep`
+        // above, because this is a different anchor shape with a
+        // deliberately different (non-recursive) reach.
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join("config")).unwrap();
+        std::fs::create_dir(dir.path().join("config").join("archive")).unwrap();
+        let items = vec![check_path_dir_item("fan-speed", "config", "fan_speed: 255")];
+        let content = "fan_speed: 255 ; regressed";
+
+        assert_eq!(
+            find_dir_content_violation(&items, "config/archive/old-macros.cfg", content, Some(dir.path())),
+            None,
+            "a file nested in a subdirectory must never be reached - non-recursive by design"
+        );
+    }
+
+    #[test]
+    fn a_check_path_naming_an_ordinary_file_is_untouched_by_the_new_directory_arm() {
+        // Regression: the classic single-file shape must keep working
+        // exactly as it always did once `find_dir_content_violation` also
+        // consults `first_check_path_dir_violation` - mirrors `a_path_
+        // anchored_item_is_invisible_to_the_dir_anchored_function` above,
+        // proven again here against the NEW arm specifically.
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("NOTES.md"), "# notes\n").unwrap();
+        let items = vec![check_path_dir_item("r1", "NOTES.md", "forbidden")];
+        let content = "this text contains the forbidden word";
+        assert_eq!(find_dir_content_violation(&items, "NOTES.md", content, Some(dir.path())), None);
+    }
+
+    #[test]
+    fn a_check_path_directory_that_does_not_exist_never_blocks() {
+        // Currency first, same as every other arm: an anchor that cannot
+        // resolve proves nothing, so it must never block - mirrors
+        // `a_dir_anchored_rule_whose_directory_no_longer_exists_never_blocks_
+        // and_is_recorded_as_stale` above for this arm's own anchor shape.
+        let dir = tempfile::tempdir().unwrap();
+        // "config" is deliberately never created.
+        let items = vec![check_path_dir_item("fan-speed", "config", "fan_speed: 255")];
+        let content = "fan_speed: 255 ; regressed";
+        assert_eq!(find_dir_content_violation(&items, "config/macros.cfg", content, Some(dir.path())), None);
+    }
+
+    #[test]
+    fn an_absent_all_check_path_directory_blocks_a_direct_file_carrying_any_literal() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join("docs")).unwrap();
+        let items = vec![LiveItem {
+            id: "typography".to_string(),
+            item: Item {
+                id: "typography".to_string(),
+                kind: Kind::Rule,
+                text: "typography: no stray punctuation in this directory".to_string(),
+                bindings: vec![Binding::Target { kind: TargetKind::Path, value: "placeholder.txt".to_string() }],
+                severity: Some(Severity::HouseStyle),
+                project: None,
+                tags: vec![],
+                expires: None,
+                key: None,
+                falsifier: Some("typography turns out not to matter".to_string()),
+                check: Some(Check::AbsentAll {
+                    path: "docs".to_string(),
+                    literals: vec!["\u{2014}".to_string(), "\u{2013}".to_string()],
+                }),
+            },
+        }];
+        let content = "an em dash \u{2014} sneaks in here";
+
+        let reason = find_dir_content_violation(&items, "docs/STYLE.md", content, Some(dir.path()))
+            .expect("must block");
+        assert!(reason.contains("typography"), "{reason}");
+    }
+
+    // ------------------- text that must remain, check_path ITSELF a directory
+    //
+    // `find_missing_required`'s own mirror of the section just above, for
+    // `Check::Contains`. THE SUBTLETY THIS GETS RIGHT: the directory's
+    // aggregate answer ("does ANY direct file hold the literal") is the
+    // wrong question for a SINGLE write - see `find_missing_required`'s own
+    // doc comment. A sibling file that never carried the literal must never
+    // be blamed for a DIFFERENT file's text disappearing.
+
+    /// A live Rule whose `Check::Contains` check_path IS itself a directory,
+    /// bound the same deliberately-unrelated way `check_path_dir_item` above
+    /// is, for the identical reason.
+    fn check_path_dir_item_requiring(id: &str, check_path_dir: &str, literal: &str) -> LiveItem {
+        LiveItem {
+            id: id.to_string(),
+            item: Item {
+                id: id.to_string(),
+                kind: Kind::Rule,
+                text: format!("{id}: keep this literal somewhere in the directory"),
+                bindings: vec![Binding::Target { kind: TargetKind::Path, value: "placeholder.txt".to_string() }],
+                severity: Some(Severity::HouseStyle),
+                project: None,
+                tags: vec![],
+                expires: None,
+                key: None,
+                falsifier: Some(format!("{id} turns out not to matter")),
+                check: Some(Check::Contains { path: check_path_dir.to_string(), literal: literal.to_string() }),
+            },
+        }
+    }
+
+    #[test]
+    fn dropping_the_required_literal_from_a_direct_file_that_currently_holds_it_is_blocked() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join("docs")).unwrap();
+        std::fs::write(dir.path().join("docs").join("LICENSE"), "Licensed under GPLv3\n").unwrap();
+        let items = vec![check_path_dir_item_requiring("license", "docs", "GPLv3")];
+
+        let reason = find_missing_required(&items, "docs/LICENSE", "Licensed under MIT now", Some(dir.path()))
+            .expect("dropping the literal from the file that currently holds it must block");
+        assert!(reason.contains("license"), "{reason}");
+        assert!(reason.contains("GPLv3"), "must name what went missing: {reason}");
+    }
+
+    #[test]
+    fn a_sibling_file_that_never_held_the_required_literal_is_never_blocked_for_lacking_it() {
+        // THE FALSE BLOCK THIS PREVENTS: the directory's own aggregate
+        // answer (does ANY direct file hold the literal) must never leak
+        // into the decision for a DIFFERENT, unrelated file that never
+        // carried it - see this section's own banner comment.
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join("docs")).unwrap();
+        std::fs::write(dir.path().join("docs").join("LICENSE"), "Licensed under GPLv3\n").unwrap();
+        std::fs::write(dir.path().join("docs").join("README.md"), "# just a readme\n").unwrap();
+        let items = vec![check_path_dir_item_requiring("license", "docs", "GPLv3")];
+
+        assert_eq!(
+            find_missing_required(&items, "docs/README.md", "# still just a readme, no license text here", Some(dir.path())),
+            None,
+            "README.md never carried the literal, so it must never be blamed for lacking it"
+        );
+    }
+
+    #[test]
+    fn a_write_that_keeps_the_required_literal_in_a_directory_scoped_file_passes() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join("docs")).unwrap();
+        std::fs::write(dir.path().join("docs").join("LICENSE"), "Licensed under GPLv3\n").unwrap();
+        let items = vec![check_path_dir_item_requiring("license", "docs", "GPLv3")];
+
+        assert!(find_missing_required(
+            &items,
+            "docs/LICENSE",
+            "Licensed under GPLv3, reformatted but still here",
+            Some(dir.path())
+        )
+        .is_none());
+    }
+
+    #[test]
+    fn a_file_in_a_subdirectory_is_not_consulted_for_the_required_literal_either() {
+        // Non-recursive, mirroring `a_write_to_a_file_in_a_subdirectory_of_
+        // the_check_path_directory_is_not_blocked` above for this arm.
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join("docs")).unwrap();
+        std::fs::create_dir(dir.path().join("docs").join("archive")).unwrap();
+        std::fs::write(dir.path().join("docs").join("archive").join("OLD-LICENSE"), "Licensed under GPLv3\n")
+            .unwrap();
+        let items = vec![check_path_dir_item_requiring("license", "docs", "GPLv3")];
+
+        assert_eq!(
+            find_missing_required(&items, "docs/archive/OLD-LICENSE", "no license text here anymore", Some(dir.path())),
+            None,
+            "a nested file must never be consulted - non-recursive by design"
+        );
     }
 
     // ------------------------------------------- block, AbsentAll (set form), dir-anchored

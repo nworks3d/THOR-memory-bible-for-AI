@@ -285,7 +285,14 @@ wherever it might be written. A check anchored to a file also catches a shell
 command that deletes it, empties it out, or overwrites it (`rm`, `truncate`,
 `sed -i`, `tee`, a redirect, `mv`/`cp` onto it) and not only a direct Edit or
 Write - though a glob in the command is never expanded to guess which files it
-might touch.
+might touch. `contains`, `absent` and `absent_all` can also point at a FOLDER
+instead of one file: then they look at every file sitting directly inside it,
+but never a file in a folder inside that one. Use this when the same fact
+lives in more than one file in the same place - a setting that has to match
+between two config files, say. Pointing the check at the folder they share
+covers both of them with one rule, without also reaching into an old backup
+copy of one of those files kept somewhere else in the project, which is what
+would happen with `forbidden`.
 
 `requires` is the odd one out: every check above asks whether some text is
 present or absent, which cannot see a forgotten field - forgetting leaves no

@@ -312,7 +312,12 @@ currency, alongside the required prose falsifier, never instead of it: a rule wh
 HOLDS is the ONLY kind of rule this memory ever uses to block a write outright; a rule backed by \
 prose alone can inform, but can never block. Use check_kind absent_all with check_literals when ONE \
 rule forbids SEVERAL literals together in one specific file - e.g. a file that must never regain a \
-TODO it was just cleaned of. Use check_kind forbidden with check_literals (never check_path - \
+TODO it was just cleaned of. check_path may also name a DIRECTORY instead of a file, for contains/ \
+absent/absent_all - reaching every regular file DIRECTLY inside it, never a file in a subdirectory: \
+use this when the SAME fact spans more than one file in that directory (e.g. a setting duplicated \
+across two config files that must agree), which needs neither picking just one of them to anchor to \
+nor a path-less forbidden that would also catch honest historical copies elsewhere in the checkout. \
+Use check_kind forbidden with check_literals (never check_path - \
 forbidden takes none) when the SAME kind of set has nothing to anchor to at all - e.g. a typography \
 rule banning six punctuation characters wherever they might be written is ONE forbidden item with a \
 six-entry set, never six near-identical items each banning one, and never absent_all anchored to one \
@@ -694,9 +699,16 @@ pub struct RememberArgs {
     #[serde(default)]
     pub check_kind: Option<String>,
     /// The exact file this check inspects, relative to the root the checker
-    /// runs against. Required together with check_kind, for every check_kind
-    /// EXCEPT forbidden - forbidden carries no path at all, and is refused
-    /// if one is given.
+    /// runs against - or, for contains/absent/absent_all only, a DIRECTORY
+    /// instead: every regular file DIRECTLY inside it, never a file in a
+    /// subdirectory. Use the directory form when one fact spans more than
+    /// one file in the same directory (e.g. a setting duplicated across two
+    /// config files that must agree) - a single check_kind can then cover
+    /// both, where naming just one file would leave the other unguarded and
+    /// a path-less "forbidden" would over-reach into honest historical
+    /// copies elsewhere in the checkout. Required together with check_kind,
+    /// for every check_kind EXCEPT forbidden - forbidden carries no path at
+    /// all, and is refused if one is given.
     #[serde(default)]
     pub check_path: Option<String>,
     /// The exact literal a "contains" or "absent" check_kind looks for.
@@ -828,9 +840,11 @@ pub struct ReviseArgs {
     /// absent_all and forbidden require check_literals instead).
     #[serde(default)]
     pub check_kind: Option<String>,
-    /// See check_kind's own note on the omit/clear/replace convention.
-    /// Refused outright if check_kind is "forbidden" - that kind carries no
-    /// path at all.
+    /// See check_kind's own note on the omit/clear/replace convention, and
+    /// RememberArgs' own note on check_path for the directory shape
+    /// contains/absent/absent_all also accept (every regular file DIRECTLY
+    /// inside it, never a subdirectory). Refused outright if check_kind is
+    /// "forbidden" - that kind carries no path at all.
     #[serde(default)]
     pub check_path: Option<String>,
     /// See check_kind's own note on the omit/clear/replace convention.

@@ -8,7 +8,7 @@
 //! the caller, never swallowed.
 
 use crate::gate::{self, Refusal};
-use crate::item::{Binding, Item, Kind};
+use crate::item::{Binding, Check, Item, Kind};
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use thor_core::cas::compute_head_sets;
@@ -440,6 +440,32 @@ pub fn declare_in(
     root: Option<&Path>,
 ) -> Result<Event, WriteError> {
     if let Some(root) = root {
+        // A `Contains`/`Absent`/`AbsentAll` check_path may now name a
+        // DIRECTORY (see `Check::Absent`'s own doc comment) - checked ONLY
+        // in the one shape this can decide without breaking the existing,
+        // deliberate leniency for a FILE check_path that is not written yet
+        // (see the `deliberate-anchor` tag `archive` already honours for
+        // that pattern): when `check_path` ALREADY resolves, right now, to a
+        // real directory, `gate::check_dir_check_path_exists` re-proves it
+        // is not one of the filesystem's own roots. A check_path that
+        // resolves to nothing at all is left exactly as ambiguous as it
+        // always was between "a file not written yet" and "a directory not
+        // created yet" - this cannot tell the two apart any more than
+        // `declare`'s own pure validation could, so it is not refused here;
+        // see this project's own report on this change for the exact,
+        // narrower gap that leaves open (a directory check_path with a typo
+        // is not caught until something is written under it).
+        let dir_check_path = item.check.as_ref().and_then(|check| match check {
+            Check::Contains { path, .. } | Check::Absent { path, .. } | Check::AbsentAll { path, .. } => {
+                Some(path.as_str())
+            }
+            Check::PathExists { .. } | Check::Forbidden { .. } | Check::Requires { .. } => None,
+        });
+        if let Some(path) = dir_check_path {
+            if root.join(path).is_dir() {
+                gate::check_dir_check_path_exists(path, root).map_err(WriteError::Refused)?;
+            }
+        }
         let stale = unsettled_neighbours(store, &normalized(item), root).map_err(WriteError::Store)?;
         if !stale.is_empty() {
             let named = stale

@@ -131,7 +131,14 @@ fn is_route_like(v: &str) -> bool {
 /// after it as a web route and refuses it as a place. `/tmp` is not a route on
 /// any machine this runs on; neither are the others below. A closed list, not
 /// a guess: anything outside it keeps the old reading.
-fn is_a_root_directory(v: &str) -> bool {
+///
+/// `pub(crate)` for a second caller: `gate::check_path` reuses this SAME
+/// closed list to refuse a `Check::Contains`/`Absent`/`AbsentAll`/
+/// `PathExists` whose check_path names one of these directories outright -
+/// the identical "too broad to mean anything" judgement this function
+/// already makes for a `Dir` Target binding, never a second, independently
+/// maintained list.
+pub(crate) fn is_a_root_directory(v: &str) -> bool {
     const ROOTS: &[&str] = &[
         "/tmp", "/var", "/etc", "/usr", "/opt", "/home", "/root", "/srv", "/mnt", "/media", "/dev",
         "/proc", "/bin", "/sbin", "/lib",

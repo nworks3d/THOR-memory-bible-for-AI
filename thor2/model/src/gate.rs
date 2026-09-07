@@ -16,6 +16,7 @@ use crate::normalize::{last_segment, normalize_target};
 use intent::Action;
 use std::collections::HashSet;
 use std::fmt;
+use std::path::Path;
 
 /// A rule/orientation whose text is unreadable at a glance is not readable
 /// at the moment of action either. Measured on the real 301-line corpus:
@@ -231,6 +232,81 @@ fn check_path(path: &str) -> Result<(), Refusal> {
         return Err(Refusal::new(
             format!("the check path '{path}' contains a glob wildcard, so it does not name one exact file"),
             "name the exact file this check must look at instead of a glob pattern",
+        ));
+    }
+    // GROUND 26: a check_path naming one of the filesystem's own root-level
+    // directories is too broad to mean anything, the identical judgement
+    // `check_target_binding` already makes for a `Dir` Target value (see
+    // `anchor_shape::is_a_root_directory`, reused here rather than a second,
+    // independently maintained list). Applies to every path-carrying form,
+    // `PathExists` included: since `Contains`/`Absent`/`AbsentAll` now accept
+    // a directory as well as a file (see `Check::Absent`'s own doc comment),
+    // this is the one place, at write time, that can refuse the shape
+    // lexically, with no filesystem to resolve against - it catches an
+    // absolute spelling like "/tmp" outright; a RELATIVE directory that only
+    // resolves to something this broad (a bare "." naming the whole
+    // checkout) is a known, narrower gap - see this project's own report on
+    // this change for why it is flagged rather than guessed at here.
+    if anchor_shape::is_a_root_directory(path.trim()) {
+        return Err(Refusal::new(
+            format!("the check path '{path}' is one of the filesystem's own root-level directories"),
+            "name the exact file, or the specific project directory, this check must look at - never a system-wide root",
+        ));
+    }
+    Ok(())
+}
+
+/// The write-time counterpart to `check_path` above for the one thing a pure,
+/// root-less validator cannot decide: whether a check_path a caller means to
+/// use as a DIRECTORY (see `Check::Absent`'s own doc comment on the two
+/// shapes one path can carry) actually resolves to a real, existing,
+/// non-root-level one. `check_path`/`check_check`/`declare` stay pure on
+/// purpose (no filesystem, no root - see `proves_something`'s own doc
+/// comment: "declare is pure and has no filesystem root to resolve
+/// against"), so this lives beside them rather than inside them, callable
+/// only where a root is actually available - `store::declare_in` is that
+/// caller today (see its own doc comment on the neighbourhood toll, the
+/// identical shape: a check needing a root simply does not run without one).
+///
+/// Three outcomes, proven directly below rather than inferred from
+/// `declare_in`'s own narrower use of this (see that function's doc comment
+/// for exactly when it calls this and why it only ever exercises two of the
+/// three):
+///   - `path`, resolved against `root`, is a real, existing directory that is
+///     not one of the filesystem's own roots: accepted.
+///   - it does not exist there at all: refused - unlike an ordinary FILE
+///     check_path (which may legitimately name something not written yet;
+///     see the `deliberate-anchor` tag `store::archive` already honours for
+///     that pattern), a directory this check is meant to scan cannot mean
+///     anything before it exists, so a typo is caught here instead of
+///     silently producing a check that can only ever report `CannotRun`.
+///   - it resolves to one of `anchor_shape::is_a_root_directory`'s own closed
+///     list: refused, the same judgement `check_path` above already makes
+///     lexically, reproven here against the real, resolved path rather than
+///     the raw string, for a check_path that only becomes root-like once
+///     `root` is joined onto it.
+pub fn check_dir_check_path_exists(path: &str, root: &Path) -> Result<(), Refusal> {
+    // Cheap and lexical first, exactly the order `check_path` above already
+    // keeps between its own glob check and this same judgement: a root-level
+    // directory is refused on its spelling alone, before anything touches
+    // the filesystem. This ordering is not just style here - resolving an
+    // ABSOLUTE value like "/tmp" against `root` on Windows does not join it
+    // as a subdirectory at all (`Path::join` on an absolute or root-anchored
+    // path replaces everything but `root`'s own drive prefix, the identical
+    // footgun `check::resolve_within_root`'s own doc comment describes), so
+    // checking existence first would answer "does not exist" for entirely
+    // the wrong path, never reaching this judgement at all.
+    if anchor_shape::is_a_root_directory(path.trim()) {
+        return Err(Refusal::new(
+            format!("'{path}' is one of the filesystem's own root-level directories"),
+            "name the specific project directory this check must look at - never a system-wide root",
+        ));
+    }
+    let resolved = root.join(path);
+    if !resolved.is_dir() {
+        return Err(Refusal::new(
+            format!("the directory '{path}' does not exist in this checkout"),
+            "create the directory first, or correct the path if this was a typo - a directory check_path has to be there to mean anything",
         ));
     }
     Ok(())
@@ -2929,6 +3005,91 @@ mod tests {
         let mut item = base(Kind::Orientation);
         item.check = Some(Check::Absent { path: "src/main.rs".to_string(), literal: "TODO".to_string() });
         assert!(declare(&item).is_ok());
+    }
+
+    // -------------------------------------------------------- ground 26
+    //
+    // A check_path may now name a DIRECTORY as well as a file (see
+    // `Check::Absent`'s own doc comment on the two shapes) - refused here,
+    // purely lexically, when that directory is one of the filesystem's own
+    // roots, reusing the SAME closed list `check_target_binding` already
+    // applies to a `Dir` Target value (`anchor_shape::is_a_root_directory`),
+    // never a second, independently maintained one.
+
+    #[test]
+    fn a_check_path_naming_a_root_level_directory_is_refused() {
+        let mut item = base(Kind::Orientation);
+        item.check = Some(Check::Absent { path: "/tmp".to_string(), literal: "danger".to_string() });
+        let err = declare(&item).unwrap_err();
+        assert!(err.problem.contains("root-level"), "names what is wrong: {}", err.problem);
+    }
+
+    #[test]
+    fn a_check_path_naming_an_ordinary_project_directory_is_accepted() {
+        // THE FALSE REFUSAL THIS AVOIDS: ground 26 must refuse only the
+        // closed list of filesystem-wide roots, never an ordinary project
+        // directory that merely happens to hold more than one file - exactly
+        // the shape the whole directory feature exists to accept.
+        let mut item = base(Kind::Orientation);
+        item.check = Some(Check::Absent { path: "P1-5/config".to_string(), literal: "danger".to_string() });
+        assert!(declare(&item).is_ok());
+    }
+
+    #[test]
+    fn a_path_exists_check_naming_a_root_level_directory_is_also_refused() {
+        // Ground 26 is shared, unconditionally, by every path-carrying form
+        // - proven again here, not just assumed, the same way ground 15's
+        // own tests re-prove ground 13/14 for AbsentAll rather than trusting
+        // the shared code path by inspection alone.
+        let mut item = base(Kind::Orientation);
+        item.check = Some(Check::PathExists { path: "/var".to_string() });
+        assert!(declare(&item).is_err());
+    }
+
+    // ------------------------------------- check_dir_check_path_exists
+    //
+    // The root-aware counterpart to `check_path`/ground 26 above (see that
+    // function's own doc comment for why it cannot live in `declare`'s pure
+    // validation): whether a check_path meant as a DIRECTORY actually
+    // resolves to a real, existing, non-root-level one. Exercised directly
+    // here, never through `declare`/`declare_in`: `declare` has no root at
+    // all to prove existence against, and `declare_in` (`model::store`) only
+    // ever calls this once it has ALREADY confirmed the path is a directory
+    // - see that function's own doc comment for exactly why "missing" is
+    // reachable here but not through that wiring.
+
+    #[test]
+    fn check_dir_check_path_exists_accepts_a_real_existing_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join("config")).unwrap();
+        assert!(check_dir_check_path_exists("config", dir.path()).is_ok());
+    }
+
+    #[test]
+    fn check_dir_check_path_exists_refuses_a_directory_that_is_not_there() {
+        let dir = tempfile::tempdir().unwrap();
+        let err = check_dir_check_path_exists("never-created", dir.path()).unwrap_err();
+        assert!(err.problem.contains("does not exist"), "names what is wrong: {}", err.problem);
+    }
+
+    #[test]
+    fn check_dir_check_path_exists_refuses_an_existing_file_the_same_way_as_a_missing_directory() {
+        // A file is not a directory, whatever its name suggests: this
+        // function's whole contract is "does this name a usable directory",
+        // so an existing FILE is refused exactly like a path that is not
+        // there at all, never silently accepted as though it were the
+        // classic single-file check_path shape - that leniency belongs to
+        // `check_path`/`declare`, never to this function.
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("calibrate.cfg"), b"fan_speed: 100").unwrap();
+        assert!(check_dir_check_path_exists("calibrate.cfg", dir.path()).is_err());
+    }
+
+    #[test]
+    fn check_dir_check_path_exists_refuses_a_root_level_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        let err = check_dir_check_path_exists("/tmp", dir.path()).unwrap_err();
+        assert!(err.problem.contains("root-level"), "names what is wrong: {}", err.problem);
     }
 
     // -------------------------------------------------------- ground 15

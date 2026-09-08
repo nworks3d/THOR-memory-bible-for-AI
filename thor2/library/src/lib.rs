@@ -1050,6 +1050,27 @@ mod tests {
         assert!(lib.retire(id, "   ").is_err());
     }
 
+    /// The exclusion has to reach every read path, not only the plain shelf
+    /// listing - a search that still surfaced a retired entry would make
+    /// "nothing is deleted" read as "nothing is ever really gone from view".
+    #[test]
+    fn a_retired_entry_is_also_excluded_from_search() {
+        let (lib, _d) = stocked();
+        let id = lib.add("eten", "Mislukt experiment met bier in het deeg", "", &[]).unwrap();
+        lib.retire(id, "smaakte nergens naar").unwrap();
+
+        match lib.search("mislukt experiment", None).unwrap() {
+            Found::ShelvesInstead { .. } => {}
+            other => panic!("a retired entry must not be found by a library-wide search, got {other:?}"),
+        }
+        match lib.search("mislukt experiment", Some("eten")).unwrap() {
+            Found::ShelfInstead { entries, .. } => {
+                assert!(!entries.iter().any(|e| e.id == id), "not even when the search is aimed at its own shelf");
+            }
+            other => panic!("expected the shelf back with the retired entry excluded, got {other:?}"),
+        }
+    }
+
     // -------------------------------------------------------------- search
 
     /// THE MEASURED DEFECT THIS CLOSES. On the code side "ribbetjes" returned

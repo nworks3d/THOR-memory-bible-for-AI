@@ -28,6 +28,11 @@ fn fact_type_str(ft: Option<FactType>) -> Option<&'static str> {
 }
 
 fn main() {
+    if std::env::args().any(|a| thor_core::is_version_flag(&a)) {
+        println!("footer_read {}", env!("CARGO_PKG_VERSION"));
+        return;
+    }
+
     let stdin = io::stdin();
     let stdout = io::stdout();
     let mut out = stdout.lock();

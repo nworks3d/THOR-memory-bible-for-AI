@@ -28,11 +28,11 @@ makes structurally impossible and the test that enforces it.
 
 | where | what |
 |---|---|
-| `core/`, `model/`, `intent/`, `serve/`, `mcp/`, `codeindex/`, `ops/` | the seven crates. This is the product. |
+| `core/`, `model/`, `intent/`, `serve/`, `mcp/`, `library/`, `codeindex/`, `ops/` | the eight crates. This is the product. |
 | `CONTRACT.md` | the standard the build is judged against. Read this first. |
 | `SPEC-ENFORCEMENT.md` | how the enforcement layer is specified. |
 | `JUDGE-TRANSPORT.md` | the write-up of the judge transport experiment. |
-| `deploy/` | the container build for running a copy on a NAS or a server. |
+| `deploy/` | the container builds: a replica for a NAS or a server, and the stand-alone memory server that seeds its own store on first start. |
 | `eval/` | the measurement record and the one-off scaffolding behind it. Ignored by git in full. |
 
 `eval/` is ignored deliberately and not as an oversight. It holds measurement
@@ -44,7 +44,7 @@ This directory sits inside the THOR repository rather than beside it. Every
 numbered version of THOR is the same project rebuilt, so it belongs in the same
 place; the number says a real rebuild happened, not that a new project started.
 
-## The seven crates
+## The eight crates
 
 | crate | job |
 |---|---|
@@ -52,7 +52,8 @@ place; the number says a real rebuild happened, not that a new project started.
 | `core` | the append-only event log the whole thing is built on. |
 | `intent` | reads what an agent is about to do and turns it into a moment a rule can bind to. |
 | `serve` | everything the agent sees: session start, the pre-tool gate, the write guard, lookup. |
-| `mcp` | the sixteen tools an agent calls: six write and state operations (remember, revise, retract, mark, pin, unpin), five read operations (get, history, status, resolve, lookup), three code analysis tools (search_code, where_used, outline), and two library tools (library, shelve). |
+| `mcp` | the sixteen tools an agent calls: seven write and state operations (remember, revise, retract, mark, pin, unpin, resolve), four read operations (get, history, status, lookup), three code analysis tools (search_code, where_used, outline), and two library tools (library, shelve). |
+| `library` | the everyday-knowledge library behind the two library tools - shelves and entries, kept apart from the event log above. This crate cannot reach that log at all: it depends on nothing from that side. |
 | `codeindex` | a map of every symbol in your source, rebuilt from the code itself. It is what answers "who calls this" and "what breaks if I change it". |
 | `ops` | install, doctor, backup, sync. |
 
@@ -201,6 +202,11 @@ rule is one entry with:
 target/release/doctor.exe --db "<store>"
 ```
 
+Its first line always names the build it was run from (`doctor 2.3.2`), so a
+report you paste somewhere says which version made it - every program in this
+directory answers the same way to `--version` or `-V`, on its own, with no
+store needed.
+
 It tells you whether the store is healthy, whether searching by meaning is on,
 how many rules carry a runnable proof, how many anchors point at nothing, how
 many rules still lack a falsifier, and how many live items are bound only to a
@@ -212,9 +218,10 @@ Two of those checks - whether an old reference still points at a real file,
 and whether some facts never win a place - need to know where your other
 checkouts live, normally via `--checkouts <dir>`. Leave that flag off and
 doctor now guesses: it looks at the folder just above the repo you ran it
-from. The first line it prints always says which folder it ended up using -
-the one you gave it, its own guess, or, if it could not find either, a plain
-note that those two checks did not run this time and how to make them run.
+from. The line right after its version always says which folder it ended up
+using - the one you gave it, its own guess, or, if it could not find either, a
+plain note that those two checks did not run this time and how to make them
+run.
 
 One line only speaks up when there is something to say: `wal`, the size of the
 store's own write-ahead log. It stays silent for the ordinary case of a log
@@ -247,6 +254,15 @@ to append to the log. A second machine (a NAS, a server you can reach from
 your phone) can hold a copy and answer reads from it, but if it ever wrote to
 its own copy the two logs would fork, and the next replication would be
 refused with no way back except rebuilding the copy.
+
+Keeping that copy up to date is `sync ship`'s job, usually run on a schedule
+(once an hour, for example): it sends only the events the copy is still
+missing. A receiver that refuses a batch or simply never answers now fails
+that run loudly - a bounded timeout so it cannot hang, one line on stderr
+naming what went wrong, and a non-zero exit code - instead of leaving a
+scheduled task stuck and silent for weeks; and `doctor` names a copy whose
+last successful ship has gone stale, so a broken schedule shows up there even
+if nobody is watching the task itself.
 
 So a write arriving at the copy is not applied there. It is queued, and the
 authority applies it later. Three commands, in the order you set them up:
@@ -295,7 +311,7 @@ tunnel, never on the open internet.
 cd thor2 && cargo test --workspace --all-targets
 ```
 
-1043 tests across 72 binaries, all green as of 2026-08-07. Every refusal the
+1623 tests across 96 binaries, all green as of 2026-09-08. Every refusal the
 write gate can produce has a test named after the defect it prevents. A refusal
 reason with no test does not exist, by the contract's own rule.
 
@@ -388,5 +404,11 @@ example: a rule bound to the commands `Agent` and `Workflow`, with literals
 three cheap models is refused, and so is a `Workflow` call, because the rule
 watches both bindings it is bound to, not only the one spelled out as the
 trigger.
+
+One more thing `revise` refuses without asking first: weakening a rule that
+already carries a check - clearing or changing the check, lowering its
+severity, dropping a binding, or narrowing it from every project to one -
+needs a `because`, the same way `retract` has always needed a reason, and it
+lands in the item's own history right beside what changed.
 
 The store is the source. Every document, this one included, is a mirror of it.

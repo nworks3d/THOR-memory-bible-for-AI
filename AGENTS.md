@@ -238,9 +238,11 @@ the same way a full set of preferences would.
   competing with every other project's notes. Skip it and every fact stays
   global - fine with one project, noisy once there is more than one.
 - **That the memory is theirs to correct.** A changed fact is corrected with
-  `revise`, never stored a second time. A fact that is simply wrong is
-  removed with `retract` and a reason. A true fact that fired in the wrong
-  place is marked as noise with `mark`, instead of being deleted.
+  `revise`, never stored a second time - though taking teeth away from a rule
+  that can already block a mistake (its check, its severity, a binding, its
+  reach) needs a reason too, the same as removing one. A fact that is simply
+  wrong is removed with `retract` and a reason. A true fact that fired in the
+  wrong place is marked as noise with `mark`, instead of being deleted.
 
 Apply each answer where it belongs - a reply-shape rule in the rulebook file,
 a standing preference as a stored fact - then store a short summary of what he
@@ -266,6 +268,11 @@ or a note that has never been asked whether it can refuse anything. Each has one
 honest way out, and the message says which. Saying it in your reply settles
 nothing - the fix has to be a real change to the note, or the tag that records
 the decision.
+
+The first of those only ever names a note THIS session actually saw fire -
+never one that only ever showed up during other, unrelated work. Answer for
+one and this session will not ask about that same note again, however many
+more times it fires before the session ends.
 
 ## If you are talking to a remote copy
 

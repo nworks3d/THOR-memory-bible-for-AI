@@ -28,7 +28,11 @@ use std::process::ExitCode;
 use thor_core::event_store::EventStore;
 
 #[derive(Parser)]
-#[command(name = "repair-project", about = "Move items whose project NAMES the global tier onto the global tier")]
+#[command(
+    name = "repair-project",
+    version = env!("CARGO_PKG_VERSION"),
+    about = "Move items whose project NAMES the global tier onto the global tier"
+)]
 struct Cli {
     #[arg(long)]
     db: PathBuf,

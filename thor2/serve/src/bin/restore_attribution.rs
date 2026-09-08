@@ -37,7 +37,11 @@ use std::process::ExitCode;
 use thor_core::event_store::EventStore;
 
 #[derive(Parser)]
-#[command(name = "restore-attribution", about = "Give back the project attribution the migration dropped")]
+#[command(
+    name = "restore-attribution",
+    version = env!("CARGO_PKG_VERSION"),
+    about = "Give back the project attribution the migration dropped"
+)]
 struct Cli {
     /// The 2.0 store to repair.
     #[arg(long)]

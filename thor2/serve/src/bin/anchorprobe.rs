@@ -25,6 +25,11 @@ use serve::input::ServeInput;
 use thor_core::event_store::EventStore;
 
 fn main() -> anyhow::Result<()> {
+    if std::env::args().any(|a| thor_core::is_version_flag(&a)) {
+        println!("anchorprobe {}", env!("CARGO_PKG_VERSION"));
+        return Ok(());
+    }
+
     let mut args = std::env::args().skip(1);
     let db = args.next().unwrap_or_default();
     if db.is_empty() {

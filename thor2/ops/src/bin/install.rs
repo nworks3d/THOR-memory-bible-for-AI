@@ -30,6 +30,7 @@ use std::process::ExitCode;
 #[derive(Parser)]
 #[command(
     name = "install",
+    version = env!("CARGO_PKG_VERSION"),
     about = "Set THOR up: create the store, wire the hooks, register the tool server"
 )]
 struct Cli {

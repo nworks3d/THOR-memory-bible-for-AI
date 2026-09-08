@@ -7,6 +7,42 @@ pub mod repo;
 pub mod backup;
 pub mod ledger;
 
+/// True when `arg` is either spelling of the version flag. THE GAP THIS
+/// CLOSES: verified 2026-09-08 by grepping every binary in the workspace for
+/// `CARGO_PKG_VERSION` and finding it nowhere - no binary answered
+/// `--version`, `status` carried no version line, and MCP's own serverInfo
+/// showed only the SDK's version, so a client's tool list, a pasted bug
+/// report or the public directory could not say which THOR build was
+/// running; only a build log or git tag could ever answer that.
+///
+/// Shared, at zero new dependency cost, by this crate's own two hand-rolled
+/// binaries (`verify`, `footer_read`) and by `serve`'s hand-rolled top-of-main
+/// check (`serve` already depends on this crate for its store). `codeindex`
+/// and `library` parse argv by hand too, but neither already depends on this
+/// crate - `library` in particular depends on NOTHING from the code side on
+/// purpose (see its own Cargo.toml) - so each keeps its own inline check
+/// rather than the workspace gaining a new dependency edge to dedupe one
+/// boolean expression further. Every clap-based binary gets clap's own
+/// `#[command(version = ...)]` instead of this at all, since that already
+/// recognises both spellings and prints/exits on its own.
+pub fn is_version_flag(arg: &str) -> bool {
+    arg == "--version" || arg == "-V"
+}
+
+#[cfg(test)]
+mod version_flag_tests {
+    use super::is_version_flag;
+
+    #[test]
+    fn recognises_both_spellings_and_nothing_else() {
+        assert!(is_version_flag("--version"));
+        assert!(is_version_flag("-V"));
+        assert!(!is_version_flag("-v"), "lowercase -v is a different, unclaimed flag");
+        assert!(!is_version_flag("--rebuild-fts"));
+        assert!(!is_version_flag("thor.db"));
+    }
+}
+
 // The comprehensive_tests module below is ported unchanged (module name and
 // all) from thor/src/lib.rs lines 35-564 of the 1.0 crate. It exercises
 // event_store, cas and auditor together and does not reference any

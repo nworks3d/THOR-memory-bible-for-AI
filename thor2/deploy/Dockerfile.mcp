@@ -10,10 +10,19 @@
 #
 # 1. `mcp` refuses to start when the store does not exist, on purpose: a
 #    server that quietly creates an empty memory next to a typo in the path
-#    is worse than one that stops and says the path is wrong. A container
-#    starts with no store at all, so the entry point below writes one first
-#    note, which is what creates the file. Mount a real store on /data and
-#    that step is skipped and yours is opened untouched.
+#    is worse than one that stops and says the path is wrong (see
+#    core::event_store::EventStore::open_existing). A container starts with
+#    no store at all, so deploy/entrypoint.sh runs first and brings up a
+#    properly seeded one - the working contract and the response-guard
+#    rulebook, not a single placeholder note - before handing off to `mcp`.
+#    Mount a real store on /data and that step is skipped and yours is opened
+#    untouched; see entrypoint.sh's own header for the full account.
+#
+#    This is this image's own default; it says nothing about the OTHER
+#    Dockerfile beside this one. `deploy/Dockerfile` (the NAS replica) still
+#    defaults to starting the log-shipping receiver, and does so on purpose -
+#    deploy/docker-compose.yml's thor2-recv service pins that role with its
+#    own explicit command, so it never depends on either image's default.
 #
 # 2. No `semantic` feature. That pulls in the ONNX runtime and the embedding
 #    model, which is a large download and a lot of build time for something
@@ -29,8 +38,10 @@
 FROM rust:1-bookworm AS build
 WORKDIR /src
 COPY thor2/ ./
-# `model` comes along only to create the first store - see the entry point.
-RUN cargo build --release --bin mcp --bin model
+# `initstore` is the headless store bootstrap deploy/entrypoint.sh calls on a
+# first start - see its own doc comment for why that is a separate binary
+# from `install` rather than `install` itself.
+RUN cargo build --release --bin mcp --bin initstore
 
 FROM debian:bookworm-slim
 
@@ -53,7 +64,7 @@ RUN apt-get update \
  && apt-get install -y --no-install-recommends ca-certificates \
  && rm -rf /var/lib/apt/lists/*
 COPY --from=build /src/target/release/mcp /usr/local/bin/mcp
-COPY --from=build /src/target/release/model /usr/local/bin/model
+COPY --from=build /src/target/release/initstore /usr/local/bin/initstore
 
 # The store lives here. Mount a volume to keep what the memory learns; without
 # one it starts empty every run, which is fine for a health check and useless
@@ -61,19 +72,10 @@ COPY --from=build /src/target/release/model /usr/local/bin/model
 ENV THOR_DB=/data/thor.db
 VOLUME /data
 
-# Written here rather than copied in, so this file stands on its own: a
-# directory that only accepts a Dockerfile can build it with nothing else.
-RUN printf '%s\n' \
-  '#!/bin/sh' \
-  'set -e' \
-  'if [ ! -f "$THOR_DB" ]; then' \
-  '  mkdir -p "$(dirname "$THOR_DB")"' \
-  '  model --db "$THOR_DB" declare --id container-first-note --kind report \' \
-  '    --project getting-started \' \
-  '    --text "This memory was created empty by the container image, because the memory server opens an existing store and never creates one. Replace it by mounting your own store on /data." >/dev/null' \
-  'fi' \
-  'exec mcp --db "$THOR_DB"' \
-  > /usr/local/bin/thor-mcp \
- && chmod +x /usr/local/bin/thor-mcp
+# Copied from the build stage's own checkout rather than the host context
+# directly, so this Dockerfile only ever reads through the one COPY at the
+# top (`COPY thor2/ ./`) - see entrypoint.sh for what this actually does.
+COPY --from=build /src/deploy/entrypoint.sh /usr/local/bin/entrypoint.sh
+RUN chmod +x /usr/local/bin/entrypoint.sh
 
-ENTRYPOINT ["/usr/local/bin/thor-mcp"]
+ENTRYPOINT ["/usr/local/bin/entrypoint.sh"]

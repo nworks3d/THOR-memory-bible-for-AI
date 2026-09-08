@@ -46,6 +46,11 @@
 use std::io::{Read, Write};
 
 fn main() {
+    if std::env::args().any(|a| thor_core::is_version_flag(&a)) {
+        println!("fake_judge {}", env!("CARGO_PKG_VERSION"));
+        return;
+    }
+
     let mut discard = String::new();
     let _ = std::io::stdin().read_to_string(&mut discard);
 

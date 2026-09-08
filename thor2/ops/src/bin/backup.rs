@@ -19,6 +19,7 @@ use thor_core::event_store::EventStore;
 #[derive(Parser)]
 #[command(
     name = "backup",
+    version = env!("CARGO_PKG_VERSION"),
     about = "Export the event log into a git clone, then commit and push it"
 )]
 struct Cli {
@@ -132,6 +133,14 @@ fn main() -> ExitCode {
     match backup::backup_to_repo(&store, &repo, &cli.subdir, cli.force) {
         Ok(line) => {
             println!("{line}");
+            // The person who only ever reads this one line (this binary runs
+            // far more often than `doctor` does) still learns the copy on
+            // the NAS has gone stale - see `ops::health::ship_line`'s own
+            // doc comment for why it prints nothing at all when this machine
+            // was never the one doing the shipping.
+            if let Some(ship) = ops::health::ship_line(&cli.db) {
+                println!("{ship}");
+            }
             ExitCode::SUCCESS
         }
         Err(e) => {

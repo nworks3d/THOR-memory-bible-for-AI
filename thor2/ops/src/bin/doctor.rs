@@ -5,7 +5,11 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 
 #[derive(Parser)]
-#[command(name = "doctor", about = "One plain-language line per component: the memory store, the code index, the replica, and how many rules still lack a falsifier")]
+#[command(
+    name = "doctor",
+    version = env!("CARGO_PKG_VERSION"),
+    about = "One plain-language line per component: the memory store, the code index, the replica, and how many rules still lack a falsifier"
+)]
 struct Cli {
     #[arg(long)]
     db: PathBuf,
@@ -62,6 +66,7 @@ struct Cli {
 
 fn main() -> ExitCode {
     let cli = Cli::parse();
+    println!("{}", ops::health::version_line());
 
     let token = match &cli.to {
         Some(_) => match std::env::var("THOR_SYNC_TOKEN") {
@@ -89,7 +94,24 @@ fn main() -> ExitCode {
     let checkouts = checkouts_root.as_path();
 
     println!("{}", ops::health::checkouts_root_line(&checkouts_root));
-    for line in ops::health::report(&cli.db, cli.index_db.as_deref(), cli.repo.as_deref(), replica, cli.model_dir.as_deref(), checkouts, cli.full) {
+    // This checkout's own project, the same resolver every real injection
+    // surface uses (`serve::project::resolve_project`) - an explicit --repo
+    // wins (it already names the checkout `code_index_line` above checks
+    // against), otherwise fall back to where doctor itself is standing, the
+    // same default `resolve_checkouts_root` already applies to --checkouts.
+    // Feeds `judgement_debt_line`'s own project-scoped half; see that
+    // function's doc comment for why doctor needs this at all.
+    let checkout_project = serve::project::resolve_project(cli.repo.as_deref().unwrap_or(&cwd));
+    for line in ops::health::report(
+        &cli.db,
+        cli.index_db.as_deref(),
+        cli.repo.as_deref(),
+        replica,
+        cli.model_dir.as_deref(),
+        checkouts,
+        cli.full,
+        checkout_project.as_deref(),
+    ) {
         println!("{line}");
     }
 

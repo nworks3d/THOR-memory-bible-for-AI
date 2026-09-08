@@ -9,7 +9,11 @@ use std::str::FromStr;
 use thor_core::event_store::EventStore;
 
 #[derive(Parser)]
-#[command(name = "model", about = "Declare and show typed memory items (Rule/Orientation/Report/Lookup)")]
+#[command(
+    name = "model",
+    version = env!("CARGO_PKG_VERSION"),
+    about = "Declare and show typed memory items (Rule/Orientation/Report/Lookup)"
+)]
 struct Cli {
     /// Path to the core event-log database.
     #[arg(long)]

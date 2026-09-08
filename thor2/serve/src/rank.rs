@@ -71,7 +71,16 @@ pub use model::normalize::target_matches;
 /// `Chunk`/`Lookup`. An item bound to BOTH `Always` and a real `Moment`/
 /// `Target` still reaches the moment/prompt surfaces through that other
 /// binding; only the `Always` binding itself is inert here.
-fn binding_matches(binding: &Binding, input: &ServeInput) -> bool {
+///
+/// `item_project` is the CANDIDATE's own scope (never the session's - that
+/// comparison already happened in `select`'s own `project::applies_to`
+/// filter before this function is ever called), and `input.root` is the
+/// session's own project root, when one was resolved. Both exist only to
+/// feed `absent_guard::scoped_target_matches`'s own root-aware Path/Dir
+/// comparison - see that function's own doc comment for why a bare
+/// `target_matches` let a project-scoped, repo-relative anchor reach a file
+/// far outside the project (measured 2026-09-08).
+fn binding_matches(binding: &Binding, input: &ServeInput, item_project: Option<&str>) -> bool {
     match binding {
         Binding::Always => false,
         Binding::Moment(action) => input.moments.contains(action),
@@ -92,10 +101,16 @@ fn binding_matches(binding: &Binding, input: &ServeInput) -> bool {
             .targets
             .iter()
             .any(|(k, v)| *k == TargetKind::Command && crate::absent_guard::command_anchor_names(value, v)),
+        // Path/Dir (and every other kind: Symbol/Host/Route/Project, where
+        // `scoped_target_matches` itself falls straight through to the plain
+        // `target_matches` below, unchanged) go through the ONE root-aware
+        // comparison - never `target_matches` directly any more, so a
+        // project-scoped anchor can no longer reach a file the project's own
+        // root does not contain.
         Binding::Target { kind, value } => input
             .targets
             .iter()
-            .any(|(k, v)| target_matches(*kind, value, *k, v)),
+            .any(|(k, v)| crate::absent_guard::scoped_target_matches(item_project, *kind, value, *k, v, input.root.as_deref())),
     }
 }
 
@@ -130,7 +145,7 @@ pub fn select(candidates: &[LiveItem], input: &ServeInput) -> Vec<RankedItem> {
         // this surface's four slots in every project - see
         // `project::applies_to` for the measurement that found it.
         .filter(|c| crate::project::applies_to(c.item.project.as_deref(), input.project.as_deref()))
-        .filter(|c| c.item.bindings.iter().any(|b| binding_matches(b, input)))
+        .filter(|c| c.item.bindings.iter().any(|b| binding_matches(b, input, c.item.project.as_deref())))
         .map(|c| RankedItem { id: c.id.clone(), item: c.item.clone() })
         .collect();
 
@@ -205,6 +220,7 @@ mod tests {
     use crate::input::ServeInput;
     use intent::Action;
     use model::item::{Binding, Item, Kind, Severity, TargetKind};
+    use std::path::PathBuf;
 
     fn base(id: &str, kind: Kind) -> LiveItem {
         LiveItem {
@@ -239,6 +255,7 @@ mod tests {
             project: None,
             command: None,
             file: None,
+            root: None,
         }
     }
 
@@ -258,6 +275,7 @@ mod tests {
             project: name.map(str::to_string),
             command: None,
             file: None,
+            root: None,
         }
     }
 
@@ -299,6 +317,57 @@ mod tests {
         let hits = select(&candidates, &in_project(None));
         let ids: Vec<&str> = hits.iter().map(|r| r.id.as_str()).collect();
         assert_eq!(ids, vec!["g"]);
+    }
+
+    // -------------------------------------------------- root-aware reach
+    //
+    // THE DEFECT THIS PREVENTS, measured in a real session (2026-09-08): a
+    // Rule scoped to a project, anchored at a repo-relative "README.md",
+    // reached a foreign clone's own README.md sitting entirely outside the
+    // project - `binding_matches` compared by bare suffix
+    // (`model::normalize::target_matches`) with no notion of a root at all.
+    // See `absent_guard::scoped_target_matches`'s own doc comment for the
+    // three rules `select` now applies through it, and that function's own
+    // test module for the unit-level cases (docs/README.md, Dir containment,
+    // absolute anchors, no root resolved).
+
+    #[test]
+    fn a_project_scoped_relative_path_anchor_never_reaches_a_file_outside_the_session_root() {
+        let mut c = owned_by("readme-rule", Some("acme-shop"));
+        c.item.bindings = vec![Binding::Target { kind: TargetKind::Path, value: "README.md".to_string() }];
+        let mut input = in_project(Some("acme-shop"));
+        input.root = Some(PathBuf::from("C:/repo"));
+        input.targets = vec![(TargetKind::Path, "C:/elsewhere/scratch/README.md".to_string())];
+        assert!(
+            select(&[c], &input).is_empty(),
+            "a project-scoped, repo-relative anchor must not reach a file outside its own project root"
+        );
+    }
+
+    /// The same rule still reaches the exact file inside its own root - the
+    /// fix narrows reach, it does not blind the rule to its own project.
+    #[test]
+    fn a_project_scoped_relative_path_anchor_still_reaches_the_exact_file_inside_the_session_root() {
+        let mut c = owned_by("readme-rule", Some("acme-shop"));
+        c.item.bindings = vec![Binding::Target { kind: TargetKind::Path, value: "README.md".to_string() }];
+        let mut input = in_project(Some("acme-shop"));
+        input.root = Some(PathBuf::from("C:/repo"));
+        input.targets = vec![(TargetKind::Path, "C:/repo/README.md".to_string())];
+        assert_eq!(select(&[c], &input).len(), 1, "the rule must still reach its own project's own file");
+    }
+
+    /// A GLOBAL rule's relative anchor keeps its old, root-blind suffix reach
+    /// outside the session root - there is no root to resolve it against,
+    /// and a global rule about "README.md" is meant everywhere, not only
+    /// inside one checkout.
+    #[test]
+    fn a_global_relative_path_anchor_still_reaches_a_file_outside_the_session_root() {
+        let mut c = owned_by("readme-rule", None);
+        c.item.bindings = vec![Binding::Target { kind: TargetKind::Path, value: "README.md".to_string() }];
+        let mut input = in_project(Some("acme-shop"));
+        input.root = Some(PathBuf::from("C:/repo"));
+        input.targets = vec![(TargetKind::Path, "C:/elsewhere/scratch/README.md".to_string())];
+        assert_eq!(select(&[c], &input).len(), 1, "a global rule must keep reaching outside the session root");
     }
 
     // --------------------------------------------------------- eligibility
@@ -380,6 +449,7 @@ mod tests {
             project: None,
             command: None,
             file: None,
+            root: None,
         };
         assert!(select(&[c.clone_for_test()], &miss).is_empty());
         let hit = ServeInput {
@@ -389,6 +459,7 @@ mod tests {
             project: None,
             command: None,
             file: None,
+            root: None,
         };
         assert_eq!(select(&[c], &hit).len(), 1);
     }
@@ -410,6 +481,7 @@ mod tests {
             project: None,
             command: None,
             file: None,
+            root: None,
         };
         assert_eq!(select(&[c], &input).len(), 1);
     }
@@ -430,6 +502,7 @@ mod tests {
             project: None,
             command: None,
             file: None,
+            root: None,
         };
         assert_eq!(select(&[c], &input).len(), 1);
     }
@@ -452,6 +525,7 @@ mod tests {
             project: None,
             command: None,
             file: None,
+            root: None,
         };
         assert_eq!(select(&[c.clone_for_test()], &with_args).len(), 1, "the arguments are the normal case");
 
@@ -465,6 +539,7 @@ mod tests {
                 project: None,
                 command: None,
                 file: None,
+                root: None,
             };
             assert!(select(&[c.clone_for_test()], &input).is_empty(), "must not fire on: {miss}");
         }
@@ -481,6 +556,7 @@ mod tests {
             project: None,
             command: None,
             file: None,
+            root: None,
         };
         assert!(select(&[c], &input).is_empty(), "a Command binding must not answer a Path target");
     }
@@ -533,6 +609,7 @@ mod tests {
             project: None,
             command: None,
             file: None,
+            root: None,
         };
         let hits = select(&[generic, specific], &input);
         assert_eq!(hits[0].id, "s", "the item naming the real command/path must rank first");

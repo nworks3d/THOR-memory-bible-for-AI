@@ -172,6 +172,29 @@ impl DecayContext {
 /// eligibility. Order-preserving (a plain filter, never a re-sort): decay
 /// never touches ranking, only removes what should not reach a gate at all.
 /// Drops what the reader has twice said did not belong, and nothing else.
+///
+/// THE WRITE GUARD IS DELIBERATELY NOT ONE OF THESE CALLERS. "Every
+/// injection surface" above means exactly the three that only ever SHOW
+/// something - session start, the per-prompt/per-action render, and their
+/// `why`/`check` previews. `serve::absent_guard` (wired into
+/// `bin/serve.rs`'s `absent_guard_block`/`command_guard_block`/
+/// `requires_guard_block`) is not a fourth one: it decides whether a write is
+/// REFUSED outright, and it must never route its own candidate pool through
+/// this function. Investigated 2026-09-08 against another memory server's
+/// own rule ("an agent cannot write its own success story"): `mark::
+/// record_noise` is callable by the very agent a block just refused, and
+/// `NOISE_MARKS_BEFORE_STALE` calls to it is all `is_stale` above needs. Had
+/// the guard's candidate pool ever been taken through `retain_live`, two
+/// `mark noise` calls plus the write a rule exists to stop would have been
+/// enough to get it through - an agent judging the very rule that judges it.
+/// It is not wired that way, and `absent_guard.rs` itself names none of this
+/// module at all - see `serve/tests/decay_is_decided_in_exactly_one_place.rs`'s
+/// own `the_write_guard_never_applies_decay_to_its_candidate_pool` (fails the
+/// build the day that source-level claim stops being true) and `serve/tests/
+/// decay_never_disarms_the_write_guard.rs` for the end-to-end proof through
+/// the real compiled binary. A proof-backed rule comes down only by
+/// `retract` (with its reason, logged) or by the owner revising it - never by
+/// an agent's own noise verdict on the refusal it just received.
 pub fn retain_live(items: Vec<RankedItem>, decay: &DecayContext) -> Vec<RankedItem> {
     items.into_iter().filter(|r| !decay.is_stale(&r.item)).collect()
 }

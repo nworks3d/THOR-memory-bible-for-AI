@@ -63,7 +63,11 @@ use std::process::ExitCode;
 use thor_core::event_store::EventStore;
 
 #[derive(Parser)]
-#[command(name = "import-noise", about = "Carry 1.0's explicit noise judgements into 2.0 as events")]
+#[command(
+    name = "import-noise",
+    version = env!("CARGO_PKG_VERSION"),
+    about = "Carry 1.0's explicit noise judgements into 2.0 as events"
+)]
 struct Cli {
     #[arg(long)]
     db: PathBuf,

@@ -4,9 +4,10 @@
 //! smaller tool set because 2.0 has a much smaller model: five kinds and one
 //! write gate instead of one kind doing three jobs).
 //!
-//! Fourteen tools, and deliberately no more. Six keep a fact honest, two make
+//! Sixteen tools, and deliberately no more. Six keep a fact honest, two make
 //! or unmake a standing rule, three read, three answer questions about the
-//! code:
+//! code, and two open a second, fully separate lane for the owner's everyday
+//! knowledge:
 //!
 //!   remember  declare a NEW item, through `model::store::declare` - the
 //!             write gate's refusal grounds apply unconditionally, and a
@@ -43,6 +44,15 @@
 //!   status    what the store holds right now: counts per kind, how many
 //!             fireable items never fired, how many were served repeatedly, how many
 //!             carry no falsifier (`serve::status::store_status`).
+//!   library   read the second lane: the owner's everyday knowledge - recipes,
+//!             books, a training log and the like - through the `library`
+//!             crate, which depends on nothing from the code side at all.
+//!   shelve    write into that same second lane. Different in kind from the
+//!             fourteen above, not just a fourteenth-and-fifteenth: nothing
+//!             filed here can ever be injected, ranked against a standing
+//!             rule, or counted toward any cap - see `library`'s own
+//!             Cargo.toml for why that is a dependency-graph guarantee, not
+//!             a promise kept by care.
 //!
 //! Every code answer carries the commit its index was read at and whether the
 //! checkout has moved on since, so a stale line number is always a LABELLED
@@ -83,7 +93,7 @@
 use model::item::{Binding, Item, Kind, Severity, TargetKind};
 use rmcp::handler::server::router::tool::ToolRouter;
 use rmcp::handler::server::wrapper::Parameters;
-use rmcp::model::{ServerCapabilities, ServerInfo};
+use rmcp::model::{Implementation, ServerCapabilities, ServerInfo};
 use rmcp::{tool, tool_handler, tool_router, ServerHandler, ServiceExt};
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
@@ -561,6 +571,55 @@ fn shelf_menu(library: Option<&std::path::Path>) -> String {
     }
 }
 
+/// REFUSE FILING ONTO A SHELF THAT DOES NOT EXIST, unless the owner just named
+/// it - the library lane's twin of `refuse_a_new_collection` above. Same shape
+/// of refusal (name what is missing, name the one way through, accept nothing
+/// but the owner's own word repeated back), but this one actually OPENS the
+/// shelf on a match: a shelf is a real row this crate controls
+/// (`library::Library::create_shelf`), never merely whatever a live item's own
+/// field happens to say, so there is something concrete to create.
+///
+/// THE GAP THIS CLOSES. `library::Library::create_shelf` already existed,
+/// behind the `library` command-line binary's own `shelf-new` - the owner's
+/// own terminal, on the owner's own machine. An agent that found no fitting
+/// shelf had exactly one correct move, asking, and then no way at all to act
+/// on the answer: the owner would have to leave the conversation and run a
+/// command himself. For a new user that is a dead end at the very first
+/// recipe. The rule does not change - only the owner names a shelf - only who
+/// is allowed to press the button once he has.
+fn open_a_new_shelf_if_named_by_owner(
+    lib: &::library::Library,
+    shelf: &str,
+    named_by_owner: Option<&str>,
+) -> Result<(), String> {
+    let shelf = shelf.trim();
+    let shelves = lib.shelves()?;
+    if shelves.iter().any(|s| s.name.eq_ignore_ascii_case(shelf)) {
+        return Ok(());
+    }
+    if named_by_owner.map(str::trim).is_some_and(|n| n.eq_ignore_ascii_case(shelf)) {
+        return lib.create_shelf(shelf, "").map_err(|refusal| format!("REFUSED: {refusal}"));
+    }
+    if let Some(mismatch) = named_by_owner.map(str::trim).filter(|n| !n.is_empty()) {
+        return Err(format!(
+            "REFUSED: this write says the owner named a new shelf '{mismatch}', but it files the entry on \
+             '{shelf}'. Those have to be the same word - file it where he said, or ask him again which of \
+             the two he meant."
+        ));
+    }
+    let menu = if shelves.is_empty() {
+        "there are none yet, so this would be the first".to_string()
+    } else {
+        shelves.iter().map(|s| format!("{} ({})", s.name, s.entries)).collect::<Vec<_>>().join(", ")
+    };
+    Err(format!(
+        "REFUSED: there is no shelf called '{shelf}' - nothing was filed. Put it on one of these: {menu}. \
+         If none of them honestly fits, STOP and ASK the owner what the new shelf should be called, and \
+         repeat his name in 'new_shelf_named_by_owner' on your next call - never invent one, and never file \
+         it somewhere it does not belong just to get past this."
+    ))
+}
+
 /// Only a check that is TRIED and stays SILENT is refused. A check that cannot
 /// be tried without a working copy passes - reporting it as unproven belongs
 /// to `doctor`, not to a door that would otherwise refuse every file-reading
@@ -815,6 +874,17 @@ pub struct ReviseArgs {
     /// item under.
     #[serde(default)]
     pub new_collection_named_by_owner: Option<String>,
+    /// Required when this revise WEAKENS a Rule/Orientation that carries a
+    /// check: clearing or changing the check, lowering or clearing severity,
+    /// removing a binding (target, moment or Always), or narrowing scope
+    /// from global to one project. Say in one sentence why - it is written
+    /// into this item's own history (see `history`), the same way retract's
+    /// reason is, so the owner can read later why a rule that could refuse a
+    /// write lost its teeth. Blank or missing on one of those five is
+    /// refused outright. Accepted and stored on any other revise too, but
+    /// never required for one.
+    #[serde(default)]
+    pub because: Option<String>,
 }
 
 #[derive(Deserialize, Serialize, schemars::JsonSchema)]
@@ -875,26 +945,27 @@ pub struct LibraryArgs {
     pub id: Option<i64>,
 }
 
-#[derive(Deserialize, Serialize, schemars::JsonSchema)]
+#[derive(Deserialize, Serialize, schemars::JsonSchema, Default)]
 #[serde(deny_unknown_fields)]
 pub struct ShelveArgs {
-    /// An EXISTING shelf. If none fits, ask the owner - you may not create one.
+    /// An EXISTING shelf, or the one just named in `new_shelf_named_by_owner` on this same call.
     pub shelf: String,
     /// CORRECT AN ENTRY THAT ALREADY EXISTS instead of filing a new one: its number, as the shelf
     /// listing shows it. The fields given replace what is there; the number stays, and the version
     /// replaced stays readable. Use this whenever a filed entry turns out wrong, badly worded or
     /// missing a label - a second entry saying the same thing better makes a shelf unreadable. Omit
-    /// it to file something new.
+    /// it to file something new. Required together with `retire`.
     #[serde(default)]
     pub id: Option<i64>,
-    /// One line that stands on its own. This is the index. When correcting an
-    /// entry (see `id`), leave it empty to keep the title it has.
+    /// One line that stands on its own. This is the index. When correcting an entry (see `id`),
+    /// leave it empty to keep the title it has. Leave it empty on a `retire` too - retire is refused
+    /// together with a title, body or label change.
     #[serde(default)]
     pub title: String,
-    /// The rest, at any length. Optional.
+    /// The rest, at any length. Optional. See `title`'s own note on `retire`.
     #[serde(default)]
     pub body: String,
-    /// Optional labels for filtering inside a shelf.
+    /// Optional labels for filtering inside a shelf. See `title`'s own note on `retire`.
     #[serde(default)]
     pub labels: Vec<String>,
     /// WHY THIS LONG BODY IS STILL ONE THING - required past the length where an entry is usually
@@ -904,6 +975,28 @@ pub struct ShelveArgs {
     /// get a pile past the question.
     #[serde(default)]
     pub one_thing_because: Option<String>,
+    /// THE OWNER JUST NAMED A NEW SHELF - repeat that name here exactly as he gave it, and it is
+    /// created (the shelf ceiling still applies) and this entry filed onto it in the same call.
+    /// THE GAP THIS CLOSES: creating a shelf used to live only behind the `library` command-line
+    /// binary's own `shelf-new` - an agent that asked and was answered still had no way to act on the
+    /// answer, which was a dead end at a new user's very first recipe. Never fill this in on your own
+    /// judgement or to get past a refusal - only after the owner himself named it. Must match `shelf`
+    /// on this same call, or the write is refused. Meaningless together with `id`: correcting or
+    /// retiring an entry never creates a shelf.
+    #[serde(default)]
+    pub new_shelf_named_by_owner: Option<String>,
+    /// Take this entry out of the shelf listing and out of search, without deleting it - `library`
+    /// still returns it whole, marked retired, when asked for by its number. Works only together
+    /// with `id`, and only alone: refused together with a title, body or label change (one thing per
+    /// call), and refused without `id`. Requires `retire_because`.
+    #[serde(default)]
+    pub retire: bool,
+    /// Required together with `retire: true`: why this entry no longer belongs on the shelf, in a
+    /// real sentence - the same requirement `retract` makes on the code lane, and for the same
+    /// reason: without it nobody can tell a decision from an accident later. Ignored when retire is
+    /// not set.
+    #[serde(default)]
+    pub retire_because: Option<String>,
 }
 
 #[derive(Deserialize, Serialize, schemars::JsonSchema)]
@@ -1221,7 +1314,7 @@ impl ThorMcpServer {
         }
     }
 
-    #[tool(description = "Code lane: declares a NEW item (Rule, Orientation, Report, Lookup or Chunk) through the write gate. Call lookup first so this corrects an existing item instead of storing a near-duplicate; for anything about the owner's own life use shelve, never this. On a replica this queues instead of writing ('queued for the main machine' is not an error). Refuses, with the exact reason and the fix, when a Rule/Orientation has no binding, no falsifier, or exceeds 300 characters, or when a Report/Chunk names no project scope; nothing is written on a refusal. check_kind/check_path/check_literal(s) optionally attach a machine-runnable proof alongside the falsifier - see server instructions for the six check kinds. Replies with the stored id, kind and event sequence, or the refusal text.")]
+    #[tool(description = "Code lane: declares a NEW item (Rule, Orientation, Report, Lookup or Chunk) through the write gate. Call lookup first so this corrects an existing item instead of storing a near-duplicate; for anything about the owner's own life use shelve, never this. On a replica this queues instead of writing ('queued for the main machine' is not an error). Refuses, with the exact reason and the fix, when a Rule/Orientation has no binding, no falsifier, or exceeds 300 characters, or when a Report/Chunk names no project scope; nothing is written on a refusal. check_kind/check_path/check_literal(s) optionally attach a machine-runnable proof alongside the falsifier - see server instructions for the six check kinds. Replies with the stored id, kind and event sequence, or the refusal text.", annotations(title = "Remember a fact", read_only_hint = false, destructive_hint = false, idempotent_hint = false, open_world_hint = false))]
     async fn remember(&self, Parameters(args): Parameters<RememberArgs>) -> String {
         if let Some(queued) = self.capture("remember", &args) {
             return queued;
@@ -1281,7 +1374,7 @@ impl ThorMcpServer {
         .await
     }
 
-    #[tool(description = "Code lane: corrects an EXISTING item by id, through the same write gate as remember, plus one more rule: a field left unmentioned keeps its current value, and none may silently vanish - clear one on purpose with an empty string (severity, project, expires, key, falsifier) or check_kind \"\" (clears the check). On a replica this queues instead of writing ('queued for the main machine' is not an error). Prefer this over remember for anything that already exists and merely changed. Refuses, with the exact reason, on the same grounds as remember, plus a field dropped without being named. Replies with the revised id and event sequence, or the refusal text.")]
+    #[tool(description = "Code lane: corrects an EXISTING item by id, through the same write gate as remember, plus: a field left unmentioned keeps its current value, and none may silently vanish - clear one on purpose with an empty string (severity, project, expires, key, falsifier) or check_kind \"\" (clears the check). Weakening a checked rule (clearing/changing the check, lowering/clearing severity, dropping a binding, or narrowing scope to a project) needs because: one sentence, kept in history. On a replica this queues instead of writing ('queued for the main machine' is not an error). Prefer this over remember for an existing item that merely changed; retract, with its own reason, is for one that is simply wrong. Refuses, with the exact reason, on remember's grounds, plus a dropped field or an unexplained weakening. Replies with the revised id and event sequence, or the refusal text.", annotations(title = "Revise an item", read_only_hint = false, destructive_hint = false, idempotent_hint = false, open_world_hint = false))]
     async fn revise(&self, Parameters(args): Parameters<ReviseArgs>) -> String {
         if let Some(queued) = self.capture("revise", &args) {
             return queued;
@@ -1484,7 +1577,22 @@ impl ThorMcpServer {
             ) {
                 return Err(why);
             }
-            match model::store::revise(s, SESSION_ID, LINEAGE_ID, ACTOR, &gate_existing, &updated) {
+            // Computed from the TRUE `existing` (never `gate_existing`) for
+            // exactly the reason `gate::weakenings`'s own doc comment gives:
+            // a check or severity `ClearedFields` blanked for a legitimate
+            // clear must still be named here, and `gate_existing` is
+            // precisely the value that blanking hides it behind.
+            let weakenings = model::gate::weakenings(&existing, &updated);
+            match model::store::revise_because(
+                s,
+                SESSION_ID,
+                LINEAGE_ID,
+                ACTOR,
+                &gate_existing,
+                &updated,
+                &existing,
+                args.because.as_deref(),
+            ) {
                 Ok(event) => {
                     // A deliberate clear is the one revise outcome that is
                     // easy to mistake for a no-op reply - "revised" alone
@@ -1492,11 +1600,22 @@ impl ThorMcpServer {
                     // a caller who cleared the last tag on purpose gets it
                     // named here rather than having to `get` the item back
                     // to confirm the list is really empty now.
-                    let success = if tags_cleared {
+                    let mut success = if tags_cleared {
                         format!("revised '{}' (event seq {}, tags cleared)", updated.id, event.seq)
                     } else {
                         format!("revised '{}' (event seq {})", updated.id, event.seq)
                     };
+                    // Named here too, for the identical reason: "revised"
+                    // alone does not say a checked rule just lost its teeth,
+                    // and the caller should not have to `history` the item
+                    // back to learn that this call was the one that did it.
+                    if !weakenings.is_empty() {
+                        let labels: Vec<&str> = weakenings.iter().map(|w| w.label).collect();
+                        success.push_str(&format!(" - weakened: {}", labels.join(", ")));
+                        if let Some(reason) = args.because.as_deref().map(str::trim).filter(|r| !r.is_empty()) {
+                            success.push_str(&format!("; because: {reason}"));
+                        }
+                    }
                     Ok(with_warnings(
                         success,
                         &updated,
@@ -1520,7 +1639,7 @@ impl ThorMcpServer {
     /// go through `model::store::revise`, so the write gate still governs
     /// what may carry an `Always` binding (a Report or Chunk carrying any
     /// binding at all is refused there, exactly as it is for `remember`).
-    #[tool(description = "Code lane: adds the Always binding to an existing item, so it is served in full at every session start; every other binding and field stays untouched. Use revise instead when anything besides the binding needs to change. Idempotent - pinning an already-pinned item changes nothing and is not an error. On a replica this queues instead of writing ('queued for the main machine' is not an error). Refused, loudly, when the item's kind may carry no binding at all (a Report or Chunk). Replies 'pinned' with the event sequence, 'already pinned', or the refusal text.")]
+    #[tool(description = "Code lane: adds the Always binding to an existing item, so it is served in full at every session start; every other binding and field stays untouched. Use revise instead when anything besides the binding needs to change. Idempotent - pinning an already-pinned item changes nothing and is not an error. On a replica this queues instead of writing ('queued for the main machine' is not an error). Refused, loudly, when the item's kind may carry no binding at all (a Report or Chunk). Replies 'pinned' with the event sequence, 'already pinned', or the refusal text.", annotations(title = "Pin an item", read_only_hint = false, destructive_hint = false, idempotent_hint = true, open_world_hint = false))]
     async fn pin(&self, Parameters(args): Parameters<PinArgs>) -> String {
         if let Some(queued) = self.capture("pin", &args) {
             return queued;
@@ -1540,7 +1659,7 @@ impl ThorMcpServer {
         .await
     }
 
-    #[tool(description = "Code lane: removes the Always binding from an existing item; every other binding and field stays untouched. Use revise instead when anything besides the binding needs to change. Idempotent - unpinning an item with no Always binding changes nothing and is not an error. On a replica this queues instead of writing ('queued for the main machine' is not an error). Refused, loudly, when removing Always would leave the item with no binding left to ever fire on - give it a Moment or Target binding first, or leave it pinned. Replies 'unpinned' with the event sequence, 'already unpinned', or the refusal text.")]
+    #[tool(description = "Code lane: removes the Always binding from an existing item; every other binding and field stays untouched. Use revise instead when anything besides the binding needs to change. Idempotent - unpinning an item with no Always binding changes nothing and is not an error. On a replica this queues instead of writing ('queued for the main machine' is not an error). Refused, loudly, when removing Always would leave the item with no binding left to ever fire on - give it a Moment or Target binding first, or leave it pinned. Replies 'unpinned' with the event sequence, 'already unpinned', or the refusal text.", annotations(title = "Unpin an item", read_only_hint = false, destructive_hint = false, idempotent_hint = true, open_world_hint = false))]
     async fn unpin(&self, Parameters(args): Parameters<UnpinArgs>) -> String {
         if let Some(queued) = self.capture("unpin", &args) {
             return queued;
@@ -1570,7 +1689,7 @@ impl ThorMcpServer {
         .await
     }
 
-    #[tool(description = "Code lane: shows one item whole, by id. Use lookup instead when the id is not already known. Read-only. Reports a plain, honest error - never a blank reply that could look like success - when the id is unknown, when the item is DIVERGED (more than one current head; read history, then use resolve), or when its stored body will not parse. Replies with the item as formatted JSON, or the error text.")]
+    #[tool(description = "Code lane: shows one item whole, by id. Use lookup instead when the id is not already known. Read-only. Reports a plain, honest error - never a blank reply that could look like success - when the id is unknown, when the item is DIVERGED (more than one current head; read history, then use resolve), or when its stored body will not parse. Replies with the item as formatted JSON, or the error text.", annotations(title = "Get an item", read_only_hint = true, destructive_hint = false, idempotent_hint = true, open_world_hint = false))]
     async fn get(&self, Parameters(args): Parameters<GetArgs>) -> String {
         self.blocking(move |s| match model::store::show(s, &args.id) {
             Ok(item) => serde_json::to_string_pretty(&item).map_err(|e| format!("could not render item: {e}")),
@@ -1579,7 +1698,7 @@ impl ThorMcpServer {
         .await
     }
 
-    #[tool(description = "Code lane: searches THOR's memory - every project, archive kinds (Report, Chunk) included - never scoped to only the current project. Call this before remember, so an existing near-duplicate becomes a revise instead. No arguments returns the catalogue of scopes; scope alone lists everything filed there; scope with query narrows a search to it; query alone searches everywhere; key answers only a Lookup item's own exact key (query and scope are then ignored). Read-only, and never an injection surface - nothing here reaches you unprompted. Replies with up to 25 matching lines (id, kind, text) and how many more exist, the catalogue, or a plain 'no matches'.")]
+    #[tool(description = "Code lane: searches THOR's memory - every project, archive kinds (Report, Chunk) included - never scoped to only the current project. Call this before remember, so an existing near-duplicate becomes a revise instead. No arguments returns the catalogue of scopes; scope alone lists everything filed there; scope with query narrows a search to it; query alone searches everywhere; key answers only a Lookup item's own exact key (query and scope are then ignored). Read-only, and never an injection surface - nothing here reaches you unprompted. Replies with up to 25 matching lines (id, kind, text) and how many more exist, the catalogue, or a plain 'no matches'.", annotations(title = "Search the memory", read_only_hint = true, destructive_hint = false, idempotent_hint = true, open_world_hint = false))]
     async fn lookup(&self, Parameters(args): Parameters<LookupArgs>) -> String {
         let vectors = self.vectors.clone();
         #[cfg(feature = "semantic")]
@@ -1682,7 +1801,7 @@ impl ThorMcpServer {
         .await
     }
 
-    #[tool(description = "Library lane: reads the owner's everyday knowledge - recipes, books, a training log, expenses - kept apart from the code lane; nothing here is ever injected, ranked against a rule, or counted toward any cap. Use shelve to write instead. No arguments lists the shelves and how much each holds; shelf lists that shelf's entries (label narrows it); id returns one entry whole; query searches, optionally within shelf. Read-only. A search never answers 'nothing' - it hands back the shelf, or the shelf list, to read instead, since the words asked with are rarely the words written. Replies with the requested listing or entry, or that fallback.")]
+    #[tool(description = "Library lane: reads the owner's everyday knowledge - recipes, books, a training log, expenses - kept apart from the code lane; nothing here is ever injected, ranked against a rule, or counted toward any cap. Use shelve to write instead. No arguments lists the shelves and how much each holds; shelf lists that shelf's live entries (label narrows it); id returns one entry whole, retired or not, marked '(retired)' if so; query searches live entries, optionally within one shelf. Read-only. A search never answers 'nothing' - it hands back the shelf, or the shelf list, to read instead, since the words asked with are rarely the words written. Replies with the requested listing or entry, or that fallback.", annotations(title = "Read the library", read_only_hint = true, destructive_hint = false, idempotent_hint = true, open_world_hint = false))]
     async fn library(&self, Parameters(args): Parameters<LibraryArgs>) -> String {
         const SHOWN: usize = 50;
         let Some(path) = self.library.clone() else {
@@ -1722,10 +1841,15 @@ impl ThorMcpServer {
         }
     }
 
-    #[tool(description = "Library lane: files one new entry on an EXISTING shelf, or corrects one by id - never the code lane, and it cannot create a shelf. Use remember instead for facts about code or how to work, never for the owner's own life. On a replica this queues instead of writing ('queued for the main machine' is not an error). Refused, naming the shelves that do exist, when none fits (ask the owner what a new one should be called); refused on a near-duplicate of an entry already on that shelf, pointing at it; refused past roughly 600 characters unless one_thing_because names the single thing the entry is. Replies 'filed <id>' or 'revised <id>', or the refusal text.")]
+    #[tool(description = "Library lane: files one new entry on an existing shelf, or corrects or retires one by id - never the code lane. Use remember instead for code or how to work, never the owner's own life. On a replica this queues instead of writing ('queued for the main machine' is not an error). Refused, naming the shelves that exist, when none fits, unless new_shelf_named_by_owner repeats the owner's new name - then it is created (refused at the ceiling) and the entry filed on it in one call. Refused on a near-duplicate already there, pointing at it; refused past roughly 600 characters unless one_thing_because names the single thing the entry is. retire (id alone) removes it from the listing and search; library still shows it by number, refused without id, with a title/body/label change, or without retire_because. Replies 'filed <id>', 'revised <id>' or 'retired <id>', or the refusal text.", annotations(title = "Shelve a library entry", read_only_hint = false, destructive_hint = false, idempotent_hint = false, open_world_hint = false))]
     async fn shelve(&self, Parameters(args): Parameters<ShelveArgs>) -> String {
         if let Some(queued) = self.capture("shelve", &args) {
             return queued;
+        }
+        if args.retire && args.id.is_none() {
+            return "REFUSED: retire needs an id - name the entry to retire, exactly as the shelf listing \
+                     shows it. Nothing was changed."
+                .to_string();
         }
         {
             let key = pile_key(&args);
@@ -1747,7 +1871,9 @@ impl ThorMcpServer {
             // THE SILENT MOVE THIS PREVENTS: `revise` works on the number
             // alone, so naming another shelf used to be ignored and answered
             // with "revised" - an agent that thought it moved an entry got a
-            // success and the entry never went anywhere.
+            // success and the entry never went anywhere. Retire reuses the
+            // same guard: it is exactly as wrong to retire entry 4 while
+            // believing it lives on 'sport' when it is really on 'eten'.
             match lib.get(id) {
                 Ok(Some(entry)) if !entry.shelf.eq_ignore_ascii_case(args.shelf.trim()) => {
                     return format!(
@@ -1760,6 +1886,29 @@ impl ThorMcpServer {
                 Err(e) => return e,
                 _ => {}
             }
+            if args.retire {
+                // ONE THING PER CALL. A retire that also snuck in a body
+                // change would leave no way to tell, later, whether the new
+                // wording was ever actually read before the entry vanished
+                // from the shelf - retire it, or correct it, never in the
+                // same breath.
+                let body_change =
+                    !args.title.trim().is_empty() || !args.body.trim().is_empty() || !args.labels.is_empty();
+                if body_change {
+                    return "REFUSED: retire cannot share a call with a title, body or label change - one \
+                             thing per call. Retire this entry on its own; if it also needs correcting, do \
+                             that as a separate call, before or after."
+                        .to_string();
+                }
+                let why = args.retire_because.as_deref().unwrap_or("");
+                return match lib.retire(id, why) {
+                    Ok(()) => format!(
+                        "retired {id} - it is out of the shelf listing and out of search, and stays fully \
+                         readable whole by its own number"
+                    ),
+                    Err(refusal) => format!("REFUSED: {refusal}"),
+                };
+            }
             let labels = if args.labels.is_empty() { None } else { Some(args.labels.as_slice()) };
             let body = if args.body.trim().is_empty() { None } else { Some(args.body.as_str()) };
             let title = if args.title.trim().is_empty() { None } else { Some(args.title.as_str()) };
@@ -1770,13 +1919,18 @@ impl ThorMcpServer {
                 Err(refusal) => format!("REFUSED: {refusal}"),
             };
         }
+        if let Err(why) =
+            open_a_new_shelf_if_named_by_owner(&lib, &args.shelf, args.new_shelf_named_by_owner.as_deref())
+        {
+            return why;
+        }
         match lib.add(&args.shelf, &args.title, &args.body, &args.labels) {
             Ok(id) => format!("filed {id} on shelf {}", args.shelf.trim()),
             Err(refusal) => format!("REFUSED: {refusal}"),
         }
     }
 
-    #[tool(description = "Code lane: judges an item you were served or looked up. Default records that it HELPED, which clears noise recorded before it (a later noise mark still counts - the newest verdict wins). Pass noise:true for the opposite; two noise marks since the last useful one retire the item from the injection surfaces, though it stays fully findable via lookup. On a replica this queues instead of writing ('queued for the main machine' is not an error). Refused when the item is not live (retracted or archived) - there is nothing to judge. Replies with the verdict recorded, or the refusal text.")]
+    #[tool(description = "Code lane: judges an item you were served or looked up. Default records that it HELPED, which clears noise recorded before it (a later noise mark still counts - the newest verdict wins). Pass noise:true for the opposite; two noise marks since the last useful one retire the item from the injection surfaces, though it stays fully findable via lookup. On a replica this queues instead of writing ('queued for the main machine' is not an error). Refused when the item is not live (retracted or archived) - there is nothing to judge. Replies with the verdict recorded, or the refusal text.", annotations(title = "Record a verdict", read_only_hint = false, destructive_hint = false, idempotent_hint = false, open_world_hint = false))]
     async fn mark(&self, Parameters(args): Parameters<MarkArgs>) -> String {
         if let Some(queued) = self.capture("mark", &args) {
             return queued;
@@ -1815,11 +1969,17 @@ impl ThorMcpServer {
         .await
     }
 
-    #[tool(description = "Code lane: reports what the memory holds right now - live item counts per kind, how many Rule/Orientation items exist, how many were declared but have never once fired, how many were served repeatedly without ever being marked useful, and how many carry no falsifier. Use get or history instead for one specific item. Read-only, takes no arguments. Replies with one count per line.")]
+    #[tool(description = "Code lane: reports what the memory holds right now - live item counts per kind, how many Rule/Orientation items exist, how many were declared but have never once fired, how many were served repeatedly without ever being marked useful, and how many carry no falsifier. Use get or history instead for one specific item. Read-only, takes no arguments. Replies with a 'THOR <version>' line first, so a pasted reply always names the build, then one count per line.", annotations(title = "Show memory status", read_only_hint = true, destructive_hint = false, idempotent_hint = true, open_world_hint = false))]
     async fn status(&self) -> String {
         self.blocking(move |s| {
             let st = serve::status::store_status(s);
-            let mut out = String::new();
+            // THE GAP THIS CLOSES: a pasted status reply carried no build
+            // number at all, so a bug report could not say which THOR was
+            // running except by build log or git tag - see
+            // `thor_core::is_version_flag`'s own doc comment for the fuller
+            // survey this line is one half of (the other half is every
+            // binary's own `--version`).
+            let mut out = format!("THOR {}\n", env!("CARGO_PKG_VERSION"));
             for row in &st.counts {
                 out.push_str(&format!("{:?}: {}\n", row.kind, row.count));
             }
@@ -1841,7 +2001,7 @@ impl ThorMcpServer {
         .await
     }
 
-    #[tool(description = "Code lane: walks one item's whole life by id, oldest first - every declare, revise and retraction, each with its sequence number, revision hash and author. Use get instead for only the current version. Read-only; nothing is ever deleted from the log, so this still answers for a retracted item - read it before you revise or retract again. Replies with one line per revision, or the plain 'no history for id X' for an unknown id (not an error).")]
+    #[tool(description = "Code lane: walks one item's whole life by id, oldest first - every declare, revise and retraction, each with its sequence number, revision hash and author. Use get instead for only the current version. Read-only; nothing is ever deleted from the log, so this still answers for a retracted item - read it before you revise or retract again. Replies with one line per revision, or the plain 'no history for id X' for an unknown id (not an error).", annotations(title = "Show item history", read_only_hint = true, destructive_hint = false, idempotent_hint = true, open_world_hint = false))]
     async fn history(&self, Parameters(args): Parameters<HistoryArgs>) -> String {
         self.blocking(move |s| match model::store::history(s, &args.id) {
             Ok(log) if log.is_empty() => Ok(format!("no history for id '{}'", args.id)),
@@ -1854,13 +2014,22 @@ impl ThorMcpServer {
                         .map(|i| i.text.clone())
                         .unwrap_or_else(|| "(no readable item body at this step)".to_string());
                     out.push_str(&format!(
-                        "seq {} {} by {} [{}]: {}\n",
+                        "seq {} {} by {} [{}]: {}",
                         rev.seq,
                         rev.kind,
                         rev.actor,
                         &rev.rev_hash[..rev.rev_hash.len().min(12)],
                         text
                     ));
+                    // Present only on a revision `gate::revise_weakening`
+                    // judged a weakening (see `store::because_reason`) - so
+                    // the owner can see, right on this line, why a rule that
+                    // could refuse a write lost its teeth, not just that it
+                    // did.
+                    if let Some(reason) = &rev.because {
+                        out.push_str(&format!(" (because: {reason})"));
+                    }
+                    out.push('\n');
                 }
                 Ok(out)
             }
@@ -1869,7 +2038,7 @@ impl ThorMcpServer {
         .await
     }
 
-    #[tool(description = "Code lane: removes an item that is simply WRONG or no longer applies - it stops being live everywhere (session start, the moment of action, lookup), but nothing is deleted, and history still walks it. Use revise instead when the item merely changed. A reason is required; a blank one is refused. On a replica this queues instead of writing ('queued for the main machine' is not an error). Bringing the fact back later is a fresh remember, never a revise of the tombstone. Replies 'retracted <id> (<reason>)', or the refusal text.")]
+    #[tool(description = "Code lane: removes an item that is simply WRONG or no longer applies - it stops being live everywhere (session start, the moment of action, lookup), but nothing is deleted, and history still walks it. Use revise instead when the item merely changed. A reason is required; a blank one is refused. On a replica this queues instead of writing ('queued for the main machine' is not an error). Bringing the fact back later is a fresh remember, never a revise of the tombstone. Replies 'retracted <id> (<reason>)', or the refusal text.", annotations(title = "Retract an item", read_only_hint = false, destructive_hint = true, idempotent_hint = true, open_world_hint = false))]
     async fn retract(&self, Parameters(args): Parameters<RetractArgs>) -> String {
         if let Some(queued) = self.capture("retract", &args) {
             return queued;
@@ -1883,7 +2052,7 @@ impl ThorMcpServer {
         .await
     }
 
-    #[tool(description = "Code lane: settles an item with more than one current head - what get reports as DIVERGED, from two machines revising the same fact apart. Read history first; never guess which head is real. Name the surviving revision hash in keep and every other current head in discard - leaving one out fails rather than silently discarding it. On a replica this queues instead of writing ('queued for the main machine' is not an error). The head set is rechecked under the write lock, so a head that appears mid-decision fails the call loudly instead of being dropped. Replies 'resolved <id> onto <keep>', or the refusal text.")]
+    #[tool(description = "Code lane: settles an item with more than one current head - what get reports as DIVERGED, from two machines revising the same fact apart. Read history first; never guess which head is real. Name the surviving revision hash in keep and every other current head in discard - leaving one out fails rather than silently discarding it. On a replica this queues instead of writing ('queued for the main machine' is not an error). The head set is rechecked under the write lock, so a head that appears mid-decision fails the call loudly instead of being dropped. Replies 'resolved <id> onto <keep>', or the refusal text.", annotations(title = "Resolve a divergence", read_only_hint = false, destructive_hint = true, idempotent_hint = true, open_world_hint = false))]
     async fn resolve(&self, Parameters(args): Parameters<ResolveArgs>) -> String {
         if let Some(queued) = self.capture("resolve", &args) {
             return queued;
@@ -1905,7 +2074,7 @@ impl ThorMcpServer {
         .await
     }
 
-    #[tool(description = "Code lane: answers who defines and who uses one symbol name - the question to ask before changing a function, struct or variable, since the reference list IS the blast radius. Use outline instead to see everything one file declares. Read-only. Resolution is by bare name only, so two unrelated things sharing a name come back together - open the files rather than treating the list as a conclusion. Replies with every definition and use site as file:line, the indexed commit, and whether the checkout has since moved on.")]
+    #[tool(description = "Code lane: answers who defines and who uses one symbol name - the question to ask before changing a function, struct or variable, since the reference list IS the blast radius. Use outline instead to see everything one file declares. Read-only. Resolution is by bare name only, so two unrelated things sharing a name come back together - open the files rather than treating the list as a conclusion. Replies with every definition and use site as file:line, the indexed commit, and whether the checkout has since moved on.", annotations(title = "Find symbol usage", read_only_hint = true, destructive_hint = false, idempotent_hint = true, open_world_hint = false))]
     async fn where_used(&self, Parameters(args): Parameters<WhereUsedArgs>) -> String {
         let Some(code) = self.code.clone() else {
             return NO_CODE_INDEX.to_string();
@@ -1935,7 +2104,7 @@ impl ThorMcpServer {
         }
     }
 
-    #[tool(description = "Code lane: lists what one file declares, in line order - its shape without reading the whole thing. Use where_used instead to find every caller of one symbol. Takes a repository-relative path. Read-only. States plainly when the index has never seen that path, which differs from 'this file defines nothing' - a file added since the last index build falls in the first case. Replies with one line per definition (name and line number), or the plain 'not indexed' or 'defines nothing' text.")]
+    #[tool(description = "Code lane: lists what one file declares, in line order - its shape without reading the whole thing. Use where_used instead to find every caller of one symbol. Takes a repository-relative path. Read-only. States plainly when the index has never seen that path, which differs from 'this file defines nothing' - a file added since the last index build falls in the first case. Replies with one line per definition (name and line number), or the plain 'not indexed' or 'defines nothing' text.", annotations(title = "Outline a file", read_only_hint = true, destructive_hint = false, idempotent_hint = true, open_world_hint = false))]
     async fn outline(&self, Parameters(args): Parameters<OutlineArgs>) -> String {
         let Some(code) = self.code.clone() else {
             return NO_CODE_INDEX.to_string();
@@ -1960,7 +2129,7 @@ impl ThorMcpServer {
         }
     }
 
-    #[tool(description = "Code lane: searches the indexed SOURCE CODE of the current project, not the memory - a case-insensitive substring search. Use lookup instead for facts stored in memory, or where_used for one symbol's callers. Read-only. Every answer names the commit the text was read at and whether the working copy has since moved on - open the real file before trusting a line number. States plainly when no code index is configured, rather than returning an empty result. Replies with up to 10 matching snippets as path:start-end plus text.")]
+    #[tool(description = "Code lane: searches the indexed SOURCE CODE of the current project, not the memory - a case-insensitive substring search. Use lookup instead for facts stored in memory, or where_used for one symbol's callers. Read-only. Every answer names the commit the text was read at and whether the working copy has since moved on - open the real file before trusting a line number. States plainly when no code index is configured, rather than returning an empty result. Replies with up to 10 matching snippets as path:start-end plus text.", annotations(title = "Search the code", read_only_hint = true, destructive_hint = false, idempotent_hint = true, open_world_hint = false))]
     async fn search_code(&self, Parameters(args): Parameters<SearchCodeArgs>) -> String {
         let Some(code) = self.code.clone() else {
             return NO_CODE_INDEX.to_string();
@@ -2121,6 +2290,7 @@ impl ThorMcpServer {
             "marked useful: ",
             "marked noise: ",
             "filed ",
+            "retired ",
         ];
         let landed = LANDED.iter().any(|prefix| text.starts_with(prefix));
         if landed {
@@ -2133,8 +2303,21 @@ impl ThorMcpServer {
 
 #[tool_handler]
 impl ServerHandler for ThorMcpServer {
+    /// THE GAP THIS CLOSES: `ServerInfo::new` alone leaves `server_info` at
+    /// rmcp's own `Implementation::from_build_env()` default, which expands
+    /// `env!("CARGO_PKG_VERSION")` (and `CARGO_CRATE_NAME`) INSIDE RMCP'S OWN
+    /// crate - verified against rmcp 1.8.0's source
+    /// (`Implementation::from_build_env`, `~/.cargo/registry/src/.../
+    /// rmcp-1.8.0/src/model.rs`). So a client's server list, and the public
+    /// directory, showed the SDK's own name and version, never THOR's - the
+    /// only way to know which THOR build answered was a build log or git
+    /// tag. `with_server_info` overrides both fields: "thor" (the same name
+    /// `ops::install::install_tool_server` already registers this server
+    /// under) and this crate's own `CARGO_PKG_VERSION`.
     fn get_info(&self) -> ServerInfo {
-        ServerInfo::new(ServerCapabilities::builder().enable_tools().build()).with_instructions(INSTRUCTIONS)
+        ServerInfo::new(ServerCapabilities::builder().enable_tools().build())
+            .with_server_info(Implementation::new("thor", env!("CARGO_PKG_VERSION")))
+            .with_instructions(INSTRUCTIONS)
     }
 }
 
@@ -2381,6 +2564,7 @@ mod tests {
         assert!(stored.starts_with("stored"), "fixture setup must succeed: {stored}");
 
         let revise_args = ReviseArgs {
+            because: None,
             new_collection_named_by_owner: None,
             append: None,
             replace_from: None,
@@ -2701,6 +2885,7 @@ mod tests {
         srv.remember(Parameters(base_remember("revise-1"))).await;
 
         let revise_args = ReviseArgs {
+            because: None,
             new_collection_named_by_owner: None,
             append: None,
             replace_from: None,
@@ -2871,6 +3056,7 @@ mod tests {
         assert!(srv.remember(Parameters(args)).await.starts_with("stored"));
 
         let revise_args = ReviseArgs {
+            because: Some("lowering severity to prove an unrelated field change still lands".to_string()),
             new_collection_named_by_owner: None,
             append: None,
             replace_from: None,
@@ -2914,6 +3100,7 @@ mod tests {
         assert!(srv.remember(Parameters(args)).await.starts_with("stored"));
 
         let revise_args = ReviseArgs {
+            because: None,
             new_collection_named_by_owner: None,
             append: None,
             replace_from: None,
@@ -2962,6 +3149,7 @@ mod tests {
         assert!(srv.remember(Parameters(base_remember("check-clear-noop-1"))).await.starts_with("stored"));
 
         let revise_args = ReviseArgs {
+            because: None,
             new_collection_named_by_owner: None,
             append: None,
             replace_from: None,
@@ -3000,6 +3188,7 @@ mod tests {
         assert!(srv.remember(Parameters(args)).await.starts_with("stored"));
 
         let revise_args = ReviseArgs {
+            because: None,
             new_collection_named_by_owner: None,
             append: None,
             replace_from: None,
@@ -3058,6 +3247,7 @@ mod tests {
         assert!(srv.remember(Parameters(args)).await.starts_with("stored"));
 
         let revise_args = ReviseArgs {
+            because: Some("the roadmap file check is redundant now that CI verifies it".to_string()),
             new_collection_named_by_owner: None,
             append: None,
             replace_from: None,
@@ -3084,6 +3274,92 @@ mod tests {
         let get_reply = srv.get(Parameters(GetArgs { id: "check-clear-populated-1".to_string() })).await;
         let item: Item = serde_json::from_str(&get_reply).unwrap();
         assert_eq!(item.check, None, "a deliberate clear must actually clear the field");
+    }
+
+    // ------------------------------------------------- weakening a checked rule
+    //
+    // THE HOLE THESE TESTS CLOSE (task report, 2026-09-08): through THIS real
+    // tool surface, not `model::gate::revise_weakening` in isolation - the
+    // gate-level tests in `model/src/gate.rs` already prove the classifier
+    // itself; these prove the MCP layer actually wires `because` through to
+    // it, and that a successful weakening reply names what happened rather
+    // than reading exactly like any other "revised" reply.
+
+    #[tokio::test]
+    async fn revise_refuses_weakening_a_checked_rule_with_no_because() {
+        let srv = server();
+        let mut args = base_remember("weaken-no-because-1");
+        args.text = "the roadmap lives in ROADMAP.md at the repo root".to_string();
+        args.check_kind = Some("path_exists".to_string());
+        args.check_path = Some("ROADMAP.md".to_string());
+        assert!(srv.remember(Parameters(args)).await.starts_with("stored"));
+
+        let reply = srv
+            .revise(Parameters(ReviseArgs {
+                id: "weaken-no-because-1".to_string(),
+                check_kind: Some("".to_string()), // clearing a real check with no `because`
+                ..Default::default()
+            }))
+            .await;
+        assert!(reply.starts_with("REFUSED"), "{reply}");
+        assert!(
+            reply.contains("this clears the check of a rule that can refuse a write"),
+            "the refusal must name the weakening GROUND 28 saw: {reply}"
+        );
+        assert!(reply.to_lowercase().contains("because"), "the refusal must say to give `because`: {reply}");
+
+        let get_reply = srv.get(Parameters(GetArgs { id: "weaken-no-because-1".to_string() })).await;
+        let item: Item = serde_json::from_str(&get_reply).unwrap();
+        assert!(item.check.is_some(), "a refused weakening must change nothing");
+    }
+
+    #[tokio::test]
+    async fn revise_accepts_weakening_a_checked_rule_with_a_because_and_the_reply_names_it() {
+        let srv = server();
+        let mut args = base_remember("weaken-with-because-1");
+        args.text = "the roadmap lives in ROADMAP.md at the repo root".to_string();
+        args.check_kind = Some("path_exists".to_string());
+        args.check_path = Some("ROADMAP.md".to_string());
+        assert!(srv.remember(Parameters(args)).await.starts_with("stored"));
+
+        let reply = srv
+            .revise(Parameters(ReviseArgs {
+                id: "weaken-with-because-1".to_string(),
+                check_kind: Some("".to_string()),
+                because: Some("the roadmap file check is redundant now that CI verifies it".to_string()),
+                ..Default::default()
+            }))
+            .await;
+        assert!(reply.starts_with("revised"), "{reply}");
+        assert!(reply.contains("weakened: check cleared"), "the reply must name the weakening: {reply}");
+        assert!(
+            reply.contains("because: the roadmap file check is redundant now that CI verifies it"),
+            "the reply must echo the reason back: {reply}"
+        );
+    }
+
+    #[tokio::test]
+    async fn history_shows_the_because_line_through_the_real_tool() {
+        let srv = server();
+        let mut args = base_remember("weaken-history-1");
+        args.text = "the roadmap lives in ROADMAP.md at the repo root".to_string();
+        args.check_kind = Some("path_exists".to_string());
+        args.check_path = Some("ROADMAP.md".to_string());
+        assert!(srv.remember(Parameters(args)).await.starts_with("stored"));
+
+        srv.revise(Parameters(ReviseArgs {
+            id: "weaken-history-1".to_string(),
+            check_kind: Some("".to_string()),
+            because: Some("superseded by CI".to_string()),
+            ..Default::default()
+        }))
+        .await;
+
+        let log = srv.history(Parameters(HistoryArgs { id: "weaken-history-1".to_string() })).await;
+        assert!(
+            log.contains("(because: superseded by CI)"),
+            "history must show why the check was cleared, right on the revision's own line: {log}"
+        );
     }
 
     // --------------------------------------------------------- absent_all
@@ -3184,6 +3460,7 @@ mod tests {
         assert!(srv.remember(Parameters(args)).await.starts_with("stored"));
 
         let revise_args = ReviseArgs {
+            because: Some("lowering severity to prove an unrelated field change still lands".to_string()),
             new_collection_named_by_owner: None,
             append: None,
             replace_from: None,
@@ -3235,6 +3512,7 @@ mod tests {
         assert!(srv.remember(Parameters(args)).await.starts_with("stored"));
 
         let revise_args = ReviseArgs {
+            because: Some("widening the typography check from one dash to the whole forbidden set".to_string()),
             new_collection_named_by_owner: None,
             append: None,
             replace_from: None,
@@ -3356,6 +3634,7 @@ mod tests {
         assert!(srv.remember(Parameters(args)).await.starts_with("stored"));
 
         let revise_args = ReviseArgs {
+            because: Some("lowering severity to prove an unrelated field change still lands".to_string()),
             new_collection_named_by_owner: None,
             append: None,
             replace_from: None,
@@ -3409,6 +3688,7 @@ mod tests {
         assert!(srv.remember(Parameters(args)).await.starts_with("stored"));
 
         let revise_args = ReviseArgs {
+            because: Some("the rule no longer depends on one file, so it drops the path-carrying form".to_string()),
             new_collection_named_by_owner: None,
             append: None,
             replace_from: None,
@@ -3451,6 +3731,7 @@ mod tests {
         assert!(srv.remember(Parameters(args)).await.starts_with("stored"));
 
         let revise_args = ReviseArgs {
+            because: Some("the em dash rule is now enforced by the shared style linter instead".to_string()),
             new_collection_named_by_owner: None,
             append: None,
             replace_from: None,
@@ -3503,6 +3784,7 @@ mod tests {
         assert!(srv.remember(Parameters(args)).await.starts_with("stored"));
 
         let revise_args = ReviseArgs {
+            because: None,
             new_collection_named_by_owner: None,
             append: None,
             replace_from: None,
@@ -3547,6 +3829,7 @@ mod tests {
         assert!(srv.remember(Parameters(args)).await.starts_with("stored"));
 
         let revise_args = ReviseArgs {
+            because: None,
             new_collection_named_by_owner: None,
             append: None,
             replace_from: None,
@@ -3591,6 +3874,7 @@ mod tests {
         assert!(srv.remember(Parameters(args)).await.starts_with("stored"));
 
         let revise_args = ReviseArgs {
+            because: None,
             new_collection_named_by_owner: None,
             append: None,
             replace_from: None,
@@ -3627,6 +3911,7 @@ mod tests {
         assert!(srv.remember(Parameters(blank_report("clear-expires-1"))).await.starts_with("stored"));
 
         let revise_args = ReviseArgs {
+            because: None,
             new_collection_named_by_owner: None,
             append: None,
             replace_from: None,
@@ -3669,6 +3954,7 @@ mod tests {
         assert!(srv.remember(Parameters(args)).await.starts_with("stored"));
 
         let revise_args = ReviseArgs {
+            because: None,
             new_collection_named_by_owner: None,
             append: None,
             replace_from: None,
@@ -3710,6 +3996,7 @@ mod tests {
         assert!(srv.remember(Parameters(args)).await.starts_with("stored"));
 
         let revise_args = ReviseArgs {
+            because: None,
             new_collection_named_by_owner: None,
             append: None,
             replace_from: None,
@@ -3768,6 +4055,7 @@ mod tests {
         assert!(srv.remember(Parameters(args)).await.starts_with("stored"));
 
         let revise_args = ReviseArgs {
+            because: None,
             new_collection_named_by_owner: None,
             append: None,
             replace_from: None,
@@ -3830,6 +4118,7 @@ mod tests {
         assert!(srv.remember(Parameters(args)).await.starts_with("stored"));
 
         let revise_args = ReviseArgs {
+            because: None,
             new_collection_named_by_owner: None,
             append: None,
             replace_from: None,
@@ -3881,6 +4170,7 @@ mod tests {
         assert!(srv.remember(Parameters(args)).await.starts_with("stored"));
 
         let revise_args = ReviseArgs {
+            because: None,
             new_collection_named_by_owner: None,
             append: None,
             replace_from: None,
@@ -3920,6 +4210,7 @@ mod tests {
         assert!(srv.remember(Parameters(args)).await.starts_with("stored"));
 
         let revise_args = ReviseArgs {
+            because: None,
             new_collection_named_by_owner: None,
             append: None,
             replace_from: None,
@@ -4326,6 +4617,7 @@ mod tests {
                 body: "Twee uur op 120 graden.".to_string(),
                 labels: vec!["bbq".to_string()],
                 one_thing_because: None,
+                ..Default::default()
             }))
             .await;
         assert!(filed.starts_with("filed"), "{filed}");
@@ -4339,6 +4631,7 @@ mod tests {
                 body: String::new(),
                 labels: vec![],
                 one_thing_because: None,
+                ..Default::default()
             }))
             .await;
         assert!(fixed.starts_with("revised"), "{fixed}");
@@ -4370,6 +4663,7 @@ mod tests {
                 body: "x".repeat(900),
                 labels: vec![],
                 one_thing_because: None,
+                ..Default::default()
             }))
             .await;
         assert!(reply.contains("REFUSED"), "{reply}");
@@ -4398,6 +4692,7 @@ mod tests {
                 one_thing_because: Some(
                     "Dit is een trainingsplan met schema, gewichten, voeding en preventie".to_string(),
                 ),
+                ..Default::default()
             }))
             .await;
         assert!(reply.contains("REFUSED"), "the pile must stop at the question: {reply}");
@@ -4420,6 +4715,7 @@ mod tests {
             body: "x".repeat(900),
             labels: vec![],
             one_thing_because: Some("dit is een recept voor pizzadeeg".to_string()),
+            ..Default::default()
         };
         // The first call is refused even WITH the reason: answering a question
         // that was never asked is what let a five-part pile in.
@@ -4445,6 +4741,7 @@ mod tests {
             body: "x".repeat(900),
             labels: vec![],
             one_thing_because: Some("ja".to_string()),
+            ..Default::default()
         };
         assert!(srv.shelve(Parameters(args())).await.contains("REFUSED"));
         let again = srv.shelve(Parameters(args())).await;
@@ -4468,9 +4765,263 @@ mod tests {
                 body: "Twee uur op 120 graden met kersenhout, dan 30 minuten in folie.".to_string(),
                 labels: vec!["bbq".to_string()],
                 one_thing_because: None,
+                ..Default::default()
             }))
             .await;
         assert!(reply.starts_with("filed"), "{reply}");
+    }
+
+    /// THE GAP THIS CLOSES: creation used to live only behind the `library`
+    /// command-line binary, so an agent that asked the owner what to call a
+    /// new shelf and got an answer still had no way to act on it. The
+    /// refusal itself has to name the field that finishes the job, or asking
+    /// is a dead end.
+    #[tokio::test]
+    async fn filing_onto_an_unknown_shelf_is_refused_and_names_the_field_to_answer_with() {
+        let dir = tempfile::tempdir().unwrap();
+        let srv = ThorMcpServer::new(EventStore::in_memory().unwrap())
+            .with_library(dir.path().join("library.db"));
+        ::library::Library::open(&dir.path().join("library.db")).unwrap().create_shelf("eten", "").unwrap();
+
+        let reply = srv
+            .shelve(Parameters(ShelveArgs {
+                shelf: "sport".to_string(),
+                title: "Push pull legs".to_string(),
+                ..Default::default()
+            }))
+            .await;
+        assert!(reply.contains("REFUSED"), "{reply}");
+        assert!(reply.contains("eten"), "the shelves that exist: {reply}");
+        assert!(reply.contains("ASK the owner"), "asking beats inventing: {reply}");
+        assert!(
+            reply.contains("new_shelf_named_by_owner"),
+            "and it has to say how to finish once he answers: {reply}"
+        );
+
+        let lib = ::library::Library::open(&dir.path().join("library.db")).unwrap();
+        assert_eq!(lib.shelves().unwrap().len(), 1, "nothing was created by the refused attempt");
+    }
+
+    /// The way through when nothing fits: the agent asked, the owner named
+    /// it, and the name he gave comes back on the next call - which now
+    /// actually creates the shelf, rather than refusing a second time.
+    #[tokio::test]
+    async fn a_shelf_the_owner_named_himself_is_created_and_the_entry_filed_in_one_call() {
+        let dir = tempfile::tempdir().unwrap();
+        let srv = ThorMcpServer::new(EventStore::in_memory().unwrap())
+            .with_library(dir.path().join("library.db"));
+        ::library::Library::open(&dir.path().join("library.db")).unwrap().create_shelf("eten", "").unwrap();
+
+        let reply = srv
+            .shelve(Parameters(ShelveArgs {
+                shelf: "sport".to_string(),
+                title: "Push pull legs".to_string(),
+                new_shelf_named_by_owner: Some("sport".to_string()),
+                ..Default::default()
+            }))
+            .await;
+        assert!(reply.starts_with("filed"), "{reply}");
+
+        let lib = ::library::Library::open(&dir.path().join("library.db")).unwrap();
+        let shelves = lib.shelves().unwrap();
+        assert!(shelves.iter().any(|s| s.name == "sport"), "{shelves:?}");
+        assert_eq!(lib.entries("sport", None).unwrap().len(), 1, "and the entry landed on it");
+    }
+
+    /// The name has to be the one being filed, or the field is just a box
+    /// that was ticked - the same enforcement `new_collection_named_by_owner`
+    /// already gets on the code lane.
+    #[tokio::test]
+    async fn a_new_shelf_name_that_does_not_match_what_is_being_filed_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let srv = ThorMcpServer::new(EventStore::in_memory().unwrap())
+            .with_library(dir.path().join("library.db"));
+        ::library::Library::open(&dir.path().join("library.db")).unwrap().create_shelf("eten", "").unwrap();
+
+        let reply = srv
+            .shelve(Parameters(ShelveArgs {
+                shelf: "sport".to_string(),
+                title: "Push pull legs".to_string(),
+                new_shelf_named_by_owner: Some("hardlopen".to_string()),
+                ..Default::default()
+            }))
+            .await;
+        assert!(reply.contains("REFUSED"), "{reply}");
+        assert!(reply.contains("have to be the same word"), "{reply}");
+
+        let lib = ::library::Library::open(&dir.path().join("library.db")).unwrap();
+        assert_eq!(lib.shelves().unwrap().len(), 1, "no shelf was created on a mismatch");
+    }
+
+    /// The ceiling has to hold even when the owner himself named the shelf -
+    /// the whole point is that something gets merged first, not that the
+    /// field is a way around the limit.
+    #[tokio::test]
+    async fn a_new_shelf_past_the_ceiling_is_refused_even_when_the_owner_named_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let srv = ThorMcpServer::new(EventStore::in_memory().unwrap())
+            .with_library(dir.path().join("library.db"));
+        let seed = ::library::Library::open(&dir.path().join("library.db")).unwrap();
+        for i in 0..::library::MAX_SHELVES {
+            seed.create_shelf(&format!("plank{i}"), "").unwrap();
+        }
+
+        let reply = srv
+            .shelve(Parameters(ShelveArgs {
+                shelf: "nog-een".to_string(),
+                title: "iets".to_string(),
+                new_shelf_named_by_owner: Some("nog-een".to_string()),
+                ..Default::default()
+            }))
+            .await;
+        assert!(reply.contains("REFUSED"), "{reply}");
+        assert!(reply.contains("ceiling"), "{reply}");
+        assert_eq!(seed.shelves().unwrap().len(), ::library::MAX_SHELVES, "still at the ceiling, not past it");
+    }
+
+    /// NOTHING IS EVER DELETED, now reachable from the agent's own door: a
+    /// retired entry disappears from the shelf listing and from search, and
+    /// `library` still returns it whole, by number, marked retired.
+    #[tokio::test]
+    async fn retiring_an_entry_through_shelve_hides_it_from_listing_and_search_but_not_from_get() {
+        let dir = tempfile::tempdir().unwrap();
+        let srv = ThorMcpServer::new(EventStore::in_memory().unwrap())
+            .with_library(dir.path().join("library.db"));
+        ::library::Library::open(&dir.path().join("library.db")).unwrap().create_shelf("eten", "").unwrap();
+
+        let keep = srv
+            .shelve(Parameters(ShelveArgs {
+                shelf: "eten".to_string(),
+                title: "Pizzadeeg voor de Kamado".to_string(),
+                ..Default::default()
+            }))
+            .await;
+        assert!(keep.starts_with("filed"), "{keep}");
+
+        let filed = srv
+            .shelve(Parameters(ShelveArgs {
+                shelf: "eten".to_string(),
+                title: "Mislukt experiment met bier in het deeg".to_string(),
+                ..Default::default()
+            }))
+            .await;
+        assert!(filed.starts_with("filed"), "{filed}");
+        let id: i64 = filed.split_whitespace().nth(1).unwrap().parse().unwrap();
+
+        let retired = srv
+            .shelve(Parameters(ShelveArgs {
+                id: Some(id),
+                shelf: "eten".to_string(),
+                retire: true,
+                retire_because: Some("smaakte nergens naar".to_string()),
+                ..Default::default()
+            }))
+            .await;
+        assert!(retired.starts_with("retired"), "{retired}");
+
+        let listing = srv
+            .library(Parameters(LibraryArgs { shelf: Some("eten".to_string()), query: None, label: None, id: None }))
+            .await;
+        assert!(!listing.contains("Mislukt experiment"), "gone from the listing: {listing}");
+        assert!(listing.contains("Pizzadeeg"), "the survivor stays: {listing}");
+
+        let searched = srv
+            .library(Parameters(LibraryArgs {
+                shelf: None,
+                query: Some("Mislukt experiment".to_string()),
+                label: None,
+                id: None,
+            }))
+            .await;
+        assert!(!searched.contains("Mislukt experiment"), "gone from search too: {searched}");
+
+        let whole =
+            srv.library(Parameters(LibraryArgs { shelf: None, query: None, label: None, id: Some(id) })).await;
+        assert!(whole.contains("Mislukt experiment"), "still readable whole by number: {whole}");
+        assert!(whole.contains("retired"), "and marked as such: {whole}");
+    }
+
+    #[tokio::test]
+    async fn retire_without_an_id_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let srv = ThorMcpServer::new(EventStore::in_memory().unwrap())
+            .with_library(dir.path().join("library.db"));
+        ::library::Library::open(&dir.path().join("library.db")).unwrap().create_shelf("eten", "").unwrap();
+
+        let reply = srv
+            .shelve(Parameters(ShelveArgs {
+                shelf: "eten".to_string(),
+                retire: true,
+                retire_because: Some("omdat".to_string()),
+                ..Default::default()
+            }))
+            .await;
+        assert!(reply.contains("REFUSED"), "{reply}");
+        assert!(reply.contains("needs an id"), "{reply}");
+    }
+
+    /// ONE THING PER CALL: retire may not smuggle a correction in beside it,
+    /// or nobody could later tell whether the new wording was ever read
+    /// before the entry left the shelf.
+    #[tokio::test]
+    async fn retire_together_with_a_body_change_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let srv = ThorMcpServer::new(EventStore::in_memory().unwrap())
+            .with_library(dir.path().join("library.db"));
+        ::library::Library::open(&dir.path().join("library.db")).unwrap().create_shelf("eten", "").unwrap();
+
+        let filed = srv
+            .shelve(Parameters(ShelveArgs {
+                shelf: "eten".to_string(),
+                title: "Spareribs op de Kamado".to_string(),
+                ..Default::default()
+            }))
+            .await;
+        let id: i64 = filed.split_whitespace().nth(1).unwrap().parse().unwrap();
+
+        let reply = srv
+            .shelve(Parameters(ShelveArgs {
+                id: Some(id),
+                shelf: "eten".to_string(),
+                body: "een nieuwe tekst".to_string(),
+                retire: true,
+                retire_because: Some("omdat".to_string()),
+                ..Default::default()
+            }))
+            .await;
+        assert!(reply.contains("REFUSED"), "{reply}");
+        assert!(reply.contains("one thing per call"), "{reply}");
+
+        let lib = ::library::Library::open(&dir.path().join("library.db")).unwrap();
+        assert!(!lib.get(id).unwrap().unwrap().retired, "nothing must have happened at all");
+    }
+
+    /// The same requirement `retract` makes on the code lane, reused here:
+    /// without a reason nobody can tell a decision from an accident later.
+    #[tokio::test]
+    async fn retire_without_a_reason_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let srv = ThorMcpServer::new(EventStore::in_memory().unwrap())
+            .with_library(dir.path().join("library.db"));
+        ::library::Library::open(&dir.path().join("library.db")).unwrap().create_shelf("eten", "").unwrap();
+
+        let filed = srv
+            .shelve(Parameters(ShelveArgs {
+                shelf: "eten".to_string(),
+                title: "Spareribs op de Kamado".to_string(),
+                ..Default::default()
+            }))
+            .await;
+        let id: i64 = filed.split_whitespace().nth(1).unwrap().parse().unwrap();
+
+        let reply = srv
+            .shelve(Parameters(ShelveArgs { id: Some(id), shelf: "eten".to_string(), retire: true, ..Default::default() }))
+            .await;
+        assert!(reply.contains("REFUSED"), "{reply}");
+        assert!(reply.contains("reason"), "{reply}");
+
+        let lib = ::library::Library::open(&dir.path().join("library.db")).unwrap();
+        assert!(!lib.get(id).unwrap().unwrap().retired, "nothing must have happened at all");
     }
 
     /// A verdict on something that is gone is not a verdict: the debt could
@@ -4686,6 +5237,21 @@ mod tests {
         assert!(reply.contains("declared, never fired: 1"), "{reply}");
     }
 
+    /// THE DEFECT THIS CLOSES: a pasted `status` reply carried no build
+    /// number at all, so a bug report could not say which THOR was running
+    /// except by build log or git tag. Fails if the version line is
+    /// reverted: the reply would then start directly with the first kind's
+    /// count line instead of naming a build at all.
+    #[tokio::test]
+    async fn status_reply_starts_with_the_thor_version_line() {
+        let srv = server();
+        let reply = srv.status().await;
+        assert!(
+            reply.starts_with(&format!("THOR {}\n", env!("CARGO_PKG_VERSION"))),
+            "expected the version line first, got: {reply}"
+        );
+    }
+
     // ------------------------------------------------------- input validation
 
     #[tokio::test]
@@ -4897,5 +5463,91 @@ mod tests {
             CapturedOutcome::NotApplied(text) => assert!(text.contains("divert mode"), "{text}"),
         }
         assert!(!path.exists(), "the refused replay must not have queued anything");
+    }
+
+    // ----------------------------------------------------- tool annotations
+
+    /// THE GAP THIS CLOSES, measured 2026-09-08 on the public directory's
+    /// scoring of this server: every one of the sixteen tools scored "No
+    /// annotations are provided, so the description carries the full
+    /// transparency burden" - none had a title, readOnlyHint, destructiveHint,
+    /// idempotentHint or openWorldHint at all. Clients use readOnlyHint in
+    /// particular to treat a read-only tool more lightly, so this reads
+    /// through `ToolRouter::list_all` - the exact call `#[tool_handler]`'s
+    /// generated `list_tools` makes (`tools: #router.list_all()`, see
+    /// rmcp-macros' `tool_handler.rs`) - never a text scrape of this file, so
+    /// a tool whose `#[tool(...)]` attribute forgets `annotations(...)` fails
+    /// HERE, on the same path a real `tools/list` answers from.
+    ///
+    /// Table-driven on purpose: a seventeenth tool added without a row here
+    /// fails on the length check below before its missing annotations could
+    /// even be read, and a row naming a tool the router does not have fails
+    /// just as loudly the other way.
+    #[test]
+    fn every_tool_carries_its_five_annotation_hints_and_a_title() {
+        // name, read_only_hint, destructive_hint, idempotent_hint, open_world_hint
+        const EXPECTED: &[(&str, bool, bool, bool, bool)] = &[
+            ("get", true, false, true, false),
+            ("history", true, false, true, false),
+            ("lookup", true, false, true, false),
+            ("status", true, false, true, false),
+            ("search_code", true, false, true, false),
+            ("where_used", true, false, true, false),
+            ("outline", true, false, true, false),
+            ("library", true, false, true, false),
+            ("remember", false, false, false, false),
+            ("revise", false, false, false, false),
+            ("retract", false, true, true, false),
+            ("resolve", false, true, true, false),
+            ("pin", false, false, true, false),
+            ("unpin", false, false, true, false),
+            ("mark", false, false, false, false),
+            ("shelve", false, false, false, false),
+        ];
+
+        let tools = ThorMcpServer::tool_router().list_all();
+        assert_eq!(
+            tools.len(),
+            EXPECTED.len(),
+            "the router lists {} tools but this table expects {} - a tool added or removed without \
+             updating this table is exactly the drift this test exists to catch",
+            tools.len(),
+            EXPECTED.len()
+        );
+
+        for &(name, read_only, destructive, idempotent, open_world) in EXPECTED {
+            let tool = tools
+                .iter()
+                .find(|t| t.name.as_ref() == name)
+                .unwrap_or_else(|| panic!("'{name}' is in this table but the router does not list it"));
+            let annotations = tool.annotations.as_ref().unwrap_or_else(|| {
+                panic!("'{name}' has no annotations at all - every tool needs a title and all five hints")
+            });
+            assert!(
+                matches!(annotations.title.as_deref(), Some(t) if !t.trim().is_empty()),
+                "'{name}' must carry a non-empty human title"
+            );
+            assert_eq!(annotations.read_only_hint, Some(read_only), "'{name}' readOnlyHint");
+            assert_eq!(annotations.destructive_hint, Some(destructive), "'{name}' destructiveHint");
+            assert_eq!(annotations.idempotent_hint, Some(idempotent), "'{name}' idempotentHint");
+            assert_eq!(annotations.open_world_hint, Some(open_world), "'{name}' openWorldHint");
+        }
+    }
+
+    // ------------------------------------------------------- server identity
+
+    /// THE DEFECT THIS CLOSES: `ServerInfo::new` alone falls back to rmcp's
+    /// own `Implementation::from_build_env`, which names the SDK build
+    /// (verified against rmcp 1.8.0's own source), never a way to tell which
+    /// THOR build answered. Fails if `get_info`'s `.with_server_info(...)`
+    /// call is reverted: the name would read back "rmcp" (from
+    /// `CARGO_CRATE_NAME`) and the version rmcp's own crate version, neither
+    /// of which is "thor" or this crate's own `CARGO_PKG_VERSION`.
+    #[test]
+    fn server_info_names_thor_and_this_crates_own_version() {
+        let srv = server();
+        let info = srv.get_info();
+        assert_eq!(info.server_info.name, "thor");
+        assert_eq!(info.server_info.version, env!("CARGO_PKG_VERSION"));
     }
 }

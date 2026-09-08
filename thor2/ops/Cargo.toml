@@ -39,6 +39,10 @@ name = "install"
 path = "src/bin/install.rs"
 
 [[bin]]
+name = "initstore"
+path = "src/bin/initstore.rs"
+
+[[bin]]
 name = "doctor"
 path = "src/bin/doctor.rs"
 

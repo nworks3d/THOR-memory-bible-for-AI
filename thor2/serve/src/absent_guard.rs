@@ -44,6 +44,25 @@
 //!   doc comment). The location guard follows the identical stance: no
 //!   matching anchor, a stale one, or an unresolvable root all fall through
 //!   to "nothing to say", never a block.
+//! - The noise-retirement doctrine in `serve/src/decay.rs` never reaches any
+//!   of this. An item twice called noise since anyone last called it useful
+//!   stops reaching the three INJECTION surfaces only (session start, the
+//!   per-prompt/per-action render, their `why`/`check` previews) - see that
+//!   file's own doc comment, and the one it carries (updated 2026-09-08) on
+//!   the single function every injection surface calls, for why this guard
+//!   is deliberately not a fourth one. Investigated the same day against
+//!   another memory server's own rule ("an agent cannot write its own
+//!   success story"): `mark::record_noise` is callable by the very agent a
+//!   block just refused, so if this file's own candidate pools were ever
+//!   taken AFTER that retirement, two such noise verdicts plus the write a
+//!   rule exists to stop would have been enough to get it through. They are
+//!   not - every pool here comes straight off `live::candidates_for`/
+//!   `live::live_items`/`live::always_candidates`, and `serve/tests/
+//!   decay_is_decided_in_exactly_one_place.rs`'s own `the_write_guard_
+//!   never_applies_decay_to_its_candidate_pool` fails the build the day this
+//!   file's source ever names that retirement machinery at all. See
+//!   `serve/tests/decay_never_disarms_the_write_guard.rs` for the end-to-end
+//!   proof through the real compiled binary.
 //!
 //! Governing doctrine the LOCATION guard exists to prove (see
 //! `location_anchor`'s own doc comment for the full three-condition rule):
@@ -627,15 +646,27 @@ fn first_violation<'a>(
         // the file being written? That is the only binding kind a file touch
         // can match, and `rank::select` used the same comparison to let this
         // item in.
+        //
+        // ROOT- AND SCOPE-AWARE, via `scoped_target_matches` - never the bare
+        // `model::normalize::target_matches` any more. THE DEFECT THIS
+        // CLOSES, measured in a real session (2026-09-08): with the bare
+        // suffix comparison, a project-scoped item anchored at a
+        // repo-relative "README.md" reached this file's own foreign clone
+        // under a scratch directory, because that path also ends in
+        // "/readme.md" and nothing here asked whether the touched file was
+        // even inside the project the anchor is relative to. See
+        // `scoped_target_matches`'s own doc comment for the three rules.
         let reached_by_path = candidate.item.bindings.iter().any(|b| {
             matches!(
                 b,
                 model::item::Binding::Target { kind: model::item::TargetKind::Path, value }
-                    if model::normalize::target_matches(
+                    if scoped_target_matches(
+                        candidate.item.project.as_deref(),
                         model::item::TargetKind::Path,
                         value,
                         model::item::TargetKind::Path,
                         file_path,
+                        Some(root),
                     )
             )
         });
@@ -979,6 +1010,272 @@ fn path_is_or_contains(anchor_abs: &Path, file_abs: &Path) -> bool {
     let anchor = normalize_target(&anchor_abs.to_string_lossy());
     let file = normalize_target(&file_abs.to_string_lossy());
     file == anchor || file.starts_with(&format!("{anchor}/"))
+}
+
+// ------------------------------------------- root- and scope-aware matching
+
+/// Root- and project-scope-aware replacement for
+/// `model::normalize::target_matches`, for every site that decides whether
+/// an item's `Path`/`Dir` anchor reaches a REAL touched file - this module's
+/// own `first_violation` (`reached_by_path`) and `rank::select`'s own
+/// `binding_matches`. `model::normalize::target_matches` itself is left
+/// exactly as it was: it has no notion of a root, and its one caller that
+/// compares one item's binding against ANOTHER item's binding at write time
+/// (`model::store::pool_rivals`) has no touched file to have a root FOR - it
+/// is comparing two anchors to each other, not an anchor to a place someone
+/// is about to write.
+///
+/// THE DEFECT THIS CLOSES, measured in a real session (2026-09-08). A Rule
+/// scoped to project "The-AI-memory-bible", bound to `Target{Path,
+/// "README.md"}` with a forbidden-literal check, refused an `Edit` of a
+/// cloned FOREIGN repository's own `README.md`, sitting under a scratch
+/// directory entirely outside the project. `target_matches` compares by
+/// equality OR by SUFFIX on a segment boundary with no notion of a root at
+/// all, so a bare, repo-relative anchor like "README.md" matches every path
+/// on the machine that happens to end in "/readme.md" - the anchor was only
+/// ever meant to reach the one file inside the one project it was written
+/// for.
+///
+/// THE THREE RULES:
+/// 1. The touched file is INSIDE `root`: a RELATIVE anchor is resolved
+///    against that SAME root (`root.join(item_value)`) and compared EXACTLY
+///    from there - a `Path` anchor must now equal the file, a `Dir` anchor
+///    must contain it on a segment boundary (`path_is_or_contains`, the same
+///    comparison the location guard above already uses) - never a suffix any
+///    more. Consequence, stated rather than left to be rediscovered:
+///    "README.md" no longer also matches "docs/README.md" - that is a
+///    DIFFERENT file, and a suffix match could never tell the two apart.
+/// 2. The touched file is OUTSIDE `root`: a relative anchor is relative to a
+///    root the file is not even in. An item SCOPED to a project
+///    (`item_project: Some(_)`) can therefore never reach it there; a GLOBAL
+///    item (`item_project: None`) keeps today's suffix reach unchanged -
+///    there is no root to resolve it against, and a global rule about
+///    "README.md" is meant everywhere, not only inside one checkout.
+/// 3. `root` is `None` (never resolved for this session): behaviour is
+///    entirely unchanged - every comparison falls straight through to
+///    `model::normalize::target_matches`.
+///
+/// An ABSOLUTE (root-anchored) anchor compares as today in every case,
+/// inside or outside `root` alike: it already names one exact location, so
+/// there is nothing a project root could sharpen. Detected via
+/// `Path::has_root` rather than `Path::is_absolute` alone, for the same
+/// Windows footgun `model::check::resolve_within_root` already documents: a
+/// root-anchored path with no drive prefix (`\temp`, or `/tmp` once
+/// separators are unified) is not "absolute" by that method alone, yet it is
+/// still an exact, unambiguous location, never one this function should
+/// re-root against a project.
+///
+/// Only a `Path`/`Dir` anchor names a filesystem location a root can say
+/// anything about: a `Symbol`/`Host`/`Route`/`Project` anchor (or either side
+/// paired with one of those - a kind mismatch `target_matches` already
+/// refuses) keeps the plain, root-blind `target_matches` comparison
+/// completely unchanged. `Command` never reaches here at all - `rank::
+/// binding_matches` already gives it its own comparison
+/// (`command_anchor_names`), which has nothing to do with a filesystem root.
+pub fn scoped_target_matches(
+    item_project: Option<&str>,
+    item_kind: TargetKind,
+    item_value: &str,
+    in_kind: TargetKind,
+    in_value: &str,
+    root: Option<&Path>,
+) -> bool {
+    if !matches!(item_kind, TargetKind::Path | TargetKind::Dir) || !matches!(in_kind, TargetKind::Path | TargetKind::Dir)
+    {
+        return model::normalize::target_matches(item_kind, item_value, in_kind, in_value);
+    }
+    let Some(root) = root else {
+        return model::normalize::target_matches(item_kind, item_value, in_kind, in_value);
+    };
+    if Path::new(item_value).has_root() {
+        return model::normalize::target_matches(item_kind, item_value, in_kind, in_value);
+    }
+    let touched_abs = root.join(in_value);
+    if path_is_or_contains(root, &touched_abs) {
+        let anchor_abs = root.join(item_value);
+        match item_kind {
+            TargetKind::Path => {
+                normalize_target(&anchor_abs.to_string_lossy()) == normalize_target(&touched_abs.to_string_lossy())
+            }
+            TargetKind::Dir => path_is_or_contains(&anchor_abs, &touched_abs),
+            _ => unreachable!("guarded to Path/Dir above"),
+        }
+    } else {
+        match item_project {
+            Some(_) => false,
+            None => model::normalize::target_matches(item_kind, item_value, in_kind, in_value),
+        }
+    }
+}
+
+#[cfg(test)]
+mod scoped_target_matches_tests {
+    use super::*;
+
+    /// Rule 1, and the consequence the function's own doc comment states
+    /// plainly: a relative `Path` anchor resolved against the root must
+    /// equal the touched file EXACTLY - never a suffix any more, so
+    /// "README.md" no longer also matches a same-named file sitting in a
+    /// DIFFERENT directory of the very same project.
+    #[test]
+    fn a_relative_path_anchor_no_longer_matches_a_same_named_file_in_a_different_directory_inside_the_root() {
+        let root = Path::new("C:/repo");
+        assert!(
+            !scoped_target_matches(
+                None,
+                TargetKind::Path,
+                "README.md",
+                TargetKind::Path,
+                "C:/repo/docs/README.md",
+                Some(root),
+            ),
+            "docs/README.md is a DIFFERENT file from the project's own README.md"
+        );
+        // The one file it actually names still matches.
+        assert!(scoped_target_matches(
+            None,
+            TargetKind::Path,
+            "README.md",
+            TargetKind::Path,
+            "C:/repo/README.md",
+            Some(root),
+        ));
+    }
+
+    /// Rule 1's `Dir` half. NOT a no-op case: a bare `model::normalize::
+    /// target_matches` never actually reached this shape either, because its
+    /// own Dir arm requires the TOUCHED string to start with the anchor's
+    /// literal text, and a real touched file always arrives as an ABSOLUTE
+    /// path (`C:/repo/deploy/...`), which never starts with a bare relative
+    /// anchor (`deploy`). Resolving both against the same root is what makes
+    /// a repo-relative `Dir` anchor reach a real, absolute touched file at
+    /// all - proven by reverting this function to a bare `target_matches`
+    /// call, which fails exactly this test.
+    #[test]
+    fn a_relative_dir_anchor_still_reaches_a_nested_file_inside_the_root() {
+        let root = Path::new("C:/repo");
+        assert!(scoped_target_matches(
+            None,
+            TargetKind::Dir,
+            "deploy",
+            TargetKind::Path,
+            "C:/repo/deploy/compose.yml",
+            Some(root),
+        ));
+        assert!(
+            scoped_target_matches(
+                Some("acme-shop"),
+                TargetKind::Dir,
+                "deploy",
+                TargetKind::Path,
+                "C:/repo/deploy/nested/compose.yml",
+                Some(root),
+            ),
+            "a Dir anchor still reaches an arbitrarily nested file, project-scoped or not"
+        );
+    }
+
+    /// Rule 2, the measured defect's own shape at this function's level: a
+    /// relative anchor is relative to a root the touched file is not even
+    /// in, so a PROJECT-SCOPED item can never reach it there.
+    #[test]
+    fn a_relative_anchor_on_a_project_scoped_item_never_reaches_a_file_outside_the_root() {
+        let root = Path::new("C:/repo");
+        assert!(!scoped_target_matches(
+            Some("The-AI-memory-bible"),
+            TargetKind::Path,
+            "README.md",
+            TargetKind::Path,
+            "C:/Users/x/scratch/awesome-mcp-servers/README.md",
+            Some(root),
+        ));
+    }
+
+    /// Rule 2's other half: a GLOBAL item keeps today's suffix reach outside
+    /// the root unchanged - there is no root to resolve it against, and a
+    /// global rule about "README.md" is meant everywhere, not only inside
+    /// one checkout.
+    #[test]
+    fn a_relative_anchor_on_a_global_item_still_reaches_outside_the_root() {
+        let root = Path::new("C:/repo");
+        assert!(scoped_target_matches(
+            None,
+            TargetKind::Path,
+            "README.md",
+            TargetKind::Path,
+            "C:/Users/x/scratch/awesome-mcp-servers/README.md",
+            Some(root),
+        ));
+    }
+
+    /// "Absolute anchors compare as today" - proven two ways: (1) a project
+    /// root must never turn a project-scoped item's own exact, absolute
+    /// anchor into a non-match just because it sits outside that root (Rule
+    /// 2 is about RELATIVE anchors only, decided via `Path::has_root` before
+    /// project scope is even consulted); (2) the SUFFIX reach an absolute
+    /// anchor already had (`model::normalize::target_matches`'s own
+    /// documented "either direction" rule) survives untouched - neither is
+    /// silently narrowed to an exact-only match just because a root is now
+    /// known.
+    #[test]
+    fn an_absolute_anchor_outside_the_root_still_fires() {
+        let root = Path::new("C:/repo");
+        assert!(
+            scoped_target_matches(
+                Some("acme-shop"),
+                TargetKind::Path,
+                "C:/elsewhere/secrets.txt",
+                TargetKind::Path,
+                "C:/elsewhere/secrets.txt",
+                Some(root),
+            ),
+            "an absolute anchor already names one exact location; a project root must never narrow it"
+        );
+        assert!(
+            scoped_target_matches(
+                None,
+                TargetKind::Path,
+                "C:/x/y/server/lib/orders.js",
+                TargetKind::Path,
+                "server/lib/orders.js",
+                Some(root),
+            ),
+            "the suffix reach an absolute anchor already had must survive unchanged"
+        );
+    }
+
+    /// Rule 3: no root resolved at all, behaviour is entirely unchanged -
+    /// even a project-scoped item keeps its old, root-blind suffix reach,
+    /// because there is nothing here to tell "inside" from "outside" with.
+    #[test]
+    fn with_no_root_resolved_behaviour_is_unchanged() {
+        assert!(scoped_target_matches(
+            Some("The-AI-memory-bible"),
+            TargetKind::Path,
+            "README.md",
+            TargetKind::Path,
+            "C:/Users/x/scratch/awesome-mcp-servers/README.md",
+            None,
+        ));
+    }
+
+    /// A non-Path/Dir kind (Symbol, Host, Route, Project) is untouched by any
+    /// of this: it always falls straight through to the plain
+    /// `target_matches`, root or no root, scoped or not - narrowing a
+    /// hostname or a symbol name by "project root" would be a different,
+    /// unrelated feature, not this fix.
+    #[test]
+    fn a_non_path_kind_is_unaffected_by_root_or_project() {
+        let root = Path::new("C:/repo");
+        assert!(scoped_target_matches(
+            Some("acme-shop"),
+            TargetKind::Host,
+            "shop.example.com",
+            TargetKind::Host,
+            "shop.example.com",
+            Some(root),
+        ));
+    }
 }
 
 /// Whether `file_abs` is a file DIRECTLY inside the directory `anchor_abs`
@@ -2313,6 +2610,78 @@ sonnet").is_none(),
 
         let content = "this text contains the forbidden word too";
         assert_eq!(find_violation(&ranked, "NOTES.md", content, Some(dir.path())), None);
+    }
+
+    // ------------------------------- root- and project-scope-aware reach
+    //
+    // THE DEFECT THIS PREVENTS, measured in a real session (2026-09-08): a
+    // Rule scoped to project "The-AI-memory-bible", bound to
+    // `Target{Path, "README.md"}` with a forbidden-literal check, refused an
+    // Edit of a cloned FOREIGN repository's own README.md, sitting under a
+    // scratch directory entirely outside the project. `reached_by_path`
+    // compared by bare suffix with no notion of a root, so the anchor
+    // matched every path on the machine ending in "/readme.md". These three
+    // tests run the exact same shape end to end through `find_violation`,
+    // never just `scoped_target_matches` in isolation - see that function's
+    // own test module above for the unit-level rules.
+
+    /// The repro itself: the foreign clone's own README.md must no longer be
+    /// blocked, with the forbidden literal genuinely present in the write -
+    /// proving the reach is refused, not that the content happened to miss.
+    #[test]
+    fn find_violation_no_longer_blocks_a_foreign_clones_same_named_file_outside_the_project_root() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(root.path().join("README.md"), "# this project\n").unwrap();
+        let foreign = tempfile::tempdir().unwrap();
+        let foreign_file = foreign.path().join("awesome-mcp-servers").join("README.md");
+
+        let mut scoped = item_with_check("readme-rule", "README.md", "MCP server]");
+        scoped.item.project = Some("The-AI-memory-bible".to_string());
+        let content = "a line naming an [MCP server] right here";
+
+        assert_eq!(
+            find_violation(&[scoped], &foreign_file.to_string_lossy(), content, Some(root.path())),
+            None,
+            "a project-scoped, repo-relative anchor must never reach a file outside its own project root"
+        );
+    }
+
+    /// The other half of the same fix: the identical rule still refuses the
+    /// REAL file, inside the root it is actually scoped to - the fix narrows
+    /// reach, it does not blind the rule to its own project.
+    #[test]
+    fn find_violation_still_blocks_the_same_anchor_for_the_real_file_inside_the_root() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(root.path().join("README.md"), "# this project\n").unwrap();
+
+        let mut scoped = item_with_check("readme-rule", "README.md", "MCP server]");
+        scoped.item.project = Some("The-AI-memory-bible".to_string());
+        let content = "a line naming an [MCP server] right here";
+        let real_file = root.path().join("README.md");
+
+        let reason = find_violation(&[scoped], &real_file.to_string_lossy(), content, Some(root.path()))
+            .expect("the same rule must still refuse a write to its own project's own file");
+        assert!(reason.contains("readme-rule"), "{reason}");
+    }
+
+    /// A GLOBAL rule's relative anchor keeps its old, root-blind suffix
+    /// reach outside the root - there is no root to resolve it against, and
+    /// a global rule about "README.md" is meant everywhere, not only inside
+    /// one checkout. Same foreign-clone shape as the project-scoped case
+    /// above, `item.project` simply left unset.
+    #[test]
+    fn find_violation_still_blocks_a_global_rules_relative_anchor_outside_the_root() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(root.path().join("README.md"), "# this project\n").unwrap();
+        let foreign = tempfile::tempdir().unwrap();
+        let foreign_file = foreign.path().join("awesome-mcp-servers").join("README.md");
+
+        let global = item_with_check("readme-rule", "README.md", "MCP server]");
+        let content = "a line naming an [MCP server] right here";
+
+        let reason = find_violation(&[global], &foreign_file.to_string_lossy(), content, Some(root.path()))
+            .expect("a global rule's relative anchor must keep reaching outside the project root");
+        assert!(reason.contains("readme-rule"), "{reason}");
     }
 
     /// THE DEFECT THIS PREVENTS: an item with prose describing a rule but no

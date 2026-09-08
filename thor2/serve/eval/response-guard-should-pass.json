@@ -371,5 +371,24 @@
     "reply": "Hier is de lijst met alle stappen die je moet volgen:\n- stap 1: rond dit onderdeel van de taak af en noteer het resultaat\n- stap 2: rond dit onderdeel van de taak af en noteer het resultaat\n- stap 3: rond dit onderdeel van de taak af en noteer het resultaat\n- stap 4: rond dit onderdeel van de taak af en noteer het resultaat\n- stap 5: rond dit onderdeel van de taak af en noteer het resultaat\n- stap 6: rond dit onderdeel van de taak af en noteer het resultaat\n- stap 7: rond dit onderdeel van de taak af en noteer het resultaat\n- stap 8: rond dit onderdeel van de taak af en noteer het resultaat\n- stap 9: rond dit onderdeel van de taak af en noteer het resultaat\n- stap 10: rond dit onderdeel van de taak af en noteer het resultaat\n- stap 11: rond dit onderdeel van de taak af en noteer het resultaat\n- stap 12: rond dit onderdeel van de taak af en noteer het resultaat\n- stap 13: rond dit onderdeel van de taak af en noteer het resultaat\n- stap 14: rond dit onderdeel van de taak af en noteer het resultaat\n- stap 15: rond dit onderdeel van de taak af en noteer het resultaat\n- stap 16: rond dit onderdeel van de taak af en noteer het resultaat\n- stap 17: rond dit onderdeel van de taak af en noteer het resultaat\n- stap 18: rond dit onderdeel van de taak af en noteer het resultaat\n- stap 19: rond dit onderdeel van de taak af en noteer het resultaat\n- stap 20: rond dit onderdeel van de taak af en noteer het resultaat\n- stap 21: rond dit onderdeel van de taak af en noteer het resultaat\n- stap 22: rond dit onderdeel van de taak af en noteer het resultaat\n- stap 23: rond dit onderdeel van de taak af en noteer het resultaat\n- stap 24: rond dit onderdeel van de taak af en noteer het resultaat\n- stap 25: rond dit onderdeel van de taak af en noteer het resultaat\n- stap 26: rond dit onderdeel van de taak af en noteer het resultaat\n- stap 27: rond dit onderdeel van de taak af en noteer het resultaat\n- stap 28: rond dit onderdeel van de taak af en noteer het resultaat\n- stap 29: rond dit onderdeel van de taak af en noteer het resultaat\n- stap 30: rond dit onderdeel van de taak af en noteer het resultaat\n- stap 31: rond dit onderdeel van de taak af en noteer het resultaat\n- stap 32: rond dit onderdeel van de taak af en noteer het resultaat\n- stap 33: rond dit onderdeel van de taak af en noteer het resultaat\n- stap 34: rond dit onderdeel van de taak af en noteer het resultaat\n- stap 35: rond dit onderdeel van de taak af en noteer het resultaat\n- stap 36: rond dit onderdeel van de taak af en noteer het resultaat\n- stap 37: rond dit onderdeel van de taak af en noteer het resultaat\n- stap 38: rond dit onderdeel van de taak af en noteer het resultaat\n- stap 39: rond dit onderdeel van de taak af en noteer het resultaat\n- stap 40: rond dit onderdeel van de taak af en noteer het resultaat",
     "rule": null,
     "class": "list-requested-and-delivered"
+  },
+  {
+    "id": "b63",
+    "reply": "Publieke inzendingen worden eerst nagekeken door een moderator voordat ze op de site verschijnen, dus daar hoef jij niets voor te doen.",
+    "rule": null,
+    "class": "third-party-review-not-a-claim"
+  },
+  {
+    "id": "b64",
+    "reply": "Wat ik zelf kan nakijken zonder dat jij iets hoeft op te zoeken, zit allemaal in de repo, dus dat pak ik zo op.",
+    "rule": null,
+    "class": "future-ability-not-a-claim"
+  },
+  {
+    "id": "b65",
+    "prompt": "Kan je dit allemaal zelf nakijken?",
+    "reply": "Je vroeg net 'kan je dit allemaal zelf nakijken?' - ja, dan kan ik dat zelf nakijken zodra ik toegang heb tot de logs.",
+    "rule": null,
+    "class": "quoted-question-and-future-intent"
   }
 ]

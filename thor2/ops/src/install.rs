@@ -719,6 +719,39 @@ pub fn seed_working_contract(db: &Path) -> anyhow::Result<Vec<SeededItem>> {
     Ok(out)
 }
 
+/// The combined outcome of `ensure_and_seed_store`: what happened to the
+/// store itself, the starting notes (empty when the store already existed),
+/// and the response-guard rulebook beside it.
+#[derive(Debug)]
+pub struct BootstrapReport {
+    pub store: StoreOutcome,
+    pub seeded: Vec<SeededItem>,
+    pub rulebook: RulebookReport,
+}
+
+/// Bring a store from nothing to one that answers - the exact sequence
+/// `install`'s own CLI runs by hand (`ensure_store`, then only on a store
+/// this call created `seed_working_contract`, then `seed_response_rulebook`
+/// on every call regardless) - collapsed into one call for a caller with no
+/// settings.json to write into and no business going near one.
+///
+/// WHY THIS IS SEPARATE FROM `install`. `install`'s CLI always resolves a
+/// settings.json (defaulting under HOME/USERPROFILE when none is named) and
+/// refuses outright when the `serve` binary it would wire hooks to is not
+/// there - both wrong for a container entry point, which ships neither
+/// `serve` nor an agent's configuration to touch. This function is the store
+/// half alone: no hooks, no tool-server registration, no project marker.
+/// See `ops/src/bin/initstore.rs`, the binary built on exactly this.
+pub fn ensure_and_seed_store(db: &Path) -> anyhow::Result<BootstrapReport> {
+    let store = ensure_store(db)?;
+    let seeded = match store {
+        StoreOutcome::Created => seed_working_contract(db)?,
+        StoreOutcome::AlreadyThere => Vec::new(),
+    };
+    let rulebook = seed_response_rulebook(db)?;
+    Ok(BootstrapReport { store, seeded, rulebook })
+}
+
 /// What happened to the tool-server registration on this run.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ServerOutcome {
@@ -1353,6 +1386,52 @@ mod tests {
         for s in &again {
             assert!(!s.stored, "{} was stored a second time - the memory now holds it twice", s.id);
         }
+    }
+
+    /// The defect `ensure_and_seed_store` exists to fix: a container's entry
+    /// point calling `mcp` straight against an empty volume got "no THOR
+    /// store at ... this command never creates one" and nothing that speaks
+    /// the tool protocol. This is the whole bootstrap in one call, proving it
+    /// leaves a store with the full working contract (22 notes, matching
+    /// `working_contract().len()`) and the response-guard rulebook, not the
+    /// bare file `ensure_store` alone would leave.
+    #[test]
+    fn ensure_and_seed_store_creates_22_notes_and_the_rulebook_when_absent() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("thor.db");
+
+        let report = ensure_and_seed_store(&db).unwrap();
+
+        assert_eq!(report.store, StoreOutcome::Created);
+        assert_eq!(working_contract().len(), 22, "this test's own claim of 22 starting notes is now stale");
+        let stored = report.seeded.iter().filter(|s| s.stored).count();
+        assert_eq!(stored, 22, "expected all 22 starting notes to be stored, got {stored}");
+        assert_eq!(report.rulebook.outcome, RulebookOutcome::Written);
+        assert!(report.rulebook.path.exists(), "the rulebook path reported back must be the one actually written");
+    }
+
+    /// The other half of the same defect: a second start against a volume
+    /// that already holds a real memory (this container's own second run, or
+    /// a volume someone pointed at their existing store) must never reseed it
+    /// or touch the rulebook again - see `ensure_store` and
+    /// `seed_response_rulebook`'s own "only ever write into an absence"
+    /// stance, which this call inherits.
+    #[test]
+    fn ensure_and_seed_store_leaves_an_existing_store_untouched() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("thor.db");
+        ensure_and_seed_store(&db).unwrap();
+        let before = fs::read(&db).unwrap();
+        let rulebook_path = respond::default_rulebook_path(&db);
+        let rulebook_before = fs::read(&rulebook_path).unwrap();
+
+        let second = ensure_and_seed_store(&db).unwrap();
+
+        assert_eq!(second.store, StoreOutcome::AlreadyThere);
+        assert!(second.seeded.is_empty(), "a store that already existed must not be seeded again");
+        assert_eq!(second.rulebook.outcome, RulebookOutcome::AlreadyThere);
+        assert_eq!(fs::read(&db).unwrap(), before, "a second call must not write a single byte to the store");
+        assert_eq!(fs::read(&rulebook_path).unwrap(), rulebook_before, "nor to the rulebook beside it");
     }
 
     /// The new starter note rides the same three tests above (they iterate

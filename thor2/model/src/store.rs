@@ -570,6 +570,81 @@ pub fn revise(
         .map_err(WriteError::Store)
 }
 
+/// The `revise` entry point for a caller that can explain a WEAKENING
+/// revision - see `gate::revise_weakening`'s own doc comment for the five
+/// shapes it refuses without one. Everything `revise` above does, plus that
+/// one extra gate and, when it fires, `because` travelling into the stored
+/// event body (`body_with_because`) so `history` can show it later.
+///
+/// `existing` keeps its exact meaning from `revise` above - the ground-9
+/// comparison baseline, which a caller may legitimately hand a
+/// `ClearedFields`-blanked value for. `before` must be different: the item
+/// exactly as `show` returns it, NEVER blanked, because ground 9's baseline
+/// is precisely what a `check_kind ""` or `severity ""` clear hides the
+/// truth behind - see `gate::weakenings`'s own doc comment for why this
+/// function cannot reuse `existing` for both jobs. In every call site with
+/// nothing to clear, `existing` and `before` are the same value.
+///
+/// `revise` above is untouched by this addition and stays the entry point
+/// for every caller with nothing to explain - `pin`, `unpin`, every one-off
+/// repair binary, every test written before this existed. This is strictly
+/// additive.
+pub fn revise_because(
+    store: &mut EventStore,
+    session_id: &str,
+    lineage_id: &str,
+    actor: &str,
+    existing: &Item,
+    updated: &Item,
+    before: &Item,
+    because: Option<&str>,
+) -> Result<Event, WriteError> {
+    let existing = normalized(existing);
+    let updated = normalized(updated);
+    let before = normalized(before);
+    gate::revise(&existing, &updated).map_err(WriteError::Refused)?;
+    gate::revise_weakening(&before, &updated, because).map_err(WriteError::Refused)?;
+    if let Capacity::DeadOnArrival(refusal) | Capacity::Full(refusal) =
+        capacity(store, &updated).map_err(WriteError::Store)?
+    {
+        return Err(WriteError::Refused(refusal));
+    }
+    let reason = because.map(str::trim).filter(|r| !r.is_empty());
+    let body = match reason {
+        Some(reason) => body_with_because(&updated, reason).map_err(WriteError::Serialize)?,
+        None => canonical_body(&updated).map_err(WriteError::Serialize)?,
+    };
+    store
+        .append_mutate_checked(session_id, lineage_id, actor, EventKind::FactRevised, &updated.id, None, &body)
+        .map_err(WriteError::Store)
+}
+
+/// `canonical_body`, with one extra trailing key appended: `"because":
+/// "<reason>"`. Spliced onto the end of the already-serialised bytes rather
+/// than merged through a `serde_json::Value` map - going through `Value`
+/// would lose the declared field order `canonical_body`'s own doc comment
+/// relies on (`serde_json::Map` sorts its keys unless the crate's
+/// `preserve_order` feature is on, which this workspace deliberately does
+/// not enable). `parse_body` (a plain `Item` deserialize, with no
+/// `deny_unknown_fields`) reads a body built this way exactly as it always
+/// has - the extra key is simply ignored; `because_reason` below is the one
+/// place that reads it back out.
+fn body_with_because(item: &Item, because: &str) -> Result<String, serde_json::Error> {
+    let body = canonical_body(item)?;
+    let reason = serde_json::to_string(because)?;
+    debug_assert!(body.ends_with('}'), "canonical_body always produces a JSON object");
+    Ok(format!("{},\"because\":{reason}}}", &body[..body.len() - 1]))
+}
+
+/// The `because` a `fact_revised` event body carries, if any - present only
+/// on one written by `revise_because` for a revision `gate::revise_weakening`
+/// judged a weakening; `None` for every other event, an ordinary `revise`
+/// included. Mirrors `tombstone_reason` above: never fails, a body this
+/// cannot parse simply carries none.
+fn because_reason(body: &str) -> Option<String> {
+    serde_json::from_str::<serde_json::Value>(body).ok()?.get("because")?.as_str().map(str::to_string)
+}
+
 /// What the capacity check concluded about a new item's chances of ever
 /// being shown.
 #[derive(Debug)]
@@ -1336,6 +1411,11 @@ pub struct Revision {
     /// A tombstone or an unreadable body leaves this `None` rather than
     /// dropping the row: the step happened either way.
     pub item: Option<Item>,
+    /// Why, for a revision `gate::revise_weakening` judged a weakening -
+    /// `None` for every other step, an ordinary revise, a declare or a
+    /// retraction (see `tombstone_reason` for that one's own reason) alike.
+    /// See `because_reason`, the one place that reads it out of the body.
+    pub because: Option<String>,
 }
 
 /// The whole revision log for one id, oldest first, including retractions.
@@ -1351,6 +1431,7 @@ pub fn history(store: &EventStore, entity_id: &str) -> Result<Vec<Revision>, Rea
             rev_hash: e.this_hash.clone(),
             actor: e.actor.clone(),
             item: parse_body(&e.body).ok(),
+            because: because_reason(&e.body),
         })
         .collect())
 }
@@ -1445,6 +1526,122 @@ mod tests {
         let err = revise(&mut store, "s1", "l1", "test", &item, &updated).unwrap_err();
         assert!(matches!(err, WriteError::Refused(_)));
         assert_eq!(store.get_all_events().unwrap().len(), 1, "a refused revise must append nothing");
+    }
+
+    // ---------------------------------------------------- revise_because
+
+    /// `sample()` with a real check - `sample()` itself carries none, and
+    /// `gate::revise_weakening` (GROUND 28) has nothing to say about an item
+    /// that never carried one.
+    fn checked_sample() -> Item {
+        let mut item = sample();
+        item.check = Some(Check::PathExists { path: "config/app.toml".to_string() });
+        item
+    }
+
+    /// THE HOLE THIS TEST PROVES CLOSED: before GROUND 28 existed, clearing a
+    /// real check through `revise` cost nothing but the four bytes `""` on
+    /// `check_kind` - see `model::gate::weakenings`'s own doc comment.
+    #[test]
+    fn revise_because_refuses_a_weakening_with_no_because_and_writes_nothing() {
+        let mut store = EventStore::in_memory().unwrap();
+        let item = checked_sample();
+        declare(&mut store, "s1", "l1", "test", &item).unwrap();
+
+        let mut updated = item.clone();
+        updated.check = None; // GROUND 28's own shape 1: clearing the check
+
+        // `existing` (the ground-9 baseline) is deliberately blanked here,
+        // exactly the way `mcp::revise` blanks it for a real `check_kind ""`
+        // call (see `gate::ClearedFields`) - otherwise ground 9 would refuse
+        // this same call first, for an unrelated reason, and this test would
+        // pass for the wrong one. `before` stays the true, unblanked item:
+        // that is the whole point of GROUND 28.
+        let existing_baseline = gate::ClearedFields { check: true, ..Default::default() }.baseline(&item);
+        let err =
+            revise_because(&mut store, "s1", "l1", "test", &existing_baseline, &updated, &item, None).unwrap_err();
+        assert!(matches!(err, WriteError::Refused(_)));
+        assert_eq!(store.get_all_events().unwrap().len(), 1, "a refused weakening must append nothing beyond the declare");
+    }
+
+    #[test]
+    fn revise_because_accepts_a_weakening_with_a_because_and_the_event_body_carries_it() {
+        let mut store = EventStore::in_memory().unwrap();
+        let item = checked_sample();
+        declare(&mut store, "s1", "l1", "test", &item).unwrap();
+
+        let mut updated = item.clone();
+        updated.check = None;
+        let existing_baseline = gate::ClearedFields { check: true, ..Default::default() }.baseline(&item);
+
+        let event = revise_because(
+            &mut store,
+            "s1",
+            "l1",
+            "test",
+            &existing_baseline,
+            &updated,
+            &item,
+            Some("the config file check was replaced by CI"),
+        )
+        .unwrap();
+        assert!(
+            event.body.contains("\"because\":\"the config file check was replaced by CI\""),
+            "the stored event body must carry the reason verbatim: {}",
+            event.body
+        );
+
+        let back = show(&store, &item.id).unwrap();
+        assert_eq!(back, updated, "the extra `because` key must not disturb the item itself");
+    }
+
+    #[test]
+    fn history_shows_the_because_line_for_a_weakening_revise_and_none_for_an_ordinary_one() {
+        let mut store = EventStore::in_memory().unwrap();
+        let item = checked_sample();
+        declare(&mut store, "s1", "l1", "test", &item).unwrap();
+
+        let mut weakened = item.clone();
+        weakened.check = None;
+        let existing_baseline = gate::ClearedFields { check: true, ..Default::default() }.baseline(&item);
+        revise_because(&mut store, "s1", "l1", "test", &existing_baseline, &weakened, &item, Some("superseded by CI"))
+            .unwrap();
+
+        let mut reworded = weakened.clone();
+        reworded.text = "the config lives in config/app.toml, reworded".to_string();
+        revise(&mut store, "s1", "l1", "test", &weakened, &reworded).unwrap();
+
+        let log = history(&store, &item.id).unwrap();
+        assert_eq!(log.len(), 3, "declare, the weakening revise and the ordinary revise must all be there");
+        assert_eq!(log[0].because, None, "a declare carries no because");
+        assert_eq!(
+            log[1].because,
+            Some("superseded by CI".to_string()),
+            "history must show why the check was cleared"
+        );
+        assert_eq!(log[2].because, None, "an ordinary revise with nothing to explain carries none");
+    }
+
+    /// Point 2 of the task's own rule: `because` is accepted and stored if
+    /// given, never REQUIRED, on a revise `weakenings` finds nothing in.
+    #[test]
+    fn revise_because_stores_a_because_even_when_the_revise_is_not_a_weakening() {
+        let mut store = EventStore::in_memory().unwrap();
+        let item = checked_sample();
+        declare(&mut store, "s1", "l1", "test", &item).unwrap();
+
+        let mut updated = item.clone();
+        updated.text = "the config lives in config/app.toml, read once at start".to_string();
+
+        revise_because(&mut store, "s1", "l1", "test", &item, &updated, &item, Some("clarifying when it is read"))
+            .unwrap();
+
+        let log = history(&store, &item.id).unwrap();
+        assert_eq!(
+            log[1].because,
+            Some("clarifying when it is read".to_string()),
+            "a because given on a non-weakening revise is still stored, never required but never discarded either"
+        );
     }
 
     /// The defect this guards against: a retracted item that still answers

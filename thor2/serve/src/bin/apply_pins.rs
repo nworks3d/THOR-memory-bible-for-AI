@@ -16,7 +16,11 @@ use std::path::PathBuf;
 use thor_core::event_store::EventStore;
 
 #[derive(Parser)]
-#[command(name = "apply_pins", about = "Apply the old system's pinned fact ids as Always bindings, through the real write gate")]
+#[command(
+    name = "apply_pins",
+    version = env!("CARGO_PKG_VERSION"),
+    about = "Apply the old system's pinned fact ids as Always bindings, through the real write gate"
+)]
 struct Cli {
     /// Path to the target 2.0 store to modify.
     #[arg(long)]

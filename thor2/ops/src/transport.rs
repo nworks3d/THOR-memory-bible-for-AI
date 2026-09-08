@@ -267,8 +267,39 @@ pub fn run_receiver(db: &Path, bind: &str, token: String, inbox: Option<PathBuf>
     })
 }
 
+/// Bounds on every HTTP call this transport makes to a receiver, so one that
+/// is slow, unreachable, or silently dropping packets fails the call in
+/// seconds - never as a process that simply never returns.
+///
+/// TWO SEPARATE BOUNDS, because they guard two different phases. `CONNECT`
+/// covers only reaching the receiver at all: this transport is LAN/tailnet
+/// only (see this module's own top comment), so a TCP handshake with a
+/// machine on the same network either completes in a fraction of a second or
+/// the receiver simply is not there to answer - 5 seconds is already
+/// generous slack for a NAS waking from sleep. `REQUEST` covers everything
+/// after that, including the receiver validating and answering a batch of up
+/// to `DEFAULT_BATCH` events, which legitimately takes longer than a
+/// handshake.
+///
+/// THE DEFECT THIS CLOSES. On 2026-08-17 the receiver on the owner's NAS
+/// began refusing the hourly `sync ship`, and the scheduled task sat in a
+/// ghost "Running" state for four weeks: the run never returned, so it never
+/// reached the error handling `sync.rs`'s `main` already has (print one line
+/// to stderr, exit non-zero - see this crate's own tests for proof that path
+/// works once it is reached). A bound that is never set cannot fire, no
+/// matter how correct the code past it is.
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
+const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// `build_client`, with both bounds given explicitly - the seam a test uses
+/// to shrink them, so proving the timeout fires does not cost the suite 30
+/// real seconds per test (see `a_receiver_that_never_answers_is_timed_out_not_hung_forever`).
+fn build_client_with_timeouts(connect: Duration, request: Duration) -> anyhow::Result<reqwest::blocking::Client> {
+    Ok(reqwest::blocking::Client::builder().connect_timeout(connect).timeout(request).build()?)
+}
+
 fn build_client() -> anyhow::Result<reqwest::blocking::Client> {
-    Ok(reqwest::blocking::Client::builder().timeout(Duration::from_secs(30)).build()?)
+    build_client_with_timeouts(CONNECT_TIMEOUT, REQUEST_TIMEOUT)
 }
 
 /// Ask the receiver at `base` where it stands: its hole-proof contiguous tip.
@@ -826,5 +857,48 @@ mod tests {
 
         assert_eq!(both, (1, 1, "retract".to_string()), "the un-acked batch must be re-served");
         server.abort();
+    }
+
+    /// The timeout half of the defect `CONNECT_TIMEOUT`/`REQUEST_TIMEOUT`
+    /// close: a receiver that accepts the connection and then answers
+    /// nothing at all must not hang the caller forever.
+    ///
+    /// Bounded TWICE so a reverted fix cannot hang this suite: the client
+    /// under test is built with a small timeout via
+    /// `build_client_with_timeouts`, and the request itself runs on a
+    /// background thread this test joins through a channel with its OWN,
+    /// separate bound - so even a client built with no timeout at all fails
+    /// this test loudly (the `expect` below) rather than blocking `cargo
+    /// test` indefinitely.
+    #[test]
+    fn a_receiver_that_never_answers_is_timed_out_not_hung_forever() {
+        use std::sync::mpsc;
+
+        // Accepts the one connection the client below makes, then holds it
+        // open without ever reading or writing - answering nothing at all,
+        // for longer than this test's own bound, so the client genuinely has
+        // nothing to receive rather than a fast connection-reset.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        std::thread::spawn(move || {
+            if let Ok((stream, _)) = listener.accept() {
+                std::thread::sleep(Duration::from_secs(10));
+                drop(stream);
+            }
+        });
+
+        let (tx, rx) = mpsc::channel();
+        std::thread::spawn(move || {
+            let client = build_client_with_timeouts(Duration::from_millis(300), Duration::from_millis(300)).unwrap();
+            let started = std::time::Instant::now();
+            let result = client.get(format!("http://{addr}/sync/cursor")).send();
+            let _ = tx.send((result.is_err(), started.elapsed()));
+        });
+
+        let (returned_err, elapsed) = rx.recv_timeout(Duration::from_secs(5)).expect(
+            "the request must return well inside 5s - a hang here means CONNECT_TIMEOUT/REQUEST_TIMEOUT regressed",
+        );
+        assert!(returned_err, "a receiver that never answers must be reported as an error, not silently succeed");
+        assert!(elapsed < Duration::from_secs(5), "took {elapsed:?} - the configured timeout did not fire promptly");
     }
 }

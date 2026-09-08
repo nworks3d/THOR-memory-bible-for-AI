@@ -9,6 +9,7 @@
 //!   codeindex <db-path> <repo-path> refresh
 //!   codeindex <db-path> <repo-path> status
 //!   codeindex <db-path> <repo-path> search <query> [limit]
+//!   codeindex --version | -V
 
 use std::path::PathBuf;
 use std::process::ExitCode;
@@ -21,6 +22,10 @@ fn usage() -> String {
 
 fn run() -> Result<(), String> {
     let args: Vec<String> = std::env::args().skip(1).collect();
+    if args.iter().any(|a| a == "--version" || a == "-V") {
+        println!("codeindex {}", env!("CARGO_PKG_VERSION"));
+        return Ok(());
+    }
     if args.len() < 3 {
         return Err(usage());
     }

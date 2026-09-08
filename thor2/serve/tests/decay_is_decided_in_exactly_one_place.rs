@@ -84,3 +84,43 @@ fn every_injection_surface_caller_applies_retain_live() {
          serve::serve, which already does)"
     );
 }
+
+/// THE HOLE THIS RULES OUT, raised 2026-09-08 against another memory
+/// server's own rule ("an agent cannot write its own success story"): THOR's
+/// mark tool is callable by the very agent a blocking rule just refused, and
+/// two `mark noise` verdicts since the last useful one is all
+/// `decay::is_stale` needs to retire an item from an injection surface. If
+/// the write guard (`absent_guard`, wired in `bin/serve.rs`'s
+/// `absent_guard_block`/`command_guard_block`/`requires_guard_block`) ever
+/// took its own candidate pool AFTER that retirement, two `mark noise` calls
+/// plus the write a rule exists to stop would be enough to get it through -
+/// an agent judging the very rule that judges it.
+///
+/// It does not: every one of the guard's pure decision functions
+/// (`find_violation`, `first_location_violation`, `first_dir_violation`,
+/// `first_check_path_dir_violation`, `find_requires_violation`,
+/// `first_command_violation`, `find_missing_required`, `find_forbidden_
+/// violation`) lives in `absent_guard.rs`, and every one of them reads its
+/// candidates straight off `live::candidates_for`/`live::live_items`/
+/// `live::always_candidates` - never through `decay::retain_live` or
+/// `DecayContext::is_stale`. This is the static half of that proof: the
+/// source names none of decay's own machinery at all, so a future change
+/// cannot wire the two together by accident without this test naming the
+/// exact line it happened on. See `serve/tests/
+/// decay_never_disarms_the_write_guard.rs` for the end-to-end half, through
+/// the real compiled binary against a real noise-marked rule.
+#[test]
+fn the_write_guard_never_applies_decay_to_its_candidate_pool() {
+    let workspace_root = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .expect("serve/ has a parent directory (the workspace root)")
+        .to_path_buf();
+    let absent_guard_rs = std::fs::read_to_string(workspace_root.join("serve/src/absent_guard.rs")).unwrap();
+    for needle in ["decay::", "DecayContext", "retain_live", "is_stale"] {
+        assert!(
+            !absent_guard_rs.contains(needle),
+            "absent_guard.rs must never reference {needle} - the write guard's own candidate pool \
+             must never pass through noise-based retirement, only through live::* readers"
+        );
+    }
+}

@@ -6,6 +6,7 @@
 
 use intent::Action;
 use model::item::TargetKind;
+use std::path::PathBuf;
 
 /// One whitespace-separated argument, stripped of the shell punctuation that
 /// wraps or follows it, and of a leading `--flag=`.
@@ -505,6 +506,17 @@ pub struct ServeInput {
     /// The verbatim string last handed to `add_file`, for the same reason
     /// `command` above exists.
     pub file: Option<String>,
+    /// The project ROOT this session is standing in - the same filesystem
+    /// root `serve/src/bin/serve.rs` already resolves once per hook call and
+    /// threads into `absent_guard`'s own `root: Option<&Path>` parameters,
+    /// carried here too so `rank::select`'s own anchor matching
+    /// (`absent_guard::scoped_target_matches`) can tell a touched file
+    /// INSIDE this project from one outside it. `None` exactly when no root
+    /// was resolved (or none was ever supplied, e.g. a hand-built input) -
+    /// `scoped_target_matches` then falls back to the old, root-blind
+    /// comparison rather than guessing. See that function's own doc comment
+    /// for the defect this exists to close.
+    pub root: Option<PathBuf>,
 }
 
 impl ServeInput {

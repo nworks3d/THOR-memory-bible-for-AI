@@ -2,23 +2,44 @@
 
 # THOR - a memory for your AI coding assistant
 
-**Your assistant forgets you the second you close the window. THOR does not.**
+**Most memory tools can only remind your assistant. THOR can refuse.**
 
-Tell it once:
+Give it a note with a proof attached - a small check it can run right now,
+like "this file still contains that line." From then on the note stops being
+advice. THOR refuses the matching edit or command before it runs. Not a
+suggestion your assistant is free to skip. A hard stop.
 
-- *never deploy on a Friday*
-- *the invoice number goes in the payment reference, never in the description*
-- *the dough is 65% water and rests overnight, not two hours*
+That proof runs live, at the exact moment it matters, against your actual
+project. A note that has gone stale, that no longer describes what is really
+there, quietly stops counting as proof - so it can never block you by
+mistake.
 
-Weeks later, in a conversation that has never heard of any of it, the right one
-comes back on its own - while you are deploying, while you are invoicing, while
-you are making dough. You did not search for it. You did not remind anyone.
+Other local memories can refuse a write too. What is different is where
+the block comes from: a proof, checked live, never a rule taken on faith.
+And the whole loop that produces it, learning included, runs in one place:
+this machine.
 
-It was built for code and it turned out not to care what the subject is. The
-same memory holds your deploy rules, how your company does its billing, and what
-you learned the last time you made pizza.
+Most notes only inform: pinned so they are handed over at the start of
+every session, or surfaced the first time your assistant reaches for the
+file or command they are about.
 
-Runs on your own machine. No account, no key, nothing sent anywhere.
+A note that keeps being served without ever being judged makes THOR stop
+the turn and ask whether it helped or got in the way. Two bad verdicts in
+a row retire a note from being served again, though it stays there if you
+go looking for it. That ask only ever names a note your own session
+actually saw fire - never one that only ever showed up during other,
+unrelated work. Answer for a note once and this session leaves it alone for
+good, no matter how many more times it fires before you are done.
+
+A health check names what has rotted, out loud: proofs that now come out
+false, notes pointing at nothing, notes too crowded to ever be shown.
+
+Everything that is not code - a recipe, a book, a training log - lives in
+its own library, kept apart, so it never competes with a deploy rule for
+room.
+
+Everything stays on your machine: no account, no key, no cloud - including
+what it learns about which of your notes are worth keeping.
 
 ---
 
@@ -188,7 +209,7 @@ guards nothing. That is why the health check reports two different numbers - how
 many notes could refuse something, and how many ever actually did. Trust the
 second one.
 
-## What changed in version 2
+## A memory with a spine
 
 Version 1 remembered well and never argued. It would hand your assistant a note
 at the right moment and hope. Version 2 is the same memory with a spine.
@@ -235,7 +256,7 @@ at the right moment and hope. Version 2 is the same memory with a spine.
   bump a lighter one out of sight unnoticed. Version 1 accepted it and said
   nothing, which is how a memory fills up with advice nobody will ever see.
 
-## New in 2.1: a second memory, for everything that is not code
+## A second memory, for everything that is not code
 
 The memory above is built for work. It has a gate, notes that interrupt you,
 and a hard cap on how much ever reaches the conversation - all of which is
@@ -253,16 +274,19 @@ It works the way a shelf works.
   refused, and the refusal lists the shelves you have, so your assistant picks
   from real ones instead of inventing a name.
 - **Only you create a shelf.** If nothing fits, your assistant has to ask you
-  what the new one should be called. This is the rule that stops a tidy list of
-  eight from becoming a sprawl of sixty.
+  what the new one should be called - and once you answer, it repeats your own
+  word back and the shelf is created, with the entry filed onto it, in that
+  same reply. It can never invent a name or skip the question. This is the
+  rule that stops a tidy list of eight from becoming a sprawl of sixty.
 - **A shelf that grows gets labels, never a split.** Two hundred recipes on one
   shelf, filtered by "bbq" or "dessert", stays one shelf. That is what keeps the
   list of shelves short enough to hold in your head.
 - **You get an index, not a wall of text.** Open a shelf and you see one line
   per entry. Ask for one by number to read it whole.
 - **The same thing twice is refused**, pointing at the entry you already have.
-- **Nothing is ever deleted.** Retiring an entry takes it out of the listing and
-  leaves it readable.
+- **Nothing is ever deleted.** Your assistant can retire an entry that no
+  longer belongs - it comes out of the listing and out of search, and stays
+  fully readable by its own number for as long as the library exists.
 - **A search never answers "nothing".** If your words miss - and they will, since
   the words you ask with are rarely the words you wrote - it hands you the shelf
   to read instead. Asking for "ribbetjes" when you wrote "ribben" finds it.
@@ -343,10 +367,16 @@ after a restart. Until then, it can already read the memory but not add to it.
 thor2/target/release/doctor.exe --db "C:\Users\you\AppData\Local\thor2\thor.db"
 ```
 
-Fourteen plain-language lines, one per part: whether your memory is healthy,
-whether searching by meaning is switched on, how many of your notes can prove
-themselves, how many point at files that are no longer there, and how many are
-bound to something that can never happen. It changes nothing.
+Sixteen plain-language lines, one per part: which build you are running,
+whether your memory is healthy, whether searching by meaning is switched on,
+how many of your notes can prove themselves, how many point at files that are
+no longer there, and how many are bound to something that can never happen. It
+changes nothing.
+
+**To see just the build number** - useful when you are reporting a problem and
+need to say exactly which version you have - run `doctor` as above and read its
+first line, or run any of the programs in `thor2/target/release/` with
+`--version`, for example `thor2/target/release/serve.exe --version`.
 
 One of those lines only speaks up when it has something to report: if it ever
 says your memory's own log file has outgrown the memory itself, something is
@@ -386,8 +416,7 @@ A generic client config, the shape most tool-calling assistants expect:
       "args": [
         "run", "-i", "--rm",
         "-v", "thor-data:/data",
-        "ghcr.io/nworks3d/thor-mcp:2.3.1",
-        "mcp", "--db", "/data/thor.db"
+        "ghcr.io/nworks3d/thor-mcp:2.3.2"
       ]
     }
   }
@@ -397,14 +426,16 @@ A generic client config, the shape most tool-calling assistants expect:
 ### Run it as a container
 
 ```bash
-docker run -i --rm -v thor-data:/data ghcr.io/nworks3d/thor-mcp:2.3.1 mcp --db /data/thor.db
+docker run -i --rm -v thor-data:/data ghcr.io/nworks3d/thor-mcp:2.3.2
 ```
 
-The container does not build a fresh memory by itself - point `-v` at a folder
-or named volume that already holds a `thor.db` (a copy of the one your own
-build created, say). `-i` keeps input open, which is what talking to it over
-stdio needs; drop `--rm` if you would rather keep the stopped container around
-than have it clean up after itself.
+On an empty volume, the container creates a memory and seeds it with THOR's
+own handful of starting notes before it starts answering - the same first
+step the setup above takes. Point `-v` at a folder or named volume that
+already holds a `thor.db` instead (a copy of the one your own build created,
+say), and that one is opened untouched. `-i` keeps input open, which is what
+talking to it over stdio needs; drop `--rm` if you would rather keep the
+stopped container around than have it clean up after itself.
 
 ## Stay in one conversation
 
@@ -500,7 +531,10 @@ split in two.
 **Code lane** - projects, rules, how to work:
 
 - `remember` - store a new rule, note, report or lookup entry
-- `revise` - correct one that already exists, instead of a near-duplicate
+- `revise` - correct one that already exists, instead of a near-duplicate;
+  taking teeth away from a rule that can already stop a mistake - dropping
+  its check, lowering its severity, or narrowing where it applies - needs a
+  reason too, kept in its history
 - `retract` - remove one that turned out wrong (a reason is required; nothing
   is deleted)
 - `resolve` - settle two versions of the same fact that diverged apart
@@ -522,7 +556,7 @@ split in two.
 code lane:
 
 - `library` - read a shelf's index, one entry, or search across shelves
-- `shelve` - file a new entry, or correct one that already exists
+- `shelve` - file a new entry, correct one that already exists, or retire one
 
 ## Documentation
 

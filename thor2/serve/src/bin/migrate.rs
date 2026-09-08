@@ -9,7 +9,11 @@ use std::path::PathBuf;
 use thor_core::event_store::EventStore;
 
 #[derive(Parser)]
-#[command(name = "migrate", about = "Migrate a JSONL item export into a 2.0 store through the real write gate")]
+#[command(
+    name = "migrate",
+    version = env!("CARGO_PKG_VERSION"),
+    about = "Migrate a JSONL item export into a 2.0 store through the real write gate"
+)]
 struct Cli {
     /// Path to the target event-log database. Created if it does not exist;
     /// a rerun against an existing one is safe - an item already present is

@@ -28,7 +28,8 @@ fn usage() -> ! {
                                    creates a shelf itself.
   export <file>                    write the whole library out as one JSON
                                    object per line, retired entries included
-  restore <file>                   rebuild an EMPTY library from such a file"
+  restore <file>                   rebuild an EMPTY library from such a file
+  --version | -V                   print the version and exit"
     );
     std::process::exit(2)
 }
@@ -54,6 +55,10 @@ fn take_all(args: &mut Vec<String>, flag: &str) -> Vec<String> {
 
 fn main() {
     let mut args: Vec<String> = std::env::args().skip(1).collect();
+    if args.iter().any(|a| a == "--version" || a == "-V") {
+        println!("library {}", env!("CARGO_PKG_VERSION"));
+        return;
+    }
     let db = take_flag(&mut args, "--db").map(PathBuf::from).unwrap_or_else(|| usage());
     let labels = take_all(&mut args, "--label");
     let body = take_flag(&mut args, "--body").unwrap_or_default();

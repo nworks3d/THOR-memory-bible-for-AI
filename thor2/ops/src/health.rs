@@ -8,6 +8,19 @@ use std::path::Path;
 use thor_core::auditor::{verify_chain_integrity, DifferentialAuditor};
 use thor_core::event_store::{Event, EventStore};
 
+/// The first line of every report `doctor` prints - which build produced it.
+/// THE GAP THIS CLOSES: verified 2026-09-08 by grepping every binary in the
+/// workspace for `CARGO_PKG_VERSION` and finding it nowhere - a pasted report
+/// carried no build number at all, so a new user's bug report could not say
+/// which THOR was running, and the only way to check was a build log or git
+/// tag. Called directly from `main`, the same way `checkouts_root_line`
+/// already is, rather than folded into `report`'s own Vec below - both are
+/// "said once, before the per-component lines", not a component of the
+/// health check itself.
+pub fn version_line() -> String {
+    format!("doctor {}", env!("CARGO_PKG_VERSION"))
+}
+
 /// Open `db` and read every event, or explain in one line (no "memory
 /// store: " prefix - the caller adds whatever prefix fits it) why that
 /// could not be done. The one place that decides what "the store is not
@@ -125,6 +138,46 @@ pub fn replica_line(db: &Path, replica: Option<(&str, &str)>) -> String {
         }
         Err(e) => format!("replica: {base}, UNREACHABLE ({e})"),
     }
+}
+
+/// How long a successful ship (`ops::transport::push_once`, run hourly by
+/// the owner's own scheduled task via `sync ship`) may age before this line
+/// calls it stale.
+///
+/// WHY THREE HOURS. The task runs hourly, so one missed cycle is an hour
+/// overdue and two missed cycles is two - either is explained by an ordinary
+/// reboot or a NAS that blinked off for a firmware update, and neither is
+/// the failure this line exists to catch. Three hours is the first point the
+/// SAME hourly task has had three consecutive chances to run and used none
+/// of them - a real gap, not noise from a single missed run. THE DEFECT THIS
+/// LINE CLOSES ran four WEEKS past any such ceiling before a person noticed
+/// the date by hand (see `ops::ship_state`'s own doc comment) - three hours
+/// only has to be small next to that.
+pub const SHIP_STALE_CEILING_HOURS: u64 = 3;
+
+/// Component: how long ago `sync ship` last completed without error, read
+/// from the sidecar `ops::ship_state` writes beside `db` on every success.
+///
+/// `None`, ON PURPOSE, WHEN THIS MACHINE HAS NEVER SHIPPED. Shipping is a
+/// per-machine role - only the one machine with the hourly task cares, and
+/// most machines a report runs on (a laptop, the NAS receiver itself, a
+/// cloud sandbox) were never meant to ship anywhere. A permanent "ship: not
+/// configured" line on every one of them would be exactly the alarm that
+/// cries wolf `gate_verdict`'s own doc comment already refuses to become
+/// elsewhere - so this line simply does not exist until the first
+/// successful ship writes the sidecar that makes it meaningful.
+pub fn ship_line(db: &Path) -> Option<String> {
+    let state = crate::ship_state::read(db)?;
+    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).ok()?.as_secs();
+    let age_hours = now.saturating_sub(state.completed_unix) / 3600;
+    Some(if age_hours >= SHIP_STALE_CEILING_HOURS {
+        format!(
+            "ship: last succeeded {age_hours}h ago - STALE (ceiling {SHIP_STALE_CEILING_HOURS}h): the \
+             hourly ship may be stuck or failing silently; check it by hand"
+        )
+    } else {
+        format!("ship: last succeeded {age_hours}h ago - fresh")
+    })
 }
 
 /// Component 5: how many fireable items (Rule/Orientation) still have no
@@ -634,6 +687,54 @@ pub fn unjudged_line(db: &Path) -> String {
     format!(
         "unjudged: {heavy} trigger-bound item(s) fired {HEAVY}+ times and were never judged either way ({total_unjudged} unjudged in total, pinned items excluded - the owner answered that question by pinning them) - `mark` is the only thing that ever retires noise, and silence decides nothing"
     )
+}
+
+/// Component: the judgement debt's own two-number backlog - store-wide, and
+/// how much of it belongs to the checkout this run stands in - built on the
+/// exact same fold the Stop hook's own `judgement_debt` acts on
+/// (`serve::usefulness::judgement_debt_counts`), so this line can never
+/// silently disagree with the mechanism it reports on the way `unjudged_line`
+/// above already can (see that shared fold's own doc comment: pinned items
+/// are included here, where `unjudged_line` still excludes them).
+///
+/// A SEPARATE LINE, ADDED RATHER THAN REPLACING `unjudged_line`: the two
+/// count different things on purpose (pinned items in or out) and nothing
+/// here removes either capability - it only adds the number `doctor` had no
+/// way to report before today.
+///
+/// WHY THIS EXISTS AT ALL, recorded as `oordeelschuld-komt-binnen-de-sessie-
+/// terug` (2026-09-08). The Stop hook itself now floors each item to at most
+/// one ask per session and only ever asks about what the CURRENT session and
+/// its own project actually saw fire - correctly quieter, but that also
+/// means no single session is ever shown the size of the whole backlog
+/// again. `doctor` runs outside any one session, so it is the one place left
+/// that can still say how large that backlog is - store-wide, and for this
+/// checkout specifically - without re-introducing the nagging the session
+/// floor exists to stop.
+///
+/// SILENT AT ZERO, the same convention as `ship_line` above: a clean backlog
+/// is not a finding, and a permanent "0 owed" line on every quiet run would
+/// be exactly the noise that trains a reader to stop reading this report.
+pub fn judgement_debt_line(db: &Path, checkout_project: Option<&str>) -> Option<String> {
+    let store = EventStore::open_existing(db).ok()?;
+    let (total, in_project) = serve::usefulness::judgement_debt_counts(&store, checkout_project);
+    if total == 0 {
+        return None;
+    }
+    let threshold = serve::usefulness::JUDGEMENT_DEBT_AFTER;
+    Some(match checkout_project {
+        Some(project) => format!(
+            "judgement debt: {total} item(s) store-wide are owed a verdict (fired {threshold}+ times since \
+             the last one, or never judged at all) - {in_project} of them apply to this checkout ('{project}', \
+             or global); `mark` each once it is next served to settle it"
+        ),
+        None => format!(
+            "judgement debt: {total} item(s) store-wide are owed a verdict (fired {threshold}+ times since \
+             the last one, or never judged at all) - this checkout resolves to no project, so only the \
+             {in_project} global one(s) among them would ever be asked about here; `mark` each once it is \
+             next served to settle it"
+        ),
+    })
 }
 
 fn short(hash: &str) -> &str {
@@ -1233,6 +1334,7 @@ pub fn report(
     model_dir: Option<&Path>,
     checkouts: Option<&Path>,
     full: bool,
+    checkout_project: Option<&str>,
 ) -> Vec<String> {
     // Measured before ANYTHING else in this function, including `store_line`
     // right below - see `wal_line_from_size`'s doc comment for why that
@@ -1248,9 +1350,13 @@ pub fn report(
     // default rather than a "wal: fine" line on every ordinary run.
     lines.extend(wal_line_from_size(wal_size, db));
     lines.push(dead_moment_bindings_line(db));
+    lines.push(code_index_line(index_db, repo));
+    lines.push(replica_line(db, replica));
+    // Silent unless this machine has ever completed a ship - see
+    // `ship_line`'s own doc comment for why "never shipped" is not itself a
+    // finding worth a permanent line.
+    lines.extend(ship_line(db));
     lines.extend([
-        code_index_line(index_db, repo),
-        replica_line(db, replica),
         falsifier_line(db),
         proof_line(db),
         gate_line(db),
@@ -1262,6 +1368,10 @@ pub fn report(
         semantic_line(model_dir),
         orphan_projects_line(db, checkouts),
     ]);
+    // Silent unless something is actually owed - see `judgement_debt_line`'s
+    // own doc comment for why this exists alongside `unjudged_line` above
+    // rather than in place of it.
+    lines.extend(judgement_debt_line(db, checkout_project));
     lines
 }
 
@@ -1357,6 +1467,15 @@ mod tests {
     use super::*;
     use model::item::{Binding, Check, Item, Kind, TargetKind};
     use model::store;
+
+    // ------------------------------------------------------------ identity
+
+    #[test]
+    fn version_line_names_this_binary_and_the_workspace_version() {
+        let line = version_line();
+        assert!(line.starts_with("doctor "), "{line}");
+        assert!(line.ends_with(env!("CARGO_PKG_VERSION")), "{line}");
+    }
 
     fn rule(id: &str) -> Item {
         Item {
@@ -1513,6 +1632,64 @@ mod tests {
         );
     }
 
+    // ----------------------------------------------- judgement_debt_line
+    //
+    // Built on `serve::usefulness::judgement_debt_counts`, the same fold
+    // `bin/serve.rs`'s own Stop-time `judgement_debt` now shares - see
+    // `judgement_debt_line`'s own doc comment for why `doctor` needs this at
+    // all now that the Stop hook floors each item to at most one ask per
+    // session (`oordeelschuld-komt-binnen-de-sessie-terug`, 2026-09-08).
+
+    /// Silent at zero, the same convention `ship_line` already uses above: a
+    /// clean backlog is not a finding.
+    #[test]
+    fn judgement_debt_line_is_silent_when_nothing_is_owed() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("t.db");
+        EventStore::new(&db).unwrap();
+        assert_eq!(judgement_debt_line(&db, None), None);
+        assert_eq!(judgement_debt_line(&db, Some("thor")), None);
+    }
+
+    /// Once something is owed, the line names both the store-wide count and
+    /// this checkout's own share of it - built on the exact same fold the
+    /// Stop hook acts on, so it can never disagree with what it reports on.
+    #[test]
+    fn judgement_debt_line_names_both_numbers_once_something_is_owed() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("t.db");
+        {
+            let mut store = EventStore::new(&db).unwrap();
+            store::declare(&mut store, "s", "l", "a", &rule("owed-global")).unwrap();
+            for _ in 0..serve::usefulness::JUDGEMENT_DEBT_AFTER {
+                serve::deliver::record_delivery(&mut store, "s", "l", "t", "2026-09-08T00:00:00Z", &["owed-global".to_string()]);
+            }
+        }
+        let line = judgement_debt_line(&db, Some("thor")).expect("something is owed, the line must speak");
+        assert!(line.starts_with("judgement debt: "), "{line}");
+        assert!(line.contains("1 item"), "{line}");
+        assert!(line.contains("thor"), "must name this checkout's own project: {line}");
+    }
+
+    /// A checkout that resolves to no project at all still gets an honest
+    /// answer - the global share of the backlog, said plainly rather than
+    /// silently dropped.
+    #[test]
+    fn judgement_debt_line_still_speaks_for_a_checkout_with_no_project() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("t.db");
+        {
+            let mut store = EventStore::new(&db).unwrap();
+            store::declare(&mut store, "s", "l", "a", &rule("owed-global-2")).unwrap();
+            for _ in 0..serve::usefulness::JUDGEMENT_DEBT_AFTER {
+                serve::deliver::record_delivery(&mut store, "s", "l", "t", "2026-09-08T00:00:00Z", &["owed-global-2".to_string()]);
+            }
+        }
+        let line = judgement_debt_line(&db, None).expect("a global item is still owed with no project resolved");
+        assert!(line.contains("resolves to no project"), "{line}");
+        assert!(line.contains("1 global"), "{line}");
+    }
+
     #[test]
     fn store_line_reports_missing_store_without_creating_one() {
         let dir = tempfile::tempdir().unwrap();
@@ -1546,6 +1723,73 @@ mod tests {
         let db = dir.path().join("t.db");
         EventStore::new(&db).unwrap();
         assert_eq!(replica_line(&db, None), "replica: not configured");
+    }
+
+    // --------------------------------------------------------------- ship
+    //
+    // THE DEFECT THESE PREVENT A REPEAT OF: a hung, silently-refused ship
+    // left no trace anywhere for four weeks (see `ops::ship_state`'s own doc
+    // comment). These prove the three shapes this line must take: silent
+    // when shipping was never this machine's job, brief when a ship just
+    // succeeded, and named - age AND ceiling, never a bare number - when one
+    // has not succeeded in far too long.
+
+    /// Mirrors `replica_line_says_plainly_when_not_configured`, but ship is
+    /// the ONE component in this report that stays completely silent rather
+    /// than saying "not configured" - see `ship_line`'s own doc comment for
+    /// why: most machines this ever runs on were never meant to ship at all.
+    #[test]
+    fn ship_line_is_none_when_this_machine_has_never_shipped() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("t.db");
+        EventStore::new(&db).unwrap();
+        assert_eq!(ship_line(&db), None, "a machine that never shipped must print nothing, not an alarm");
+    }
+
+    #[test]
+    fn ship_line_reports_fresh_just_after_a_successful_ship() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("t.db");
+        EventStore::new(&db).unwrap();
+        let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs();
+        crate::ship_state::record_success_at(&db, 7, now).unwrap();
+
+        let line = ship_line(&db).expect("a recorded ship must produce a line");
+        assert!(line.starts_with("ship:"), "{line}");
+        assert!(line.contains("fresh"), "{line}");
+        assert!(!line.contains("STALE"), "just-completed must never read as stale: {line}");
+    }
+
+    /// THE EXACT CASE THE DEFECT NEEDS CAUGHT: a ship well past the hourly
+    /// schedule's own ceiling must say so, with both the age and the ceiling
+    /// it was measured against - never a bare number.
+    #[test]
+    fn ship_line_reports_stale_past_the_ceiling() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("t.db");
+        EventStore::new(&db).unwrap();
+        let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs();
+        let stale_by_a_day = now - 24 * 3600;
+        crate::ship_state::record_success_at(&db, 3, stale_by_a_day).unwrap();
+
+        let line = ship_line(&db).expect("a recorded ship must produce a line even when stale");
+        assert!(line.contains("STALE"), "{line}");
+        assert!(line.contains("24h"), "the age must be named: {line}");
+        assert!(
+            line.contains(&SHIP_STALE_CEILING_HOURS.to_string()),
+            "the ceiling must be named, never a bare number: {line}"
+        );
+    }
+
+    #[test]
+    fn ship_line_is_part_of_the_report_once_a_ship_has_happened() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("t.db");
+        EventStore::new(&db).unwrap();
+        crate::ship_state::record_success_at(&db, 1, 1_000_000).unwrap();
+
+        let lines = report(&db, None, None, None, None, None, false, None);
+        assert!(lines.iter().any(|l| l.starts_with("ship:")), "{lines:#?}");
     }
 
     /// THE DEFECT THIS PREVENTS: counting a check by its FORM instead of by
@@ -1802,7 +2046,7 @@ mod tests {
         {
             let _ = EventStore::new(&db).unwrap();
         }
-        let lines = report(&db, None, None, None, None, None, false);
+        let lines = report(&db, None, None, None, None, None, false, None);
         assert!(lines.iter().any(|l| l.starts_with("gate:")), "{lines:#?}");
     }
 
@@ -1814,7 +2058,7 @@ mod tests {
             let mut s = EventStore::new(&db).unwrap();
             store::declare(&mut s, "s", "l", "a", &rule("prose-only")).unwrap();
         }
-        let lines = report(&db, None, None, None, None, None, false);
+        let lines = report(&db, None, None, None, None, None, false, None);
         assert!(
             lines.iter().any(|l| l.starts_with("provable rules:")),
             "the health check must report proof coverage every run: {lines:?}"
@@ -1845,7 +2089,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let db = dir.path().join("t.db");
         EventStore::new(&db).unwrap();
-        let lines = report(&db, None, None, None, None, None, false);
+        let lines = report(&db, None, None, None, None, None, false, None);
         // 14, not 13: `wal_line` stays silent on a fresh store (see its own
         // doc comment - it never contributes a line unless the WAL has
         // actually outgrown both the 64 MB floor and the store itself), but
@@ -2237,7 +2481,7 @@ mod tests {
             EventStore::new(&db).unwrap();
         }
         write_sized(&wal_sidecar_path(&db), 500 * 1024 * 1024);
-        let lines = report(&db, None, None, None, None, None, false);
+        let lines = report(&db, None, None, None, None, None, false, None);
         assert!(
             lines.iter().any(|l| l.starts_with("wal:")),
             "a 500 MB WAL must still be reported even though report() itself opens and closes a \
@@ -2257,7 +2501,7 @@ mod tests {
             EventStore::new(&db).unwrap();
         }
         write_sized(&wal_sidecar_path(&db), 1024);
-        let lines = report(&db, None, None, None, None, None, false);
+        let lines = report(&db, None, None, None, None, None, false, None);
         assert!(!lines.iter().any(|l| l.starts_with("wal:")), "an ordinary small WAL must never nag: {lines:#?}");
     }
 

@@ -11,7 +11,7 @@
 //! both classes it currently covers.
 
 use crate::anchor_shape::{self, UnmatchableAnchor};
-use crate::item::{Binding, Check, Item, Kind, Severity, TargetKind};
+use crate::item::{severity_rank, Binding, Check, Item, Kind, Severity, TargetKind};
 use crate::normalize::{last_segment, normalize_target};
 use intent::Action;
 use std::collections::HashSet;
@@ -1401,6 +1401,142 @@ impl ClearedFields {
         }
         baseline
     }
+}
+
+/// One of the five ways a revise can WEAKEN a Rule/Orientation that carries a
+/// check - see `weakenings` below for the exhaustive definition. `label` is
+/// the short name a successful revise's own reply echoes back ("check
+/// cleared"); `problem` is the full sentence GROUND 28 names it with when
+/// `because` is missing.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Weakening {
+    pub label: &'static str,
+    pub problem: String,
+}
+
+/// Every way `updated` weakens `before` - a Rule or Orientation that CARRIES
+/// A CHECK, i.e. `before.check.is_some()`. An item with no check has nothing
+/// this function protects: it returns empty for one regardless of what else
+/// changes, exactly the grandfather `revise_weakening` below relies on to
+/// leave clearing a check-less item's severity, or dropping one of its
+/// bindings, or narrowing its scope, exactly as unquestioned as it always was.
+///
+/// Five shapes, decided by task report 2026-09-08 and not re-opened here:
+/// clearing the check; changing its kind, path or literal(s); lowering or
+/// clearing severity (`item::severity_rank`'s own order: irreversible >
+/// costly > house_style > none, so a rank that GROWS is a severity that
+/// weakened); removing any binding, whichever kind (Target, Moment or
+/// Always); narrowing scope from global to a project. Everything else - a
+/// text, tag or falsifier edit, ADDING a binding, RAISING severity, adding a
+/// check where none stood, or simply keeping one - is deliberately absent:
+/// this list is exhaustive, not illustrative, so a shape not named here is a
+/// shape `because` is never demanded for.
+///
+/// `before` must be the item exactly as `store::show` returns it, NEVER the
+/// `ClearedFields`-blanked baseline `revise` above compares `updated` against
+/// for its own, unrelated ground 9 - a baseline blanked for a legitimate
+/// clear already reads, to that comparison, as "this field was never there",
+/// which is exactly how a `check_kind ""` (or a `severity ""`) could disarm a
+/// proof-backed rule with nothing but silence. THE HOLE this function exists
+/// to close.
+pub fn weakenings(before: &Item, updated: &Item) -> Vec<Weakening> {
+    let mut found = Vec::new();
+    if before.check.is_none() {
+        return found;
+    }
+    match (&before.check, &updated.check) {
+        (Some(_), None) => found.push(Weakening {
+            label: "check cleared",
+            problem: "this clears the check of a rule that can refuse a write".to_string(),
+        }),
+        (Some(old), Some(new)) if old != new => found.push(Weakening {
+            label: "check changed",
+            problem: "this changes the check of a rule that can refuse a write".to_string(),
+        }),
+        _ => {}
+    }
+    if severity_rank(before.severity) < severity_rank(updated.severity) {
+        found.push(Weakening {
+            label: if updated.severity.is_none() { "severity cleared" } else { "severity lowered" },
+            problem: "this lowers the severity of a rule that can refuse a write".to_string(),
+        });
+    }
+    if binding_removed(&before.bindings, &updated.bindings) {
+        found.push(Weakening {
+            label: "binding removed",
+            problem: "this removes a binding from a rule that can refuse a write, narrowing where it can ever fire"
+                .to_string(),
+        });
+    }
+    if before.project.is_none() && updated.project.is_some() {
+        found.push(Weakening {
+            label: "scope narrowed",
+            problem: "this narrows a rule that can refuse a write from global to one project".to_string(),
+        });
+    }
+    found
+}
+
+/// Whether `updated` has lost at least one binding `before` carried.
+/// Multiset-safe - a binding repeated twice in `before` needs two surviving
+/// copies in `updated`, not merely one - because `Binding` derives neither
+/// `Ord` nor `Hash` to sort or bucket by; order-independent, since only
+/// whether every prior binding still has a match matters, never which
+/// position it holds.
+fn binding_removed(before: &[Binding], updated: &[Binding]) -> bool {
+    let mut remaining: Vec<&Binding> = updated.iter().collect();
+    for binding in before {
+        match remaining.iter().position(|b| *b == binding) {
+            Some(pos) => {
+                remaining.remove(pos);
+            }
+            None => return true,
+        }
+    }
+    false
+}
+
+/// GROUND 28: a revise that WEAKENS a Rule/Orientation carrying a check (see
+/// `weakenings` above for the exhaustive list of five shapes) requires
+/// `because` - one sentence saying why - because a `revise` this powerful was
+/// the one write left with no reason at all.
+///
+/// THE HOLE THIS CLOSES (task report, 2026-09-08). `retract` has always
+/// demanded a reason (`store::retract`); `revise` never did, and ground 9
+/// above (the unconditional field-preservation check) is exactly the wrong
+/// tool to demand one with, because `ClearedFields` has to be able to blank a
+/// field ON PURPOSE for an ordinary, honest clear - severity, project,
+/// expires, key, falsifier and check all document "pass an empty string to
+/// clear it", and ground 9 must keep honouring that unconditionally. The same
+/// assistant a proof-backed rule just refused could revise that very rule
+/// with `check_kind ""` and no reason at all, or lower its severity, or drop
+/// the one binding that reaches the file it protects - and ground 9 would
+/// never notice, because the baseline it compares against is blanked before
+/// the comparison ever runs (see `ClearedFields::baseline`'s own doc
+/// comment). History would show WHAT changed and never WHY.
+///
+/// Refuses only when `weakenings` finds something AND `because` is blank or
+/// missing; a revise for which `weakenings` finds nothing never reaches this
+/// function's own refusal, whatever `because` says or does not say. When
+/// weakening IS found, `because` is returned right back in the `Ok` alongside
+/// every shape found, so a caller can both name the weakening and echo the
+/// reason - see `store::revise_because` for where it is then stored, and
+/// `history` for where it is read back.
+pub fn revise_weakening(before: &Item, updated: &Item, because: Option<&str>) -> Result<Vec<Weakening>, Refusal> {
+    let found = weakenings(before, updated);
+    if found.is_empty() {
+        return Ok(found);
+    }
+    if because.map(str::trim).unwrap_or("").is_empty() {
+        let problems: Vec<&str> = found.iter().map(|w| w.problem.as_str()).collect();
+        return Err(Refusal::new(
+            format!("{}, with no `because`", problems.join("; ")),
+            "give `because`: one sentence saying why this weakening is right - `because` is written into \
+             this item's own history, same as retract's reason, so the owner can read why a rule that could \
+             refuse a write lost its teeth",
+        ));
+    }
+    Ok(found)
 }
 
 /// Turn the four flat `check_kind`/`check_path`/`check_literal`/
@@ -4879,5 +5015,226 @@ mod tests {
             .expect("this ground must only ever speak about the seeded note id");
         retract("some-unrelated-fact", true)
             .expect("this ground must only ever speak about the seeded note id");
+    }
+
+    // -------------------------------------------------------- ground 28
+    //
+    // THE HOLE THESE TESTS CLOSE (task report, 2026-09-08): `weakenings` and
+    // `revise_weakening` above, GROUND 28. Each shape below has an
+    // `_is_refused_with_no_because` test and an `_accepts...with_a_because`
+    // twin, proving both halves of the same property: refused silent,
+    // accepted explained. Every test constructs `Item`s directly and calls
+    // `weakenings`/`revise_weakening` in isolation - neither function
+    // touches a store, so none of these need one.
+
+    /// A checked item with a real severity, a real project and two
+    /// bindings - the one fixture every test below starts from and mutates
+    /// exactly one way. Which check FORM it carries is irrelevant to every
+    /// shape except the two that are about the check itself.
+    fn checked_item() -> Item {
+        let mut item = base(Kind::Orientation);
+        item.check = Some(Check::PathExists { path: "README.md".to_string() });
+        item.severity = Some(Severity::Irreversible);
+        item.bindings = vec![
+            Binding::Always,
+            Binding::Target { kind: TargetKind::Path, value: "src/thing.rs".to_string() },
+        ];
+        item
+    }
+
+    /// THE GRANDFATHER THIS GROUND MUST NEVER TOUCH: an item with no check
+    /// has nothing GROUND 28 protects - clearing its severity, dropping a
+    /// binding and narrowing its scope all stay exactly as unquestioned as
+    /// they were before this ground existed (see
+    /// `a_severity_named_cleared_lets_revise_accept_dropping_it` above,
+    /// proven again here at the `weakenings` layer, for every shape at once).
+    #[test]
+    fn weakenings_is_empty_when_the_existing_item_carries_no_check() {
+        let mut before = checked_item();
+        before.check = None;
+        let mut updated = before.clone();
+        updated.severity = None;
+        updated.bindings = vec![Binding::Always];
+        updated.project = None;
+        assert!(weakenings(&before, &updated).is_empty());
+        assert!(revise_weakening(&before, &updated, None).is_ok(), "no check means nothing to explain");
+    }
+
+    #[test]
+    fn weakenings_is_empty_for_a_text_only_change_on_a_checked_item() {
+        let before = checked_item();
+        let mut updated = before.clone();
+        updated.text = "a slightly reworded version of the same fact".to_string();
+        assert!(weakenings(&before, &updated).is_empty());
+        assert!(revise_weakening(&before, &updated, None).is_ok(), "a text-only revise must never need `because`");
+    }
+
+    #[test]
+    fn revise_weakening_refuses_clearing_a_checked_rules_check_with_no_because() {
+        let before = checked_item();
+        let mut updated = before.clone();
+        updated.check = None;
+        let err = revise_weakening(&before, &updated, None).unwrap_err();
+        assert!(err.problem.contains("this clears the check of a rule that can refuse a write"), "{}", err.problem);
+        assert!(err.fix.to_lowercase().contains("because"), "the fix must say to give `because`: {}", err.fix);
+    }
+
+    #[test]
+    fn revise_weakening_accepts_clearing_a_checked_rules_check_with_a_because() {
+        let before = checked_item();
+        let mut updated = before.clone();
+        updated.check = None;
+        let found = revise_weakening(&before, &updated, Some("the file it watched was deleted on purpose"))
+            .expect("a because must let this through");
+        assert_eq!(
+            found,
+            vec![Weakening {
+                label: "check cleared",
+                problem: "this clears the check of a rule that can refuse a write".to_string(),
+            }]
+        );
+    }
+
+    #[test]
+    fn revise_weakening_refuses_changing_a_checked_rules_check_with_no_because() {
+        let before = checked_item();
+        let mut updated = before.clone();
+        updated.check = Some(Check::Contains { path: "README.md".to_string(), literal: "GPLv3".to_string() });
+        let err = revise_weakening(&before, &updated, None).unwrap_err();
+        assert!(err.problem.contains("this changes the check of a rule that can refuse a write"), "{}", err.problem);
+    }
+
+    #[test]
+    fn revise_weakening_accepts_changing_a_checked_rules_check_with_a_because() {
+        let before = checked_item();
+        let mut updated = before.clone();
+        updated.check = Some(Check::Contains { path: "README.md".to_string(), literal: "GPLv3".to_string() });
+        let found = revise_weakening(&before, &updated, Some("the file no longer merely needs to exist"))
+            .expect("a because must let this through");
+        assert_eq!(found[0].label, "check changed");
+    }
+
+    #[test]
+    fn revise_weakening_refuses_lowering_severity_on_a_checked_rule_with_no_because() {
+        let before = checked_item(); // Irreversible
+        let mut updated = before.clone();
+        updated.severity = Some(Severity::Costly);
+        let err = revise_weakening(&before, &updated, None).unwrap_err();
+        assert!(err.problem.contains("this lowers the severity of a rule that can refuse a write"), "{}", err.problem);
+    }
+
+    #[test]
+    fn revise_weakening_accepts_lowering_severity_on_a_checked_rule_with_a_because() {
+        let before = checked_item();
+        let mut updated = before.clone();
+        updated.severity = Some(Severity::Costly);
+        let found = revise_weakening(&before, &updated, Some("a revert is cheap now that the check catches it"))
+            .expect("a because must let this through");
+        assert_eq!(found[0].label, "severity lowered");
+    }
+
+    #[test]
+    fn revise_weakening_refuses_clearing_severity_on_a_checked_rule_with_no_because() {
+        let before = checked_item();
+        let mut updated = before.clone();
+        updated.severity = None;
+        let err = revise_weakening(&before, &updated, None).unwrap_err();
+        assert!(err.problem.contains("this lowers the severity of a rule that can refuse a write"), "{}", err.problem);
+    }
+
+    #[test]
+    fn revise_weakening_accepts_clearing_severity_on_a_checked_rule_with_a_because() {
+        let before = checked_item();
+        let mut updated = before.clone();
+        updated.severity = None;
+        let found = revise_weakening(&before, &updated, Some("severity no longer applies once the check runs"))
+            .expect("a because must let this through");
+        assert_eq!(found[0].label, "severity cleared");
+    }
+
+    #[test]
+    fn revise_weakening_refuses_removing_a_binding_from_a_checked_rule_with_no_because() {
+        let before = checked_item(); // Always + a Path target
+        let mut updated = before.clone();
+        updated.bindings = vec![Binding::Always]; // the Path target is gone
+        let err = revise_weakening(&before, &updated, None).unwrap_err();
+        assert!(
+            err.problem.contains("this removes a binding from a rule that can refuse a write"),
+            "{}",
+            err.problem
+        );
+    }
+
+    #[test]
+    fn revise_weakening_accepts_removing_a_binding_from_a_checked_rule_with_a_because() {
+        let before = checked_item();
+        let mut updated = before.clone();
+        updated.bindings = vec![Binding::Always];
+        let found = revise_weakening(&before, &updated, Some("src/thing.rs was deleted for good"))
+            .expect("a because must let this through");
+        assert_eq!(found[0].label, "binding removed");
+    }
+
+    #[test]
+    fn revise_weakening_refuses_narrowing_scope_on_a_checked_rule_with_no_because() {
+        let mut before = checked_item();
+        before.project = None; // global
+        let mut updated = before.clone();
+        updated.project = Some("thor2".to_string());
+        let err = revise_weakening(&before, &updated, None).unwrap_err();
+        assert!(
+            err.problem.contains("this narrows a rule that can refuse a write from global to one project"),
+            "{}",
+            err.problem
+        );
+    }
+
+    #[test]
+    fn revise_weakening_accepts_narrowing_scope_on_a_checked_rule_with_a_because() {
+        let mut before = checked_item();
+        before.project = None;
+        let mut updated = before.clone();
+        updated.project = Some("thor2".to_string());
+        let found = revise_weakening(&before, &updated, Some("this only ever applied inside thor2 anyway"))
+            .expect("a because must let this through");
+        assert_eq!(found[0].label, "scope narrowed");
+    }
+
+    /// THE OTHER HALF OF THE DEFINITION: raising severity and ADDING a
+    /// binding are both explicitly not weakening (see `weakenings`'s own doc
+    /// comment - "Everything else... is deliberately absent"), so neither
+    /// may ever need a `because`, however heavily the item is already
+    /// checked.
+    #[test]
+    fn revise_weakening_never_asks_for_strengthening_a_checked_rule() {
+        let before = checked_item(); // Irreversible severity, two bindings
+        let mut updated = before.clone();
+        updated.bindings.push(Binding::Moment(intent::Action::Configure)); // ADDING a binding
+        assert!(weakenings(&before, &updated).is_empty());
+
+        let mut lowered_first = before.clone();
+        lowered_first.severity = Some(Severity::HouseStyle);
+        let mut raised_back = lowered_first.clone();
+        raised_back.severity = Some(Severity::Irreversible); // RAISING it back up
+        assert!(weakenings(&lowered_first, &raised_back).is_empty(), "raising severity must never count as weakening");
+    }
+
+    #[test]
+    fn revise_weakening_names_every_shape_at_once_when_several_apply() {
+        let before = checked_item();
+        let mut updated = before.clone();
+        updated.check = None;
+        updated.severity = None;
+        let err = revise_weakening(&before, &updated, None).unwrap_err();
+        assert!(err.problem.contains("this clears the check"), "{}", err.problem);
+        assert!(err.problem.contains("this lowers the severity"), "{}", err.problem);
+    }
+
+    #[test]
+    fn revise_weakening_treats_a_whitespace_only_because_as_missing() {
+        let before = checked_item();
+        let mut updated = before.clone();
+        updated.check = None;
+        assert!(revise_weakening(&before, &updated, Some("   ")).is_err());
     }
 }

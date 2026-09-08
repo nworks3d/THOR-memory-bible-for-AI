@@ -14,6 +14,7 @@ use std::path::{Path, PathBuf};
 #[derive(Parser)]
 #[command(
     name = "mcp",
+    version = env!("CARGO_PKG_VERSION"),
     about = "Serve THOR 2.0's agent surface (remember/revise/retract/resolve/get/lookup/history/search_code/mark/status) over stdio"
 )]
 struct Cli {

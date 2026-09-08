@@ -14,7 +14,11 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 
 #[derive(Parser)]
-#[command(name = "sync", about = "Replicate THOR's log to/from a remote copy over a bearer-gated HTTP transport")]
+#[command(
+    name = "sync",
+    version = env!("CARGO_PKG_VERSION"),
+    about = "Replicate THOR's log to/from a remote copy over a bearer-gated HTTP transport"
+)]
 struct Cli {
     #[command(subcommand)]
     command: Command,
@@ -110,6 +114,16 @@ fn main() -> ExitCode {
                 "shipped: {} applied, {} already present, {} batch(es), receiver now at seq {}",
                 summary.applied, summary.skipped, summary.batches, summary.final_cursor
             );
+            // Reaching here means `push_once` returned Ok: the receiver
+            // agreed with everything shipped, including the "nothing to
+            // ship" case (see `push_once`'s own doc comment on the AHEAD/
+            // DIFFERENT-tip checks that guard that case from a false
+            // success). Record it even though nothing else here reads it
+            // this run - see `ops::ship_state`'s own doc comment for the
+            // four-week silence this exists to close.
+            if let Err(e) = ops::ship_state::record_success(&db, summary.final_cursor) {
+                eprintln!("ship state NOT recorded ({e}) - the shipment above still succeeded");
+            }
             Ok(())
         }),
         Command::Status { db, to } => {

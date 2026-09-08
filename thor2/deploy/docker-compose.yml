@@ -26,6 +26,10 @@ services:
       context: ..
       dockerfile: deploy/Dockerfile
     container_name: thor2-recv
+    # Pinned to this image's own default (deploy/Dockerfile's CMD, copied
+    # verbatim) so this service keeps starting the receiver no matter what
+    # that Dockerfile's default becomes later - zero behaviour change today.
+    command: ["/bin/sh", "-c", "exec /usr/local/bin/sync recv --db /data/thor.db --bind 0.0.0.0:5555 --inbox /data/inbox.jsonl"]
     # Not "always": a receiver that keeps restarting through a real refusal
     # hides the refusal. On-failure with a cap surfaces a genuine problem in
     # `docker ps` instead of looping quietly.

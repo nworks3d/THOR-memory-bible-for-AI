@@ -378,5 +378,17 @@
     "reply": "Ja, dat heb ik gecheckt, het klopt allemaal.",
     "rule": 8,
     "class": "checked-claim-no-sha-or-path"
+  },
+  {
+    "id": "a64",
+    "reply": "Ik heb het gecheckt, alles klopt.",
+    "rule": 8,
+    "class": "checked-claim-bare-heb-het-gecheckt"
+  },
+  {
+    "id": "a65",
+    "reply": "Gecontroleerd: de config klopt.",
+    "rule": 8,
+    "class": "checked-claim-bare-colon-verdict"
   }
 ]

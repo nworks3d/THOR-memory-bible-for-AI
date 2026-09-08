@@ -30,7 +30,7 @@
   {
     "id": "checked-claim-needs-evidence",
     "tier": "block",
-    "any_of": ["gecheckt", "gecontroleerd", "geverifieerd", "nagekeken", "verified", "confirmed", "checked against", "gevalideerd"],
+    "any_of": ["heb ik gecheckt", "heb het gecheckt", "gecheckt:", "geverifieerd:", "gecontroleerd:", "is gecheckt", "is geverifieerd", "is gecontroleerd", "zijn gecheckt", "checked:", "verified:"],
     "none_of": [".py:", ".mjs:", ".cfg:", ".md:", ".js:", ".json:", ".rs:", ".ts:", ".sh:", ".ps1:", "commit ", "regel ", "line ", "niet gecheckt", "not checked", "niet geverifieerd", "not verified", "niet nagekeken", "not looked up", "niet gecontroleerd", "niet gevalideerd", "nog niet gecheckt", "niet bevestigd", "not confirmed", "unverified"],
     "none_of_patterns": ["commit_sha", "path_line"],
     "reminder": "You are claiming something was checked or verified without evidence. Name the file with a line number (path:line) or the commit, or say plainly that it was not checked."

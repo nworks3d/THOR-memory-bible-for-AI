@@ -8,6 +8,7 @@
 //! step.
 //!
 //! Usage: verify <path-to-thor.db> [--rebuild-fts] [--rebuild-heads]
+//!        verify --version | -V
 //!
 //! `--rebuild-fts` only matters when the FTS step fails: it rebuilds the
 //! index from the log (see `rebuild_fts`'s own doc comment for why that is
@@ -26,6 +27,10 @@ use thor_core::event_store::{rebuild_fts, verify_fts_integrity, verify_fts_proje
 
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().collect();
+    if args.iter().any(|a| thor_core::is_version_flag(a)) {
+        println!("verify {}", env!("CARGO_PKG_VERSION"));
+        return ExitCode::SUCCESS;
+    }
     let rebuild_fts_flag = args.iter().any(|a| a == "--rebuild-fts");
     let rebuild_heads_flag = args.iter().any(|a| a == "--rebuild-heads");
     let Some(path) = args.iter().skip(1).find(|a| !a.starts_with("--")) else {

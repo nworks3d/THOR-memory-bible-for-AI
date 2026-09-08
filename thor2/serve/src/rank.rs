@@ -220,7 +220,6 @@ mod tests {
     use crate::input::ServeInput;
     use intent::Action;
     use model::item::{Binding, Item, Kind, Severity, TargetKind};
-    use std::path::PathBuf;
 
     fn base(id: &str, kind: Kind) -> LiveItem {
         LiveItem {
@@ -330,14 +329,27 @@ mod tests {
     // three rules `select` now applies through it, and that function's own
     // test module for the unit-level cases (docs/README.md, Dir containment,
     // absolute anchors, no root resolved).
+    //
+    // THE FIXTURE DEFECT THIS ALSO FIXES: two of the three tests below used
+    // to build `input.root`/`input.targets` from a hand-typed Windows
+    // literal (`PathBuf::from("C:/repo")`, `"C:/elsewhere/scratch/
+    // README.md"`), which is only actually rooted per `Path::has_root`/
+    // `PathBuf::join` on Windows - "thor2 / linux (default)" went red on
+    // commit 0c9aea8 over exactly this. See `scoped_target_matches_tests`'s
+    // own module comment in `absent_guard.rs` for the full mechanism; every
+    // root/target path below now comes from a real `tempfile::tempdir()`
+    // instead.
 
     #[test]
     fn a_project_scoped_relative_path_anchor_never_reaches_a_file_outside_the_session_root() {
+        let root = tempfile::tempdir().unwrap();
+        let foreign = tempfile::tempdir().unwrap();
+        let foreign_file = foreign.path().join("scratch").join("README.md");
         let mut c = owned_by("readme-rule", Some("acme-shop"));
         c.item.bindings = vec![Binding::Target { kind: TargetKind::Path, value: "README.md".to_string() }];
         let mut input = in_project(Some("acme-shop"));
-        input.root = Some(PathBuf::from("C:/repo"));
-        input.targets = vec![(TargetKind::Path, "C:/elsewhere/scratch/README.md".to_string())];
+        input.root = Some(root.path().to_path_buf());
+        input.targets = vec![(TargetKind::Path, foreign_file.to_string_lossy().into_owned())];
         assert!(
             select(&[c], &input).is_empty(),
             "a project-scoped, repo-relative anchor must not reach a file outside its own project root"
@@ -348,11 +360,12 @@ mod tests {
     /// fix narrows reach, it does not blind the rule to its own project.
     #[test]
     fn a_project_scoped_relative_path_anchor_still_reaches_the_exact_file_inside_the_session_root() {
+        let root = tempfile::tempdir().unwrap();
         let mut c = owned_by("readme-rule", Some("acme-shop"));
         c.item.bindings = vec![Binding::Target { kind: TargetKind::Path, value: "README.md".to_string() }];
         let mut input = in_project(Some("acme-shop"));
-        input.root = Some(PathBuf::from("C:/repo"));
-        input.targets = vec![(TargetKind::Path, "C:/repo/README.md".to_string())];
+        input.root = Some(root.path().to_path_buf());
+        input.targets = vec![(TargetKind::Path, root.path().join("README.md").to_string_lossy().into_owned())];
         assert_eq!(select(&[c], &input).len(), 1, "the rule must still reach its own project's own file");
     }
 
@@ -362,11 +375,14 @@ mod tests {
     /// inside one checkout.
     #[test]
     fn a_global_relative_path_anchor_still_reaches_a_file_outside_the_session_root() {
+        let root = tempfile::tempdir().unwrap();
+        let foreign = tempfile::tempdir().unwrap();
+        let foreign_file = foreign.path().join("scratch").join("README.md");
         let mut c = owned_by("readme-rule", None);
         c.item.bindings = vec![Binding::Target { kind: TargetKind::Path, value: "README.md".to_string() }];
         let mut input = in_project(Some("acme-shop"));
-        input.root = Some(PathBuf::from("C:/repo"));
-        input.targets = vec![(TargetKind::Path, "C:/elsewhere/scratch/README.md".to_string())];
+        input.root = Some(root.path().to_path_buf());
+        input.targets = vec![(TargetKind::Path, foreign_file.to_string_lossy().into_owned())];
         assert_eq!(select(&[c], &input).len(), 1, "a global rule must keep reaching outside the session root");
     }
 

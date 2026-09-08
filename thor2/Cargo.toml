@@ -6,6 +6,6 @@ members = ["core", "intent", "model", "serve", "codeindex", "mcp", "ops", "libra
 # only make sense together - a store written by one and read by another -
 # so a per-crate version would invite a mismatched pair.
 [workspace.package]
-version = "2.3.2"
+version = "2.3.3"
 edition = "2021"
 

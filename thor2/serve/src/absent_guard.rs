@@ -1112,6 +1112,39 @@ pub fn scoped_target_matches(
 mod scoped_target_matches_tests {
     use super::*;
 
+    /// THE DEFECT THIS FIXTURE STYLE CLOSES. "thor2 / linux (default)" went
+    /// red on commit 0c9aea8 (six tests, exit 101) while the identical suite
+    /// stayed green on Windows - not because `scoped_target_matches` behaves
+    /// differently per platform, but because these tests used to stand in
+    /// for "an absolute path" with a hand-typed Windows literal like
+    /// `Path::new("C:/repo")`. This function decides "absolute or not" via
+    /// `Path::has_root` and resolves a relative anchor via `PathBuf::join`,
+    /// both of which parse their argument against the CURRENT platform's
+    /// path grammar, exactly like `model::check::resolve_within_root`
+    /// already has to account for. `has_root()` on "C:/repo" is `true` on
+    /// Windows (prefix "C:" plus a root) and `false` on Linux, where a drive
+    /// letter means nothing and the whole string is just two ordinary
+    /// components, "C:" and "repo" - never rooted at all. Two consequences
+    /// follow purely from that one platform-dependent boolean, and both are
+    /// silent: (1) an item_value meant to trip the function's own
+    /// `has_root()` early return (an "absolute anchor") instead falls
+    /// through to the root-relative branch on Linux; (2) `root.join(that_
+    /// same_literal)` REPLACES on Windows (a genuinely absolute path always
+    /// does) but APPENDS on Linux (the literal is merely relative there),
+    /// producing a doubled path like "C:/repo/C:/repo/README.md" that exists
+    /// on neither platform. That doubled path still happens to start with
+    /// the root's own text, which trips `path_is_or_contains` into the
+    /// wrong branch too - the function under test was never wrong; only a
+    /// literal that is not a real path on every platform was. Every fixture
+    /// below that stands for a genuine absolute location now comes from
+    /// `tempfile::tempdir()`, which is native-format and actually rooted on
+    /// whichever platform runs the suite. `with_no_root_resolved_behaviour_
+    /// is_unchanged` and `a_non_path_kind_is_unaffected_by_root_or_project`
+    /// are untouched on purpose: both return before this function ever
+    /// calls `has_root()`/`join` on their literal, so it is never parsed as
+    /// a `Path` at all, only ever compared as an opaque string - there is no
+    /// platform-dependent branch left in either one to fix.
+
     /// Rule 1, and the consequence the function's own doc comment states
     /// plainly: a relative `Path` anchor resolved against the root must
     /// equal the touched file EXACTLY - never a suffix any more, so
@@ -1119,15 +1152,17 @@ mod scoped_target_matches_tests {
     /// DIFFERENT directory of the very same project.
     #[test]
     fn a_relative_path_anchor_no_longer_matches_a_same_named_file_in_a_different_directory_inside_the_root() {
-        let root = Path::new("C:/repo");
+        let root = tempfile::tempdir().unwrap();
+        let nested = root.path().join("docs").join("README.md");
+        let exact = root.path().join("README.md");
         assert!(
             !scoped_target_matches(
                 None,
                 TargetKind::Path,
                 "README.md",
                 TargetKind::Path,
-                "C:/repo/docs/README.md",
-                Some(root),
+                &nested.to_string_lossy(),
+                Some(root.path()),
             ),
             "docs/README.md is a DIFFERENT file from the project's own README.md"
         );
@@ -1137,8 +1172,8 @@ mod scoped_target_matches_tests {
             TargetKind::Path,
             "README.md",
             TargetKind::Path,
-            "C:/repo/README.md",
-            Some(root),
+            &exact.to_string_lossy(),
+            Some(root.path()),
         ));
     }
 
@@ -1153,14 +1188,16 @@ mod scoped_target_matches_tests {
     /// call, which fails exactly this test.
     #[test]
     fn a_relative_dir_anchor_still_reaches_a_nested_file_inside_the_root() {
-        let root = Path::new("C:/repo");
+        let root = tempfile::tempdir().unwrap();
+        let direct = root.path().join("deploy").join("compose.yml");
+        let nested = root.path().join("deploy").join("nested").join("compose.yml");
         assert!(scoped_target_matches(
             None,
             TargetKind::Dir,
             "deploy",
             TargetKind::Path,
-            "C:/repo/deploy/compose.yml",
-            Some(root),
+            &direct.to_string_lossy(),
+            Some(root.path()),
         ));
         assert!(
             scoped_target_matches(
@@ -1168,8 +1205,8 @@ mod scoped_target_matches_tests {
                 TargetKind::Dir,
                 "deploy",
                 TargetKind::Path,
-                "C:/repo/deploy/nested/compose.yml",
-                Some(root),
+                &nested.to_string_lossy(),
+                Some(root.path()),
             ),
             "a Dir anchor still reaches an arbitrarily nested file, project-scoped or not"
         );
@@ -1180,14 +1217,16 @@ mod scoped_target_matches_tests {
     /// in, so a PROJECT-SCOPED item can never reach it there.
     #[test]
     fn a_relative_anchor_on_a_project_scoped_item_never_reaches_a_file_outside_the_root() {
-        let root = Path::new("C:/repo");
+        let root = tempfile::tempdir().unwrap();
+        let foreign = tempfile::tempdir().unwrap();
+        let foreign_file = foreign.path().join("awesome-mcp-servers").join("README.md");
         assert!(!scoped_target_matches(
             Some("The-AI-memory-bible"),
             TargetKind::Path,
             "README.md",
             TargetKind::Path,
-            "C:/Users/x/scratch/awesome-mcp-servers/README.md",
-            Some(root),
+            &foreign_file.to_string_lossy(),
+            Some(root.path()),
         ));
     }
 
@@ -1197,14 +1236,16 @@ mod scoped_target_matches_tests {
     /// one checkout.
     #[test]
     fn a_relative_anchor_on_a_global_item_still_reaches_outside_the_root() {
-        let root = Path::new("C:/repo");
+        let root = tempfile::tempdir().unwrap();
+        let foreign = tempfile::tempdir().unwrap();
+        let foreign_file = foreign.path().join("awesome-mcp-servers").join("README.md");
         assert!(scoped_target_matches(
             None,
             TargetKind::Path,
             "README.md",
             TargetKind::Path,
-            "C:/Users/x/scratch/awesome-mcp-servers/README.md",
-            Some(root),
+            &foreign_file.to_string_lossy(),
+            Some(root.path()),
         ));
     }
 
@@ -1219,26 +1260,29 @@ mod scoped_target_matches_tests {
     /// known.
     #[test]
     fn an_absolute_anchor_outside_the_root_still_fires() {
-        let root = Path::new("C:/repo");
+        let root = tempfile::tempdir().unwrap();
+        let elsewhere = tempfile::tempdir().unwrap();
+        let secrets = elsewhere.path().join("secrets.txt");
         assert!(
             scoped_target_matches(
                 Some("acme-shop"),
                 TargetKind::Path,
-                "C:/elsewhere/secrets.txt",
+                &secrets.to_string_lossy(),
                 TargetKind::Path,
-                "C:/elsewhere/secrets.txt",
-                Some(root),
+                &secrets.to_string_lossy(),
+                Some(root.path()),
             ),
             "an absolute anchor already names one exact location; a project root must never narrow it"
         );
+        let orders = elsewhere.path().join("x").join("y").join("server").join("lib").join("orders.js");
         assert!(
             scoped_target_matches(
                 None,
                 TargetKind::Path,
-                "C:/x/y/server/lib/orders.js",
+                &orders.to_string_lossy(),
                 TargetKind::Path,
                 "server/lib/orders.js",
-                Some(root),
+                Some(root.path()),
             ),
             "the suffix reach an absolute anchor already had must survive unchanged"
         );

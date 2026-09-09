@@ -88,7 +88,7 @@ fn an_untouched_rulebook_blocks_identically_through_the_new_path() {
     let mut fired = 0usize;
     for msg in &messages {
         let old = respond::block_reason(Some(text), msg);
-        let verdict = respond::guard_verdict(Some(text), msg, "");
+        let verdict = respond::guard_verdict(Some(text), msg, "", false);
         assert_eq!(old, verdict.block_reason, "block verdict diverged for: {msg:?}");
         assert!(verdict.warn_reason.is_none(), "nothing here asks for a warn: {msg:?}");
         if old.is_some() {

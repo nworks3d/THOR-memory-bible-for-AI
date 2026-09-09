@@ -351,12 +351,23 @@ pub struct OptInRule {
     /// Empty (every rulebook before this field existed) means no such
     /// exemption, unchanged from today.
     pub list_request_any_of: Vec<String>,
+    /// `true` marks this rule as being about the OWNER's own reading of a
+    /// reply, not about whether the agent was honest or diligent - skipped
+    /// for a subagent payload (`evaluate_opt_in`'s own `is_subagent`
+    /// parameter) as if the rule had not matched at all. Missing, `false`,
+    /// or a malformed value all mean the same thing: this rule keeps
+    /// applying to everyone, subagent included. See this section's own
+    /// "READER SCOPE" doc comment, further down, for why that is the
+    /// direction this field fails in, and `parse_opt_in_rules` for exactly
+    /// how a malformed value is read as `false` rather than rejected.
+    pub owner_reading_only: bool,
 }
 
 /// Parse the rulebook into `OptInRule`s: every field `parse_rules` reads,
-/// plus `before`, `tier`, `none_of_patterns` and `list_request_any_of`. Same
-/// fail-open stance as `parse_rules` - malformed JSON, or an entry missing
-/// `reminder`, drops that entry rather than erroring.
+/// plus `before`, `tier`, `none_of_patterns`, `list_request_any_of` and
+/// `owner_reading_only`. Same fail-open stance as `parse_rules` - malformed
+/// JSON, or an entry missing `reminder`, drops that entry rather than
+/// erroring.
 pub fn parse_opt_in_rules(text: &str) -> Vec<OptInRule> {
     let Ok(Value::Array(arr)) = serde_json::from_str::<Value>(text) else {
         return vec![];
@@ -369,7 +380,17 @@ pub fn parse_opt_in_rules(text: &str) -> Vec<OptInRule> {
                 r.get("tier").and_then(|v| v.as_str()).and_then(Tier::from_json).unwrap_or(Tier::Block);
             let none_of_patterns = str_list(r, "none_of_patterns");
             let list_request_any_of = str_list(r, "list_request_any_of");
-            Some(OptInRule { base, before, tier, none_of_patterns, list_request_any_of })
+            // `.as_bool()` is `None` for anything that is not a literal JSON
+            // `true`/`false` - absent, a string, a number, an object, an
+            // array - and `unwrap_or(false)` reads every one of those the
+            // SAME way the field's total absence already reads: this rule is
+            // NOT owner-reading-only, so it keeps applying to everyone. See
+            // this file's own "READER SCOPE" doc comment, above
+            // `evaluate_opt_in`, for why a malformed value must fail toward a
+            // rule applying rather than toward it going quiet.
+            let owner_reading_only =
+                r.get("owner_reading_only").and_then(|v| v.as_bool()).unwrap_or(false);
+            Some(OptInRule { base, before, tier, none_of_patterns, list_request_any_of, owner_reading_only })
         })
         .collect()
 }
@@ -555,15 +576,78 @@ fn list_exempted(rule: &OptInRule, prompt_lower: &str, haystack_lower: &str) -> 
     asked_for_a_list && is_mostly_list_lines(haystack_lower)
 }
 
+// ------------------------------------------------------- reader scope
+//
+// THE DEFECT THIS FIELD FIXES, decided by the owner 2026-09-09, the same day
+// `serve/src/bin/serve.rs` first gave a subagent's Stop a blanket exemption
+// from this whole guard. That exemption was all-or-nothing: EVERY rule in
+// the rulebook stopped applying to a subagent's own reply, the moment the
+// payload carried an `agent_id` at all. Two of the rulebook's rules are not
+// about how a reply READS to the owner but about whether the agent told the
+// truth - a claim that something was checked or verified with no evidence
+// for it (the live rulebook's `checked-claim-needs-evidence`), and a claim
+// that something could not be reached without having tried (the live
+// rulebook's `claim-no-access-without-checking`) - and those must keep
+// catching a subagent exactly as they catch the owner's own main session: a
+// subagent that lies about having checked something is the same defect this
+// whole project exists to catch, regardless of who reads the lie. The
+// blanket exemption silenced them too. Measured the same day: the rules that
+// ARE genuinely about the owner's own reading experience (the length rule,
+// the plain-language-summary rule) refused 15 of 25 real agent reports - so
+// the exemption was not wrong to exist, only wrong to cover every rule
+// alike.
+//
+// THE FIX: `owner_reading_only`, one optional boolean per rule (parsed by
+// `parse_opt_in_rules`, read here by `evaluate_opt_in`). `true` means this
+// rule judges the SHAPE of a reply for the owner's own reading - length, a
+// summary first, a tone he finds grating - rather than whether the agent was
+// honest or diligent, and is skipped entirely for a subagent payload, the
+// same as if the rule had not matched at all. Every other rule - the field
+// absent, `false`, or any value that is not a literal JSON `true` - keeps
+// applying to everyone, subagent included.
+//
+// THE DEFAULT MATTERS, and it is deliberately the OPPOSITE of `tier`'s own
+// default a few sections up. `tier` defaults to `Block` (the stricter of its
+// two choices) because every rulebook shipped before that field existed
+// already meant Block, and the default has to preserve that history. This
+// field carries no such history, so its default is chosen the other way: a
+// gate going quiet is the worst failure class this whole project exists to
+// catch (`serve/src/bin/serve.rs` has already measured that twice, under a
+// different name - see its own `is_subagent` doc comment), so a rule that
+// DECLARES NOTHING applies to EVERYONE, including a subagent, rather than to
+// no one. That way a newly written honesty rule guards a subagent from the
+// moment it exists, with no second step to remember, and a newly written
+// style rule that turns out to annoy an agent is a LOUD, visible nuisance -
+// caught, named, and marked - rather than a silent hole nobody notices. A
+// malformed value (a string, a number, anything that is not literally
+// `true`/`false`) falls back to this SAME default rather than crashing the
+// guard or erroring: this parser already fails this way on every other
+// field (`str_list` drops a non-string entry silently, `parse_one_rule`
+// drops a whole rule that carries no `reminder` at all) and on the rulebook
+// file itself (unreadable or malformed JSON yields zero rules, never an
+// error - this module's own "Failure policy" doc comment at the top) - a
+// rule whose scope cannot be read is a rule that keeps applying, not a rule
+// that goes quiet. `parse_opt_in_rules`'s own `.as_bool().unwrap_or(false)`
+// is where this is actually enforced.
+
 /// `evaluate`'s own AND/OR/NOT/min_chars matcher, reused verbatim
 /// (`rule_matches`), plus the positional escape, the pattern escape
-/// (`pattern_escaped`) and the list exemption (`list_exempted`) layered on
-/// top. Returns every fired rule's tier and reminder, in rulebook order -
-/// the same order `evaluate` returns its reminders in. `prompt_lower` is the
-/// owner's own last prompt, already lowercased, or an empty string when it
-/// could not be read - `list_exempted` treats that exactly like "the field
-/// is absent", never as a match.
-pub fn evaluate_opt_in(rules: &[OptInRule], haystack_lower: &str, prompt_lower: &str) -> Vec<(Tier, String)> {
+/// (`pattern_escaped`), the list exemption (`list_exempted`) and the reader
+/// scope (this section's own doc comment above) layered on top. Returns
+/// every fired rule's tier and reminder, in rulebook order - the same order
+/// `evaluate` returns its reminders in. `prompt_lower` is the owner's own
+/// last prompt, already lowercased, or an empty string when it could not be
+/// read - `list_exempted` treats that exactly like "the field is absent",
+/// never as a match. `is_subagent` is the caller's own answer to "is this
+/// payload from a Task-tool subagent" (`serve/src/bin/serve.rs`'s own
+/// `payload_is_from_a_subagent`) - `true` drops every fired rule whose
+/// `owner_reading_only` is `true`, `false` drops none of them.
+pub fn evaluate_opt_in(
+    rules: &[OptInRule],
+    haystack_lower: &str,
+    prompt_lower: &str,
+    is_subagent: bool,
+) -> Vec<(Tier, String)> {
     rules
         .iter()
         .filter(|r| {
@@ -571,6 +655,7 @@ pub fn evaluate_opt_in(rules: &[OptInRule], haystack_lower: &str, prompt_lower: 
                 && !positionally_escaped(r, haystack_lower)
                 && !pattern_escaped(r, haystack_lower)
                 && !list_exempted(r, prompt_lower, haystack_lower)
+                && !(r.owner_reading_only && is_subagent)
         })
         .map(|r| (r.tier, r.base.reminder.clone()))
         .collect()
@@ -593,20 +678,31 @@ pub struct GuardVerdict {
 
 /// `block_reason`'s richer sibling: same fail-open stance (no rulebook, or
 /// zero parseable rules, yields both fields `None`), but reads a rulebook
-/// that may carry `before`/`tier`/`none_of_patterns`/`list_request_any_of`
-/// and keeps a WARN-tier fire out of the block reason entirely, instead of
-/// discarding the tier and treating every fire alike. `last_user_prompt` is
-/// the owner's own last typed prompt (see the `last_user_prompt` function
-/// above for where a caller reads this from), or an empty string when it is
-/// not available - the ONLY thing that ever reads it, the list exemption,
-/// treats an empty string exactly like "the prompt did not ask for a list".
-pub fn guard_verdict(rulebook_text: Option<&str>, message: &str, last_user_prompt: &str) -> GuardVerdict {
+/// that may carry `before`/`tier`/`none_of_patterns`/`list_request_any_of`/
+/// `owner_reading_only` and keeps a WARN-tier fire out of the block reason
+/// entirely, instead of discarding the tier and treating every fire alike.
+/// `last_user_prompt` is the owner's own last typed prompt (see the
+/// `last_user_prompt` function above for where a caller reads this from), or
+/// an empty string when it is not available - the ONLY thing that ever reads
+/// it, the list exemption, treats an empty string exactly like "the prompt
+/// did not ask for a list". `is_subagent` is threaded straight through to
+/// `evaluate_opt_in` - see this file's own "READER SCOPE" doc comment, right
+/// above it, for what it does and why its default (`false`, from every
+/// existing caller that predates this parameter) must never silently narrow
+/// what a rulebook already blocks or warns about for the owner's own main
+/// session, only ever for a subagent's.
+pub fn guard_verdict(
+    rulebook_text: Option<&str>,
+    message: &str,
+    last_user_prompt: &str,
+    is_subagent: bool,
+) -> GuardVerdict {
     let rules = rulebook_text.map(parse_opt_in_rules).unwrap_or_default();
     if rules.is_empty() {
         return GuardVerdict { block_reason: None, warn_reason: None };
     }
     let prompt_lower = last_user_prompt.to_lowercase();
-    let fired = evaluate_opt_in(&rules, &haystack(message), &prompt_lower);
+    let fired = evaluate_opt_in(&rules, &haystack(message), &prompt_lower, is_subagent);
     let format_tier = |tier: Tier| -> Option<String> {
         let reasons: Vec<&str> = fired.iter().filter(|(t, _)| *t == tier).map(|(_, r)| r.as_str()).collect();
         if reasons.is_empty() {
@@ -718,7 +814,7 @@ mod tests {
     #[test]
     fn a_reply_that_opens_with_a_summary_then_jargon_does_not_trip_the_rule() {
         let msg = format!("TLDR: it works. {}", long_suffix("commit "));
-        assert!(guard_verdict(Some(POSITIONED_RULEBOOK), &msg, "").block_reason.is_none());
+        assert!(guard_verdict(Some(POSITIONED_RULEBOOK), &msg, "", false).block_reason.is_none());
     }
 
     /// Same words, reversed order: the jargon now comes first, so the rule
@@ -727,7 +823,7 @@ mod tests {
     #[test]
     fn the_same_words_in_the_other_order_trips_the_rule() {
         let msg = format!("{} TLDR: it works.", long_prefix("commit "));
-        let reason = guard_verdict(Some(POSITIONED_RULEBOOK), &msg, "").block_reason.expect("must fire");
+        let reason = guard_verdict(Some(POSITIONED_RULEBOOK), &msg, "", false).block_reason.expect("must fire");
         assert!(reason.contains("before the jargon"), "{reason}");
     }
 
@@ -737,7 +833,7 @@ mod tests {
     #[test]
     fn a_reply_with_no_jargon_at_all_never_trips_the_position_aware_rule() {
         let msg = format!("TLDR: it works. {}", "detail ".repeat(100));
-        assert!(guard_verdict(Some(POSITIONED_RULEBOOK), &msg, "").block_reason.is_none());
+        assert!(guard_verdict(Some(POSITIONED_RULEBOOK), &msg, "", false).block_reason.is_none());
     }
 
     /// A rulebook that never mentions `before` at all - every rule the owner
@@ -747,16 +843,16 @@ mod tests {
     #[test]
     fn a_rulebook_without_the_before_field_behaves_exactly_as_before() {
         let blocked = long("the commit fsck run is done, all gepusht");
-        assert_eq!(block_reason(Some(RULEBOOK), &blocked), guard_verdict(Some(RULEBOOK), &blocked, "").block_reason);
+        assert_eq!(block_reason(Some(RULEBOOK), &blocked), guard_verdict(Some(RULEBOOK), &blocked, "", false).block_reason);
 
         let compliant = long("TLDR: it works. the commit fsck run is done, all gepusht");
         assert_eq!(
             block_reason(Some(RULEBOOK), &compliant),
-            guard_verdict(Some(RULEBOOK), &compliant, "").block_reason
+            guard_verdict(Some(RULEBOOK), &compliant, "", false).block_reason
         );
 
         let short = "commit done, gepusht";
-        assert_eq!(block_reason(Some(RULEBOOK), short), guard_verdict(Some(RULEBOOK), short, "").block_reason);
+        assert_eq!(block_reason(Some(RULEBOOK), short), guard_verdict(Some(RULEBOOK), short, "", false).block_reason);
     }
 
     // ------------------------------------------------------------- tier
@@ -777,7 +873,7 @@ mod tests {
     /// then discarded it.
     #[test]
     fn a_warn_tier_rule_never_blocks() {
-        let v = guard_verdict(Some(TIERED_RULEBOOK), "ik zou liever dit anders zien", "");
+        let v = guard_verdict(Some(TIERED_RULEBOOK), "ik zou liever dit anders zien", "", false);
         assert!(v.block_reason.is_none(), "{:?}", v.block_reason);
         let warn = v.warn_reason.expect("the warn tier must still say something");
         assert!(warn.contains("preference"), "{warn}");
@@ -785,7 +881,7 @@ mod tests {
 
     #[test]
     fn a_block_tier_rule_still_blocks() {
-        let v = guard_verdict(Some(TIERED_RULEBOOK), "dat nooit meer doen, begrepen?", "");
+        let v = guard_verdict(Some(TIERED_RULEBOOK), "dat nooit meer doen, begrepen?", "", false);
         let reason = v.block_reason.expect("a block-tier match must still block");
         assert!(reason.contains("hard rule"), "{reason}");
     }
@@ -797,10 +893,10 @@ mod tests {
     /// absent or misspelled.
     #[test]
     fn an_unknown_or_missing_tier_defaults_to_block() {
-        let missing = guard_verdict(Some(TIERED_RULEBOOK), "a mystery phrase appears here", "");
+        let missing = guard_verdict(Some(TIERED_RULEBOOK), "a mystery phrase appears here", "", false);
         assert!(missing.block_reason.is_some(), "no tier key at all must still block");
 
-        let bogus = guard_verdict(Some(TIERED_RULEBOOK), "a bogus phrase appears here", "");
+        let bogus = guard_verdict(Some(TIERED_RULEBOOK), "a bogus phrase appears here", "", false);
         assert!(bogus.block_reason.is_some(), "an unrecognised tier value must still block");
     }
 
@@ -811,7 +907,7 @@ mod tests {
     #[test]
     fn block_and_warn_reasons_never_mix() {
         let msg = "ik zou liever dit anders zien, en dat nooit meer doen, begrepen?";
-        let v = guard_verdict(Some(TIERED_RULEBOOK), msg, "");
+        let v = guard_verdict(Some(TIERED_RULEBOOK), msg, "", false);
         let block = v.block_reason.expect("block-example must still fire");
         let warn = v.warn_reason.expect("warn-example must still fire");
         assert!(!block.contains("preference"), "{block}");
@@ -847,7 +943,7 @@ mod tests {
                     proxy-fix), 0dca539b (1.0.24), 9b3d5132 (onbekende plaat blokkeert dispatch niet), \
                     faa6d10a (1.0.25); werkmap schoon, server/package.json versie 1.0.25, en \
                     server/public/dashboard.html bevat de knop btn-nav-fleet. Niets verloren.";
-        let v = guard_verdict(Some(EVIDENCE_RULEBOOK), msg, "");
+        let v = guard_verdict(Some(EVIDENCE_RULEBOOK), msg, "", false);
         assert!(v.block_reason.is_none(), "{:?}", v.block_reason);
     }
 
@@ -857,7 +953,7 @@ mod tests {
     #[test]
     fn a_bare_checked_claim_with_no_sha_or_path_still_blocks() {
         let msg = "Ja, dat heb ik gecheckt, het klopt allemaal.";
-        let v = guard_verdict(Some(EVIDENCE_RULEBOOK), msg, "");
+        let v = guard_verdict(Some(EVIDENCE_RULEBOOK), msg, "", false);
         assert!(v.block_reason.is_some(), "a bare claim with nothing to point at must still block");
     }
 
@@ -867,7 +963,7 @@ mod tests {
     #[test]
     fn a_path_line_citation_in_an_unlisted_extension_escapes_the_rule() {
         let msg = "Gecheckt: config/settings.yaml:42 bevat de verkeerde waarde.";
-        let v = guard_verdict(Some(EVIDENCE_RULEBOOK), msg, "");
+        let v = guard_verdict(Some(EVIDENCE_RULEBOOK), msg, "", false);
         assert!(v.block_reason.is_none(), "{:?}", v.block_reason);
     }
 
@@ -927,7 +1023,7 @@ mod tests {
     /// ("lijst", "alle"), reply genuinely is one - must pass.
     #[test]
     fn a_long_list_reply_after_a_prompt_that_asked_for_one_is_not_blocked() {
-        let v = guard_verdict(Some(LIST_RULEBOOK), &long_list_reply(), "Kun je een lijst geven van alle stappen?");
+        let v = guard_verdict(Some(LIST_RULEBOOK), &long_list_reply(), "Kun je een lijst geven van alle stappen?", false);
         assert!(v.block_reason.is_none(), "{:?}", v.block_reason);
     }
 
@@ -936,7 +1032,7 @@ mod tests {
     /// list-shaped; it needs the owner to have asked.
     #[test]
     fn the_same_long_list_reply_still_blocks_when_the_prompt_never_asked_for_one() {
-        let v = guard_verdict(Some(LIST_RULEBOOK), &long_list_reply(), "Hoe los ik dit probleem op?");
+        let v = guard_verdict(Some(LIST_RULEBOOK), &long_list_reply(), "Hoe los ik dit probleem op?", false);
         assert!(v.block_reason.is_some(), "no list was ever requested, so the length rule must still apply");
     }
 
@@ -946,7 +1042,7 @@ mod tests {
     /// reply's SHAPE, not just about what the prompt said.
     #[test]
     fn a_long_prose_reply_still_blocks_even_when_the_prompt_asked_for_an_overview() {
-        let v = guard_verdict(Some(LIST_RULEBOOK), &long_prose_reply(), "Geef je me nog een overzicht van de opties?");
+        let v = guard_verdict(Some(LIST_RULEBOOK), &long_prose_reply(), "Geef je me nog een overzicht van de opties?", false);
         assert!(v.block_reason.is_some(), "the reply is prose, not a list, so it must still block");
     }
 
@@ -955,7 +1051,7 @@ mod tests {
     /// same behaviour this rule had before the field existed.
     #[test]
     fn an_empty_last_prompt_never_grants_the_list_exemption() {
-        let v = guard_verdict(Some(LIST_RULEBOOK), &long_list_reply(), "");
+        let v = guard_verdict(Some(LIST_RULEBOOK), &long_list_reply(), "", false);
         assert!(v.block_reason.is_some());
     }
 
@@ -1011,5 +1107,74 @@ mod tests {
             last_user_prompt(r#"{"type":"assistant","message":{"role":"assistant","content":"hoi"}}"#),
             None
         );
+    }
+
+    // ------------------------------------------------------- reader scope
+    //
+    // `owner_reading_only` (2026-09-09): proves the matcher-level contract
+    // this file's own "reader scope" doc comment (above `evaluate_opt_in`)
+    // states, independent of the hook wiring - `serve/tests/
+    // response_guard_subagent_gate.rs` and `serve/tests/
+    // response_guard_warn_stop_hook.rs` prove the same contract end to end
+    // through the compiled binary.
+
+    const READER_SCOPE_RULEBOOK: &str = r#"[
+      {"id":"owner-reading-rule","owner_reading_only":true,
+       "any_of":["te formeel geschreven"],"none_of":["any_of"],
+       "reminder":"this rule is about the owner's own reading"},
+      {"id":"unmarked-rule",
+       "any_of":["ik kon dit niet bereiken"],"none_of":["any_of"],
+       "reminder":"this rule carries no owner_reading_only key at all"}
+    ]"#;
+
+    /// THE DEFECT THIS PREVENTS: a rule the owner has explicitly marked as
+    /// being about his own reading of a reply must not catch a subagent -
+    /// the field genuinely doing what it says, not merely existing.
+    #[test]
+    fn a_rule_marked_owner_reading_only_is_skipped_for_a_subagent() {
+        let v = guard_verdict(Some(READER_SCOPE_RULEBOOK), "dit was te formeel geschreven voor mijn smaak", "", true);
+        assert!(v.block_reason.is_none(), "{:?}", v.block_reason);
+    }
+
+    /// Scoped, not a kill switch: the SAME rule and the SAME message still
+    /// fire for the owner's own main session (`is_subagent: false`).
+    #[test]
+    fn the_same_owner_reading_only_rule_still_fires_for_the_main_session() {
+        let v = guard_verdict(Some(READER_SCOPE_RULEBOOK), "dit was te formeel geschreven voor mijn smaak", "", false);
+        let reason = v.block_reason.expect("must still fire for the owner's own reading");
+        assert!(reason.contains("own reading"), "{reason}");
+    }
+
+    /// THE DEFAULT MATTERS: a rule that declares no `owner_reading_only` key
+    /// at all is NOT exempt for a subagent - it keeps applying to everyone,
+    /// the fail-safe direction this file's own "reader scope" doc comment
+    /// argues for (a gate going quiet is the worst failure class here).
+    #[test]
+    fn an_unmarked_rule_still_fires_for_a_subagent() {
+        let v = guard_verdict(Some(READER_SCOPE_RULEBOOK), "ik kon dit niet bereiken vanaf hier", "", true);
+        let reason = v.block_reason.expect("an unmarked rule must still catch a subagent");
+        assert!(reason.contains("no owner_reading_only key"), "{reason}");
+    }
+
+    /// A malformed `owner_reading_only` (a JSON string, not a bool) must
+    /// neither crash `parse_opt_in_rules` nor drop the rule - it must be
+    /// read as `false`, the SAME value the field's total absence already
+    /// produces (this file's own "reader scope" doc comment). Checked at TWO
+    /// levels: the parsed struct field directly, and the end-to-end matcher
+    /// still catching a subagent on it.
+    #[test]
+    fn a_malformed_owner_reading_only_value_is_read_as_not_marked() {
+        const MALFORMED_RULEBOOK: &str = r#"[
+          {"id":"malformed-owner-reading","owner_reading_only":"yes please",
+           "any_of":["deze regel heeft een kapotte waarde"],"none_of":["any_of"],
+           "reminder":"owner_reading_only is a string here, not a bool"}
+        ]"#;
+
+        let parsed = parse_opt_in_rules(MALFORMED_RULEBOOK);
+        assert_eq!(parsed.len(), 1, "a malformed owner_reading_only must not drop the whole rule");
+        assert!(!parsed[0].owner_reading_only, "a non-bool value must read as false, not panic or default true");
+
+        let v = guard_verdict(Some(MALFORMED_RULEBOOK), "deze regel heeft een kapotte waarde erin", "", true);
+        assert!(v.block_reason.is_some(), "a malformed value must be treated as not-marked, so it still catches a subagent");
     }
 }

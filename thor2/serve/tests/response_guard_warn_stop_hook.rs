@@ -108,8 +108,14 @@ fn fresh_store(dir: &Path) -> std::path::PathBuf {
     db
 }
 
+// `owner_reading_only: true` because this rule is squarely about the SHAPE
+// of a reply for the owner's own reading (a tone he finds too directive) -
+// see `a_pending_warn_never_reaches_a_subagents_stop` below, and
+// `serve/src/respond.rs`'s own "reader scope" doc comment (above
+// `evaluate_opt_in`) for the field this fixture exists to prove against the
+// real compiled binary.
 const WARN_ONLY_RULEBOOK: &str = r#"[
-  {"id":"prefer-warn","tier":"warn",
+  {"id":"prefer-warn","tier":"warn","owner_reading_only":true,
    "any_of":["ik zou liever dit anders zien"],"none_of":["any_of"],
    "reminder":"phrase this as a preference, not a directive"}
 ]"#;
@@ -282,18 +288,68 @@ fn a_rule_with_no_tier_still_blocks_exactly_as_today() {
 
 // ---------------------------------------------------------------- subagent
 
-/// THE DEFECT THIS PREVENTS: the subagent branch this task's own change
-/// touches (`if payload_is_from_a_subagent(&payload) { ... }`) starts
-/// dropping a pending warn instead of returning it, the moment the branch's
-/// return value stopped being an unconditional `None`. `JUDGE-TRANSPORT.md`
-/// documents the Response Guard as UNCHANGED by subagent status (only Lane C
-/// is gated) - this proves that still holds for the warn tier specifically,
-/// not only for block.
+/// THE DEFECT THIS PREVENTS, decided by the owner 2026-09-09: the Response
+/// Guard's rulebook judges the SHAPE of a reply for the OWNER's own reading
+/// (length, a summary first, evidence for a claim). An agent's reply is read
+/// by the MAIN SESSION, not by him, and is judged there - so a rule marked
+/// `owner_reading_only` (WARN_ONLY_RULEBOOK's "prefer-warn" is one) does not
+/// reach a subagent's own Stop, warn tier included, not only block
+/// (`a_block_still_returns_immediately_and_nothing_after_it_runs` above
+/// already covers block; this is the warn tier's own proof). See
+/// `serve/tests/response_guard_subagent_gate.rs`'s own module doc comment
+/// for why only a rule marked this way is exempt, and `JUDGE-TRANSPORT.md`'s
+/// own "Subagent gating" section for the same behaviour documented at the
+/// design level.
 #[test]
-fn a_pending_warn_still_reaches_a_subagents_stop() {
+fn a_pending_warn_never_reaches_a_subagents_stop() {
     let dir = tempfile::tempdir().unwrap();
     let db = fresh_store(dir.path());
     std::fs::write(dir.path().join("guard-response-rulebook.json"), WARN_ONLY_RULEBOOK).unwrap();
+
+    let out = run_hook(&db, &subagent_stop_payload("s1", WARN_MESSAGE));
+    assert!(out.trim().is_empty(), "a subagent's Stop must never carry a Response Guard warn: {out}");
+}
+
+/// The scoping half of the same proof: the SAME rulebook and message, minus
+/// `agent_id`, still reaches the owner's own main session exactly as
+/// `a_warn_tier_rule_produces_visible_text_and_does_not_block` above already
+/// proves - restated here, side by side with the subagent case, so this
+/// file shows the fix is scoped to subagent status and not a silent kill
+/// switch for the warn tier as a whole.
+#[test]
+fn the_owners_own_main_session_still_gets_the_pending_warn() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = fresh_store(dir.path());
+    std::fs::write(dir.path().join("guard-response-rulebook.json"), WARN_ONLY_RULEBOOK).unwrap();
+
+    let out = run_hook(&db, &stop_payload("s1", WARN_MESSAGE, false));
+    let v: serde_json::Value =
+        serde_json::from_str(&out).unwrap_or_else(|e| panic!("expected JSON output, got {out:?}: {e}"));
+    assert!(v.get("decision").is_none(), "a warn must never carry a \"decision\" key: {out}");
+    let text = v["hookSpecificOutput"]["additionalContext"]
+        .as_str()
+        .unwrap_or_else(|| panic!("expected a string additionalContext: {out}"));
+    assert!(text.contains("preference"), "{text}");
+}
+
+/// THE DEFECT THIS PREVENTS: an UNMARKED warn-tier rule (no
+/// `owner_reading_only` key at all) must still reach a subagent's own Stop -
+/// the warn tier's own proof of `response_guard_subagent_gate.rs`'s
+/// `a_subagent_reply_that_breaks_an_unmarked_rule_is_still_blocked`, which
+/// only covers the block tier. `claim-no-access-without-checking` and
+/// `ask-user-to-check-or-fetch`, two of the owner's own live honesty rules,
+/// are unmarked exactly like this fixture; this proves that shape survives
+/// end to end for the WARN tier too, not only block.
+#[test]
+fn an_unmarked_warn_tier_rule_still_reaches_a_subagents_stop() {
+    const UNMARKED_WARN_RULEBOOK: &str = r#"[
+      {"id":"unmarked-warn","tier":"warn",
+       "any_of":["ik zou liever dit anders zien"],"none_of":["any_of"],
+       "reminder":"this rule declares no owner_reading_only key at all"}
+    ]"#;
+    let dir = tempfile::tempdir().unwrap();
+    let db = fresh_store(dir.path());
+    std::fs::write(dir.path().join("guard-response-rulebook.json"), UNMARKED_WARN_RULEBOOK).unwrap();
 
     let out = run_hook(&db, &subagent_stop_payload("s1", WARN_MESSAGE));
     let v: serde_json::Value =
@@ -302,7 +358,7 @@ fn a_pending_warn_still_reaches_a_subagents_stop() {
     let text = v["hookSpecificOutput"]["additionalContext"]
         .as_str()
         .unwrap_or_else(|| panic!("expected a string additionalContext: {out}"));
-    assert!(text.contains("preference"), "{text}");
+    assert!(text.contains("no owner_reading_only key"), "{text}");
 }
 
 // -------------------------------------------------------- other surfaces

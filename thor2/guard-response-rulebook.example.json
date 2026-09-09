@@ -1,6 +1,7 @@
 [
   {
     "id": "no-plain-language-tldr",
+    "owner_reading_only": true,
     "any_of": ["md5", "sha256", "commit ", "gepusht", "fsck", "exit=0", "test result", "ci is groen"],
     "none_of": ["tldr", "kort:", "samengevat", "in het kort", "any_of"],
     "min_chars": 600,
@@ -14,6 +15,7 @@
   },
   {
     "id": "no-reflexive-disclaimers",
+    "owner_reading_only": true,
     "any_of": ["ik ben geen jurist", "ik ben geen dokter", "geen juridisch advies", "not legal advice", "i am not a lawyer", "raadpleeg een specialist", "consult a professional"],
     "none_of": ["disclaimer", "false positive", "vals alarm", "any_of"],
     "reminder": "Drop the reflexive AI/credential disclaimer and give the substantive answer with conviction. A real, specific, decision-relevant limitation may be stated ONCE as a concrete fact - that is information, not a hedge."
@@ -21,6 +23,7 @@
   {
     "id": "answer-is-too-long",
     "tier": "block",
+    "owner_reading_only": true,
     "any_of": [],
     "none_of": ["\n> ", "```"],
     "list_request_any_of": ["lijst", "overzicht", "rapport", "list", "overview", "report", "all the"],

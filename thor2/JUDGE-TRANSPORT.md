@@ -127,44 +127,90 @@ reached at all.
   29-item labeled fixture set proving `parse_judge_output`'s tolerance (see
   "Tolerant judge-output parsing" below).
 
-## Subagent gating (2026-08-05 correction)
+## Subagent gating
 
-Claude Code's own hooks documentation, verified after this document's first
-draft: `SessionStart` fires ONLY in the main session - never inside a
-Task-tool subagent. `PreToolUse`, `UserPromptSubmit` and `Stop` DO fire
-inside a subagent, and `agent_id`/`agent_type` are present on the payload
-ONLY in that case - a reliable, documented gate on exactly those three
-events.
+Claude Code's own hooks documentation, confirmed 2026-08-05: `SessionStart`
+fires ONLY in the main session, never inside a Task-tool subagent.
+`PreToolUse`, `UserPromptSubmit` and `Stop` DO fire inside a subagent, and
+`agent_id`/`agent_type` are present on the payload ONLY in that case - a
+reliable, documented gate on exactly those three events.
+`payload_is_from_a_subagent` (`serve/src/bin/serve.rs`) reads it: a
+non-empty `agent_id` string, and nothing else (see `INJECTION-FRAMING.md`
+step 3 for how this predicate was established).
 
-The consequence for Lane C: C1 (`UserPromptSubmit`), C2 (`Stop`) and C3
-(`PreToolUse`) all sit on surfaces that fire inside a subagent. A subagent's
-own task prompt is written by an orchestrating agent, not the owner, and is
+**Lane C (the capture guard) is gated off entirely for a subagent**, at all
+three of its call sites: C1 (`capture_flag`, `UserPromptSubmit`) never
+records a subagent's own prompt, so no marker exists for C2 or C3 to ever
+act on; C2 (`capture_stop_check`, `Stop`) is skipped for a subagent
+regardless of whether a marker somehow exists for that session id (defense
+in depth); C3 (`capture_sink_check`, `PreToolUse`) is skipped too,
+`capture::SinkVerdict::Allow` substituted directly. A subagent's own task
+prompt is written by an orchestrating agent, not the owner, and is
 routinely full of the words ("always", "never", "from now on") this guard
-watches for. Left ungated, a subagent would get a capture debt flagged
+watches for - unguarded, a subagent would get a capture debt flagged
 against its own task prompt, and its Stop would then be blocked until it
-records a "decision" the owner never made - a deadlock in the exact
+records a "decision" the owner never made: a deadlock in the exact
 delegated-task workflow this project runs on.
 
-**Fix:** `serve/src/bin/serve.rs` already had
-`payload_is_from_a_subagent(&payload)` (a non-empty `agent_id` string - see
-`INJECTION-FRAMING.md` step 3 for how this predicate was established). It now
-gates all three capture-guard call sites in `hook_once`:
+**`setup_debt` and three memory-upkeep debts - `crowding_debt`,
+`judgement_debt` and the stale-rule (false-proof) debt - are gated off for
+a subagent too**, each independently, at its own call site in
+`hook_once`'s `Stop` arm. `setup_debt` never walks a subagent through
+AGENTS.md's setup questions, because there is no owner in the room for
+that conversation either. The three memory-upkeep debts are silenced for a
+sharper reason: paying one of them - `mark` for the judgement debt,
+`revise`/`retract` for the crowding debt and the stale-rule debt - is a
+write through the tool server, and every write the tool server makes is
+stamped with the same shared session identity (`mcp::SESSION_ID`, the
+literal string "mcp"), never the caller's own Claude Code session id - so a
+subagent that settles one of these debts writes a record that later reads
+exactly as though the owner dealt with it himself, though he never read the
+item at all: a false record, worse than the gap silence leaves. Holding a
+subagent's own turn for this memory's maintenance also spends a whole agent
+run on upkeep the owner will never see asked or answered. Measured
+2026-09-09: agents working among themselves are not held by any of this; it
+applies only to what is addressed to the owner.
 
-- `UserPromptSubmit` arm: `capture_flag` is only called when
-  `!payload_is_from_a_subagent(&payload)` - a subagent's own prompt never
-  gets recorded, so no marker, no provisional signal, nothing for C2 or C3 to
-  ever act on for that session.
-- `Stop` arm: when `payload_is_from_a_subagent(&payload)` is true, the whole
-  Lane-C branch returns `None` (Allow) before `capture_stop_check` is even
-  called - this holds regardless of whether a marker somehow exists for that
-  session id (defense in depth, proven directly in the tests below).
-- `PreToolUse` default arm: `capture_sink_check` is skipped entirely
-  (`capture::SinkVerdict::Allow` substituted directly) for a subagent
-  payload - a subagent's own tool calls are never touched by C3 either.
+Each of the five - Lane C, `setup_debt`, and the three memory-upkeep debts -
+decides its own subagent scope independently, at its own call site in
+`hook_once`'s `Stop` arm, rather than behind one shared early return: this
+project has measured twice what a single early return across several gates
+does to the ones after it, most recently when an early `is_subagent` return
+in this same `Stop` arm silenced the Response Guard along with Lane C. See
+`serve/src/bin/serve.rs`'s own `is_subagent` doc comment in `hook_once`'s
+`Stop` arm for the per-gate shape, and `serve/tests/
+response_guard_subagent_gate.rs` and `serve/tests/setup_debt_stop_hook.rs`
+for the tests.
 
-The Response Guard (a separate surface, watching the assistant's reply, not
-the memory) is UNCHANGED and still runs on every `Stop` regardless of
-subagent status - this fix is scoped to Lane C only.
+**The Response Guard (a separate surface, watching the assistant's reply,
+not the memory) is NOT gated off wholesale.** It runs on every `Stop`,
+subagent or not: `is_subagent` is passed INTO `respond::guard_verdict` as a
+parameter instead of skipping the call, and each rule in the rulebook
+carries its own optional `owner_reading_only` field deciding whether THAT
+rule is exempt for a subagent payload (`serve/src/respond.rs`'s own "reader
+scope" doc comment, above `evaluate_opt_in`). A rule marked `true` is about
+the SHAPE of a reply for the owner's own reading - length, a summary first,
+a tone he finds too directive - and is skipped for a subagent; every other
+rule (the field absent, `false`, or malformed) keeps applying to everyone,
+subagent included, because two of the rulebook's own rules are not about
+reading experience but about whether the agent told the truth (a claim of
+having checked something with no evidence, a claim that something could
+not be reached without trying), and a subagent that lies about either is
+the same lazy-agent behaviour this whole project exists to catch,
+regardless of who reads the lie. That default - applies to everyone unless
+a rule opts out - is the opposite of the four debts above, which stay
+silent for a subagent by default; that is deliberate, not an
+inconsistency: for the four debts, going quiet for a subagent is the
+settled behaviour, but for a rulebook rule, going quiet by default is
+exactly the failure this field exists to prevent (see `respond.rs`'s own
+"THE DEFAULT MATTERS" reasoning). Measured 2026-09-09 on 25 real agent
+reports: the all-or-nothing guard this field replaced would have refused
+15 of them on style rules alone (length, no plain-language summary), while
+the two honesty rules never fired on that same corpus at all - the style
+rules needed scoping to the owner, and the honesty rules must not lose
+their reach over a subagent for having stayed quiet on this one corpus.
+See `serve/tests/response_guard_subagent_gate.rs` and `serve/tests/
+response_guard_warn_stop_hook.rs` for the tests.
 
 **Tests** (`serve/tests/capture_guard_subagent_gate.rs`, against the real
 compiled `serve hook` binary):

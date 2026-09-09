@@ -120,12 +120,21 @@ fn main() {
     // `&case.prompt` is threaded through now (empty for any case written
     // before the `"prompt"` field existed), unchanged in WHICH function it
     // calls.
+    //
+    // A FOURTH argument, `is_subagent`, was added 2026-09-09 for the
+    // `owner_reading_only` per-rule field (see `respond.rs`'s own "reader
+    // scope" section). Hardcoded to `false` here, not threaded from any case
+    // field: this corpus has no notion of an agent_id (every case is a bare
+    // reply/prompt pair, never a hook payload), so it measures the rulebook
+    // exactly as it applies to the owner's own main session, same as always -
+    // the subagent path is proven separately, end to end through the
+    // compiled binary, in `serve/tests/response_guard_subagent_gate.rs`.
     let mut caught_reasons: Vec<(String, u64, String)> = Vec::new(); // (id, rule, reason)
     for case in &should_block {
         let rule_key = case.rule.unwrap_or(0);
         let entry = by_rule.entry(rule_key).or_insert((0, 0));
         entry.1 += 1;
-        match respond::guard_verdict(Some(&rulebook_text), &case.reply, &case.prompt).block_reason {
+        match respond::guard_verdict(Some(&rulebook_text), &case.reply, &case.prompt, false).block_reason {
             Some(reason) => {
                 caught_total += 1;
                 entry.0 += 1;
@@ -168,7 +177,7 @@ fn main() {
     for case in &should_pass {
         let entry = by_class.entry(case.class.clone()).or_insert((0, 0));
         entry.1 += 1;
-        if let Some(reason) = respond::guard_verdict(Some(&rulebook_text), &case.reply, &case.prompt).block_reason {
+        if let Some(reason) = respond::guard_verdict(Some(&rulebook_text), &case.reply, &case.prompt, false).block_reason {
             false_block_total += 1;
             entry.0 += 1;
             false_block_examples.push((case.id.clone(), case.class.clone(), reason));

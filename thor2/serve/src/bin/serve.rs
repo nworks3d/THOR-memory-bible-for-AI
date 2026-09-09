@@ -560,13 +560,36 @@ enum HookOutput {
 /// subagent at all, so a subagent gate on that arm would be dead code - see
 /// `INJECTION-FRAMING.md`'s own addendum); `PreToolUse`, `UserPromptSubmit`
 /// and `Stop` DO fire inside a subagent, and `agent_id`/`agent_type` are only
-/// ever present in that case - which is exactly why this predicate now gates
+/// ever present in that case - which is exactly why this predicate gates
 /// Lane C's capture guard (C1/C2/C3, `capture_flag`/`capture_stop_check`/
 /// `capture_sink_check` below): a subagent's own task prompt is written by an
 /// orchestrating agent, not the owner, and is often full of the very words
 /// ("always", "never", "from now on") this guard watches for - flagging it
 /// would deadlock the subagent's own Stop on a "decision" the owner never
 /// made.
+///
+/// Also read, independently, at every other subagent-scoped gate in
+/// `hook_once`'s `Stop` arm: `setup_debt` (no owner in the room for a setup
+/// conversation either); the Response Guard's two verdict computations
+/// (`is_subagent`, local to that arm, passed INTO `respond::guard_verdict`
+/// rather than gating the call - see that arm's own `is_subagent` doc
+/// comment); and the three memory-upkeep debts `crowding_debt`,
+/// `judgement_debt` and `stale_guard_stop_check` (the false-proof debt).
+/// Settling any of those three - `mark` for `judgement_debt`,
+/// `revise`/`retract` for `crowding_debt` and the false-proof debt - is a
+/// write through the tool server, and every such write is stamped with a
+/// session identity a subagent shares with its own main session (see
+/// `crowding_debt`'s and `judgement_debt`'s own doc comments), so a subagent
+/// settling any of the three would write a record that later reads as though
+/// the owner dealt with it himself, though he never read the item at all - a
+/// false record, worse than the gap silence leaves - and it would spend a
+/// whole agent run on upkeep the owner himself will never see asked or
+/// answered. Measured 2026-09-09: agents working among themselves are not
+/// held by any of this; it applies only to what is addressed to the owner.
+/// Each of these gates decides its own scope independently, at its own call
+/// site, rather than sharing one early return - see the comments there for
+/// the per-gate shape that keeps a later change to any one of them from
+/// silencing another.
 fn payload_is_from_a_subagent(payload: &Value) -> bool {
     payload.get("agent_id").and_then(|v| v.as_str()).is_some_and(|s| !s.is_empty())
 }
@@ -739,6 +762,37 @@ fn hook_once(db_path: &Path) -> Option<HookOutput> {
     if event_name == "Stop" {
         let already_fired = payload.get("stop_hook_active").and_then(|v| v.as_bool()).unwrap_or(false);
         let msg = payload.get("last_assistant_message").and_then(|v| v.as_str()).unwrap_or("");
+        // The Response Guard's rulebook judges the SHAPE of a reply (length,
+        // a summary first, evidence for a claim) for the OWNER's own
+        // reading. An agent's reply is read and judged by the main session,
+        // not by him, so a rule of that KIND should not reach it - but two of
+        // the rulebook's own rules are not about how a reply reads, they are
+        // about whether the agent told the truth (a claim of having checked
+        // something with no evidence, a claim that something could not be
+        // reached without trying), and those must keep catching a subagent
+        // exactly as they catch the owner's own main session: a subagent
+        // that lies about either is the same lazy-agent behaviour this whole
+        // project exists to catch, regardless of who reads the lie. So the
+        // call into `respond::guard_verdict` is never skipped for a
+        // subagent: `is_subagent` is PASSED INTO it instead, and each rule in
+        // the rulebook carries its own optional `owner_reading_only` field
+        // deciding whether THAT rule is exempt for a subagent payload - see
+        // `respond.rs`'s own "READER SCOPE" doc comment, right above
+        // `evaluate_opt_in`, for the field, its default, and the 2026-09-09
+        // measurement (15 of 25 real agent reports refused on style rules
+        // alone, zero on the honesty rules) that decided it.
+        //
+        // Computed once, here, and read by both verdict computations below
+        // (the `already_fired` retry pass and the ordinary first pass), each
+        // passing it into its OWN call into `respond::guard_verdict` rather
+        // than sharing one early return - this project has measured twice
+        // what a single early return across several gates does to the ones
+        // after it (the rule about a loop guard blinding a whole hook). Every
+        // debt below (`setup_debt`, Lane C's `capture_stop_check`,
+        // `crowding_debt`, `judgement_debt`, `stale_guard_stop_check`) and
+        // the backlog burn (`teeth_debt`) reuses this same value but decides
+        // its own subagent scope independently, at its own call site.
+        let is_subagent = payload_is_from_a_subagent(&payload);
         // THE DEFECT THIS CLOSES, reported by the owner on 2026-08-09: "my
         // TLDR rules worked an hour ago and now they are gone."
         //
@@ -753,23 +807,36 @@ fn hook_once(db_path: &Path) -> Option<HookOutput> {
         // So the second pass still reads the reply and still says what it
         // found, as a WARN. A warning cannot hold the turn, so it cannot
         // loop; the loop safety that matters is keeping BLOCK to one pass,
-        // not going blind.
+        // not going blind. Only the EMPTY-message case is an early-out here
+        // any more (`is_subagent` is no longer folded into it - see this
+        // arm's own `is_subagent` doc comment above for why): a subagent
+        // payload still reaches `respond::guard_verdict` below, exactly like
+        // the owner's own main session, and it is `guard_verdict` itself
+        // that decides, rule by rule, whether `is_subagent` excuses this
+        // particular fire.
         if already_fired {
             if msg.trim().is_empty() {
                 return None;
             }
             let rulebook_text = std::fs::read_to_string(respond::default_rulebook_path(db_path)).ok();
             let last_prompt = last_user_prompt_from_payload(&payload);
-            let verdict = respond::guard_verdict(rulebook_text.as_deref(), msg, &last_prompt);
+            let verdict = respond::guard_verdict(rulebook_text.as_deref(), msg, &last_prompt, is_subagent);
             let text = verdict.block_reason.or(verdict.warn_reason)?;
             return Some(HookOutput::Warn { event_name, text });
         }
+        // Same shape for the ordinary first pass: only an empty message
+        // skips the call into `respond::guard_verdict` now. A subagent
+        // payload still computes a real verdict - `warn_text` (and the BLOCK
+        // returned just below, from `verdict.block_reason`) can still carry
+        // whichever rules `owner_reading_only` did NOT excuse for this
+        // payload, the same as the owner's own main session would see for
+        // those same rules.
         let warn_text: Option<String> = if msg.trim().is_empty() {
             None
         } else {
             let rulebook_text = std::fs::read_to_string(respond::default_rulebook_path(db_path)).ok();
             let last_prompt = last_user_prompt_from_payload(&payload);
-            let verdict = respond::guard_verdict(rulebook_text.as_deref(), msg, &last_prompt);
+            let verdict = respond::guard_verdict(rulebook_text.as_deref(), msg, &last_prompt, is_subagent);
             if let Some(reason) = verdict.block_reason {
                 return Some(HookOutput::Decision(serde_json::json!({
                     "decision": "block",
@@ -783,30 +850,32 @@ fn hook_once(db_path: &Path) -> Option<HookOutput> {
         // no BLOCK to return (a WARN, if any, is only pending in `warn_text`
         // so far, not yet returned), so this is still the one Stop path that
         // may open the store, and only read-only. See `capture_stop_check`'s
-        // own doc comment. NEVER for a subagent (`payload_is_from_a_subagent`'s
-        // own doc comment): a subagent's Stop must never be blocked over a
-        // "decision" that lives only in its own delegated task prompt - but
-        // the Response Guard's own WARN, if pending, still applies regardless
-        // of subagent status, unchanged from its existing BLOCK behaviour
-        // (`JUDGE-TRANSPORT.md`'s "Subagent gating": "The Response Guard...
-        // is UNCHANGED and still runs on every Stop regardless of subagent
-        // status - this fix is scoped to Lane C only"), so it is returned
-        // here rather than silently dropped.
-        if payload_is_from_a_subagent(&payload) {
-            return warn_text.map(|text| HookOutput::Warn { event_name, text });
-        }
+        // own doc comment.
+        //
+        // THE FOURTH DEBT (`setup_debt`) and Lane C's C2 (`capture_stop_check`)
+        // share this one `!is_subagent` check: both are about who is on the
+        // other end of the conversation, not about the store's own state.
+        // Lane C never blocks a subagent's Stop over a "decision" that lives
+        // only in its own delegated task prompt
+        // (`payload_is_from_a_subagent`'s own doc comment) - the prompt was
+        // written by an orchestrating agent, not the owner, so there is no
+        // decision of HIS to attribute. `setup_debt` never walks a subagent
+        // through AGENTS.md's setup questions - there is no owner in the
+        // room to walk through anything (see `setup_debt`'s own doc
+        // comment). A per-gate check, not the wider, shared early return
+        // this arm once had - the shape that also swallowed the Response
+        // Guard's own subagent behaviour (see the rule about a loop guard
+        // blinding a whole hook, and `is_subagent`'s own doc comment above).
+        if !is_subagent {
+            if let Some(reason) = EventStore::open_existing(db_path).ok().and_then(|s| setup_debt(&s)) {
+                return Some(HookOutput::Decision(
+                    serde_json::json!({ "decision": "block", "reason": reason }),
+                ));
+            }
 
-        // THE FOURTH DEBT, asked before Lane C and everything below it: while
-        // the seeded first-session note is still live, nothing else this
-        // hook could ask matters yet - see `setup_debt`'s own doc comment.
-        if let Some(reason) = EventStore::open_existing(db_path).ok().and_then(|s| setup_debt(&s)) {
-            return Some(HookOutput::Decision(
-                serde_json::json!({ "decision": "block", "reason": reason }),
-            ));
-        }
-
-        if let Some(output) = capture_stop_check(db_path, &session_id) {
-            return Some(output);
+            if let Some(output) = capture_stop_check(db_path, &session_id) {
+                return Some(output);
+            }
         }
 
         // THE MESS YOU MADE THIS SESSION, before the older debt below it.
@@ -824,13 +893,29 @@ fn hook_once(db_path: &Path) -> Option<HookOutput> {
             .or_else(|| std::env::current_dir().ok())
             .as_deref()
             .and_then(project::resolve_project);
-        if let Some(reason) = EventStore::open_existing(db_path)
-            .ok()
-            .and_then(|s| crowding_debt(&s, db_path, &session_id, stop_project.as_deref()))
-        {
-            return Some(HookOutput::Decision(
-                serde_json::json!({ "decision": "block", "reason": reason }),
-            ));
+        // GATED ON `is_subagent`: a fact landing on an already-full anchor is
+        // still true of the STORE no matter who wrote it, but PAYING this
+        // debt (fold or re-anchor with `revise`, retract, or the
+        // `crowded-on-purpose` tag) is a write through the tool server,
+        // which stamps every write it makes - a subagent's included - with
+        // the same session identity the owner's own main session would
+        // carry (see this function's own watermark note on the shared
+        // constant `"mcp"`), so nothing in the store afterward would show
+        // that a delegate resolved it rather than him. A false record like
+        // that is worse than the gap silence leaves, and the owner will
+        // never see this maintenance question either way, so holding a
+        // subagent's turn for it spends a whole agent run on nothing he
+        // asked for. Agents among themselves are not held by this; it
+        // applies only to what is addressed to him.
+        if !is_subagent {
+            if let Some(reason) = EventStore::open_existing(db_path)
+                .ok()
+                .and_then(|s| crowding_debt(&s, db_path, &session_id, stop_project.as_deref()))
+            {
+                return Some(HookOutput::Decision(
+                    serde_json::json!({ "decision": "block", "reason": reason }),
+                ));
+            }
         }
 
         // The one debt nobody ever pays voluntarily. Independent of the
@@ -838,42 +923,68 @@ fn hook_once(db_path: &Path) -> Option<HookOutput> {
         // is, and this must not go quiet with it. `stop_project` (resolved
         // above for `crowding_debt`) is reused here for the identical reason:
         // this session's own project right now, not just its own session_id.
-        if let Some(reason) = EventStore::open_existing(db_path)
-            .ok()
-            .and_then(|s| judgement_debt(&s, db_path, &session_id, stop_project.as_deref()))
-        {
-            return Some(HookOutput::Decision(
-                serde_json::json!({ "decision": "block", "reason": reason }),
-            ));
+        //
+        // GATED ON `is_subagent`: `mark`'s own verdict is stamped with a
+        // session identity a subagent shares with its own main session (see
+        // this function's own doc comment, "WHY THIS IS A WATERMARK... AND
+        // NOT A FILTER ON THE MARK EVENT'S OWN session_id COLUMN"), so a
+        // subagent that pays this debt settles it under a name that reads,
+        // from the store's side, exactly like the owner's own verdict -
+        // without the owner ever having read the item himself. A false
+        // record like that is worse than the gap silence leaves, and the
+        // question is one the owner will never see asked or answered
+        // regardless, so holding a subagent's turn for it wastes a whole
+        // agent run. Agents among themselves are not held by this debt; it
+        // applies only to what is addressed to him.
+        if !is_subagent {
+            if let Some(reason) = EventStore::open_existing(db_path)
+                .ok()
+                .and_then(|s| judgement_debt(&s, db_path, &session_id, stop_project.as_deref()))
+            {
+                return Some(HookOutput::Decision(
+                    serde_json::json!({ "decision": "block", "reason": reason }),
+                ));
+            }
         }
 
         // The backlog burn: one fact per turn that LOOKS armable and has
         // never been asked. Last of the debts on purpose - it is the only one
         // with no urgency, and it must never speak over a mess made this
-        // session or a verdict that is owed.
-        if let Some(reason) = EventStore::open_existing(db_path)
-            .ok()
-            .filter(|_| teeth_not_yet_asked_this_session(db_path, &session_id))
-            .and_then(|s| teeth_debt(&s, stop_project.as_deref()))
-        {
-            record_teeth_asked(db_path, &session_id);
-            return Some(HookOutput::Decision(
-                serde_json::json!({ "decision": "block", "reason": reason }),
-            ));
+        // session or a verdict that is owed. Still gated on `!is_subagent`,
+        // unchanged by today's fix: not one of the four debts it names, left
+        // exactly as it already stood.
+        if !is_subagent {
+            if let Some(reason) = EventStore::open_existing(db_path)
+                .ok()
+                .filter(|_| teeth_not_yet_asked_this_session(db_path, &session_id))
+                .and_then(|s| teeth_debt(&s, stop_project.as_deref()))
+            {
+                record_teeth_asked(db_path, &session_id);
+                return Some(HookOutput::Decision(
+                    serde_json::json!({ "decision": "block", "reason": reason }),
+                ));
+            }
         }
 
         // The stale-rule guard (`serve::stale_guard`) - AFTER both the
         // Response Guard above and Lane C's capture guard just above, on
         // purpose: it never overrides either, only fills the silence when
         // neither had anything to say. See `stale_guard_stop_check`'s own
-        // doc comment for the full doctrine. Same subagent exemption as
-        // Lane C, inherited for free from the `payload_is_from_a_subagent`
-        // check above rather than repeated here. A pending WARN loses to a
-        // maintenance BLOCK here exactly as it already lost to Lane C's own
-        // BLOCK just above - only once NEITHER has anything to say does the
-        // WARN, if any, finally reach the owner, on the very last line below.
-        if let Some(output) = stale_guard_stop_check(db_path, &session_id) {
-            return Some(output);
+        // doc comment for the full doctrine.
+        //
+        // GATED ON `is_subagent`: settling one outstanding entry here
+        // (`stale_guard::item_settled`) is itself a `revise` or a `retract`,
+        // the same tool-server write `crowding_debt` above already makes
+        // under a session identity a subagent shares with the owner's own -
+        // the same false-record risk, on top of the same wasted agent run
+        // for a maintenance question the owner will never see. A pending
+        // WARN still loses to a maintenance BLOCK whenever this DOES run -
+        // only once NEITHER has anything to say does the WARN, if any,
+        // finally reach the owner, on the very last line below.
+        if !is_subagent {
+            if let Some(output) = stale_guard_stop_check(db_path, &session_id) {
+                return Some(output);
+            }
         }
         return warn_text.map(|text| HookOutput::Warn { event_name, text });
     }

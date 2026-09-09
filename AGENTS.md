@@ -37,6 +37,10 @@ write through - creates their memory if there is not one yet, seeds the notes
 in the next section, and wires it all together. It backs up both files first,
 never removes anything it did not put there, and a second run changes nothing.
 
+It also points git at a shared set of hooks that run in every repository on
+this machine, not only this one - each one still finishes by running that
+repository's own hook, so nothing already there stops working.
+
 Nothing to type in the normal case. For an unusual setup: `--settings` and
 `--mcp-json` point it at other files, `--db` and `--serve-exe` override the
 rest, and `--no-mcp` installs a memory the agent can read but not write, on
@@ -60,34 +64,27 @@ thor2/target/release/doctor.exe --db "<their store>"
 One plain line per part. A missing language model is not a problem: THOR works
 without it, just with simpler matching.
 
-**5. Give the project its own memory.** From the project folder:
+**5. Index the project's code.** A fresh project is scoped by the name of its
+folder already, with no setup. What this command adds is the reading of the
+code. From the project folder:
 
 ```sh
 thor2/target/release/install.exe --project "<project-name>"
 ```
 
-Skip this and THOR gets worse the more they use it, because every search starts
-competing with projects they were not asking about.
+It reads this project's code once, so searching the code, finding where a symbol
+is used and outlining a file answer here at all, and from then on every commit
+keeps that reading fresh by itself. The `--project` part is only needed when the
+folder is not called what they call the project; most of the time, leave it off.
 
-That one command does three things, and they are the whole of what "a new
-project" means here:
+It refuses to change a name already there - renaming a scope would strand every
+note filed under the old one. Two answers you may get instead, both with the fix:
+a folder with no git in it cannot be read (start a repository there first), and a
+repository on a network share needs a `safe.directory` line before git will open it
+as you.
 
-- it writes a small file called `.thor-project` holding that name, which is
-  what binds this folder to that scope,
-- it reads this project's code once, so searching the code, finding where a
-  symbol is used and outlining a file answer here at all,
-- and from then on every commit keeps that reading fresh by itself.
-
-Run it FROM the folder the code is in. If the code sits one directory down,
-run it there - it does not look downward. It refuses to change a name already
-there, which is correct: renaming a scope would strand every note filed under
-the old one. Two answers you may get instead, both with the fix in them: a
-folder with no git in it cannot be read (start a repository there first), and a
-repository on a network share that git will not open as you needs one
-`safe.directory` line before it can be.
-
-You may not invent the name. The owner names a scope; if nothing that exists
-fits, ask him and use the word he gives you.
+You may not invent a name. The owner names a scope; if nothing that exists fits,
+ask him and use the word he gives you.
 
 **6. Prove it works before you say it works.** Store one real note, then start a
 fresh conversation and check that it comes back. Only then tell them setup is
@@ -233,10 +230,11 @@ the same way a full set of preferences would.
   want on, off, or reworded. Each rule in that file is one entry with a
   plain-language reminder line - edit the reminder to change what it says,
   or delete the entry to turn the rule off.
-- **Whether they want a project marker.** In each checkout,
-  `install --project <name>` scopes facts to that project so they stop
-  competing with every other project's notes. Skip it and every fact stays
-  global - fine with one project, noisy once there is more than one.
+- **How they name their projects.** Every checkout is scoped by its folder name
+  automatically - facts stay inside that project and do not compete across
+  projects. If a folder name does not match how they call the project, they can
+  run `install --project <name>` to override it. Only then ask what name they want
+  - never invent one.
 - **That the memory is theirs to correct.** A changed fact is corrected with
   `revise`, never stored a second time - though taking teeth away from a rule
   that can already block a mistake (its check, its severity, a binding, its

@@ -367,7 +367,8 @@ fn main() -> ExitCode {
         }
     }
 
-    // 5. The project scope, only when asked for.
+    // 5. The project scope: the marker only with --project, the code index
+    // either way.
     //
     // GIVING A FOLDER ITS OWN MEMORY IS ONE ACTION. Measured 2026-08-18, on a
     // fresh project the owner asked an agent to scope: it had to find three
@@ -377,8 +378,23 @@ fn main() -> ExitCode {
     // refresh. Nothing named them together, and the marker was only found
     // because the owner pointed at another repository that had one. Three
     // steps nobody can discover is a step that gets skipped.
+    //
+    // THE DEFECT THIS CLOSES, measured 2026-09-09 in a sandboxed first run
+    // that followed the setup page literally. Both the marker write and the
+    // code index used to live behind `if let Some(key) = &cli.project`, but
+    // the setup page tells a newcomer to leave that flag off most of the
+    // time now, because a folder is already named after its own project (see
+    // `serve::project::resolve_project`). Leaving it off therefore wrote no
+    // marker AND built no index, with nothing printed either way: a stranger
+    // followed the page, restarted their agent, and searching the code
+    // answered nothing - the exact silent-failure shape this project refuses
+    // everywhere else. Fixed by resolving the name through the same function
+    // every other surface uses whenever `--project` is absent, and indexing
+    // under it regardless. The flag keeps its two jobs and gains no third:
+    // it writes the marker that overrides the folder-derived name, and it
+    // still refuses to change a name that is already there.
+    let here = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
     if let Some(key) = &cli.project {
-        let here = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
         match write_project_marker(&here, key) {
             Ok(MarkerOutcome::Written) => println!("+ this folder now has its own memory, under {key:?}"),
             Ok(MarkerOutcome::AlreadyThere) => println!("= this folder already has its own memory, under {key:?}"),
@@ -387,12 +403,17 @@ fn main() -> ExitCode {
                 return ExitCode::FAILURE;
             }
         }
-        match code_index_root.as_deref().map(|r| build_project_index(r, key, &here)).transpose() {
+    }
+    match cli.project.or_else(|| serve::project::resolve_project(&here)) {
+        Some(key) => match code_index_root.as_deref().map(|r| build_project_index(r, &key, &here)).transpose() {
             Ok(Some(Some(files))) => println!("+ read this project's code, {files} file(s), so it can be searched and kept fresh on every commit"),
             Ok(Some(None)) => println!("= this project's code was already read; every commit keeps it fresh"),
             Ok(None) => {}
             Err(e) => println!("- the code here could not be read ({e}) - the memory works, code search does not"),
-        }
+        },
+        None => println!(
+            "- the code here was not indexed: no --project was given, and no git repository was found above this folder"
+        ),
     }
 
     println!();

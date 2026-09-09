@@ -135,9 +135,11 @@ own `.mcp.json`, say), `--no-mcp` installs a read-only memory on purpose, and
 `--db`, `--serve-exe`, `--mcp-exe` and `--code-index-root` override the rest.
 
 `--project <key>` additionally writes a `.thor-project` marker in the current
-directory, which is what gives a checkout its own scope. It refuses to change a
-key that is already there: re-scoping strands every item filed under the old one
-while leaving them in the store, which is invisible from every surface.
+directory to override the project name. By default, a checkout is scoped to the
+name of its repository folder. Pass `--project` only when you want a different
+name. It refuses to change a key that is already there: re-scoping strands
+every item filed under the old one while leaving them in the store, which is
+invisible from every surface.
 
 The four hooks are `SessionStart` (what the agent is handed at the start),
 `PreToolUse` (the gate that can block a write), `UserPromptSubmit`, and `Stop`

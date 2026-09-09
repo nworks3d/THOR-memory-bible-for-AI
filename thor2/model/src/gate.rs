@@ -11,7 +11,7 @@
 //! both classes it currently covers.
 
 use crate::anchor_shape::{self, UnmatchableAnchor};
-use crate::item::{severity_rank, Binding, Check, Item, Kind, Severity, TargetKind};
+use crate::item::{severity_rank, Binding, Check, Item, Kind, Severity, TargetKind, MAX_ITEMS};
 use crate::normalize::{last_segment, normalize_target};
 use intent::Action;
 use std::collections::HashSet;
@@ -787,6 +787,25 @@ fn no_literal_reason_problem(reason: &str) -> Option<Refusal> {
     None
 }
 
+/// The text's own last sentence, split on a plain full stop followed by a
+/// space: `(dropped, kept)`, where `dropped` is that sentence's own length
+/// and `kept` is what the text would be with it gone. `None` for a text with
+/// no such split - one sentence, nothing to name a cut with - so the caller
+/// must say that plainly instead of inventing one. Feeds the char-limit
+/// refusal's cheapest-cut hint below; see that ground's own comment for why
+/// it exists.
+///
+/// A byte offset doubles as a char boundary here with no extra care needed:
+/// the pattern is two single-byte ASCII characters, and no UTF-8
+/// continuation byte (0x80-0xBF) can ever equal either one, so a match can
+/// only ever start on a real character boundary.
+fn last_sentence_cut(text: &str) -> Option<(usize, usize)> {
+    let idx = text.rfind(". ")?;
+    let kept = text[..=idx].chars().count();
+    let dropped = text[idx + 2..].chars().count();
+    Some((dropped, kept))
+}
+
 /// Every `Action` variant nothing in `serve`'s real runtime path ever
 /// produces, so a Moment binding to one is silent forever.
 ///
@@ -902,7 +921,7 @@ fn shape_problems(
                     "answer one question: is there a text whose presence MEANS the mistake is happening? \
                      If yes, add a check with that literal - forbidden for a command or for any file, \
                      absent for one named file. If no (an authorised action looks identical to an \
-                     unauthorised one), put '{}<why not>' in its tags - one plain phrase of 20 to 120 characters, no \n                     comma and no line break, because it travels as a tag. The reason is the answer, and a \
+                     unauthorised one), put '{}<why not>' in its tags - one plain phrase of 20 to 120 characters, no comma and no line break, because it travels as a tag. The reason is the answer, and a \
                      bare '{}' no longer counts.",
                     crate::store::NO_LITERAL_REASON_PREFIX,
                     crate::store::NO_LITERAL_TAG
@@ -928,12 +947,54 @@ fn shape_problems(
             }
         }
     }
+    // THE FRICTION THIS REWORDING CLOSES, measured across three independent
+    // sessions on 2026-09-08: this refusal cost about seventeen rewrites in
+    // one day (eleven in one session, two in another, four in a third - two
+    // of those four over by exactly one and two characters). Every one was a
+    // full round trip: compose, get refused, count the text by hand, reword,
+    // resend. The LIMIT is not the defect - see MAX_TEXT_CHARS's own doc
+    // comment, and `serve::render`'s module doc comment for why 300 is
+    // exactly `MAX_ITEMS` items to a 1200-character block - the defect was a
+    // refusal that named neither how far over nor why the number is what it
+    // is, and offered no move cheaper than reading the whole text again.
     if item.kind.can_fire() {
         let len = item.text.chars().count();
         if len > MAX_TEXT_CHARS {
+            let over = len - MAX_TEXT_CHARS;
+            let overflow =
+                if over == 1 { "one character over".to_string() } else { format!("{over} characters over") };
+            let mut fix = String::new();
+            // A cheapest-cut hint only earns its keep close to the limit -
+            // past a fifth over, the honest fix is "shorten it", and naming
+            // a last sentence that saves 5% of a 600-character text is not a
+            // one-edit fix.
+            if over <= MAX_TEXT_CHARS / 5 {
+                match last_sentence_cut(&item.text) {
+                    Some((dropped, kept)) => fix.push_str(&format!(
+                        "cheapest cut: the last sentence is {dropped} characters - dropping it lands the \
+                         text at {kept} characters. "
+                    )),
+                    // Never claim a cut that is not there: one sentence has
+                    // nothing to drop, and pretending otherwise is exactly
+                    // the kind of refusal this rewording exists to stop.
+                    None => fix.push_str(
+                        "this text is one sentence, so there is no sentence to cut - shorten it directly \
+                         instead. ",
+                    ),
+                }
+            }
+            fix.push_str(&format!(
+                "shorten the text to at most {MAX_TEXT_CHARS} characters; move the reasoning into a Report \
+                 instead"
+            ));
             problems.push(Refusal::new(
-                format!("the text is {len} characters, over the {MAX_TEXT_CHARS}-character limit for a {:?}", item.kind),
-                format!("shorten the text to at most {MAX_TEXT_CHARS} characters; move the reasoning into a Report instead"),
+                format!(
+                    "the text is {len} characters, {overflow} the {MAX_TEXT_CHARS}-character limit for a \
+                     {:?} - a served note shares a block that holds {MAX_ITEMS} of them, so {MAX_TEXT_CHARS} \
+                     is its share of that budget",
+                    item.kind
+                ),
+                fix,
             ));
         }
     }
@@ -1537,6 +1598,145 @@ pub fn revise_weakening(before: &Item, updated: &Item, because: Option<&str>) ->
         ));
     }
     Ok(found)
+}
+
+/// The literal(s) `check` requires PRESENT in its named file - `None` for a
+/// check whose predicate is not "requires a literal present" (`PathExists`,
+/// `Absent`, `AbsentAll`, `Forbidden`), or for `Requires`, whose own literals
+/// are required in a CALL, never a file. Kept as its own real match arm for
+/// `Requires` rather than folded into the catch-all `None` - see
+/// `opposing_literals`'s own doc comment for why, exhaustive by
+/// construction, the same reason `crate::check::run`'s own `Forbidden`/
+/// `Requires` arms stay real code rather than `unreachable!()`.
+fn positive_literals(check: &Check) -> Option<Vec<&str>> {
+    match check {
+        Check::Contains { literal, .. } => Some(vec![literal.as_str()]),
+        Check::Requires { required, .. } => Some(required.iter().map(String::as_str).collect()),
+        Check::PathExists { .. } | Check::Absent { .. } | Check::AbsentAll { .. } | Check::Forbidden { .. } => None,
+    }
+}
+
+/// The mirror of `positive_literals`: the literal(s) `check` requires ABSENT
+/// from its named file.
+fn negative_literals(check: &Check) -> Option<Vec<&str>> {
+    match check {
+        Check::Absent { literal, .. } => Some(vec![literal.as_str()]),
+        Check::AbsentAll { literals, .. } => Some(literals.iter().map(String::as_str).collect()),
+        Check::PathExists { .. } | Check::Contains { .. } | Check::Forbidden { .. } | Check::Requires { .. } => None,
+    }
+}
+
+/// The literal(s) on which `a` and `b` are in DIRECT OPPOSITION - empty when
+/// they are not. See `check_opposition`'s own doc comment (GROUND 29) for
+/// what that means and why. Kept as its own pure function, free of any
+/// rival's id or text, so `serve/examples/check_contradictions.rs` - the
+/// read-only census this ground's own numbers came from - measures the
+/// IDENTICAL rule the gate enforces, rather than keeping a second,
+/// driftable copy of it (the same reason `duplicate_pairs.rs` calls
+/// `store::normalize_for_comparison`/`word_set`/`jaccard_similarity` instead
+/// of re-deriving near-duplicate detection on its own).
+///
+/// Checked both ways round (`a` positive against `b` negative, and `b`
+/// positive against `a` negative) since a pair is unordered - either side
+/// may be the one written as the positive check. Comparison is byte-for-byte
+/// exact, never a substring or a case-fold - exactly how `crate::check::run`
+/// itself compares a literal against a file's content (`str::contains`). A
+/// looser match would refuse two checks anchored to literals that merely
+/// look alike, never the same literal at all.
+pub fn opposing_literals(a: &Check, b: &Check) -> Vec<String> {
+    fn shared<'a>(positive: &[&'a str], negative: &[&'a str]) -> Vec<&'a str> {
+        let mut out: Vec<&str> = Vec::new();
+        for literal in positive {
+            if negative.contains(literal) && !out.contains(literal) {
+                out.push(literal);
+            }
+        }
+        out
+    }
+    let mut out: Vec<String> =
+        shared(&positive_literals(a).unwrap_or_default(), &negative_literals(b).unwrap_or_default())
+            .into_iter()
+            .map(String::from)
+            .collect();
+    for literal in shared(&positive_literals(b).unwrap_or_default(), &negative_literals(a).unwrap_or_default()) {
+        if !out.iter().any(|l| l == literal) {
+            out.push(literal.to_string());
+        }
+    }
+    out
+}
+
+/// GROUND 29: a NEW item's check may not be in DIRECT OPPOSITION with a live
+/// item's own check, on the same file - one side requires an exact literal
+/// PRESENT (`Contains`; `Requires` in principle, though it carries no path
+/// at all and so can never actually reach this ground through `store::
+/// declare`'s own same-file search - see `positive_literals`'s own doc
+/// comment) while the other requires the exact SAME literal ABSENT
+/// (`Absent`, `AbsentAll`). These two conditions can never both be true, for
+/// any content the named file could ever hold - a structural guarantee,
+/// decided entirely by the two checks' own shape (`opposing_literals`
+/// above), never by reading the file. Unlike the neighbourhood toll
+/// (`store::declare_in`'s own `unsettled_neighbours`), this needs no
+/// filesystem and no root at all to know the two cannot coexist, so it fires
+/// unconditionally on every `declare`, not only when a checkout root happens
+/// to be available.
+///
+/// "The same file" is decided entirely by the caller (`store::
+/// find_opposing_check`): the same normalised check path (`crate::normalize::
+/// normalize_target`) AND the same project, compared by strict equality
+/// (`None` matching only `None`) - the identical rule `unsettled_neighbours`
+/// already established, for the identical reason: "a path is only unique
+/// WITHIN a project" (see that function's own doc comment). This is
+/// deliberately NOT `find_near_duplicate`'s own looser rule (which also
+/// compares a global item against every project-scoped one): a check's path
+/// names a real FILE on disk, and a global item's own path has no single
+/// real file to be compared against, so there is nothing safe to conclude by
+/// relating it to one specific project's copy.
+///
+/// MEASURED before this ground existed, 2026-09-09, on the owner's real
+/// store (`serve/examples/check_contradictions.rs`, phase 1 of this work):
+/// of 357 live Rule/Orientation items carrying a check, 323 name a file (the
+/// other 34 are `Forbidden`/`Requires`, which name no file and can never
+/// pair with anything here); those 323 formed 265 same-file pairs (same
+/// normalised path, same project); zero of the 265 were in direct
+/// opposition. THIS GROUND CURRENTLY REFUSES NOTHING ALREADY IN THE STORE -
+/// it is entirely prospective, guarding against the FIRST such contradiction
+/// rather than cleaning up an existing one. The false-alarm rate the
+/// decision to build this ground rests on is therefore 0 of 0 real flagged
+/// pairs, not 0 of some N greater than zero - stated plainly rather than
+/// dressed up as more evidence than it is. What DOES back the rule itself:
+/// "one check requires literal L present, another requires the exact same L
+/// absent, on the same file" is a logical contradiction by construction (P
+/// and not-P), so its only possible failure mode is misjudging "the same
+/// file" or "the same literal" - both of which are exact, reused comparisons
+/// (`normalize_target`, `normalize_project`, byte-for-byte string equality),
+/// never a fuzzy or invented one, and both were exercised against the real
+/// 265 pairs with zero false positives of that kind either.
+///
+/// Deliberately narrow, the same three ways `declare_in`'s own toll is:
+/// - Structural only, as above - never dependent on which checkout the
+///   writer happens to be standing in, or on being able to reach one at all.
+/// - Fires on a NEW write only. `revise` corrects an item already allowed to
+///   exist - and may be the very fix an opposition here asks for - so it is
+///   never blocked by this ground, the same reasoning `find_near_duplicate`
+///   already applies to itself.
+/// - Refuses only an EXACT opposition on the SAME literal. Two checks that
+///   merely share a file, or share a topic but not a literal, are ground
+///   18's business (a weak check) or nobody's, never this one's.
+pub fn check_opposition(item_check: &Check, rival_id: &str, rival_text: &str, rival_check: &Check) -> Result<(), Refusal> {
+    let shared = opposing_literals(item_check, rival_check);
+    if shared.is_empty() {
+        return Ok(());
+    }
+    let quoted = shared.iter().map(|l| format!("\"{l}\"")).collect::<Vec<_>>().join(", ");
+    Err(Refusal::new(
+        format!(
+            "this item's check is in DIRECT OPPOSITION to a live item's own check on the same file: \
+             one requires {quoted} present, the other requires it absent - both can never hold at the \
+             same time, on any content the file could ever carry. The rival is '{rival_id}': {rival_text}"
+        ),
+        format!("correct one of the two - this item, or '{rival_id}' - rather than store both"),
+    ))
 }
 
 /// Turn the four flat `check_kind`/`check_path`/`check_literal`/
@@ -2374,6 +2574,95 @@ mod tests {
         assert!(declare(&item).is_ok());
     }
 
+    // THE FRICTION THESE NAME, measured across three independent sessions on
+    // 2026-09-08: about seventeen rewrites in one day against the refusal
+    // below (eleven in one session, two in another, four here - two of those
+    // four over by exactly one and two characters), every one a full round
+    // trip of compose, get refused, count by hand, reword, resend.
+
+    /// A writer one character over must read that plainly, not subtract 300
+    /// from the length itself to find it out.
+    #[test]
+    fn a_text_one_character_over_names_the_exact_overflow() {
+        let mut item = base(Kind::Rule);
+        item.bindings = vec![Binding::Always];
+        item.text = "x".repeat(MAX_TEXT_CHARS + 1);
+        let err = declare(&item).expect_err("one character over the limit is still over it");
+        assert!(err.problem.contains("one character over"), "{}", err.problem);
+    }
+
+    /// The number used to read as an arbitrary rule, which is why it got
+    /// fought instead of designed around: it is one note's exact share of a
+    /// four-note, 1200-character served block (`serve::render::
+    /// MAX_BLOCK_CHARS`), and the refusal now says so.
+    #[test]
+    fn the_char_limit_refusal_says_why_the_number_is_what_it_is() {
+        let mut item = base(Kind::Rule);
+        item.bindings = vec![Binding::Always];
+        item.text = "x".repeat(MAX_TEXT_CHARS + 1);
+        let err = declare(&item).expect_err("one character over the limit is still over it");
+        assert!(err.problem.contains(&format!("holds {MAX_ITEMS} of them")), "{}", err.problem);
+        assert!(err.problem.contains(&format!("{MAX_TEXT_CHARS} is its share of that budget")), "{}", err.problem);
+    }
+
+    /// Far over the limit AND a single sentence (no ". " anywhere) - the
+    /// far-over gate alone already rules the hint out, and this proves the
+    /// single-sentence path never sneaks a fabricated cut past it either.
+    #[test]
+    fn a_text_far_over_with_one_sentence_claims_no_cut() {
+        let mut item = base(Kind::Rule);
+        item.bindings = vec![Binding::Always];
+        item.text = "y".repeat(MAX_TEXT_CHARS + 200);
+        let err = declare(&item).expect_err("200 over is still over the limit");
+        assert!(!err.fix.contains("sentence"), "no cut of any kind may be claimed here: {}", err.fix);
+    }
+
+    /// The cheapest-cut hint's own two numbers, checked against a text built
+    /// so both are known ahead of the call: 250 filler characters, ". ", 80
+    /// more, a closing period - 333 characters total (33 over the limit,
+    /// inside the fifth). Dropping the last sentence ("B" x80 plus its own
+    /// period = 81 characters) should leave the "A" run plus its period, 251
+    /// characters.
+    #[test]
+    fn the_last_sentence_hint_reports_the_right_resulting_length() {
+        let mut item = base(Kind::Rule);
+        item.bindings = vec![Binding::Always];
+        let first = "A".repeat(250);
+        let last = "B".repeat(80);
+        item.text = format!("{first}. {last}.");
+        assert_eq!(item.text.chars().count(), 333, "fixture sanity");
+        let err = declare(&item).expect_err("333 characters is over the limit");
+        assert!(err.fix.contains("last sentence is 81 characters"), "{}", err.fix);
+        assert!(err.fix.contains("lands the text at 251 characters"), "{}", err.fix);
+    }
+
+    /// Past a fifth over the limit, the hint must disappear entirely, even
+    /// when the text plainly has several sentences it could cut - past that
+    /// point the honest fix is "shorten it", and naming a last sentence that
+    /// saves a few percent of a 600-character text is not a one-edit fix.
+    #[test]
+    fn a_text_far_over_the_fifth_does_not_get_the_hint() {
+        let mut item = base(Kind::Rule);
+        item.bindings = vec![Binding::Always];
+        let first = "A".repeat(300);
+        let last = "B".repeat(300);
+        item.text = format!("{first}. {last}.");
+        let err = declare(&item).expect_err("603 characters is over the limit");
+        assert!(!err.fix.contains("cheapest cut"), "{}", err.fix);
+    }
+
+    /// Inside the fifth but genuinely one sentence: the fix must say so
+    /// plainly instead of pretending there is a whole sentence to drop.
+    #[test]
+    fn a_text_within_the_fifth_with_one_sentence_says_so_instead_of_a_cut() {
+        let mut item = base(Kind::Rule);
+        item.bindings = vec![Binding::Always];
+        item.text = "z".repeat(MAX_TEXT_CHARS + 20);
+        let err = declare(&item).expect_err("20 over is still over the limit");
+        assert!(err.fix.contains("this text is one sentence"), "{}", err.fix);
+        assert!(!err.fix.contains("lands the text at"), "no cut length may be invented: {}", err.fix);
+    }
+
     // --------------------------------------------------------- ground 5
 
     #[test]
@@ -2623,6 +2912,34 @@ mod tests {
             crate::store::NO_LITERAL_REASON_PREFIX
         )];
         assert!(revise(&light, &answered).is_ok(), "and answering it lets the re-rating through");
+    }
+
+    /// THE DEFECT THIS CLOSES: an embedded newline in the middle of a refusal
+    /// message caused the text to render with a line break and indentation
+    /// mid-sentence. The message should be a single unbroken line. This test
+    /// verifies that the "no comma and no line break" phrase appears on one
+    /// line and the message contains no embedded newline character.
+    #[test]
+    fn the_no_literal_refusal_message_is_one_unbroken_line() {
+        let mut item = base(Kind::Rule);
+        item.bindings = vec![Binding::Always];
+        item.severity = Some(Severity::Irreversible);
+        // No check, so the teeth question is asked
+        let err = declare(&item).unwrap_err();
+        // The fix message contains guidance about the tag format
+        let fix_msg = err.fix.clone();
+        // The phrase should appear on one line, not with embedded newline
+        assert!(
+            fix_msg.contains("no comma and no line break"),
+            "fix message must contain the full phrase: {}",
+            fix_msg
+        );
+        // The message must not contain an actual newline character
+        assert!(
+            !fix_msg.contains('\n'),
+            "the fix message must be one unbroken line (no embedded newlines): {}",
+            fix_msg
+        );
     }
 
     #[test]
@@ -5236,5 +5553,87 @@ mod tests {
         let mut updated = before.clone();
         updated.check = None;
         assert!(revise_weakening(&before, &updated, Some("   ")).is_err());
+    }
+
+    // --------------------------------------------- ground 29: check_opposition
+
+    fn contains(path: &str, literal: &str) -> Check {
+        Check::Contains { path: path.to_string(), literal: literal.to_string() }
+    }
+    fn absent(path: &str, literal: &str) -> Check {
+        Check::Absent { path: path.to_string(), literal: literal.to_string() }
+    }
+    fn absent_all(path: &str, literals: &[&str]) -> Check {
+        Check::AbsentAll { path: path.to_string(), literals: literals.iter().map(|s| s.to_string()).collect() }
+    }
+
+    #[test]
+    fn opposing_literals_finds_the_shared_literal_between_contains_and_absent() {
+        let a = contains("LICENSE", "GPLv3");
+        let b = absent("LICENSE", "GPLv3");
+        assert_eq!(opposing_literals(&a, &b), vec!["GPLv3".to_string()]);
+        // Unordered: the reverse pairing must find the identical opposition.
+        assert_eq!(opposing_literals(&b, &a), vec!["GPLv3".to_string()]);
+    }
+
+    #[test]
+    fn opposing_literals_is_empty_for_different_literals() {
+        let a = contains("LICENSE", "GPLv3");
+        let b = absent("LICENSE", "MIT");
+        assert!(opposing_literals(&a, &b).is_empty());
+    }
+
+    #[test]
+    fn opposing_literals_finds_the_shared_literal_against_an_absent_all_set() {
+        let a = contains("STYLE.md", "TODO");
+        let b = absent_all("STYLE.md", &["FIXME", "TODO"]);
+        assert_eq!(opposing_literals(&a, &b), vec!["TODO".to_string()]);
+    }
+
+    #[test]
+    fn opposing_literals_is_empty_for_two_positive_checks() {
+        // Both require the literal PRESENT: nothing here ever requires it
+        // absent, so there is nothing to oppose, regardless of whether the
+        // literals match.
+        let a = contains("LICENSE", "GPLv3");
+        let b = contains("LICENSE", "GPLv3");
+        assert!(opposing_literals(&a, &b).is_empty());
+    }
+
+    #[test]
+    fn opposing_literals_is_empty_for_path_exists_against_anything() {
+        let a = Check::PathExists { path: "LICENSE".to_string() };
+        let b = absent("LICENSE", "GPLv3");
+        assert!(opposing_literals(&a, &b).is_empty());
+    }
+
+    #[test]
+    fn opposing_literals_comparison_is_case_sensitive_and_exact() {
+        // THE DEFECT THIS PREVENTS: a case-folded or substring comparison
+        // would refuse two checks anchored to literals that merely look
+        // alike, never the same literal at all.
+        let a = contains("LICENSE", "GPLv3");
+        let b = absent("LICENSE", "gplv3");
+        assert!(opposing_literals(&a, &b).is_empty(), "different case is a different literal, never merged");
+    }
+
+    #[test]
+    fn check_opposition_refuses_and_names_the_rival() {
+        let item_check = contains("LICENSE", "GPLv3");
+        let rival_check = absent("LICENSE", "GPLv3");
+        let err = check_opposition(&item_check, "rival-id", "the rival's own text", &rival_check).unwrap_err();
+        assert!(err.problem.contains("rival-id"), "must name the rival's id: {err}");
+        assert!(err.problem.contains("the rival's own text"), "must quote the rival's own text: {err}");
+        assert!(
+            err.fix.to_lowercase().contains("correct one of the two"),
+            "must say to correct one of the two rather than store both: {err}"
+        );
+    }
+
+    #[test]
+    fn check_opposition_accepts_a_non_opposing_pair() {
+        let item_check = contains("LICENSE", "GPLv3");
+        let rival_check = absent("LICENSE", "MIT");
+        assert!(check_opposition(&item_check, "rival-id", "the rival's own text", &rival_check).is_ok());
     }
 }

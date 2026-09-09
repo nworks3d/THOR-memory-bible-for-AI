@@ -340,7 +340,11 @@ thor2/target/release/install.exe
 
 It finds your assistant's own two configuration files by itself, creates your
 memory if you do not have one yet, wires THOR into your assistant, and registers
-the part your assistant writes through. It backs up both files before it touches
+the part your assistant writes through. It also installs a shared set of git
+hooks that run in every repository on this machine, which keeps the reading of
+your code fresh after each commit, and each one hands control back to your
+repository's own hooks so nothing already there stops working. It backs up both
+files before it touches
 them, it never removes anything it did not put there, and running it twice
 changes nothing the second time.
 

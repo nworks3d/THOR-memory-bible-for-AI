@@ -468,10 +468,22 @@ fn refuse_a_new_collection(
     } else {
         String::new()
     };
+    // THE CONFUSION THIS CLARIFIES. For every other kind `wanted` comes from
+    // `item.project`, a field the writer set directly - but for a Lookup it
+    // comes from the KEY's own first word instead (see `filed_under`), and
+    // nothing below said so. MEASURED 2026-09-08: an agent read this refusal
+    // for a Lookup, could not tell what field it was even about, and
+    // abandoned the write rather than rename the key. Wording only - the
+    // rule itself, and `wanted`'s own source, are unchanged.
+    let place = if item.kind == Kind::Lookup {
+        " - a Lookup's key IS the place it opens (its own first word), never a project field"
+    } else {
+        ""
+    };
     Err(format!(
-        "REFUSED: nothing is filed under '{wanted}' yet, so this write would open a new place in the \
-         memory, and only the owner names one. Nothing was written.{how} Do exactly ONE of these two, in \
-         this order:\n\
+        "REFUSED: nothing is filed under '{wanted}' yet{place}, so this write would open a new place in \
+         the memory, and only the owner names one. Nothing was written.{how} Do exactly ONE of these two, \
+         in this order:\n\
          1. DOES IT FIT SOMEWHERE THAT ALREADY EXISTS? Then file it there. Both lanes are listed \
          below: the work memory (scopes) for the projects, the library (shelves) for anything about \
          his own life - a recipe, a book, a training log, an expense. Growth inside a place goes into \
@@ -4530,6 +4542,12 @@ mod tests {
     /// A register carries its collection in its own key, so an agent writing
     /// one is opening a collection whatever it looks like - that is exactly how
     /// the profile got in.
+    ///
+    /// MEASURED 2026-09-08: an agent hit this exact refusal for a Lookup,
+    /// could not tell what field it was even about (nothing said the KEY was
+    /// the thing to change), and abandoned the write. The refusal must now
+    /// say plainly that a Lookup's key IS the place it opens, alongside the
+    /// key it refused.
     #[tokio::test]
     async fn a_register_on_an_unnamed_key_is_refused_too() {
         let srv = server_knowing(&["eten"]);
@@ -4540,6 +4558,10 @@ mod tests {
         let reply = srv.remember(Parameters(register)).await;
         assert!(reply.contains("REFUSED"), "a register opens a collection too: {reply}");
         assert!(reply.contains("profiel"), "{reply}");
+        assert!(
+            reply.contains("a Lookup's key IS the place it opens"),
+            "a Lookup's refusal must say plainly that the key is what to change: {reply}"
+        );
     }
 
     /// THE DEFECT THIS CLOSES, measured in a sandbox on a freshly installed

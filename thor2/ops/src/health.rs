@@ -811,6 +811,94 @@ pub fn orphan_projects_line(db: &Path, checkouts: Option<&Path>) -> String {
     )
 }
 
+/// Same-file pairs of live Rule/Orientation checks whose proofs currently
+/// disagree - one comes back `Holds`, the other `Fails`, on the exact same
+/// file, right now. See `serve/examples/check_contradictions.rs`'s own "(b)
+/// BOTH RUNNABLE, DISAGREEING NOW" for the full definition this line shares:
+/// neither side may be `CannotRun` (the absence of information - a missing
+/// file, usually a different checkout - never a disagreement, see `model::
+/// check::Outcome`'s own doc comment), and this says nothing about whether
+/// the two checks could ever coexist in principle. That structural question
+/// - can they NEVER both hold, regardless of the file's content - is GROUND
+/// 29's own job (`model::gate::opposing_literals`), refused at write time;
+/// this line answers a narrower, purely empirical one about right now, and
+/// on purpose does NOT feed the write gate either way: a false alarm here is
+/// exactly as expensive as one at write time, and this signal is measured
+/// against the file as it happens to stand today, never proven the way
+/// GROUND 29's structural test is.
+///
+/// PROJECT RESOLUTION is identical to `decay_check`'s own: every immediate
+/// subdirectory of `checkouts` is handed to `serve::project::resolve_
+/// project`, and a GLOBAL item (`project: None`) is skipped entirely - it
+/// names no single checkout to run its check against, the same restriction
+/// `decay_check` already places on itself, for the identical reason.
+///
+/// SILENT AT ZERO, the same convention `judgement_debt_line` above already
+/// uses: a store with nothing disagreeing is not a finding, and a permanent
+/// "0 pairs" line on every quiet run would be exactly the noise that trains
+/// a reader to stop reading this report. Also silent (never a separate error
+/// line) when the store cannot be opened or `checkouts` was not given - the
+/// same fails-open stance `judgement_debt_line` takes; decay/crowding/
+/// orphan-projects above already say, once, whether `--checkouts` was
+/// resolved at all, so a fourth line repeating that would only be noise.
+///
+/// MEASURED on the owner's real store, 2026-09-09, before this line existed:
+/// 0 same-file pairs disagree right now - see `serve/examples/
+/// check_contradictions.rs`'s own phase-1 report for the full count this was
+/// built from (357 checked items, 323 naming a file, 265 same-file pairs).
+pub fn contradiction_line(db: &Path, checkouts: Option<&Path>) -> Option<String> {
+    let store = EventStore::open_existing(db).ok()?;
+    let root = checkouts?;
+
+    let mut roots: std::collections::BTreeMap<String, std::path::PathBuf> = Default::default();
+    if let Ok(entries) = std::fs::read_dir(root) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                if let Some(key) = serve::project::resolve_project(&path) {
+                    roots.insert(key, path);
+                }
+            }
+        }
+    }
+
+    let mut by_file: std::collections::BTreeMap<(String, String), Vec<model::item::Check>> = Default::default();
+    for li in serve::live::live_items(&store) {
+        if !li.item.kind.can_fire() {
+            continue; // only Rule/Orientation can ever carry a check (gate::declare ground 12)
+        }
+        let Some(project) = li.item.project else { continue };
+        let Some(check) = li.item.check else { continue };
+        let Some(path) = model::check::named_path(&check) else { continue };
+        let path = model::normalize::normalize_target(path);
+        by_file.entry((project, path)).or_default().push(check);
+    }
+
+    let mut disagreeing = 0usize;
+    for ((project, _path), checks) in &by_file {
+        let Some(base) = roots.get(project) else { continue };
+        let decided = |o: model::check::Outcome| matches!(o, model::check::Outcome::Holds | model::check::Outcome::Fails);
+        for i in 0..checks.len() {
+            for j in (i + 1)..checks.len() {
+                let outcome_a = model::check::run(&checks[i], base);
+                let outcome_b = model::check::run(&checks[j], base);
+                if decided(outcome_a) && decided(outcome_b) && outcome_a != outcome_b {
+                    disagreeing += 1;
+                }
+            }
+        }
+    }
+
+    if disagreeing == 0 {
+        return None;
+    }
+    Some(format!(
+        "contradictions: {disagreeing} same-file pair(s) of live notes have proofs that cannot both be \
+         true right now - see serve/examples/check_contradictions.rs for the full list; a measured \
+         disagreement on the file as it stands today, not a proof the two could never coexist"
+    ))
+}
+
 /// The write-ahead log's own sidecar path: SQLite spells it `<db>-wal`,
 /// literally appended to the whole file name (never `.with_extension`, which
 /// would replace `.db` instead of extending it).
@@ -1372,6 +1460,11 @@ pub fn report(
     // own doc comment for why this exists alongside `unjudged_line` above
     // rather than in place of it.
     lines.extend(judgement_debt_line(db, checkout_project));
+    // Silent unless two live checks on the same file actually disagree right
+    // now - see `contradiction_line`'s own doc comment for how this differs
+    // from GROUND 29 (`model::gate::opposing_literals`), which refuses a
+    // structural opposition at write time and never runs here.
+    lines.extend(contradiction_line(db, checkouts));
     lines
 }
 
@@ -1688,6 +1781,76 @@ mod tests {
         let line = judgement_debt_line(&db, None).expect("a global item is still owed with no project resolved");
         assert!(line.contains("resolves to no project"), "{line}");
         assert!(line.contains("1 global"), "{line}");
+    }
+
+    // ----------------------------------------------------- contradiction_line
+
+    #[test]
+    fn contradiction_line_is_silent_when_nothing_disagrees() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("t.db");
+        let checkouts = dir.path().join("dev");
+        let repo = checkouts.join("Real-Repo");
+        std::fs::create_dir_all(repo.join(".git")).unwrap();
+        std::fs::write(repo.join("LICENSE"), "Licensed under GPLv3").unwrap();
+        {
+            let mut s = EventStore::new(&db).unwrap();
+            let mut a = rule("license-says-gpl");
+            a.text = "the license file must say GPLv3".to_string();
+            a.project = Some("Real-Repo".to_string());
+            a.check = Some(Check::Contains { path: "LICENSE".to_string(), literal: "GPLv3".to_string() });
+            store::declare(&mut s, "s", "l", "a", &a).unwrap();
+
+            let mut b = rule("license-must-not-say-mit");
+            b.text = "the license file must never mention the MIT license".to_string();
+            b.project = Some("Real-Repo".to_string());
+            b.check = Some(Check::Absent { path: "LICENSE".to_string(), literal: "MIT".to_string() });
+            store::declare(&mut s, "s", "l", "a", &b).unwrap();
+        }
+        // Both checks currently Holds against the real file - nothing to
+        // report, and this must stay silent rather than print "0 pairs".
+        assert_eq!(contradiction_line(&db, Some(&checkouts)), None);
+    }
+
+    /// `PathExists` and `Contains` ask unrelated questions (see
+    /// `contradiction_line`'s own doc comment) so GROUND 29 never refuses
+    /// this pair at write time - it can only ever be caught here, once the
+    /// two checks happen to disagree on the file as it stands today.
+    #[test]
+    fn contradiction_line_names_a_pair_that_currently_disagrees() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("t.db");
+        let checkouts = dir.path().join("dev");
+        let repo = checkouts.join("Real-Repo");
+        std::fs::create_dir_all(repo.join(".git")).unwrap();
+        std::fs::write(repo.join("STYLE.md"), "no special marker in here").unwrap();
+        {
+            let mut s = EventStore::new(&db).unwrap();
+            let mut a = rule("style-guide-must-exist");
+            a.text = "the style guide must exist at STYLE.md".to_string();
+            a.project = Some("Real-Repo".to_string());
+            a.check = Some(Check::PathExists { path: "STYLE.md".to_string() });
+            store::declare(&mut s, "s", "l", "a", &a).unwrap();
+
+            let mut b = rule("style-guide-carries-the-marker");
+            b.text = "the style guide names the MARKER_TOKEN convention".to_string();
+            b.project = Some("Real-Repo".to_string());
+            b.check = Some(Check::Contains { path: "STYLE.md".to_string(), literal: "MARKER_TOKEN".to_string() });
+            store::declare(&mut s, "s", "l", "a", &b).unwrap();
+        }
+        // STYLE.md exists (PathExists Holds) but does not contain
+        // MARKER_TOKEN (Contains Fails) - a real disagreement right now.
+        let line = contradiction_line(&db, Some(&checkouts)).expect("a pair that currently disagrees must be named");
+        assert!(line.starts_with("contradictions: "), "{line}");
+        assert!(line.contains('1'), "must name the count: {line}");
+    }
+
+    #[test]
+    fn contradiction_line_is_silent_with_no_checkouts_given() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("t.db");
+        EventStore::new(&db).unwrap();
+        assert_eq!(contradiction_line(&db, None), None);
     }
 
     #[test]

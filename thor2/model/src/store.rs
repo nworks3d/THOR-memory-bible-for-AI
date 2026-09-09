@@ -317,6 +317,55 @@ fn find_near_duplicate(store: &EventStore, item: &Item) -> anyhow::Result<Option
     Ok(None)
 }
 
+/// `Some(refusal)` when a live item's own check is in `gate::
+/// check_opposition` (GROUND 29) with `item`'s own check, on the same file -
+/// `None` when nothing opposes it, including when `item` carries no check at
+/// all, or one that names no file (`Forbidden`/`Requires` - see `crate::
+/// check::named_path`). Only `declare` calls this: `revise` corrects an item
+/// that is already allowed to exist - and may be the very fix an opposition
+/// here asks for - so it never runs through this check, the same reasoning
+/// `find_near_duplicate`'s own doc comment gives for the identical choice.
+///
+/// PROJECT SCOPING is strict equality, `None` matching only `None` - the
+/// same rule `unsettled_neighbours` above already established, for the
+/// identical reason: "a path is only unique WITHIN a project". This is NOT
+/// `find_near_duplicate`'s own looser rule (which also compares a global
+/// item against every project-scoped one): a check's `path` names a real
+/// FILE on disk, and a global item's own path has no single real file to be
+/// compared against - see `gate::check_opposition`'s own doc comment for the
+/// full reasoning, and `serve/examples/check_contradictions.rs` for the
+/// read-only census that measured this exact rule before this ground
+/// existed.
+fn find_opposing_check(store: &EventStore, item: &Item) -> anyhow::Result<Option<Refusal>> {
+    let Some(new_check) = item.check.as_ref() else { return Ok(None) };
+    let Some(new_path) = crate::check::named_path(new_check) else { return Ok(None) };
+    let new_path = crate::normalize::normalize_target(new_path);
+
+    let candidates = if store.heads_projection_current() {
+        live_items_from_projection(store)?
+    } else {
+        live_items_from_fold(store)?
+    };
+
+    for (id, existing) in candidates {
+        if id == item.id {
+            continue; // revising your own neighbourhood is not a conflict
+        }
+        if existing.project != item.project {
+            continue;
+        }
+        let Some(existing_check) = existing.check.as_ref() else { continue };
+        let Some(existing_path) = crate::check::named_path(existing_check) else { continue };
+        if crate::normalize::normalize_target(existing_path) != new_path {
+            continue;
+        }
+        if let Err(refusal) = gate::check_opposition(new_check, &id, &existing.text, existing_check) {
+            return Ok(Some(refusal));
+        }
+    }
+    Ok(None)
+}
+
 /// Validate a new item against the write gate, then refuse it if it is a
 /// near-duplicate of a live item of the same kind; only if both checks pass
 /// is it appended to the log as a `fact_created` event whose body is its
@@ -516,6 +565,15 @@ pub fn declare(
                 ),
             },
         }));
+    }
+    // GROUND 29 (gate::check_opposition): a live item's check requiring the
+    // exact opposite of this new item's own check, on the same file, is
+    // refused before either near-duplicate detection or capacity gets a say
+    // - see `find_opposing_check`'s own doc comment for the project-scoping
+    // rule and `gate::check_opposition`'s for the full reasoning and the
+    // measurement behind it.
+    if let Some(refusal) = find_opposing_check(store, &item).map_err(WriteError::Store)? {
+        return Err(WriteError::Refused(refusal));
     }
     // CONTRACT R1's own refusal class, unpaid until 2026-08-08: an item that
     // cannot reach a block is cover that looks real and never fires. Only the
@@ -1860,6 +1918,166 @@ mod tests {
         second.falsifier = None; // only Rule/Orientation require one (gate ground 10)
         declare(&mut store, "s1", "l1", "test", &second)
             .expect("identical text under a DIFFERENT kind must not be refused as a near-duplicate");
+    }
+
+    // --------------------------------------------- GROUND 29: check_opposition
+    //
+    // Deliberately DISTINCT text between the two sides of every pair below,
+    // the same reason the capacity tests further down use `DISTINCT`: the
+    // near-duplicate check (above) runs BEFORE this ground in `declare`, so a
+    // near-identical pair would be refused for the wrong reason and quietly
+    // test nothing about opposition at all.
+
+    /// A minimal, otherwise-valid Rule carrying (or not carrying) `check` -
+    /// built fresh for this section rather than reusing `sample_with`, whose
+    /// own default text is close enough between any two calls to trip the
+    /// near-duplicate check first (see this section's own banner comment).
+    fn opposable(id: &str, text: &str, check: Option<Check>) -> Item {
+        Item {
+            id: id.to_string(),
+            kind: Kind::Rule,
+            text: text.to_string(),
+            bindings: vec![Binding::Always],
+            severity: Some(Severity::Costly),
+            project: Some("thor2".to_string()),
+            tags: vec![],
+            expires: None,
+            key: None,
+            falsifier: Some(format!("{text} turns out to be false")),
+            check,
+        }
+    }
+
+    /// THE GROUND ITSELF: `Contains` and `Absent` on the exact same literal,
+    /// in the exact same file, can never both hold - refused, and the
+    /// refusal names the rival by id and quotes its own text.
+    #[test]
+    fn declare_refuses_a_direct_opposition_and_names_the_rival() {
+        let mut store = EventStore::in_memory().unwrap();
+        let first = opposable(
+            "license-says-gpl",
+            "the license file must say GPLv3",
+            Some(Check::Contains { path: "LICENSE".to_string(), literal: "GPLv3".to_string() }),
+        );
+        declare(&mut store, "s1", "l1", "test", &first).unwrap();
+
+        let second = opposable(
+            "license-must-not-say-gpl",
+            "the license file must never mention GPLv3",
+            Some(Check::Absent { path: "LICENSE".to_string(), literal: "GPLv3".to_string() }),
+        );
+        let err = declare(&mut store, "s1", "l1", "test", &second).unwrap_err();
+        match err {
+            WriteError::Refused(r) => {
+                assert!(r.problem.contains("license-says-gpl"), "the refusal must name the rival's id, got: {r}");
+                assert!(
+                    r.problem.contains("the license file must say GPLv3"),
+                    "the refusal must quote the rival's own text, got: {r}"
+                );
+                assert!(
+                    r.fix.to_lowercase().contains("correct one of the two"),
+                    "the refusal must say to correct one of the two rather than store both, got: {r}"
+                );
+            }
+            other => panic!("expected a Refused error for a direct opposition, got {other:?}"),
+        }
+        assert!(
+            matches!(show(&store, &second.id), Err(ReadError::NotFound(_))),
+            "a refused opposition must write nothing"
+        );
+    }
+
+    /// The same file, but a DIFFERENT literal: both checks can hold at once
+    /// (the license file can perfectly well mention GPLv3 and never mention
+    /// MIT), so this is not an opposition at all and must be stored.
+    #[test]
+    fn a_same_file_pair_that_is_not_an_opposition_is_stored() {
+        let mut store = EventStore::in_memory().unwrap();
+        let first = opposable(
+            "license-says-gpl",
+            "the license file must say GPLv3",
+            Some(Check::Contains { path: "LICENSE".to_string(), literal: "GPLv3".to_string() }),
+        );
+        declare(&mut store, "s1", "l1", "test", &first).unwrap();
+
+        let second = opposable(
+            "license-must-not-say-mit",
+            "the license file must never mention the MIT license",
+            Some(Check::Absent { path: "LICENSE".to_string(), literal: "MIT".to_string() }),
+        );
+        declare(&mut store, "s1", "l1", "test", &second)
+            .expect("a same-file pair on different literals is not an opposition and must be stored");
+    }
+
+    /// A note with no check at all can never be in opposition with anything,
+    /// however loud its text is about the same file a rival's check anchors.
+    #[test]
+    fn a_note_without_a_check_is_unaffected() {
+        let mut store = EventStore::in_memory().unwrap();
+        let first = opposable(
+            "license-says-gpl",
+            "the license file must say GPLv3",
+            Some(Check::Contains { path: "LICENSE".to_string(), literal: "GPLv3".to_string() }),
+        );
+        declare(&mut store, "s1", "l1", "test", &first).unwrap();
+
+        // Severity dropped to `HouseStyle` (never Costly/Irreversible) so
+        // this exercises ONLY the fact under test - GROUND 29 - and not
+        // GROUND 11's own, unrelated demand that a HEAVY rule with no check
+        // carry a reasoned `no-literal` tag instead.
+        let mut second =
+            opposable("license-note", "the license choice was made deliberately, see the project README", None);
+        second.severity = Some(Severity::HouseStyle);
+        declare(&mut store, "s1", "l1", "test", &second)
+            .expect("an item with no check at all can never be in opposition with anything");
+    }
+
+    /// The exact same literal, opposite polarity - but a DIFFERENT file, so
+    /// the two are not about the same fact at all and this ground must stay
+    /// silent.
+    #[test]
+    fn the_refusal_does_not_fire_for_a_pair_on_different_files() {
+        let mut store = EventStore::in_memory().unwrap();
+        let first = opposable(
+            "license-says-gpl",
+            "the license file must say GPLv3",
+            Some(Check::Contains { path: "LICENSE".to_string(), literal: "GPLv3".to_string() }),
+        );
+        declare(&mut store, "s1", "l1", "test", &first).unwrap();
+
+        let second = opposable(
+            "readme-must-not-say-gpl",
+            "the README must never mention GPLv3",
+            Some(Check::Absent { path: "README.md".to_string(), literal: "GPLv3".to_string() }),
+        );
+        declare(&mut store, "s1", "l1", "test", &second)
+            .expect("an opposition on a DIFFERENT file must never be refused");
+    }
+
+    /// PROJECT SCOPING, the same rule `unsettled_neighbours` already
+    /// established and `find_opposing_check`'s own doc comment explains: a
+    /// path is only unique WITHIN a project, so an opposition across two
+    /// DIFFERENT projects' own copies of a same-named file is not a real
+    /// conflict - each checkout has its own file.
+    #[test]
+    fn a_direct_opposition_in_a_different_project_is_not_refused() {
+        let mut store = EventStore::in_memory().unwrap();
+        let mut first = opposable(
+            "license-says-gpl",
+            "the license file must say GPLv3",
+            Some(Check::Contains { path: "LICENSE".to_string(), literal: "GPLv3".to_string() }),
+        );
+        first.project = Some("project-a".to_string());
+        declare(&mut store, "s1", "l1", "test", &first).unwrap();
+
+        let mut second = opposable(
+            "license-must-not-say-gpl",
+            "the license file must never mention GPLv3",
+            Some(Check::Absent { path: "LICENSE".to_string(), literal: "GPLv3".to_string() }),
+        );
+        second.project = Some("project-b".to_string());
+        declare(&mut store, "s1", "l1", "test", &second)
+            .expect("the same path in a DIFFERENT project names a different real file, not an opposition");
     }
 
     /// Wildly different sentences on purpose: the near-duplicate check runs

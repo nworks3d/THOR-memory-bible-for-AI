@@ -81,6 +81,10 @@ ls -la target/release/serve.exe
 
 Under 20 MB means you built the wrong thing. Build again with the flag.
 
+A release build is reproducible on Windows: building the same commit twice
+produces the same binary, so a published program can be checked by building
+that commit again.
+
 ## Install it
 
 One command does the whole setup, and in the common case it takes no arguments:

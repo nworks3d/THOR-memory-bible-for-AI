@@ -1,0 +1,34 @@
+# Windows MSVC release builds must be reproducible: the same source, built
+# twice, has to produce the same bytes, so a published binary can be checked
+# by rebuilding the tagged commit instead of trusting a hash blindly.
+#
+# Scoped to the MSVC target ONLY. /Brepro is an MSVC link.exe flag; the GNU
+# linker (Linux) and the macOS linker do not understand it and would refuse
+# to link if it reached them. Putting it under this [target.*] table means a
+# build for any other target - the Linux CI runner included - never sees
+# this rustflags entry at all, because Cargo only applies a [target.<triple>]
+# table's rustflags when actually building for that exact triple.
+[target.x86_64-pc-windows-msvc]
+rustflags = [
+    # Without this, link.exe stamps the PE header with the current wall-clock
+    # time and mints a fresh random PDB GUID on every link (plus copies of
+    # that timestamp in the debug directory), so two builds of identical,
+    # untouched source never hash the same. /Brepro derives both from the
+    # linker's inputs instead of the clock, making the link deterministic.
+    "-C", "link-arg=/Brepro",
+]
+
+# A separate finding, not fixed here: every dependency's source path in debug
+# info is absolute - it is wherever Cargo's registry cache sits on the machine
+# that built it (e.g. under that user's home directory). The workspace's own
+# crates are unaffected (Cargo already embeds those relative, e.g.
+# "serve\src\lookup.rs"). The proper fix is the `trim-paths` profile option,
+# which is still nightly-only on this toolchain (cargo 1.96 refuses it:
+# "feature `trim-paths` is required... not stabilized"). A hand-rolled
+# `--remap-path-prefix` for one specific machine's home directory was tried
+# and reverted: it would have to name that path literally in this checked-in
+# file, which this repository's own scripts/check-private-data.sh correctly
+# refuses to let through, and it would still do nothing for the binaries an
+# actual release ships, since those are built by a CI runner whose home
+# directory never matches a path hardcoded for this machine. Revisit once
+# `trim-paths` stabilizes.

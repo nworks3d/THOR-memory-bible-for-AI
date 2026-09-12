@@ -947,6 +947,46 @@ fn hook_once(db_path: &Path) -> Option<HookOutput> {
             }
         }
 
+        // THE EVALUATION DEBT (2026-09-12). Everything above this line asks
+        // about ONE item at a time - the busiest owed one, batched, still one
+        // item's own verdict per `mark` call. This asks a different question,
+        // once per session: is the backlog itself now big enough, and stale
+        // enough, that the honest answer is the WHOLE end-of-session routine
+        // (`ops::install::seed_eval_command`'s file, `/thor-eval`) rather than
+        // one more item. `stop_project` (resolved above, shared with
+        // `crowding_debt`/`judgement_debt`) is reused for the identical
+        // reason: this checkout's own project, never a backlog that belongs
+        // to a different one.
+        //
+        // ONCE PER SESSION, THEN SILENT REGARDLESS OF WHETHER THE DEBT STAYS -
+        // mirrors the backlog burn's own mechanism just below
+        // (`teeth_not_yet_asked_this_session`/`record_teeth_asked`), a
+        // dedicated sidecar rather than a second copy of that one: a session
+        // that hears this once must never hear it again just because the
+        // backlog (which this alone does nothing to pay down) is still there
+        // on the next turn - the same "wall" `teeth_not_yet_asked_this_
+        // session`'s own doc comment warns a per-turn version of ANY backlog
+        // debt becomes.
+        //
+        // GATED ON `is_subagent`, independently, at its own call site, same
+        // as every debt above: a subagent cannot itself type `/thor-eval` -
+        // there is no owner in the room for that any more than there is for
+        // `setup_debt`'s own conversation - so holding its turn over a
+        // routine only the owner can run would spend a whole agent run
+        // asking for something it cannot do.
+        if !is_subagent {
+            if let Some(reason) = EventStore::open_existing(db_path)
+                .ok()
+                .filter(|_| eval_debt_not_yet_asked_this_session(db_path, &session_id))
+                .and_then(|s| evaluation_debt(&s, stop_project.as_deref()))
+            {
+                record_eval_debt_asked(db_path, &session_id);
+                return Some(HookOutput::Decision(
+                    serde_json::json!({ "decision": "block", "reason": reason }),
+                ));
+            }
+        }
+
         // The backlog burn: one fact per turn that LOOKS armable and has
         // never been asked. Last of the debts on purpose - it is the only one
         // with no urgency, and it must never speak over a mess made this
@@ -2026,6 +2066,92 @@ fn judged_since(store: &EventStore, id: &str, after_seq: i64) -> bool {
                     | thor_core::event_store::EventKind::ItemMarkedNoise
             )
     })
+}
+
+/// Where the evaluation debt remembers whose turn it already asked this
+/// session - the identical SHAPE as `teeth_asked_path` above (a flat list of
+/// session ids, newest kept, oldest trimmed), but its own separate file:
+/// this debt and the backlog burn are independent questions, so each keeps
+/// its own once-per-session memory rather than sharing one and going quiet
+/// for the other's reason.
+fn eval_debt_asked_path(db: &Path) -> std::path::PathBuf {
+    db.parent().unwrap_or_else(|| Path::new(".")).join("eval-debt-asked.json")
+}
+
+/// ONCE per session, never once per turn - same mechanism and the same
+/// reason as `teeth_not_yet_asked_this_session` above: a debt that reappeared
+/// on every turn for as long as the backlog stays over the ceiling would
+/// hold every single turn of a long session, which teaches a reader to stop
+/// believing debts at all rather than to act on this one.
+fn eval_debt_not_yet_asked_this_session(db: &Path, session_id: &str) -> bool {
+    let Ok(text) = std::fs::read_to_string(eval_debt_asked_path(db)) else { return true };
+    !text.lines().any(|line| line.trim() == session_id)
+}
+
+/// Best effort, like every sidecar here: a sidecar that cannot be written
+/// means the debt asks again next turn, never that a turn breaks.
+fn record_eval_debt_asked(db: &Path, session_id: &str) {
+    let path = eval_debt_asked_path(db);
+    let mut text = std::fs::read_to_string(&path).unwrap_or_default();
+    text.push_str(session_id);
+    text.push('\n');
+    // Keep the tail only: this file is a set of recent sessions, not history.
+    let kept: Vec<&str> = text.lines().rev().take(200).collect();
+    let trimmed: String = kept.into_iter().rev().collect::<Vec<_>>().join("\n");
+    let _ = std::fs::write(&path, format!("{trimmed}\n"));
+}
+
+/// Ask for the WHOLE end-of-session evaluation, once per session, or
+/// nothing. The once-per-session gate and the subagent exclusion both live
+/// at this function's own call site (above, in `hook_once`'s `Stop` arm) -
+/// this decides only WHETHER the obligation holds right now and what to say.
+///
+/// SCOPED TO THIS CHECKOUT, both halves of the condition. `owed_in_project`
+/// is `usefulness::judgement_debt_counts`'s own second number - EXACTLY what
+/// `doctor` already names under "judgement debt" for this checkout, never a
+/// second copy of that count that could silently drift from it - and
+/// `usefulness::newest_verdict_unix` applies the identical `project::
+/// applies_to` filter for its own scope, so the two halves can never disagree
+/// about which items are this checkout's business.
+///
+/// NEITHER HALF READS `served_ids_in_session`/the session watermark the way
+/// `judgement_debt` above does for its own "seen" filter. That filter
+/// answers "did the reader being asked see this item fire", which is the
+/// right question when asking about ONE item by name - but this debt is
+/// about the size and age of the WHOLE backlog, a fact about the store, not
+/// about what this one session happened to witness. Scoping it to "seen this
+/// session" would silence it for the exact session most in need of hearing
+/// it: one that opens cold on a checkout with a large, stale backlog it has
+/// not yet touched at all.
+fn evaluation_debt(store: &EventStore, current_project: Option<&str>) -> Option<String> {
+    let (_, owed_in_project) = usefulness::judgement_debt_counts(store, current_project);
+    let newest = usefulness::newest_verdict_unix(store, current_project);
+    let now = time::now_unix();
+    if !usefulness::eval_debt_owed(owed_in_project, newest, now) {
+        return None;
+    }
+    let judged_clause = match newest {
+        Some(t) => format!("nothing here has been judged for {} day(s)", usefulness::days_ago(now, t)),
+        None => "nothing here has ever been judged".to_string(),
+    };
+    // Named when the file is actually there to read - the same location
+    // `ops::install::seed_eval_command` writes to, resolved the same way
+    // (`usefulness::default_eval_command_path`, `ops/tests` proves the two
+    // agree). Otherwise this never claims a file exists that does not: the
+    // owner may keep his own routine at a path this cannot guess, or may
+    // simply not have run `install` since this feature shipped.
+    let path = usefulness::default_eval_command_path();
+    let ask = match path {
+        Some(p) if p.exists() => {
+            format!("read '{}' and do what it says. The owner can type /thor-eval to run it.", p.display())
+        }
+        _ => "no evaluation routine is installed at `~/.claude/commands/thor-eval.md` - `install` writes one there (usable as /thor-eval), or the owner runs their own routine."
+            .to_string(),
+    };
+    Some(format!(
+        "[THOR] This project owes a verdict on {owed_in_project} item(s) and {judged_clause}. Run the THOR \
+         evaluation before you finish: {ask} This is asked once per session."
+    ))
 }
 
 /// Which capture-guard mode is live right now, for THIS store
@@ -3959,6 +4085,111 @@ mod judgement_debt_tests {
         let shown = (0..n).filter(|i| asked.contains(&format!("owed-{i}"))).count();
         assert_eq!(shown, JUDGEMENT_DEBT_BATCH_MAX, "the block must show exactly the cap, not more: {asked}");
         assert!(asked.contains(&format!("{} more", n - JUDGEMENT_DEBT_BATCH_MAX)), "{asked}");
+    }
+}
+
+#[cfg(test)]
+mod evaluation_debt_tests {
+    use super::*;
+    use model::item::{Binding, Item, Kind};
+    use usefulness::EVAL_DEBT_CEILING;
+
+    fn declare(store: &mut EventStore, id: &str, project: Option<&str>) {
+        let item = Item {
+            id: id.to_string(),
+            kind: Kind::Rule,
+            text: format!("something worth knowing about {id}"),
+            bindings: vec![Binding::Moment(intent::Action::Commit)],
+            severity: None,
+            project: project.map(str::to_string),
+            tags: vec![],
+            expires: None,
+            key: None,
+            falsifier: Some("it stops being true".to_string()),
+            check: None,
+        };
+        model::store::declare(store, "t", "t", "t", &item).expect("fixture must store");
+    }
+
+    fn serve_it(store: &mut EventStore, id: &str, times: usize) {
+        for _ in 0..times {
+            deliver::record_delivery(store, "s", "s", "t", "2026-08-07T00:00:00Z", &[id.to_string()]);
+        }
+    }
+
+    /// Declares `n` never-judged global items and serves each one enough
+    /// times to sit in this checkout's own judgement debt - the evaluation
+    /// debt's own first condition needs a real backlog, not a single item.
+    fn owe(store: &mut EventStore, n: usize) {
+        for i in 0..n {
+            let id = format!("owed-{i}");
+            declare(store, &id, None);
+            serve_it(store, &id, JUDGEMENT_DEBT_AFTER);
+        }
+    }
+
+    // ------------------------------------------------- the once-per-session gate
+    //
+    // Same shape as `judgement_debt_tests::the_burn_takes_one_turn_per_session_
+    // not_every_turn` above, for the evaluation debt's own, separate sidecar.
+
+    #[test]
+    fn the_once_per_session_gate_holds_one_session_and_forgets_none_of_the_others() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("t.db");
+        assert!(eval_debt_not_yet_asked_this_session(&db, "s1"), "a fresh session has not been asked");
+        record_eval_debt_asked(&db, "s1");
+        assert!(!eval_debt_not_yet_asked_this_session(&db, "s1"), "the same session must not be asked again");
+        assert!(eval_debt_not_yet_asked_this_session(&db, "s2"), "a different session still gets its own turn");
+    }
+
+    // --------------------------------------------------------- evaluation_debt
+
+    #[test]
+    fn fires_once_the_backlog_reaches_the_ceiling_with_no_verdict_ever() {
+        let mut store = EventStore::in_memory().unwrap();
+        owe(&mut store, EVAL_DEBT_CEILING);
+        let asked = evaluation_debt(&store, None).expect("a backlog at the ceiling, never judged, must speak");
+        assert!(asked.starts_with("[THOR]"), "{asked}");
+        assert!(asked.contains(&format!("{EVAL_DEBT_CEILING} item")), "{asked}");
+        assert!(asked.contains("ever been judged"), "{asked}");
+        assert!(asked.contains("once per session"), "{asked}");
+    }
+
+    #[test]
+    fn silent_one_below_the_ceiling() {
+        let mut store = EventStore::in_memory().unwrap();
+        owe(&mut store, EVAL_DEBT_CEILING - 1);
+        assert_eq!(evaluation_debt(&store, None), None);
+    }
+
+    #[test]
+    fn silent_when_a_fresh_verdict_exists_even_with_the_backlog_over_the_ceiling() {
+        let mut store = EventStore::in_memory().unwrap();
+        // One extra item beyond the ceiling: marking it useful "now" drops it
+        // out of the owed set on its own, so the remaining count still sits
+        // exactly at the ceiling - proving the fresh verdict, not a falling
+        // count, is what silences this.
+        owe(&mut store, EVAL_DEBT_CEILING + 1);
+        mark::record_useful(&mut store, "s", "s", "t", &time::now_iso8601(), "owed-0").unwrap();
+        assert_eq!(
+            usefulness::judgement_debt_counts(&store, None).1,
+            EVAL_DEBT_CEILING,
+            "fixture sanity: still exactly at the ceiling after one item is judged"
+        );
+        assert_eq!(evaluation_debt(&store, None), None);
+    }
+
+    #[test]
+    fn an_item_owed_only_to_another_project_never_counts_toward_this_checkout() {
+        let mut store = EventStore::in_memory().unwrap();
+        for i in 0..EVAL_DEBT_CEILING {
+            let id = format!("acme-owed-{i}");
+            declare(&mut store, &id, Some("acme"));
+            serve_it(&mut store, &id, JUDGEMENT_DEBT_AFTER);
+        }
+        assert!(evaluation_debt(&store, Some("acme")).is_some(), "fixture sanity: acme's own checkout sees it");
+        assert_eq!(evaluation_debt(&store, Some("thor")), None, "a different checkout must not");
     }
 }
 

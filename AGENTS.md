@@ -79,8 +79,11 @@ thor2/target/release/install.exe --project "<project-name>"
 
 It reads this project's code once, so searching the code, finding where a symbol
 is used and outlining a file answer here at all, and from then on every commit
-keeps that reading fresh by itself. The `--project` part is only needed when the
-folder is not called what they call the project; most of the time, leave it off.
+keeps that reading fresh by itself. That same successful read also opens the
+project in the memory itself, so the note in step 6 lands under this project's
+name without ever being asked to name a new collection. The `--project` part is
+only needed when the folder is not called what they call the project; most of the
+time, leave it off.
 
 It refuses to change a name already there - renaming a scope would strand every
 note filed under the old one. Two answers you may get instead, both with the fix:
@@ -273,6 +276,13 @@ or a note that has never been asked whether it can refuse anything. Each has one
 honest way out, and the message says which. Saying it in your reply settles
 nothing - the fix has to be a real change to the note, or the tag that records
 the decision.
+
+Once in a while it asks for something bigger instead of one more note: when a
+project has built up ten or more notes still waiting on a verdict and none of
+them has been looked at in a whole day, it asks you to run the full
+end-of-session review in one pass rather than judging notes one at a time.
+That only happens once per conversation, even if the backlog is still there
+afterward.
 
 The first of those only ever names a note THIS session actually saw fire -
 never one that only ever showed up during other, unrelated work. Answer for

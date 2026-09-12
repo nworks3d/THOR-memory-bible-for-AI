@@ -152,34 +152,40 @@ against its own task prompt, and its Stop would then be blocked until it
 records a "decision" the owner never made: a deadlock in the exact
 delegated-task workflow this project runs on.
 
-**`setup_debt` and three memory-upkeep debts - `crowding_debt`,
-`judgement_debt` and the stale-rule (false-proof) debt - are gated off for
-a subagent too**, each independently, at its own call site in
-`hook_once`'s `Stop` arm. `setup_debt` never walks a subagent through
-AGENTS.md's setup questions, because there is no owner in the room for
-that conversation either. The three memory-upkeep debts are silenced for a
-sharper reason: paying one of them - `mark` for the judgement debt,
-`revise`/`retract` for the crowding debt and the stale-rule debt - is a
-write through the tool server, and every write the tool server makes is
-stamped with the same shared session identity (`mcp::SESSION_ID`, the
-literal string "mcp"), never the caller's own Claude Code session id - so a
-subagent that settles one of these debts writes a record that later reads
-exactly as though the owner dealt with it himself, though he never read the
-item at all: a false record, worse than the gap silence leaves. Holding a
-subagent's own turn for this memory's maintenance also spends a whole agent
-run on upkeep the owner will never see asked or answered. Measured
-2026-09-09: agents working among themselves are not held by any of this; it
-applies only to what is addressed to the owner.
+**`setup_debt`, the evaluation debt, and three memory-upkeep debts -
+`crowding_debt`, `judgement_debt` and the stale-rule (false-proof) debt -
+are gated off for a subagent too**, each independently, at its own call
+site in `hook_once`'s `Stop` arm. `setup_debt` never walks a subagent
+through AGENTS.md's setup questions, because there is no owner in the room
+for that conversation either. The evaluation debt (added 2026-09-12,
+`serve/src/bin/serve.rs`'s `evaluation_debt`) is silent for the identical
+reason: a subagent cannot itself type `/thor-eval`, so holding its turn
+over a routine only the owner can run would spend a whole agent run asking
+for something it has no way to do. The three memory-upkeep debts are
+silenced for a sharper reason: paying one of them - `mark` for the
+judgement debt, `revise`/`retract` for the crowding debt and the
+stale-rule debt - is a write through the tool server, and every write the
+tool server makes is stamped with the same shared session identity
+(`mcp::SESSION_ID`, the literal string "mcp"), never the caller's own
+Claude Code session id - so a subagent that settles one of these debts
+writes a record that later reads exactly as though the owner dealt with it
+himself, though he never read the item at all: a false record, worse than
+the gap silence leaves. Holding a subagent's own turn for this memory's
+maintenance also spends a whole agent run on upkeep the owner will never
+see asked or answered. Measured 2026-09-09: agents working among
+themselves are not held by any of this; it applies only to what is
+addressed to the owner.
 
-Each of the five - Lane C, `setup_debt`, and the three memory-upkeep debts -
-decides its own subagent scope independently, at its own call site in
-`hook_once`'s `Stop` arm, rather than behind one shared early return: this
-project has measured twice what a single early return across several gates
-does to the ones after it, most recently when an early `is_subagent` return
-in this same `Stop` arm silenced the Response Guard along with Lane C. See
-`serve/src/bin/serve.rs`'s own `is_subagent` doc comment in `hook_once`'s
-`Stop` arm for the per-gate shape, and `serve/tests/
-response_guard_subagent_gate.rs` and `serve/tests/setup_debt_stop_hook.rs`
+Each of the six - Lane C, `setup_debt`, the evaluation debt, and the three
+memory-upkeep debts - decides its own subagent scope independently, at its
+own call site in `hook_once`'s `Stop` arm, rather than behind one shared
+early return: this project has measured twice what a single early return
+across several gates does to the ones after it, most recently when an
+early `is_subagent` return in this same `Stop` arm silenced the Response
+Guard along with Lane C. See `serve/src/bin/serve.rs`'s own `is_subagent`
+doc comment in `hook_once`'s `Stop` arm for the per-gate shape, and
+`serve/tests/response_guard_subagent_gate.rs`, `serve/tests/
+setup_debt_stop_hook.rs` and `serve/tests/evaluation_debt_stop_hook.rs`
 for the tests.
 
 **The Response Guard (a separate surface, watching the assistant's reply,
@@ -198,9 +204,9 @@ having checked something with no evidence, a claim that something could
 not be reached without trying), and a subagent that lies about either is
 the same lazy-agent behaviour this whole project exists to catch,
 regardless of who reads the lie. That default - applies to everyone unless
-a rule opts out - is the opposite of the four debts above, which stay
+a rule opts out - is the opposite of the five debts above, which stay
 silent for a subagent by default; that is deliberate, not an
-inconsistency: for the four debts, going quiet for a subagent is the
+inconsistency: for the five debts, going quiet for a subagent is the
 settled behaviour, but for a rulebook rule, going quiet by default is
 exactly the failure this field exists to prevent (see `respond.rs`'s own
 "THE DEFAULT MATTERS" reasoning). Measured 2026-09-09 on 25 real agent

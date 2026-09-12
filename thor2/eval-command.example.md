@@ -25,6 +25,10 @@ item, once per turn. That is the same debt this routine pays; here you
 settle it deliberately, over the whole session, instead of one item at a
 time.
 
+Once per session, when this project's own debt reaches at least ten items
+and none of them has been judged in a day, the Stop hook also asks for this
+evaluation itself, by name, instead of one more item.
+
 ---
 
 ## 1. Judge what fired

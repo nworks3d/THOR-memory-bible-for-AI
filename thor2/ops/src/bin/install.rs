@@ -21,9 +21,9 @@ use std::path::Path;
 use ops::githooks;
 use ops::install::{
     default_data_dir, default_eval_command_path, default_settings_path, default_user_mcp_path, ensure_store,
-    install_hooks, install_tool_server, seed_eval_command, seed_response_rulebook, seed_working_contract,
-    standard_hooks, write_project_marker, EvalCommandOutcome, HookOutcome, MarkerOutcome, RulebookOutcome,
-    ServerOutcome, StoreOutcome,
+    install_hooks, install_tool_server, record_project_opened, seed_eval_command, seed_response_rulebook,
+    seed_working_contract, standard_hooks, write_project_marker, EvalCommandOutcome, HookOutcome, MarkerOutcome,
+    ProjectRecordOutcome, RulebookOutcome, ServerOutcome, StoreOutcome,
 };
 use std::path::PathBuf;
 use std::process::ExitCode;
@@ -107,6 +107,17 @@ fn build_project_index(index_root: &Path, key: &str, repo: &Path) -> anyhow::Res
     let mut store = codeindex::Store::open(&db).map_err(|e| anyhow::anyhow!(e))?;
     let stats = codeindex::build_full(&mut store, repo).map_err(|e| anyhow::anyhow!(e))?;
     Ok(Some(stats.files_indexed))
+}
+
+/// The file count on record in a sidecar that ALREADY exists for `key`, for
+/// the branch below that finds one already built: there is no fresh
+/// `BuildStats` to report there, but the sidecar itself still knows how many
+/// files it holds.
+fn existing_index_file_count(index_root: &Path, key: &str) -> anyhow::Result<usize> {
+    let db = index_root.join(format!("{key}.db"));
+    let store = codeindex::Store::open(&db).map_err(|e| anyhow::anyhow!(e))?;
+    let files = store.file_count().map_err(|e| anyhow::anyhow!(e))?;
+    Ok(usize::try_from(files).unwrap_or(0))
 }
 
 fn main() -> ExitCode {
@@ -432,8 +443,53 @@ fn main() -> ExitCode {
     }
     match cli.project.or_else(|| serve::project::resolve_project(&here)) {
         Some(key) => match code_index_root.as_deref().map(|r| build_project_index(r, &key, &here)).transpose() {
-            Ok(Some(Some(files))) => println!("+ read this project's code, {files} file(s), so it can be searched and kept fresh on every commit"),
-            Ok(Some(None)) => println!("= this project's code was already read; every commit keeps it fresh"),
+            Ok(Some(Some(files))) => {
+                println!("+ read this project's code, {files} file(s), so it can be searched and kept fresh on every commit");
+                // Immediately after the read succeeds: opens the project in
+                // the memory itself, so the very first `remember` filed under
+                // it is never refused as an unknown collection (see
+                // `record_project_opened`'s own doc comment for the defect
+                // this closes). Idempotent - a rerun that hits this same
+                // branch (the code index was rebuilt, but the record already
+                // exists) writes nothing more.
+                match record_project_opened(&db, &key, files) {
+                    Ok(ProjectRecordOutcome::Written) => println!(
+                        "+ recorded this project, '{key}', in the memory: notes filed under it land without a naming question"
+                    ),
+                    Ok(ProjectRecordOutcome::AlreadyThere) => {
+                        println!("= this project was already recorded in the memory")
+                    }
+                    Err(e) => println!("  ! could not record this project in the memory: {e}"),
+                }
+            }
+            Ok(Some(None)) => {
+                println!("= this project's code was already read; every commit keeps it fresh");
+                // THE UPGRADE GAP THIS CLOSES: an owner who installed before
+                // `record_project_opened` existed (or any run that finds a
+                // sidecar but lost the record some other way) hits this
+                // branch on every later install, forever - the sidecar is
+                // already built, so the fresh-build branch above, the only
+                // other place that calls `record_project_opened`, never
+                // fires again to close it. Closed the same way here, from
+                // the sidecar's own file count rather than a fresh build's
+                // stats, and just as idempotent: once recorded, a repeat of
+                // THIS branch prints "already recorded" and writes nothing
+                // more (see `record_project_opened`'s own doc comment).
+                if let Some(root) = code_index_root.as_deref() {
+                    match existing_index_file_count(root, &key) {
+                        Ok(files) => match record_project_opened(&db, &key, files) {
+                            Ok(ProjectRecordOutcome::Written) => println!(
+                                "+ recorded this project, '{key}', in the memory: notes filed under it land without a naming question"
+                            ),
+                            Ok(ProjectRecordOutcome::AlreadyThere) => {
+                                println!("= this project was already recorded in the memory")
+                            }
+                            Err(e) => println!("  ! could not record this project in the memory: {e}"),
+                        },
+                        Err(e) => println!("  ! could not read the existing code index to record this project: {e}"),
+                    }
+                }
+            }
             Ok(None) => {}
             Err(e) => println!("- the code here could not be read ({e}) - the memory works, code search does not"),
         },

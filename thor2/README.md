@@ -147,12 +147,26 @@ there the day writes are turned on. An existing copy - the owner's own
 edited version, or one an earlier install already wrote - is left exactly
 as it is.
 
+Once a project's own backlog reaches ten items still owed a verdict and none
+of them has been judged in a day, the `Stop` hook asks for this whole routine
+by name, once per session, instead of one more item at a time - see the
+`judgement debt` line under "Check it" below for where that backlog is
+reported.
+
 `--project <key>` additionally writes a `.thor-project` marker in the current
 directory to override the project name. By default, a checkout is scoped to the
 name of its repository folder. Pass `--project` only when you want a different
 name. It refuses to change a key that is already there: re-scoping strands
 every item filed under the old one while leaving them in the store, which is
 invisible from every surface.
+
+Either way the project's name was decided, `install` also reads that project's
+code once (so `search_code`, `where_used` and `outline` can answer for it,
+refreshed automatically on every later commit) and records that same name in
+the memory itself the moment the read succeeds - so the project's first
+`remember` never has to ask which collection it belongs to. Both are
+idempotent: a later run that finds the code already indexed leaves the memory
+record exactly as it is too.
 
 The four hooks are `SessionStart` (what the agent is handed at the start),
 `PreToolUse` (the gate that can block a write), `UserPromptSubmit`, and `Stop`
@@ -232,7 +246,10 @@ with nothing in it yet, which is what a first run looks like.
 When a rule or orientation has fired many times with no verdict either way,
 doctor also names each one that applies to this checkout - how often, what
 kind, and where it fires - so a review has a list to settle instead of only a
-count.
+count. The same line also says how long ago this checkout's own newest
+verdict landed, or that none ever has, and once that backlog is both large
+and stale enough, that the `Stop` hook will ask for the whole end-of-session
+routine over it.
 
 Two of those checks - whether an old reference still points at a real file,
 and whether some facts never win a place - need to know where your other

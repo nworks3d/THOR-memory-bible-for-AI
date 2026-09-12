@@ -228,8 +228,33 @@ fn render_eval_command(bin_dir: &Path, db: &Path) -> String {
 /// directory as `default_settings_path` - one documented per-user location,
 /// not a guess, so a file placed here is exactly where typing `/thor-eval`
 /// looks.
+///
+/// Routed through `eval_command_path_from` rather than `home_dir` above
+/// directly, so that pure rule can be called on its own, with no environment
+/// to read - see that function's own doc comment for why this crate carries
+/// the rule twice.
 pub fn default_eval_command_path() -> Option<PathBuf> {
-    home_dir().map(|h| h.join(".claude").join("commands").join("thor-eval.md"))
+    eval_command_path_from(std::env::var("USERPROFILE").ok().as_deref(), std::env::var("HOME").ok().as_deref())
+}
+
+/// The pure resolution rule behind `default_eval_command_path` above: given
+/// Claude Code's per-user home candidates exactly as `std::env::var` would
+/// hand them over (`USERPROFILE` tried first, then `HOME` - `home_dir`'s own
+/// order), the path `install` writes the evaluation routine to.
+///
+/// SPLIT OUT, PURE, AND DUPLICATED IN `serve::usefulness` (the identical
+/// function, same name, same body) - the Stop hook's own evaluation debt
+/// (`serve/src/bin/serve.rs`) has to name this exact file, but `ops` depends
+/// on `serve`, never the other way round (a dependency the other direction
+/// would be a cycle Cargo refuses outright), so `serve` cannot call into
+/// `ops` to resolve it. Kept pure rather than reading the environment
+/// itself for the same reason `serve::reentry`'s own `depth_from_env_value`
+/// is split from its I/O wrapper: `std::env::set_var` is process-wide and
+/// races across parallel test threads, so proving the two copies agree
+/// (`ops/tests`) has to drive both with plain fixture strings, never by
+/// mutating this test binary's own environment.
+pub fn eval_command_path_from(userprofile: Option<&str>, home: Option<&str>) -> Option<PathBuf> {
+    userprofile.or(home).map(|h| PathBuf::from(h).join(".claude").join("commands").join("thor-eval.md"))
 }
 
 /// Write THOR's end-of-session evaluation routine to `path`, with its two
@@ -1005,6 +1030,103 @@ pub fn write_project_marker(dir: &Path, key: &str) -> anyhow::Result<MarkerOutco
     Ok(MarkerOutcome::Written)
 }
 
+/// The id `record_project_opened` writes under for project `key` - one
+/// record per project, forever, unless the owner retracts it by hand.
+///
+/// Ids in this store carry no character restriction of their own to derive
+/// around: `model::gate::declare` validates an item's SHAPE (its bindings,
+/// falsifier, text length, scope) but never its id, and `entity_id` is a
+/// free-form SQLite TEXT column with no format constraint
+/// (`core::event_store`'s schema). `key` itself is already constrained to a
+/// single, non-blank line by every path that can produce it
+/// (`serve::project::resolve_project`'s marker read and git-root basename;
+/// `write_project_marker`'s own refusal of a `--project` value containing a
+/// newline), so it is used exactly as given, with no separate normalisation
+/// step to invent.
+pub fn project_opened_record_id(key: &str) -> String {
+    format!("project-{key}-opened-by-install")
+}
+
+/// The record itself, pure: its exact id/kind/project/tags/text are
+/// testable with no store at all. `today` is `YYYY-MM-DD`.
+fn project_opened_record(key: &str, files: usize, today: &str) -> model::item::Item {
+    model::item::Item {
+        id: project_opened_record_id(key),
+        kind: model::item::Kind::Report,
+        text: format!(
+            "Project {key}: install read its code on {today} ({files} file(s)) so it can be \
+             searched with search_code and kept fresh on every commit. Notes filed under '{key}' \
+             belong to this repository."
+        ),
+        bindings: Vec::new(),
+        severity: None,
+        project: Some(key.to_string()),
+        tags: vec!["working-contract".to_string(), "project-record".to_string()],
+        expires: None,
+        key: None,
+        falsifier: None,
+        check: None,
+    }
+}
+
+/// What happened writing the project-opened record on this run.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProjectRecordOutcome {
+    Written,
+    AlreadyThere,
+}
+
+/// Record, in the memory itself, that this project's code was read - closing
+/// the gap `mcp::refuse_a_new_collection` otherwise leaves open.
+///
+/// THE DEFECT THIS CLOSES. `build_project_index` (above) reads a project's
+/// code into its own sidecar, under project name `key`, but never told the
+/// MAIN store that name was open. The write gate's own collection check
+/// (`mcp::refuse_a_new_collection`, `mcp/src/lib.rs`) passes a project only
+/// when a `.thor-project` marker names it or the scope catalogue
+/// (`serve::lookup::catalog`, built from LIVE items in the main store)
+/// already lists it - and the code index is a sidecar that catalogue never
+/// reads. So the very first well-formed note filed under a freshly-installed
+/// project (plain `install`, no `--project`, so no marker either) was
+/// refused as an unknown collection, pointed at `install --project <name>` -
+/// advice that is stale now that plain `install` already reads the code
+/// under the folder's own name.
+///
+/// One live `Report` scoped to `key` is enough to close it: `catalog()`
+/// already counts a `Report` toward its own `project` field (see
+/// `serve::lookup::catalog`'s `Kind::Report | Kind::Chunk` arm), so nothing
+/// about the gate itself needs to change once this exists.
+///
+/// IDEMPOTENT BY ID. `model::store::show` decides whether anything already
+/// answers to `project_opened_record_id(key)`; anything other than a plain
+/// "not found" - already live, retracted on purpose, diverged, an unparsable
+/// body - is left exactly as it is. This writes at most once, ever, per
+/// project, and it never overturns a decision (a retraction, say) already
+/// made about this id.
+///
+/// Written through `model::store::declare` - the exact call
+/// `seed_working_contract` already makes for the starting notes - so the
+/// write gate runs on this precisely as it would on anything an agent
+/// stores.
+pub fn record_project_opened(db: &Path, key: &str, files: usize) -> anyhow::Result<ProjectRecordOutcome> {
+    let mut store = EventStore::new(db)?;
+    let id = project_opened_record_id(key);
+    if !matches!(model::store::show(&store, &id), Err(model::store::ReadError::NotFound(_))) {
+        return Ok(ProjectRecordOutcome::AlreadyThere);
+    }
+    let item = project_opened_record(key, files, &today_ymd());
+    model::store::declare(&mut store, "install", "install", "installer", &item)
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
+    Ok(ProjectRecordOutcome::Written)
+}
+
+/// Today, as `YYYY-MM-DD` - the same one-line derivation `serve::lookup`'s
+/// own (private) `today()` uses, from the one clock this workspace shares
+/// (`serve::time::now_iso8601`).
+fn today_ymd() -> String {
+    serve::time::now_iso8601().chars().take(10).collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1725,5 +1847,77 @@ mod tests {
         assert!(evidence.none_of_patterns.contains(&"commit_sha".to_string()));
         assert!(evidence.none_of_patterns.contains(&"path_line".to_string()));
         assert!(!evidence.base.reminder.is_empty());
+    }
+
+    /// THE DEFECT `record_project_opened` CLOSES: a successful code read
+    /// opened a code-search sidecar under the project's name but never told
+    /// the main store, so `mcp::refuse_a_new_collection` never saw that name
+    /// as open. Proven directly here (id, kind, project, tags, text); the
+    /// gate-level consequence (a `remember` under this project now passes
+    /// the collection check) is proven in
+    /// `ops/tests/install_records_project_opened.rs`.
+    #[test]
+    fn a_successful_read_writes_the_record_with_the_exact_shape() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("thor.db");
+        ensure_store(&db).unwrap();
+
+        assert_eq!(record_project_opened(&db, "demo-shop", 7).unwrap(), ProjectRecordOutcome::Written);
+
+        let store = thor_core::event_store::EventStore::open_existing(&db).unwrap();
+        let item = model::store::show(&store, "project-demo-shop-opened-by-install").unwrap();
+        assert_eq!(item.kind, model::item::Kind::Report);
+        assert_eq!(item.project.as_deref(), Some("demo-shop"));
+        assert_eq!(item.tags, vec!["working-contract".to_string(), "project-record".to_string()]);
+        assert!(item.bindings.is_empty(), "a Report may carry no binding");
+        assert!(item.falsifier.is_none(), "no falsifier was asked for");
+        let today = today_ymd();
+        assert_eq!(
+            item.text,
+            format!(
+                "Project demo-shop: install read its code on {today} (7 file(s)) so it can be \
+                 searched with search_code and kept fresh on every commit. Notes filed under \
+                 'demo-shop' belong to this repository."
+            )
+        );
+    }
+
+    /// A second call for the same project must write nothing more: no
+    /// revision, no duplicate. Checked by item count, not merely by the
+    /// returned outcome, so a bug that revised the item instead of skipping
+    /// it would still be caught.
+    #[test]
+    fn a_second_call_for_the_same_project_writes_nothing_more() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("thor.db");
+        ensure_store(&db).unwrap();
+
+        record_project_opened(&db, "demo-shop", 7).unwrap();
+        let store = thor_core::event_store::EventStore::open_existing(&db).unwrap();
+        let before = store.get_all_events().unwrap().len();
+
+        let again = record_project_opened(&db, "demo-shop", 9999).unwrap();
+        assert_eq!(again, ProjectRecordOutcome::AlreadyThere);
+
+        let store = thor_core::event_store::EventStore::open_existing(&db).unwrap();
+        assert_eq!(store.get_all_events().unwrap().len(), before, "a second call appended an event");
+        let item = model::store::show(&store, "project-demo-shop-opened-by-install").unwrap();
+        assert!(item.text.contains("(7 file(s))"), "the original record must be untouched: {}", item.text);
+    }
+
+    /// The other half of idempotency: two DIFFERENT projects each get their
+    /// own record, because the id carries the project's own name.
+    #[test]
+    fn two_different_projects_each_get_their_own_record() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("thor.db");
+        ensure_store(&db).unwrap();
+
+        assert_eq!(record_project_opened(&db, "demo-shop", 3).unwrap(), ProjectRecordOutcome::Written);
+        assert_eq!(record_project_opened(&db, "other-repo", 5).unwrap(), ProjectRecordOutcome::Written);
+
+        let store = thor_core::event_store::EventStore::open_existing(&db).unwrap();
+        assert!(model::store::show(&store, "project-demo-shop-opened-by-install").is_ok());
+        assert!(model::store::show(&store, "project-other-repo-opened-by-install").is_ok());
     }
 }

@@ -6,6 +6,7 @@
 //! item, not a score.
 
 use std::collections::{HashMap, HashSet};
+use std::path::PathBuf;
 use thor_core::event_store::{EventKind, EventStore};
 
 /// Every entity id with at least one `ItemMarkedUseful` event in the log.
@@ -388,4 +389,296 @@ pub fn noise_since_last_useful(store: &EventStore) -> HashMap<String, usize> {
         }
     }
     counts
+}
+
+// ------------------------------------------------------------------------
+// The evaluation debt (2026-09-12): `bin/serve.rs`'s Stop hook, once per
+// session, asks the owner to run the WHOLE end-of-session evaluation
+// (`ops::install::seed_eval_command`'s routine) rather than judging one more
+// item, once this checkout's own judgement-debt backlog is both large and
+// stale. See `bin/serve.rs`'s own `evaluation_debt` for the Stop-hook wiring;
+// everything below is the pure/reusable half, kept here for the same reason
+// `JUDGEMENT_DEBT_AFTER` and `judgement_debt_counts` already are: `doctor`
+// (`ops::health::judgement_debt_line`) needs the exact same numbers, never a
+// second copy that can silently drift from what the hook actually acts on.
+
+/// How many items this checkout's own judgement debt must hold before the
+/// evaluation debt can even be considered - `judgement_debt_counts`'s own
+/// `in_project` half, the identical count `doctor` already names under
+/// "judgement debt" for this checkout. Ten is a backlog, not a rounding
+/// error: below it, walking the items one `mark` at a time (the per-item
+/// judgement debt above, or the owner simply noticing) is still the cheaper
+/// path, and asking for the whole routine over a handful of items would be
+/// the nag this ceiling exists to prevent.
+pub const EVAL_DEBT_CEILING: usize = 10;
+
+/// How many hours may pass since this checkout's own newest verdict before
+/// the evaluation debt is willing to speak at all - the grace period that
+/// keeps it from asking again minutes after an evaluation actually happened.
+/// A day, not an hour: an evaluation is deliberate, occasional work, and a
+/// backlog that crossed the ceiling five minutes ago is not yet a pattern.
+pub const EVAL_DEBT_STALE_HOURS: i64 = 24;
+
+/// THE PURE PREDICATE. Both inputs are already resolved elsewhere
+/// (`owed_in_project` from `judgement_debt_counts`, `newest_verdict_unix`
+/// from the fold of the same name below, `now_unix` from `crate::time::
+/// now_unix`) so this is nothing but the two conditions themselves,
+/// unit-testable with plain integers and no store, no clock, no filesystem.
+///
+/// `newest_verdict_unix` is `None` for "never" (this checkout has not
+/// recorded a single verdict on anything that applies to it) and `Some(t)`
+/// for the instant of the newest one - see that function's own doc comment
+/// for exactly which verdicts count. `now_unix.saturating_sub(t)` rather than
+/// plain subtraction: `t` is read from a stored, human-editable timestamp,
+/// and a clock skew that put it in the future must read as "not yet stale"
+/// rather than underflow.
+pub fn eval_debt_owed(owed_in_project: usize, newest_verdict_unix: Option<i64>, now_unix: i64) -> bool {
+    if owed_in_project < EVAL_DEBT_CEILING {
+        return false;
+    }
+    match newest_verdict_unix {
+        None => true,
+        Some(t) => now_unix.saturating_sub(t) > EVAL_DEBT_STALE_HOURS * 3600,
+    }
+}
+
+/// Whole days between `then_unix` and `now_unix`, floored, never negative -
+/// the one "N day(s) ago" rule both `doctor`'s judgement-debt line and the
+/// Stop hook's own evaluation-debt message use for the same instant, so
+/// neither ever rounds it differently from the other.
+pub fn days_ago(now_unix: i64, then_unix: i64) -> i64 {
+    (now_unix - then_unix).max(0) / 86400
+}
+
+/// The body shape `ItemMarkedUseful` and `ItemMarkedNoise` both carry
+/// (`model::marked`) - only the one field this fold needs, read generically
+/// so one parse serves both event kinds.
+#[derive(serde::Deserialize)]
+struct MarkedAt {
+    marked_at: String,
+}
+
+/// The most recent verdict - a mark of usefulness OR of noise, either one
+/// settles a review the same way `judged_since` (`bin/serve.rs`) already
+/// treats them - among items that apply to `checkout_project` (project-scoped
+/// to it, or global: `crate::project::applies_to`, the exact filter
+/// `judgement_debt_counts`/`judgement_debt_named` already use for their own
+/// `in_project` half), as Unix seconds. `None` when no such item has ever
+/// been marked at all.
+///
+/// DELIBERATELY NOT SCOPED TO "CURRENTLY OWED" ITEMS ONLY, even though the
+/// evaluation debt's own ceiling condition (`eval_debt_owed`'s
+/// `owed_in_project`) is. A mark of usefulness or noise resets ITS OWN
+/// item's served-since-verdict count to zero (`served_since_last_verdict`),
+/// which drops that item OUT of the owed set the moment it is judged - so a
+/// verdict scoped to "still owed right now" could never see the very
+/// judgement that just happened, and a session that had just finished a real
+/// evaluation pass would be told nothing here was ever judged. What this
+/// asks instead is the plain question the debt's own message makes to the
+/// owner - "has anything in this project's scope been judged lately" - which
+/// is answered by ANY verdict on ANY item this checkout would ever be asked
+/// about, owed or not.
+///
+/// LIVE ITEMS ONLY, same reasoning `judgement_debt` (`bin/serve.rs`) already
+/// gives for its own "AND ONLY WHAT IS STILL LIVE" filter: a verdict's own
+/// event never says what project it was scoped to at the time, only
+/// `entity_id` - so this reads that back from the CURRENT live item, and an
+/// id no longer live (retracted since) has no current scope to check at all,
+/// so it is excluded rather than guessed at.
+pub fn newest_verdict_unix(store: &EventStore, checkout_project: Option<&str>) -> Option<i64> {
+    let live = crate::live::live_items(store);
+    let project_of: HashMap<&str, Option<&str>> =
+        live.iter().map(|li| (li.id.as_str(), li.item.project.as_deref())).collect();
+    let events = store.get_all_events().ok()?;
+    events
+        .iter()
+        .filter(|e| matches!(e.kind, EventKind::ItemMarkedUseful | EventKind::ItemMarkedNoise))
+        .filter(|e| {
+            project_of.get(e.entity_id.as_str()).is_some_and(|p| crate::project::applies_to(*p, checkout_project))
+        })
+        .filter_map(|e| serde_json::from_str::<MarkedAt>(&e.body).ok())
+        .filter_map(|m| crate::time::unix_from_iso8601(&m.marked_at))
+        .max()
+}
+
+/// The pure resolution rule behind `default_eval_command_path` below:
+/// Claude Code's per-user commands folder is under whichever of these two
+/// candidates is set, USERPROFILE tried first - exactly
+/// `ops::install::default_eval_command_path`'s own rule (`home_dir`, that
+/// crate). DUPLICATED, not shared: `ops` depends on `serve`, never the other
+/// way round (`ops/Cargo.toml` names `serve` as a dependency; the reverse
+/// would be a cycle Cargo refuses outright), so the Stop hook here cannot
+/// call into `ops` to find this file. Split into a pure function taking the
+/// two candidates as plain strings, rather than reading the environment
+/// itself, for the same reason `reentry.rs`'s own `depth_from_env_value`
+/// is split from its I/O wrapper: `std::env::set_var` is process-wide and
+/// races across parallel test threads, so the rule a test needs to drive
+/// with every combination of "set"/"unset" has to be pure. `ops/tests` calls
+/// this function directly, side by side with `ops::install`'s own copy, to
+/// prove neither ever silently drifts from the other.
+pub fn eval_command_path_from(userprofile: Option<&str>, home: Option<&str>) -> Option<PathBuf> {
+    userprofile.or(home).map(|h| PathBuf::from(h).join(".claude").join("commands").join("thor-eval.md"))
+}
+
+/// Where the owner's end-of-session evaluation routine lives right now, read
+/// from this process' own environment - see `eval_command_path_from` for the
+/// pure rule and why this crate carries its own copy of it.
+pub fn default_eval_command_path() -> Option<PathBuf> {
+    eval_command_path_from(std::env::var("USERPROFILE").ok().as_deref(), std::env::var("HOME").ok().as_deref())
+}
+
+#[cfg(test)]
+mod eval_debt_predicate_tests {
+    use super::*;
+
+    // Fixed reference instant - any value works, since the predicate only
+    // ever looks at the DIFFERENCE between it and a verdict's own timestamp.
+    const NOW: i64 = 1_800_000_000;
+
+    #[test]
+    fn fires_at_exactly_the_ceiling_with_a_verdict_25_hours_old() {
+        let verdict = NOW - 25 * 3600;
+        assert!(eval_debt_owed(EVAL_DEBT_CEILING, Some(verdict), NOW));
+    }
+
+    #[test]
+    fn silent_one_below_the_ceiling() {
+        // A verdict that is "never" (None) would otherwise satisfy the
+        // staleness half outright - proving the ceiling alone still holds
+        // the line even against the most permissive possible staleness input.
+        assert!(!eval_debt_owed(EVAL_DEBT_CEILING - 1, None, NOW));
+    }
+
+    #[test]
+    fn silent_with_a_verdict_23_hours_old() {
+        let verdict = NOW - 23 * 3600;
+        assert!(!eval_debt_owed(EVAL_DEBT_CEILING, Some(verdict), NOW));
+    }
+
+    #[test]
+    fn fires_with_no_verdict_ever() {
+        assert!(eval_debt_owed(EVAL_DEBT_CEILING + 5, None, NOW));
+    }
+
+    #[test]
+    fn a_verdict_from_the_future_is_not_yet_stale() {
+        // Clock skew, or a hand-edited timestamp: must not underflow into a
+        // huge apparent age via `saturating_sub` reading the wrong direction.
+        assert!(!eval_debt_owed(EVAL_DEBT_CEILING, Some(NOW + 3600), NOW));
+    }
+
+    #[test]
+    fn days_ago_floors_and_never_goes_negative() {
+        assert_eq!(days_ago(NOW, NOW - 3 * 86400), 3);
+        assert_eq!(days_ago(NOW, NOW - 3 * 86400 - 1), 3, "not yet a fourth full day");
+        assert_eq!(days_ago(NOW, NOW + 3600), 0, "a future timestamp reads as 0, never negative");
+    }
+}
+
+#[cfg(test)]
+mod newest_verdict_tests {
+    use super::*;
+    use model::item::{Binding, Item, Kind};
+
+    fn declare(store: &mut EventStore, id: &str, project: Option<&str>) {
+        let item = Item {
+            id: id.to_string(),
+            kind: Kind::Rule,
+            text: format!("something worth knowing about {id}"),
+            bindings: vec![Binding::Moment(intent::Action::Commit)],
+            severity: None,
+            project: project.map(str::to_string),
+            tags: vec![],
+            expires: None,
+            key: None,
+            falsifier: Some("it stops being true".to_string()),
+            check: None,
+        };
+        model::store::declare(store, "t", "t", "t", &item).expect("fixture must store");
+    }
+
+    #[test]
+    fn an_empty_store_has_no_newest_verdict() {
+        let store = EventStore::in_memory().unwrap();
+        assert_eq!(newest_verdict_unix(&store, None), None);
+    }
+
+    #[test]
+    fn a_single_mark_is_the_newest_verdict() {
+        let mut store = EventStore::in_memory().unwrap();
+        declare(&mut store, "a", None);
+        crate::mark::record_useful(&mut store, "s", "l", "a", "2026-08-02T00:00:00Z", "a").unwrap();
+        assert_eq!(
+            newest_verdict_unix(&store, None),
+            crate::time::unix_from_iso8601("2026-08-02T00:00:00Z")
+        );
+    }
+
+    #[test]
+    fn the_later_of_two_verdicts_wins_regardless_of_kind() {
+        let mut store = EventStore::in_memory().unwrap();
+        declare(&mut store, "a", None);
+        declare(&mut store, "b", None);
+        crate::mark::record_useful(&mut store, "s", "l", "a", "2026-08-02T00:00:00Z", "a").unwrap();
+        crate::mark::record_noise(&mut store, "s", "l", "a", "2026-08-05T00:00:00Z", "b").unwrap();
+        assert_eq!(
+            newest_verdict_unix(&store, None),
+            crate::time::unix_from_iso8601("2026-08-05T00:00:00Z"),
+            "a later NOISE mark still counts as the newest verdict"
+        );
+    }
+
+    #[test]
+    fn a_verdict_owed_only_to_another_project_is_excluded() {
+        let mut store = EventStore::in_memory().unwrap();
+        declare(&mut store, "acme-item", Some("acme"));
+        crate::mark::record_useful(&mut store, "s", "l", "a", "2026-08-02T00:00:00Z", "acme-item").unwrap();
+        assert_eq!(newest_verdict_unix(&store, Some("thor")), None, "a different checkout must not see it");
+        assert!(newest_verdict_unix(&store, Some("acme")).is_some(), "fixture sanity: acme's own checkout does");
+    }
+
+    #[test]
+    fn a_global_verdict_counts_toward_every_project() {
+        let mut store = EventStore::in_memory().unwrap();
+        declare(&mut store, "global-item", None);
+        crate::mark::record_useful(&mut store, "s", "l", "a", "2026-08-02T00:00:00Z", "global-item").unwrap();
+        assert!(newest_verdict_unix(&store, Some("thor")).is_some());
+        assert!(newest_verdict_unix(&store, Some("acme")).is_some());
+    }
+
+    #[test]
+    fn a_verdict_on_a_since_retracted_item_is_excluded() {
+        let mut store = EventStore::in_memory().unwrap();
+        declare(&mut store, "gone", None);
+        crate::mark::record_useful(&mut store, "s", "l", "a", "2026-08-02T00:00:00Z", "gone").unwrap();
+        assert!(newest_verdict_unix(&store, None).is_some(), "fixture sanity: live and judged");
+        model::store::retract(&mut store, "t", "t", "t", "gone", "no longer needed").unwrap();
+        assert_eq!(newest_verdict_unix(&store, None), None, "a verdict on a dead item proves nothing current");
+    }
+}
+
+#[cfg(test)]
+mod eval_command_path_tests {
+    use super::*;
+
+    #[test]
+    fn userprofile_wins_when_both_are_set() {
+        assert_eq!(
+            eval_command_path_from(Some("C:\\Users\\fixture"), Some("/home/fixture")),
+            Some(PathBuf::from("C:\\Users\\fixture").join(".claude").join("commands").join("thor-eval.md"))
+        );
+    }
+
+    #[test]
+    fn home_is_the_fallback_when_userprofile_is_absent() {
+        assert_eq!(
+            eval_command_path_from(None, Some("/home/fixture")),
+            Some(PathBuf::from("/home/fixture").join(".claude").join("commands").join("thor-eval.md"))
+        );
+    }
+
+    #[test]
+    fn neither_set_resolves_to_nothing() {
+        assert_eq!(eval_command_path_from(None, None), None);
+    }
 }

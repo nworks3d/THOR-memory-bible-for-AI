@@ -858,10 +858,7 @@ pub fn capacity(store: &EventStore, item: &Item) -> anyhow::Result<Capacity> {
     // ITEM, not the filtered list. A pinned item is served in full at every
     // session start, so "never shown as advice" would be a flat lie about an
     // [Always, Dir] pair - and both reviews caught exactly that wording.
-    let pinned = item.bindings.iter().any(|b| matches!(b, Binding::Always));
-    let all_dir = !pinned
-        && bindings.iter().all(|b| matches!(b, Binding::Target { kind: crate::item::TargetKind::Dir, .. }));
-    if all_dir {
+    if is_all_dir_binding_set(item, &bindings) {
         // Note, not a refusal: since 2026-08-19 a directory anchor DOES reach
         // the files inside it (`normalize::target_matches`), so this is about
         // breadth, not about silence. It used to say such an item could never
@@ -878,30 +875,21 @@ pub fn capacity(store: &EventStore, item: &Item) -> anyhow::Result<Capacity> {
 
     let mine = crate::item::severity_rank(item.severity);
     let mut every_binding_is_hopeless = true;
-    let mut crowded: Option<String> = None;
 
     for binding in &bindings {
         let rivals = pool_rivals(&candidates, item, binding);
         let heavier = rivals.iter().filter(|(_, o)| crate::item::severity_rank(o.severity) < mine).count();
-        let at_least_equal =
-            rivals.iter().filter(|(_, o)| crate::item::severity_rank(o.severity) <= mine).count();
-
         if heavier < crate::item::MAX_ITEMS {
             every_binding_is_hopeless = false;
         }
-        if crowded.is_none() && at_least_equal >= crate::item::MAX_ITEMS {
-            crowded = Some(format!(
-                "{} already holds AT LEAST {at_least_equal} item(s) of the same weight or heavier, \
-                 for {} place(s) in a block - this one may well never be shown there. At least, \
-                 because this count sees only the rivals sharing this one binding; the real crowd \
-                 also includes everything reaching that place through a moment, which only doctor's \
-                 crowding line can count. Bind it to the exact file or command it is about instead \
-                 of the broad moment, or fold it into whichever item already carries that ground.",
-                describe(binding),
-                crate::item::MAX_ITEMS
-            ));
-        }
     }
+    // The note half (never a refusal) is its own function - see
+    // `crowded_binding_note`'s own doc comment for why: `capacity_for_revise`
+    // needs to ask this exact question again, against the same candidates, to
+    // know whether a REVISE's own crowding note is this one (measurable) or
+    // the different, unconditional directory note just above (nothing to
+    // measure).
+    let crowded = crowded_binding_note(&candidates, item, &bindings).map(|(note, _, _)| note);
 
     if every_binding_is_hopeless {
         let worst = bindings
@@ -929,6 +917,128 @@ pub fn capacity(store: &EventStore, item: &Item) -> anyhow::Result<Capacity> {
         Some(note) => Capacity::Crowded(note),
         None => Capacity::Fine,
     })
+}
+
+/// Every binding this item carries (besides `Always`, already dropped by
+/// `capacity`'s own caller) is a DIRECTORY - the one case `capacity` reports
+/// unconditionally, before it ever asks `pool_rivals` a single question. A
+/// pinned item is exempt: `Always` next to a `Dir` still means "everywhere",
+/// not "this one broad place" - see `capacity`'s own comment on why the
+/// filtered `bindings` list is not enough to decide this alone.
+fn is_all_dir_binding_set(item: &Item, bindings: &[&Binding]) -> bool {
+    let pinned = item.bindings.iter().any(|b| matches!(b, Binding::Always));
+    !pinned && bindings.iter().all(|b| matches!(b, Binding::Target { kind: crate::item::TargetKind::Dir, .. }))
+}
+
+/// The first binding (in order) already holding `item::MAX_ITEMS` live rivals
+/// of the same weight or heavier, the note `capacity`'s own `Crowded` case
+/// builds from it, and the count the note quotes - factored out of
+/// `capacity`'s own loop so `capacity_for_revise` can ask the identical
+/// question, against the same candidates, without re-deriving the wording and
+/// risking a second copy that silently drifts from the first.
+///
+/// Returns the earliest binding whose rivals reach the cap, not every one
+/// that does - exactly what `capacity`'s own `crowded.is_none()` guard kept
+/// before this was its own function: a note names ONE place to fix, not an
+/// exhaustive report of every full pool this item touches.
+fn crowded_binding_note<'a>(
+    candidates: &[(String, Item)],
+    item: &Item,
+    bindings: &[&'a Binding],
+) -> Option<(String, &'a Binding, usize)> {
+    let mine = crate::item::severity_rank(item.severity);
+    for binding in bindings {
+        let rivals = pool_rivals(candidates, item, binding);
+        let at_least_equal = rivals.iter().filter(|(_, o)| crate::item::severity_rank(o.severity) <= mine).count();
+        if at_least_equal >= crate::item::MAX_ITEMS {
+            let note = format!(
+                "{} already holds AT LEAST {at_least_equal} item(s) of the same weight or heavier, \
+                 for {} place(s) in a block - this one may well never be shown there. At least, \
+                 because this count sees only the rivals sharing this one binding; the real crowd \
+                 also includes everything reaching that place through a moment, which only doctor's \
+                 crowding line can count. Bind it to the exact file or command it is about instead \
+                 of the broad moment, or fold it into whichever item already carries that ground.",
+                describe(binding),
+                crate::item::MAX_ITEMS
+            );
+            return Some((note, binding, at_least_equal));
+        }
+    }
+    None
+}
+
+/// `capacity`, sharpened for a REVISE that leaves every binding exactly as it
+/// was.
+///
+/// MEASURED, NOT PREDICTED, AND HERE IS WHY THAT DIFFERENCE IS SOUND. A
+/// revise that keeps its bindings does not move into a place and wonder if it
+/// will be seen there - it is already the live occupant of every binding it
+/// carries (`full_reliable_anchor`'s own doc comment: a write never refuses
+/// the binding an item already stands on), and has been since some earlier
+/// write. So "will this be shown at that binding" is not a question about the
+/// future the way it is for a brand new `declare` or a revise that just
+/// changed WHERE the item sits - the store's own `item_served` log already
+/// answered it, every time a gate actually reached this item and chose to
+/// show it or not.
+///
+/// THE DAY THIS WAS MEASURED. A revise that changed only an item's falsifier
+/// text, bindings untouched, got the ordinary "may well never be shown there"
+/// prediction - while that same item had been served 55 times at that exact
+/// binding since its last verdict, and doctor's own crowding line counted
+/// nothing outranked in the project. The note guessed at a future the log had
+/// already settled.
+///
+/// WHY A CHANGED BINDING OR A BRAND NEW `declare` DOES NOT GET THIS. Either
+/// one is a real unknown again: a new binding has no service history AT THAT
+/// BINDING to read (the item's OLD servings happened somewhere else, and
+/// counting them here would measure the wrong place), and a `declare` has no
+/// `existing` at all to compare against. Both keep the ordinary prediction
+/// from `capacity` untouched.
+///
+/// `now` is an ISO-8601 UTC timestamp (`served_at`'s own shape) - threaded in
+/// by the caller rather than read from the clock in here, so this stays as
+/// testable against a fixed instant as everything else this crate proves
+/// against a temp store.
+pub fn capacity_for_revise(
+    store: &EventStore,
+    existing: &Item,
+    updated: &Item,
+    now: &str,
+) -> anyhow::Result<Capacity> {
+    let cap = capacity(store, updated)?;
+    if existing.bindings != updated.bindings {
+        return Ok(cap);
+    }
+    if !matches!(cap, Capacity::Crowded(_)) {
+        return Ok(cap);
+    }
+    let bindings: Vec<&Binding> =
+        updated.bindings.iter().filter(|b| !matches!(b, Binding::Always)).collect();
+    // The one `Crowded` note this function knows how to measure is the
+    // per-binding one `crowded_binding_note` builds. The all-directory note
+    // `capacity` returns unconditionally, before ever reaching that
+    // computation, says something about BREADTH, not about a rival pool -
+    // there is nothing here for a servings count to confirm or replace.
+    if is_all_dir_binding_set(updated, &bindings) {
+        return Ok(cap);
+    }
+    let candidates = if store.heads_projection_current() {
+        live_items_from_projection(store)?
+    } else {
+        live_items_from_fold(store)?
+    };
+    let Some((_, binding, _)) = crowded_binding_note(&candidates, updated, &bindings) else {
+        return Ok(cap);
+    };
+    let served = crate::served::served_count(store, &updated.id, now, crate::served::SERVED_WINDOW_DAYS);
+    if served == 0 {
+        return Ok(cap);
+    }
+    Ok(Capacity::Crowded(format!(
+        "shown {served} time(s) in the last {} days at {} - not crowded out",
+        crate::served::SERVED_WINDOW_DAYS,
+        describe(binding)
+    )))
 }
 
 /// One binding, in the words a refusal can use.
@@ -2390,6 +2500,159 @@ mod tests {
         widened.bindings.push(Binding::Target { kind: TargetKind::Path, value: "src/shared/gateway.rs".to_string() });
         revise(&mut store, "s", "l", "t", &existing, &widened)
             .expect_err("adding a binding to a full anchor is a new arrival there, judged as one");
+    }
+
+    // ------------------------------------------------ capacity_for_revise
+
+    /// Appends a live `FactCreated` directly, bypassing `declare`'s own write
+    /// gate.
+    ///
+    /// WHY A TEST NEEDS A BACK DOOR HERE. The real crowding this fix is
+    /// about - measured 2026-09-12, "5 item(s) of the same weight or
+    /// heavier, for 4 place(s)" - cannot be built through `declare` any more:
+    /// `full_reliable_anchor` refuses a fifth arrival at a Path/Dir/Command
+    /// binding already holding `item::MAX_ITEMS`, so five co-resident rivals
+    /// is exactly the state today's front door no longer allows a NEW item to
+    /// reach (see `a_fifth_equal_weight_fact_on_a_full_path_anchor_is_refused`
+    /// above). The real fixture that surfaced this bug predates that refusal
+    /// (added 2.2.1, 2026-09-05); a raw append is the only way this test can
+    /// put a temp store back in that same, still-live shape.
+    fn seed_live(store: &mut EventStore, item: &Item) {
+        let body = canonical_body(item).unwrap();
+        store.append_event("s", "l", "t", EventKind::FactCreated, &item.id, None, &body).unwrap();
+    }
+
+    /// One `item_served` event for `id`, appended directly - the shape
+    /// `serve::deliver::record_delivery` writes in production
+    /// (`model::served::ItemServed`), built here because `model`'s own tests
+    /// cannot depend on `serve` to call that function (see `served.rs`'s own
+    /// top comment for why the dependency runs the other way).
+    fn seed_served(store: &mut EventStore, id: &str, served_at: &str) {
+        let body = serde_json::to_string(&crate::served::ItemServed { served_at: served_at.to_string() }).unwrap();
+        store.append_event("s", "l", "t", EventKind::ItemServed, id, None, &body).unwrap();
+    }
+
+    /// `mine`, live at `path` alongside `item::MAX_ITEMS` other live items of
+    /// the SAME weight - exactly the shape `crowded_binding_note` reports on
+    /// (`at_least_equal >= item::MAX_ITEMS`), via `seed_live` rather than
+    /// `declare` for the reason that function's own doc comment gives.
+    fn seeded_crowded_item(store: &mut EventStore, path: &str) -> Item {
+        let mine = path_bound("mine", 0, path, Some(Severity::Costly));
+        seed_live(store, &mine);
+        for i in 0..crate::item::MAX_ITEMS {
+            let rival = path_bound(&format!("rival-{i}"), i + 1, path, Some(Severity::Costly));
+            seed_live(store, &rival);
+        }
+        mine
+    }
+
+    const NOW: &str = "2026-09-12T00:00:00Z";
+    const RECENTLY: &str = "2026-09-10T00:00:00Z";
+
+    /// THE MEASUREMENT ITSELF: a revise that leaves its bindings untouched,
+    /// on an item the log shows was actually served at that very binding,
+    /// gets a measured line instead of a guess - see `capacity_for_revise`'s
+    /// own doc comment for the day a prediction and a 55-servings measurement
+    /// disagreed about the same binding.
+    #[test]
+    fn capacity_for_revise_reports_a_measured_line_when_served_and_bindings_are_unchanged() {
+        let mut store = EventStore::in_memory().unwrap();
+        let existing = seeded_crowded_item(&mut store, "src/ops/install.rs");
+        seed_served(&mut store, &existing.id, RECENTLY);
+        seed_served(&mut store, &existing.id, RECENTLY);
+
+        let mut updated = existing.clone();
+        updated.falsifier = Some("a different falsifier entirely".to_string());
+
+        match capacity_for_revise(&store, &existing, &updated, NOW).unwrap() {
+            Capacity::Crowded(note) => {
+                assert!(note.contains("shown 2 time(s)"), "{note}");
+                assert!(note.contains("not crowded out"), "{note}");
+                assert!(!note.contains("may well never be shown"), "the measured line replaces the guess: {note}");
+            }
+            other => panic!("expected a measured Crowded note, got {other:?}"),
+        }
+    }
+
+    /// THE OTHER HALF: no servings on record at all, so there is nothing to
+    /// measure - the ordinary prediction stands exactly as it did before this
+    /// fix existed.
+    #[test]
+    fn capacity_for_revise_keeps_the_prediction_when_never_served() {
+        let mut store = EventStore::in_memory().unwrap();
+        let existing = seeded_crowded_item(&mut store, "src/ops/never-served.rs");
+
+        let mut updated = existing.clone();
+        updated.falsifier = Some("a different falsifier entirely".to_string());
+
+        match capacity_for_revise(&store, &existing, &updated, NOW).unwrap() {
+            Capacity::Crowded(note) => assert!(note.contains("may well never be shown there"), "{note}"),
+            other => panic!("expected the ordinary predicted Crowded note, got {other:?}"),
+        }
+    }
+
+    /// A revise that also moves the item - even just ADDING a binding, the
+    /// old ones untouched - is a real unknown again: the service history at
+    /// the binding that stayed put says nothing about whether the new one
+    /// will ever be reached, so this keeps the prediction too.
+    #[test]
+    fn capacity_for_revise_keeps_the_prediction_when_bindings_changed() {
+        let mut store = EventStore::in_memory().unwrap();
+        let existing = seeded_crowded_item(&mut store, "src/ops/moved.rs");
+        seed_served(&mut store, &existing.id, RECENTLY);
+
+        let mut updated = existing.clone();
+        updated.bindings.push(Binding::Target { kind: TargetKind::Path, value: "src/ops/also.rs".to_string() });
+
+        match capacity_for_revise(&store, &existing, &updated, NOW).unwrap() {
+            Capacity::Crowded(note) => {
+                assert!(note.contains("may well never be shown there"), "a changed binding is a new unknown: {note}")
+            }
+            other => panic!("expected the ordinary predicted Crowded note, got {other:?}"),
+        }
+    }
+
+    /// A brand new `declare` has no `existing` to compare against at all -
+    /// plain `capacity` (what `declare`'s own response note still reads)
+    /// never measures, however often the id happens to have fired under some
+    /// earlier life of the same string.
+    #[test]
+    fn plain_capacity_never_measures_even_when_served() {
+        let mut store = EventStore::in_memory().unwrap();
+        let mine = seeded_crowded_item(&mut store, "src/ops/fresh.rs");
+        seed_served(&mut store, &mine.id, RECENTLY);
+
+        match capacity(&store, &mine).unwrap() {
+            Capacity::Crowded(note) => assert!(note.contains("may well never be shown there"), "{note}"),
+            other => panic!("expected the ordinary predicted Crowded note, got {other:?}"),
+        }
+    }
+
+    /// GATE-LEVEL: the same measurement, proved through the real `revise`
+    /// entry point on a temp store rather than against the decision function
+    /// in isolation - the write actually lands (bindings unchanged, so
+    /// `full_reliable_anchor` never sees a new arrival at a full anchor), and
+    /// the note `with_warnings` would attach is computed the same way
+    /// production does.
+    #[test]
+    fn a_real_revise_that_keeps_its_binding_gets_the_measured_line() {
+        let mut store = EventStore::in_memory().unwrap();
+        let existing = seeded_crowded_item(&mut store, "src/ops/real-revise.rs");
+        for _ in 0..3 {
+            seed_served(&mut store, &existing.id, RECENTLY);
+        }
+
+        let mut updated = existing.clone();
+        updated.falsifier = Some("the install script stops writing this file".to_string());
+        revise(&mut store, "s", "l", "t", &existing, &updated).expect("bindings unchanged, must not be refused");
+
+        match capacity_for_revise(&store, &existing, &updated, NOW).unwrap() {
+            Capacity::Crowded(note) => {
+                assert!(note.contains("shown 3 time(s)"), "{note}");
+                assert!(note.contains("not crowded out"), "{note}");
+            }
+            other => panic!("expected a measured Crowded note after the real revise, got {other:?}"),
+        }
     }
 
     /// The promise archiving makes: the words survive, the claim to fire does

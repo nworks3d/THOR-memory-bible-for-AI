@@ -218,6 +218,7 @@ fn merge_clear_flag(field: &str, flag_name: &str, value: Option<&str>, flag: boo
 fn with_warnings(
     success: String,
     item: &model::item::Item,
+    existing: Option<&model::item::Item>,
     root: Option<&std::path::Path>,
     store: Option<&thor_core::event_store::EventStore>,
 ) -> String {
@@ -226,8 +227,21 @@ fn with_warnings(
     // Without this call it was dead code: constructed in `model::store` and
     // read by nothing but its own unit test, so a writer filling a pool that
     // is already full of equals was told nothing at all.
+    //
+    // `existing` tells a REVISE apart from a `remember` (`None`, no prior
+    // item to compare against). A revise that kept every binding already IS
+    // the live occupant of the place `capacity` is asking about - the
+    // store's own `item_served` log can measure whether it is actually
+    // reaching a block instead of guessing, and `capacity_for_revise` is the
+    // one place that measurement replaces the ordinary prediction. See that
+    // function's own doc comment for the day a prediction and a real
+    // 55-servings measurement disagreed about the same binding.
     if let Some(store) = store {
-        if let Ok(model::store::Capacity::Crowded(note)) = model::store::capacity(store, item) {
+        let cap = match existing {
+            Some(existing) => model::store::capacity_for_revise(store, existing, item, &serve::time::now_iso8601()),
+            None => model::store::capacity(store, item),
+        };
+        if let Ok(model::store::Capacity::Crowded(note)) = cap {
             notes.push(note);
         }
     }
@@ -497,12 +511,22 @@ fn refuse_a_new_collection(
     }
     // A checkout with no marker is the "new project" case, and the way to fix
     // it is one command the agent has no other way of learning about.
+    //
+    // THE STALE ADVICE THIS REPLACED. This used to send the owner to `install
+    // --project {wanted}`, back when the plain command indexed nothing at all
+    // without that flag. `install` (see `ops/src/bin/install.rs`) now reads a
+    // checkout's code under its own resolved name whether or not `--project`
+    // is given, and records that name in this very store
+    // (`ops::install::record_project_opened`) the moment the read succeeds -
+    // so the flag is no longer what opens the scope, and telling the owner to
+    // pass it was pointing at a step that no longer does the job.
     let unscoped_here = root.is_some() && checkout_project(root).is_none();
     let how = if unscoped_here {
         format!(
             "\nThis folder has no memory of its own yet: if it is meant to be THIS project, the owner \
-             gives it one in a single command from here - `install --project {wanted}` - which writes the \
-             marker, reads this project's code, and makes every later write land under that name."
+             gives it one in a single command, run from inside this repository - `install` - which reads \
+             this project's code, records it under {wanted}, and makes every later write land under that \
+             name."
         )
     } else {
         String::new()
@@ -1218,6 +1242,33 @@ pub struct CodeIndexPaths {
     pub repo: std::path::PathBuf,
 }
 
+/// One verdict `mark` itself has written for an item, kept only long enough
+/// to catch an exact repeat from the SAME process - see `ThorMcpServer::
+/// mark_history`'s own doc comment for why a process is the session boundary
+/// this server can actually observe. `seq` is the real store event sequence
+/// for an authority write, and `None` for a replica write (`capture` queues
+/// it; there is no event here yet to number).
+#[derive(Debug, Clone, Copy)]
+struct MarkRecord {
+    noise: bool,
+    seq: Option<i64>,
+}
+
+impl MarkRecord {
+    fn verdict_word(self) -> &'static str {
+        if self.noise { "noise" } else { "useful" }
+    }
+
+    /// " (event seq N)" for an authority write, or nothing at all for a
+    /// queued one that never got a real sequence number.
+    fn seq_suffix(self) -> String {
+        match self.seq {
+            Some(n) => format!(" (event seq {n})"),
+            None => String::new(),
+        }
+    }
+}
+
 #[derive(Clone)]
 pub struct ThorMcpServer {
     store: Arc<Mutex<EventStore>>,
@@ -1275,6 +1326,25 @@ pub struct ThorMcpServer {
     /// cheapest possible failure mode, and nothing about this belongs in the
     /// log forever.
     asked_piles: Arc<Mutex<std::collections::HashSet<u64>>>,
+    /// The verdict `mark` itself most recently wrote for each item id, this
+    /// process only.
+    ///
+    /// THE GAP THIS CLOSES. Every `item_marked_useful`/`item_marked_noise`
+    /// event is stamped with the constant `SESSION_ID` ("mcp") - see that
+    /// constant's own doc comment - so the STORE cannot tell one Claude Code
+    /// session's verdict from the next session's. This server process can:
+    /// one process lives exactly as long as one session (stdio, one client).
+    /// Measured: a verdict replayed from a stale debt list repeated an
+    /// identical noise verdict already given earlier in the same session, and
+    /// the item was retired by an accident of bookkeeping rather than a
+    /// second, independent judgement - two noise marks retire an item from
+    /// every injection surface, and the first one had already fired.
+    ///
+    /// In memory on purpose, same as `asked_piles` above: never persisted,
+    /// never read by anything but `mark` itself, and a restart simply forgets
+    /// it, which is the right amount of memory for "did THIS conversation
+    /// already say this".
+    mark_history: Arc<Mutex<std::collections::HashMap<String, MarkRecord>>>,
     #[allow(dead_code)] // read only inside the #[tool_handler] macro expansion
     tool_router: ToolRouter<Self>,
 }
@@ -1292,6 +1362,7 @@ impl ThorMcpServer {
             inbox: None,
             library: None,
             asked_piles: Arc::new(Mutex::new(std::collections::HashSet::new())),
+            mark_history: Arc::new(Mutex::new(std::collections::HashMap::new())),
             tool_router: Self::tool_router(),
         }
     }
@@ -1311,6 +1382,7 @@ impl ThorMcpServer {
             inbox: None,
             library: None,
             asked_piles: Arc::new(Mutex::new(std::collections::HashSet::new())),
+            mark_history: Arc::new(Mutex::new(std::collections::HashMap::new())),
             tool_router: Self::tool_router(),
         }
     }
@@ -1474,6 +1546,7 @@ impl ThorMcpServer {
                 Ok(event) => Ok(with_warnings(
                     format!("stored '{}' ({:?}, event seq {})", item.id, item.kind, event.seq),
                     &item,
+                    None,
                     root.as_deref().map(|p| p.as_path()),
                     Some(s),
                 )),
@@ -1760,6 +1833,7 @@ impl ThorMcpServer {
                     Ok(with_warnings(
                         success,
                         &updated,
+                        Some(&existing),
                         revise_root.as_deref().map(|p| p.as_path()),
                         Some(s),
                     ))
@@ -2071,11 +2145,48 @@ impl ThorMcpServer {
         }
     }
 
-    #[tool(description = "Code lane: judges an item you were served or looked up. Default records that it HELPED, which clears noise recorded before it (a later noise mark still counts - the newest verdict wins). Pass noise:true for the opposite; two noise marks since the last useful one retire the item from the injection surfaces, though it stays fully findable via lookup. On a replica this queues instead of writing ('queued for the main machine' is not an error). Refused when the item is not live (retracted or archived) - there is nothing to judge. Replies with the verdict recorded, or the refusal text.", annotations(title = "Record a verdict", read_only_hint = false, destructive_hint = false, idempotent_hint = false, open_world_hint = false))]
+    #[tool(description = "Code lane: judges an item you were served or looked up. Default records that it HELPED, which clears noise recorded before it (a later noise mark still counts - the newest verdict wins). Pass noise:true for the opposite; two noise marks since the last useful one retire the item from the injection surfaces, though it stays fully findable via lookup. A second call THIS SESSION for the same id with the same verdict writes nothing and says so; a different verdict is written and the earlier one is named in the reply. On a replica this queues instead of writing ('queued for the main machine' is not an error). Refused when the item is not live (retracted or archived) - there is nothing to judge. Replies with the verdict recorded, or the refusal text.", annotations(title = "Record a verdict", read_only_hint = false, destructive_hint = false, idempotent_hint = false, open_world_hint = false))]
     async fn mark(&self, Parameters(args): Parameters<MarkArgs>) -> String {
-        if let Some(queued) = self.capture("mark", &args) {
-            return queued;
+        // A repeat of the SAME verdict on the SAME id, from THIS process, is
+        // caught before anything else runs - before even a replica's own
+        // queue - see `mark_history`'s own doc comment for why a process
+        // boundary is the only session boundary this server can observe.
+        // Nothing is written and nothing is queued: the store (or the drain,
+        // for a replica) never sees a second identical judgement to count.
+        let previous = self.mark_history.lock().unwrap_or_else(|p| p.into_inner()).get(&args.id).copied();
+        if let Some(prev) = previous {
+            if prev.noise == args.noise {
+                return format!(
+                    "already judged {} this session{}; not counted again",
+                    prev.verdict_word(),
+                    prev.seq_suffix()
+                );
+            }
         }
+        if let Some(queued) = self.capture("mark", &args) {
+            // Replica mode keeps queuing exactly as before - the reply below
+            // is unchanged for a first verdict on this id. What changes is
+            // bookkeeping only: recording what was queued (with no real
+            // event seq to name - the drain has not run yet) so a REPEAT
+            // within this same session is caught above next time, the same
+            // way an authority write is.
+            self.mark_history
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .insert(args.id.clone(), MarkRecord { noise: args.noise, seq: None });
+            return match previous {
+                Some(prev) => format!(
+                    "{queued} - this session's earlier {}{} stands in history; the later verdict is the one \
+                     that counts",
+                    prev.verdict_word(),
+                    prev.seq_suffix()
+                ),
+                None => queued,
+            };
+        }
+        let mark_history = self.mark_history.clone();
+        let id_for_history = args.id.clone();
+        let noise = args.noise;
         self.blocking(move |s| {
             // A VERDICT ON SOMETHING THAT IS GONE IS NOT A VERDICT. Measured
             // 2026-08-19: doctor named four items owed a judgement, all four
@@ -2092,18 +2203,39 @@ impl ThorMcpServer {
                 ));
             }
             let now = serve::time::now_iso8601();
-            let written = if args.noise {
+            let written = if noise {
                 serve::mark::record_noise(s, SESSION_ID, LINEAGE_ID, ACTOR, &now, &args.id)
             } else {
                 serve::mark::record_useful(s, SESSION_ID, LINEAGE_ID, ACTOR, &now, &args.id)
             };
             match written {
-                Ok(_) if args.noise => Ok(format!(
-                    "marked noise: {} ({}+ of these, with no mark of usefulness, retires it from the injection surfaces; it stays findable via lookup)",
-                    args.id,
-                    serve::decay::NOISE_MARKS_BEFORE_STALE
-                )),
-                Ok(_) => Ok(format!("marked useful: {} (clears the noise recorded before it; a later noise mark still counts)", args.id)),
+                Ok(event) => {
+                    mark_history
+                        .lock()
+                        .unwrap_or_else(|p| p.into_inner())
+                        .insert(id_for_history, MarkRecord { noise, seq: Some(event.seq) });
+                    let mut reply = if noise {
+                        format!(
+                            "marked noise: {} ({}+ of these, with no mark of usefulness, retires it from the injection surfaces; it stays findable via lookup)",
+                            args.id,
+                            serve::decay::NOISE_MARKS_BEFORE_STALE
+                        )
+                    } else {
+                        format!(
+                            "marked useful: {} (clears the noise recorded before it; a later noise mark still counts)",
+                            args.id
+                        )
+                    };
+                    if let Some(prev) = previous {
+                        reply.push_str(&format!(
+                            " - this session's earlier {}{} stands in history; the later verdict is the one \
+                             that counts",
+                            prev.verdict_word(),
+                            prev.seq_suffix()
+                        ));
+                    }
+                    Ok(reply)
+                }
                 Err(e) => Err(format!("could not record the mark: {e}")),
             }
         })
@@ -5836,6 +5968,36 @@ mod tests {
         assert!(srv.remember(Parameters(first)).await.starts_with("stored"));
     }
 
+    /// THE STALE ADVICE THIS GUARDS AGAINST: the hint used to send the owner
+    /// to `install --project <name>`, back when the plain command indexed
+    /// nothing without that flag. `install` now reads a checkout's code (and
+    /// records it in the memory, see `ops::install::record_project_opened`)
+    /// under its own resolved name whether or not `--project` is given, so
+    /// the flag is no longer what opens the scope - the hint must say so.
+    #[tokio::test]
+    async fn the_unscoped_hint_points_at_plain_install_never_the_project_flag() {
+        let dir = tempfile::tempdir().unwrap();
+        // No .thor-project marker: the "checkout never opened" case the hint
+        // exists for.
+        let srv = ThorMcpServer::new(EventStore::in_memory().unwrap()).with_root(dir.path().to_path_buf());
+
+        let mut item = blank_report("first-note");
+        item.project = Some("brand-new-project".to_string());
+        let reply = srv.remember(Parameters(item)).await;
+
+        assert!(reply.contains("REFUSED"), "{reply}");
+        assert!(!reply.contains("install --project"), "the retired --project advice must be gone: {reply}");
+        assert!(
+            reply.contains("run from inside this repository") && reply.contains("`install`"),
+            "the hint must point at running install from inside the checkout instead: {reply}"
+        );
+        assert!(
+            reply.contains("This folder has no memory of its own yet")
+                && reply.contains("makes every later write land under that name"),
+            "the rest of what the hint teaches must survive untouched: {reply}"
+        );
+    }
+
     /// The list is attached to THAT refusal only. Every other refusal stays as
     /// short as it was - a menu stapled to an unrelated complaint is noise.
     #[tokio::test]
@@ -5937,9 +6099,41 @@ mod tests {
     /// item off the injection surfaces while leaving it in lookup. This is the
     /// only signal that retires anything - see `serve::decay` for the day a
     /// serving count was measured to be the wrong one.
+    ///
+    /// TWO SEPARATE SERVER INSTANCES ON PURPOSE, sharing one on-disk store -
+    /// standing in for two different Claude Code sessions, which is the real
+    /// shape a decaying item's history takes (`serve::decay`'s own doc
+    /// comment: the owner's 182 real noise judgements accumulated across many
+    /// sessions, not one). Reusing the SAME instance for both marks would
+    /// test the wrong thing now: one session giving the identical verdict
+    /// twice is exactly the accident `mark`'s own per-process dedup exists to
+    /// catch (see `a_repeated_identical_verdict_this_session_writes_nothing_
+    /// and_says_so` above), and would no longer write a second event at all.
     #[tokio::test]
     async fn two_noise_judgements_retire_an_item_but_leave_it_findable() {
-        let srv = server_knowing(&["some-project"]);
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("decay.db");
+        {
+            // Seeded through the owner's own path, same as `server_knowing`:
+            // filing into a collection nobody has named is refused at the
+            // agent door on purpose, so the fixture opens it directly.
+            let mut store = EventStore::new(&db_path).unwrap();
+            let seed = model::item::Item {
+                id: "seed-some-project".to_string(),
+                kind: Kind::Report,
+                text: "the owner named the collection 'some-project'".to_string(),
+                bindings: Vec::new(),
+                severity: None,
+                project: Some("some-project".to_string()),
+                tags: Vec::new(),
+                expires: None,
+                key: None,
+                falsifier: None,
+                check: None,
+            };
+            model::store::declare(&mut store, "seed", "seed", "owner", &seed).unwrap();
+        }
+        let srv = ThorMcpServer::new(EventStore::new(&db_path).unwrap());
         // A TARGET-bound rule on purpose: an Always-bound one is exempt from
         // decay by design (a pin is the owner's own standing choice), so
         // using the pinned fixture here would assert against the exemption
@@ -5950,17 +6144,107 @@ mod tests {
         args.targets = vec![TargetArg { kind: "path".to_string(), value: "src/noisy.rs".to_string() }];
         srv.remember(Parameters(args)).await;
         for _ in 0..serve::decay::NOISE_MARKS_BEFORE_STALE {
-            let reply = srv.mark(Parameters(MarkArgs { id: "noisy-1".to_string(), noise: true })).await;
+            // A fresh server per verdict: a different SESSION judging the
+            // same item once, never the same session asked twice.
+            let session = ThorMcpServer::new(EventStore::new(&db_path).unwrap());
+            let reply = session.mark(Parameters(MarkArgs { id: "noisy-1".to_string(), noise: true })).await;
             assert!(reply.contains("marked noise"), "{reply}");
         }
         {
-            let store = srv.store.lock().unwrap();
+            let store = EventStore::new(&db_path).unwrap();
             let decay = serve::decay::DecayContext::load(&store);
             let item = model::store::show(&store, "noisy-1").unwrap();
-            assert!(decay.is_stale(&item), "two judgements must retire it from the injection surfaces");
+            assert!(
+                decay.is_stale(&item),
+                "two judgements from different sessions must retire it from the injection surfaces"
+            );
         }
         let found = srv.lookup(Parameters(LookupArgs { scope: None, query: Some("noisy-1".to_string()), key: None })).await;
         assert!(found.contains("noisy-1"), "and it must stay findable via lookup: {found}");
+    }
+
+    /// THE DEFECT THIS PREVENTS. Measured: a verdict replayed from a stale
+    /// debt list repeated an identical noise verdict already given earlier in
+    /// the same session, and the item was retired by an accident of
+    /// bookkeeping - two noise marks with no mark of usefulness between them
+    /// retire an item from every injection surface, and the first one had
+    /// already fired. The store cannot see this itself: every write through
+    /// this server carries the fixed session id "mcp" (`SESSION_ID`), so only
+    /// the process asking a second time can know it already asked once.
+    #[tokio::test]
+    async fn a_repeated_identical_verdict_this_session_writes_nothing_and_says_so() {
+        let srv = server();
+        srv.remember(Parameters(base_remember("repeat-noise"))).await;
+
+        let first = srv.mark(Parameters(MarkArgs { id: "repeat-noise".to_string(), noise: true })).await;
+        assert!(first.contains("marked noise"), "{first}");
+
+        let second = srv.mark(Parameters(MarkArgs { id: "repeat-noise".to_string(), noise: true })).await;
+        assert!(second.contains("already judged noise this session"), "{second}");
+        assert!(second.contains("event seq"), "the earlier verdict's own seq must be named: {second}");
+        assert!(second.contains("not counted again"), "{second}");
+
+        let store = srv.store.lock().unwrap();
+        let events = store.get_events_by_entity("repeat-noise").unwrap();
+        let noise_events =
+            events.iter().filter(|e| e.kind == thor_core::event_store::EventKind::ItemMarkedNoise).count();
+        assert_eq!(noise_events, 1, "the repeat must not have written a second noise event");
+    }
+
+    /// The other half: a DIFFERENT verdict this session is written exactly as
+    /// it always was, and the reply names the one it supersedes so a reader
+    /// is never left wondering which of two judgements this session actually
+    /// made stands in history.
+    #[tokio::test]
+    async fn a_different_verdict_this_session_is_written_and_names_the_earlier_one() {
+        let srv = server();
+        srv.remember(Parameters(base_remember("change-of-mind"))).await;
+
+        let first = srv.mark(Parameters(MarkArgs { id: "change-of-mind".to_string(), noise: false })).await;
+        assert!(first.contains("marked useful"), "{first}");
+
+        let second = srv.mark(Parameters(MarkArgs { id: "change-of-mind".to_string(), noise: true })).await;
+        assert!(second.contains("marked noise"), "a different verdict must still be written: {second}");
+        assert!(second.contains("this session's earlier useful"), "{second}");
+        assert!(second.contains("event seq"), "{second}");
+        assert!(
+            second.contains("the later verdict is the one that counts"),
+            "{second}"
+        );
+
+        let store = srv.store.lock().unwrap();
+        let events = store.get_events_by_entity("change-of-mind").unwrap();
+        let useful_events =
+            events.iter().filter(|e| e.kind == thor_core::event_store::EventKind::ItemMarkedUseful).count();
+        let noise_events =
+            events.iter().filter(|e| e.kind == thor_core::event_store::EventKind::ItemMarkedNoise).count();
+        assert_eq!((useful_events, noise_events), (1, 1), "both verdicts must be in history, neither swallowed");
+    }
+
+    /// The map is per PROCESS, never persisted and never shared - a fresh
+    /// `ThorMcpServer` (standing in for a fresh Claude Code session, which is
+    /// what a real process boundary here actually is) has no memory of a
+    /// verdict a different instance wrote, even for the identical id, and
+    /// writes again exactly as a genuinely first judgement would.
+    #[tokio::test]
+    async fn a_fresh_server_instance_has_no_memory_of_another_ones_verdicts() {
+        let srv1 = server();
+        srv1.remember(Parameters(base_remember("fresh-process-1"))).await;
+        let on_first = srv1.mark(Parameters(MarkArgs { id: "fresh-process-1".to_string(), noise: false })).await;
+        assert!(on_first.contains("marked useful"), "{on_first}");
+        let repeat_same_instance =
+            srv1.mark(Parameters(MarkArgs { id: "fresh-process-1".to_string(), noise: false })).await;
+        assert!(repeat_same_instance.contains("already judged"), "{repeat_same_instance}");
+
+        let srv2 = server();
+        srv2.remember(Parameters(base_remember("fresh-process-1"))).await;
+        let on_fresh_instance =
+            srv2.mark(Parameters(MarkArgs { id: "fresh-process-1".to_string(), noise: false })).await;
+        assert!(
+            on_fresh_instance.contains("marked useful"),
+            "a fresh process must write again, not remember another instance's verdict: {on_fresh_instance}"
+        );
+        assert!(!on_fresh_instance.contains("already judged"), "{on_fresh_instance}");
     }
 
     // --------------------------------------------------------------- status

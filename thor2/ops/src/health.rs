@@ -757,6 +757,18 @@ fn bindings_short(bindings: &[model::item::Binding]) -> String {
 /// SILENT AT ZERO, the same convention as `ship_line` above: a clean backlog
 /// is not a finding, and a permanent "0 owed" line on every quiet run would
 /// be exactly the noise that trains a reader to stop reading this report.
+///
+/// CARRIES THE EVALUATION DEBT'S OWN TWO SIGNALS TOO, since 2026-09-12,
+/// appended to this same first line rather than a separate one: the age of
+/// this checkout's own newest verdict (`serve::usefulness::
+/// newest_verdict_unix`, the identical project scope `in_project` above
+/// already uses) and, only once the Stop hook's own obligation
+/// (`serve::usefulness::eval_debt_owed`) actually holds, a note that it will
+/// ask for the evaluation once this session. Built on the exact same
+/// numbers the Stop hook acts on (`bin/serve.rs`'s `evaluation_debt`), so
+/// this can never silently disagree with what it reports on - the same
+/// reasoning this whole line already exists for (see this doc comment's own
+/// history above).
 pub fn judgement_debt_line(db: &Path, checkout_project: Option<&str>, full: bool) -> Option<String> {
     let store = EventStore::open_existing(db).ok()?;
     let (total, in_project) = serve::usefulness::judgement_debt_counts(&store, checkout_project);
@@ -777,6 +789,16 @@ pub fn judgement_debt_line(db: &Path, checkout_project: Option<&str>, full: bool
              next served to settle it"
         ),
     }];
+    let newest = serve::usefulness::newest_verdict_unix(&store, checkout_project);
+    let now = serve::time::now_unix();
+    let age = match newest {
+        Some(t) => format!("{} day(s) ago", serve::usefulness::days_ago(now, t)),
+        None => "never".to_string(),
+    };
+    out[0].push_str(&format!(" - newest verdict in this checkout: {age}"));
+    if serve::usefulness::eval_debt_owed(in_project, newest, now) {
+        out[0].push_str("; the Stop hook asks for the evaluation once per session");
+    }
     let named = serve::usefulness::judgement_debt_named(&store, checkout_project);
     let cap = name_cap(full);
     for item in named.iter().take(cap) {
@@ -1921,6 +1943,71 @@ mod tests {
         let named_lines = line.lines().filter(|l| l.starts_with("  judgement debt: owed-")).count();
         assert_eq!(named_lines, 25, "--full must name every one of them: {line}");
         assert!(!line.contains("not named here"), "--full must leave no tail: {line}");
+    }
+
+    /// THE EVALUATION DEBT'S OWN TAIL, since 2026-09-12: once the backlog for
+    /// this checkout reaches `EVAL_DEBT_CEILING` and none of it has ever been
+    /// judged, the line names "never" for the newest verdict and adds the
+    /// note that the Stop hook will ask for the evaluation itself.
+    #[test]
+    fn judgement_debt_line_names_never_and_the_stop_hook_note_once_the_obligation_holds() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("t.db");
+        {
+            let mut store = EventStore::new(&db).unwrap();
+            for n in 0..serve::usefulness::EVAL_DEBT_CEILING {
+                let id = format!("owed-{n:02}");
+                let mut item = rule(&id);
+                item.text = format!("fixture eval debt case {n:02}");
+                item.project = Some("thor".to_string());
+                store::declare(&mut store, "s", "l", "a", &item).unwrap();
+                for _ in 0..serve::usefulness::JUDGEMENT_DEBT_AFTER {
+                    serve::deliver::record_delivery(&mut store, "s", "l", "t", "2026-09-08T00:00:00Z", &[id.clone()]);
+                }
+            }
+        }
+        let line =
+            judgement_debt_line(&db, Some("thor"), false).expect("a backlog at the ceiling, the line must speak");
+        assert!(line.contains("newest verdict in this checkout: never"), "{line}");
+        assert!(line.contains("the Stop hook asks for the evaluation once per session"), "{line}");
+    }
+
+    /// Below the ceiling, the newest-verdict age still prints (it is
+    /// unconditional whenever the line speaks at all), but the Stop-hook
+    /// note must not appear - proving the note is genuinely conditional on
+    /// the obligation, not merely glued to the age.
+    #[test]
+    fn judgement_debt_line_names_the_verdict_age_without_the_note_below_the_ceiling() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("t.db");
+        {
+            let mut store = EventStore::new(&db).unwrap();
+            let mut owed = rule("owed-alone");
+            owed.text = "fixture rule that stays owed".to_string();
+            owed.project = Some("thor".to_string());
+            store::declare(&mut store, "s", "l", "a", &owed).unwrap();
+            for _ in 0..serve::usefulness::JUDGEMENT_DEBT_AFTER {
+                serve::deliver::record_delivery(&mut store, "s", "l", "t", "2026-09-08T00:00:00Z", &["owed-alone".to_string()]);
+            }
+            // A second, GLOBAL item, never served enough to be owed itself -
+            // only marked, three days ago, so it never affects the count
+            // above and exists purely to give this checkout a real, aged
+            // verdict to report. Distinct text from `owed` above: two
+            // near-identical rules trip the write gate's own duplicate check.
+            let mut marked = rule("marked-elsewhere");
+            marked.text = "fixture rule that only ever gets a verdict".to_string();
+            store::declare(&mut store, "s", "l", "a", &marked).unwrap();
+            let three_days_ago = serve::time::iso8601_from_unix(serve::time::now_unix() - 3 * 86400);
+            serve::mark::record_useful(&mut store, "s", "l", "a", &three_days_ago, "marked-elsewhere").unwrap();
+        }
+        assert_eq!(
+            serve::usefulness::judgement_debt_counts(&EventStore::open_existing(&db).unwrap(), Some("thor")).1,
+            1,
+            "fixture sanity: only one item is owed, well under the ceiling"
+        );
+        let line = judgement_debt_line(&db, Some("thor"), false).expect("one item is still owed, the line must speak");
+        assert!(line.contains("newest verdict in this checkout: 3 day(s) ago"), "{line}");
+        assert!(!line.contains("the Stop hook asks for the evaluation"), "{line}");
     }
 
     // ----------------------------------------------------- contradiction_line

@@ -722,14 +722,15 @@ fn bindings_short(bindings: &[model::item::Binding]) -> String {
 /// how much of it belongs to the checkout this run stands in - built on the
 /// exact same fold the Stop hook's own `judgement_debt` acts on
 /// (`serve::usefulness::judgement_debt_counts`), so this line can never
-/// silently disagree with the mechanism it reports on the way `unjudged_line`
-/// above already can (see that shared fold's own doc comment: pinned items
-/// are included here, where `unjudged_line` still excludes them).
+/// silently disagree with the mechanism it reports on - including about
+/// pinned items, which both this line and `unjudged_line` above now exclude
+/// (see `usefulness::owed_items`'s own doc comment for the brief 2026-09-08
+/// to 2026-09-12 window where the two disagreed about that, and why).
 ///
 /// A SEPARATE LINE, ADDED RATHER THAN REPLACING `unjudged_line`: the two
-/// count different things on purpose (pinned items in or out) and nothing
-/// here removes either capability - it only adds the number `doctor` had no
-/// way to report before today.
+/// still differ in scope (store-wide plus this checkout's own share, versus
+/// a flat total) and nothing here removes either capability - it only adds
+/// the number `doctor` had no way to report before today.
 ///
 /// WHY THIS EXISTS AT ALL, recorded as `oordeelschuld-komt-binnen-de-sessie-
 /// terug` (2026-09-08). The Stop hook itself now floors each item to at most
@@ -779,14 +780,15 @@ pub fn judgement_debt_line(db: &Path, checkout_project: Option<&str>, full: bool
     let mut out = vec![match checkout_project {
         Some(project) => format!(
             "judgement debt: {total} item(s) store-wide are owed a verdict (fired {threshold}+ times since \
-             the last one, or never judged at all) - {in_project} of them apply to this checkout ('{project}', \
-             or global); `mark` each once it is next served to settle it"
+             the last one, or never judged at all; pinned items excluded - the owner answered that question \
+             by pinning them) - {in_project} of them apply to this checkout ('{project}', or global); `mark` \
+             each once it is next served to settle it"
         ),
         None => format!(
             "judgement debt: {total} item(s) store-wide are owed a verdict (fired {threshold}+ times since \
-             the last one, or never judged at all) - this checkout resolves to no project, so only the \
-             {in_project} global one(s) among them would ever be asked about here; `mark` each once it is \
-             next served to settle it"
+             the last one, or never judged at all; pinned items excluded - the owner answered that question \
+             by pinning them) - this checkout resolves to no project, so only the {in_project} global one(s) \
+             among them would ever be asked about here; `mark` each once it is next served to settle it"
         ),
     }];
     let newest = serve::usefulness::newest_verdict_unix(&store, checkout_project);
@@ -1868,7 +1870,14 @@ mod tests {
         let db = dir.path().join("t.db");
         {
             let mut store = EventStore::new(&db).unwrap();
-            store::declare(&mut store, "s", "l", "a", &rule("owed-global-2")).unwrap();
+            // NOT `rule()`'s own default binding (`Always`, i.e. pinned): a
+            // pinned item is excluded from the judgement debt entirely since
+            // 2026-09-12, so this fixture needs a real trigger to still be
+            // "owed" - a global Moment, since this test is specifically about
+            // a checkout that resolves to no project at all.
+            let mut item = rule("owed-global-2");
+            item.bindings = vec![Binding::Moment(intent::Action::Commit)];
+            store::declare(&mut store, "s", "l", "a", &item).unwrap();
             for _ in 0..serve::usefulness::JUDGEMENT_DEBT_AFTER {
                 serve::deliver::record_delivery(&mut store, "s", "l", "t", "2026-09-08T00:00:00Z", &["owed-global-2".to_string()]);
             }
@@ -1901,6 +1910,16 @@ mod tests {
                 // pair's overlap well under that bar.
                 let mut item = rule(&id);
                 item.text = format!("fixture debt case {n:02}");
+                // NOT `rule()`'s own default binding (`Always`, i.e.
+                // pinned): a pinned item is excluded from the judgement
+                // debt entirely since 2026-09-12, and `Always` also exists
+                // in this fixture to dodge the crowding limit this loop
+                // would otherwise hit (`model::item::MAX_ITEMS`) - a unique
+                // Command anchor per item does both jobs at once, with no
+                // rival ever sharing one, and (unlike a Path anchor) with no
+                // project required to clear ground 19.
+                item.bindings =
+                    vec![Binding::Target { kind: TargetKind::Command, value: format!("fixture-debt-command-{n:02}") }];
                 store::declare(&mut store, "s", "l", "a", &item).unwrap();
                 for _ in 0..serve::usefulness::JUDGEMENT_DEBT_AFTER {
                     serve::deliver::record_delivery(&mut store, "s", "l", "t", "2026-09-08T00:00:00Z", &[id.clone()]);
@@ -1933,6 +1952,16 @@ mod tests {
                 // pair's overlap well under that bar.
                 let mut item = rule(&id);
                 item.text = format!("fixture debt case {n:02}");
+                // NOT `rule()`'s own default binding (`Always`, i.e.
+                // pinned): a pinned item is excluded from the judgement
+                // debt entirely since 2026-09-12, and `Always` also exists
+                // in this fixture to dodge the crowding limit this loop
+                // would otherwise hit (`model::item::MAX_ITEMS`) - a unique
+                // Command anchor per item does both jobs at once, with no
+                // rival ever sharing one, and (unlike a Path anchor) with no
+                // project required to clear ground 19.
+                item.bindings =
+                    vec![Binding::Target { kind: TargetKind::Command, value: format!("fixture-debt-command-{n:02}") }];
                 store::declare(&mut store, "s", "l", "a", &item).unwrap();
                 for _ in 0..serve::usefulness::JUDGEMENT_DEBT_AFTER {
                     serve::deliver::record_delivery(&mut store, "s", "l", "t", "2026-09-08T00:00:00Z", &[id.clone()]);
@@ -1960,6 +1989,12 @@ mod tests {
                 let mut item = rule(&id);
                 item.text = format!("fixture eval debt case {n:02}");
                 item.project = Some("thor".to_string());
+                // NOT `rule()`'s own default `Always` binding - pinned since
+                // 2026-09-12 means excluded from the judgement debt (and so
+                // from the evaluation debt's own ceiling) entirely, which is
+                // exactly the number this fixture needs to actually reach.
+                item.bindings =
+                    vec![Binding::Target { kind: TargetKind::Command, value: format!("fixture-eval-command-{n:02}") }];
                 store::declare(&mut store, "s", "l", "a", &item).unwrap();
                 for _ in 0..serve::usefulness::JUDGEMENT_DEBT_AFTER {
                     serve::deliver::record_delivery(&mut store, "s", "l", "t", "2026-09-08T00:00:00Z", &[id.clone()]);
@@ -1985,6 +2020,11 @@ mod tests {
             let mut owed = rule("owed-alone");
             owed.text = "fixture rule that stays owed".to_string();
             owed.project = Some("thor".to_string());
+            // NOT `rule()`'s own default `Always` binding - see the eval-debt
+            // fixture above for why a pinned item can no longer stand in for
+            // an "owed" one.
+            owed.bindings =
+                vec![Binding::Target { kind: TargetKind::Command, value: "fixture-owed-alone-command".to_string() }];
             store::declare(&mut store, "s", "l", "a", &owed).unwrap();
             for _ in 0..serve::usefulness::JUDGEMENT_DEBT_AFTER {
                 serve::deliver::record_delivery(&mut store, "s", "l", "t", "2026-09-08T00:00:00Z", &["owed-alone".to_string()]);
@@ -2008,6 +2048,81 @@ mod tests {
         let line = judgement_debt_line(&db, Some("thor"), false).expect("one item is still owed, the line must speak");
         assert!(line.contains("newest verdict in this checkout: 3 day(s) ago"), "{line}");
         assert!(!line.contains("the Stop hook asks for the evaluation"), "{line}");
+    }
+
+    /// THE NAMED LIST NEVER CONTAINS A PINNED ITEM, with or without
+    /// `--full` - the doctor-facing half of the exclusion
+    /// `usefulness::owed_items` now applies before either the count or the
+    /// named list ever sees a pinned item, closing the defect measured
+    /// 2026-09-12: the named list once carried more than thirty Always-bound
+    /// items, two of them pinned by the owner on purpose.
+    #[test]
+    fn judgement_debt_line_and_its_named_list_exclude_a_pinned_item() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("t.db");
+        {
+            let mut store = EventStore::new(&db).unwrap();
+            // `rule()`'s own default binding is `Always` - exactly the
+            // pinned shape this test needs, left untouched on purpose.
+            let mut pinned = rule("pinned-excluded");
+            pinned.text = "fixture rule that is pinned and heavily served".to_string();
+            store::declare(&mut store, "s", "l", "a", &pinned).unwrap();
+            let mut trigger = rule("trigger-included");
+            trigger.text = "fixture rule that is trigger-bound and heavily served".to_string();
+            trigger.project = Some("thor".to_string());
+            trigger.bindings =
+                vec![Binding::Target { kind: TargetKind::Command, value: "fixture-excl-command".to_string() }];
+            store::declare(&mut store, "s", "l", "a", &trigger).unwrap();
+            for id in ["pinned-excluded", "trigger-included"] {
+                for _ in 0..serve::usefulness::JUDGEMENT_DEBT_AFTER {
+                    serve::deliver::record_delivery(&mut store, "s", "l", "t", "2026-09-08T00:00:00Z", &[id.to_string()]);
+                }
+            }
+        }
+        for full in [false, true] {
+            let line = judgement_debt_line(&db, Some("thor"), full).expect("the trigger-bound item is still owed");
+            assert!(line.contains("1 item"), "full={full}: {line}");
+            assert!(line.contains("pinned items excluded"), "full={full}: {line}");
+            assert!(line.contains("trigger-included"), "full={full}: {line}");
+            assert!(!line.contains("pinned-excluded"), "full={full}: a pinned item must never be named: {line}");
+        }
+    }
+
+    /// THE FOUR SURFACES AGREEING, end to end: `unjudged_line` and
+    /// `judgement_debt_line`, run against the SAME store, must name and
+    /// count the identical outstanding item - never the pinned one sitting
+    /// right next to it - closing the disagreement `judgement_debt_line`'s
+    /// own doc comment records for the 2026-09-08 to 2026-09-12 window where
+    /// the two lines quietly meant different things by "owed".
+    #[test]
+    fn the_unjudged_line_and_judgement_debt_line_agree_on_the_same_store() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("t.db");
+        {
+            let mut store = EventStore::new(&db).unwrap();
+            let mut pinned = rule("pinned-heavy");
+            pinned.text = "fixture rule that is pinned and heavily served".to_string();
+            store::declare(&mut store, "s", "l", "a", &pinned).unwrap();
+            let mut trigger = rule("trigger-heavy");
+            trigger.text = "fixture rule that is trigger-bound and heavily served".to_string();
+            trigger.project = Some("thor".to_string());
+            trigger.bindings =
+                vec![Binding::Target { kind: TargetKind::Command, value: "fixture-agree-command".to_string() }];
+            store::declare(&mut store, "s", "l", "a", &trigger).unwrap();
+            for id in ["pinned-heavy", "trigger-heavy"] {
+                for _ in 0..serve::usefulness::JUDGEMENT_DEBT_AFTER {
+                    serve::deliver::record_delivery(&mut store, "s", "l", "t", "2026-09-08T00:00:00Z", &[id.to_string()]);
+                }
+            }
+        }
+        let unjudged = unjudged_line(&db);
+        assert!(unjudged.contains("1 trigger-bound item"), "{unjudged}");
+        assert!(unjudged.contains("pinned items excluded"), "{unjudged}");
+
+        let debt = judgement_debt_line(&db, Some("thor"), false).expect("the trigger-bound item is still owed");
+        assert!(debt.contains("1 item"), "{debt}");
+        assert!(debt.contains("trigger-heavy"), "{debt}");
+        assert!(!debt.contains("pinned-heavy"), "both lines must agree: neither ever names the pinned item: {debt}");
     }
 
     // ----------------------------------------------------- contradiction_line

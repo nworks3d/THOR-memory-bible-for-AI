@@ -151,7 +151,9 @@ Once a project's own backlog reaches ten items still owed a verdict and none
 of them has been judged in a day, the `Stop` hook asks for this whole routine
 by name, once per session, instead of one more item at a time - see the
 `judgement debt` line under "Check it" below for where that backlog is
-reported.
+reported. A rule the owner has pinned to fire at every session start never
+counts toward that ten: pinning it already answered whether it belongs
+there.
 
 `--project <key>` additionally writes a `.thor-project` marker in the current
 directory to override the project name. By default, a checkout is scoped to the
@@ -246,10 +248,12 @@ with nothing in it yet, which is what a first run looks like.
 When a rule or orientation has fired many times with no verdict either way,
 doctor also names each one that applies to this checkout - how often, what
 kind, and where it fires - so a review has a list to settle instead of only a
-count. The same line also says how long ago this checkout's own newest
-verdict landed, or that none ever has, and once that backlog is both large
-and stale enough, that the `Stop` hook will ask for the whole end-of-session
-routine over it.
+count. A rule the owner has pinned to fire at every session start never
+appears on that list: pinning it already answered whether it belongs there,
+and a verdict on it would change nothing else in the memory. The same line
+also says how long ago this checkout's own newest verdict landed, or that
+none ever has, and once that backlog is both large and stale enough, that the
+`Stop` hook will ask for the whole end-of-session routine over it.
 
 Two of those checks - whether an old reference still points at a real file,
 and whether some facts never win a place - need to know where your other

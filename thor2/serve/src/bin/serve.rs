@@ -1853,34 +1853,56 @@ const JUDGEMENT_DEBT_BATCH_MAX: usize = 20;
 /// where this store stood for its whole life: four judgements, all on one
 /// day, out of 325 items that had fired.
 ///
-/// A PINNED ITEM GETS ONE VERDICT, NOT A STANDING EXEMPTION. This used to
-/// exclude every `Always`-bound item outright: the owner answered "did it
-/// belong where it fired" himself when he pinned it, so asking again looked
-/// unanswerable - "useful" a lie when the rule simply did not come up,
-/// "noise" overruling his own decision. Nineteen of the first forty-two owed
-/// were of exactly that kind, found by trying to pay one, and the blanket
-/// exclusion that followed was measured never to let go again: `doctor`
-/// (`ops::health::pinned_line`) went on to report "48 pinned facts (14% of
-/// all servings) never re-read" and "44 of 48 never reviewed" - every one of
-/// them permanently outside the one mechanism (`mark`, see its own doc
-/// comment above) that ever puts a verdict on a fact at all. A pin records a
-/// PLACEMENT decision ("this fires at every session start"), never a
-/// CONTENT one ("this is still right") - nothing else in the system ever
-/// looks at a pinned item's own text again, which is exactly how a stale or
-/// wrong pin sat unreviewed.
+/// A PINNED ITEM OWES NO VERDICT - reversed back, 2026-09-12, from the
+/// inclusion defended below the line, which held from 2026-09-08 until
+/// today. That inclusion was a defensible fix for a real defect (kept below,
+/// in full), but it created a sharper one: `serve::decay::DecayContext::
+/// is_stale` already ignores every verdict on an `Always`-bound item
+/// outright ("an Always-bound item is NEVER stale... it is what Always
+/// means"), so a verdict recorded here changes NOTHING anywhere else in the
+/// system - asking for one is pure waste, not caution. Measured the day this
+/// reversed: the named judgement-debt list carried more than thirty
+/// `Always`-bound items, two of them pinned by the owner on purpose, and a
+/// whole evaluation was spent judging every one of them for nothing.
 ///
-/// So a pin now gets exactly the same fold everything else does (below),
-/// with no separate carve-out: a NEVER-JUDGED pinned item that has fired
-/// `JUDGEMENT_DEBT_AFTER` times enters `owed` once, same as any trigger-bound
-/// item - answered by the same `mark` call, which resets its count to zero.
-/// After that verdict it is left alone, exactly like any other item, unless
-/// it fires that many times again - at which point asking is no longer
-/// unanswerable in the way the old exclusion assumed: the question has
-/// narrowed from "did the owner mean to pin this" (settled, once, by the
-/// first verdict) to "is this still true, this many servings later" (a real
-/// question about drift, the same one a trigger-bound item is already asked
-/// on every re-crossing). What is left unpinned fires because a TRIGGER
-/// matched, where the question was always real: the trigger can be wrong.
+/// THE DEFECT THE INCLUSION BELOW WAS REALLY FIXING, kept because it is still
+/// true and still matters. Before 2026-09-08 this excluded every
+/// `Always`-bound item outright, and the blanket exclusion was measured
+/// never to let go again: `doctor` (`ops::health::pinned_line`) went on to
+/// report "48 pinned facts (14% of all servings) never re-read" and "44 of
+/// 48 never reviewed" - every one of them permanently outside the one
+/// mechanism (`mark`) that ever puts a verdict on a fact at all. That
+/// measurement still stands, and `pinned_line` still reports it. What was
+/// wrong was the fix, not the diagnosis: nothing downstream of a verdict
+/// recorded here was ever going to read it, because `is_stale` exempts
+/// `Always` unconditionally, so manufacturing a question here answered
+/// nothing real. The actual fix for a stale or wrong pin is the owner
+/// reading `pinned_line`'s own report and revising or unpinning what it
+/// names - not this debt asking a question whose answer changes nothing.
+///
+/// So a pin is excluded again below, through the exact same shared test
+/// (`usefulness::is_pinned`) that `usefulness::owed_items` - the fold
+/// `judgement_debt_counts`/`judgement_debt_named` build doctor's own lines
+/// on - now filters on too: one predicate, both places, so the Stop-time ask
+/// and doctor's judgement-debt line can never again silently disagree about
+/// what "owed" means the way they did for these four days.
+///
+/// THE INCLUSION THIS REVERSES, kept in full rather than deleted, since it
+/// answers a question a future change here will otherwise ask again: why
+/// not simply restore the pre-2026-09-08 blanket exclusion unchanged? A pin
+/// still records only a PLACEMENT decision ("this fires at every session
+/// start"), never a CONTENT one ("this is still right") - nineteen of the
+/// first forty-two owed items were pinned ones, found by trying to pay one,
+/// and asking "did it belong where it fired" about something the owner
+/// already placed by hand looked unanswerable: "useful" a lie when the rule
+/// simply did not come up, "noise" overruling his own decision. That
+/// reasoning is exactly why an item pinned but never yet judged did, for
+/// those four days, get offered exactly one verdict rather than none at
+/// all - and it is why this doc comment keeps that history rather than
+/// erasing it: the two defects (a pin nobody ever revisits; a verdict here
+/// that changes nothing) are both real, and the fix for the second must not
+/// quietly resurrect the first. `pinned_line`'s own report is that fix -
+/// visibility without a manufactured, inert verdict.
 ///
 /// ASKS ABOUT THE WHOLE OWED SET IN ONE BLOCK, up to
 /// `JUDGEMENT_DEBT_BATCH_MAX`, not one item per Stop. Unpinning a batch of
@@ -1914,12 +1936,7 @@ fn judgement_debt(store: &EventStore, db_path: &Path, session_id: &str, current_
     }
     // Only now, and only when something is actually owed, is the whole live
     // set even fetched - the empty case stays a cheap count over event
-    // kinds, which is what every quiet turn pays. No pinned-exclusion filter
-    // here any more (see this function's own doc comment, "A PINNED ITEM
-    // GETS ONE VERDICT, NOT A STANDING EXEMPTION"): a pin's own `Always`
-    // binding is not read at all in this fold - `served`'s per-id count
-    // already resets to zero on ANY `mark` call regardless of binding, which
-    // is the entire mechanism a pin now shares with every other item.
+    // kinds, which is what every quiet turn pays.
     let live = serve::live::live_items(store);
     // And only what is still LIVE. The served/judged counts are folded from
     // event kinds, which keep every serving an item ever had, including the
@@ -1935,6 +1952,16 @@ fn judgement_debt(store: &EventStore, db_path: &Path, session_id: &str, current_
     let project_of: std::collections::HashMap<&str, Option<&str>> =
         live.iter().map(|li| (li.id.as_str(), li.item.project.as_deref())).collect();
     owed.retain(|(id, _)| project_of.contains_key(id.as_str()));
+    if owed.is_empty() {
+        return None;
+    }
+    // PINNED ITEMS EXCLUDED - see this function's own doc comment above,
+    // "A PINNED ITEM OWES NO VERDICT", for why. The same shared test
+    // `usefulness::owed_items` (the doctor-side fold) now filters on too, so
+    // the two can never again silently disagree about what "owed" means.
+    let pinned: std::collections::HashSet<&str> =
+        live.iter().filter(|li| usefulness::is_pinned(&li.item.bindings)).map(|li| li.id.as_str()).collect();
+    owed.retain(|(id, _)| !pinned.contains(id.as_str()));
     if owed.is_empty() {
         return None;
     }
@@ -3823,77 +3850,58 @@ mod judgement_debt_tests {
         );
     }
 
-    /// THE DEFECT THIS PREVENTS, reported by `doctor`'s own `pinned_line`:
-    /// "48 pinned facts (14% of all servings) never re-read", "44 of 48
-    /// never reviewed" - the OLD blanket exclusion never let a pin's own
-    /// text be looked at again, for as long as the store lived. A
-    /// never-judged pin that has fired `JUDGEMENT_DEBT_AFTER` times now
-    /// enters the debt exactly once, the same as any other item.
+    /// THE DEFECT THIS PREVENTS, and the direct cause of writing this fix:
+    /// measured 2026-09-12, the named list under doctor's own judgement-debt
+    /// line carried more than thirty `Always`-bound items, two of them
+    /// pinned by the owner on purpose, and a whole evaluation was spent
+    /// judging every one of them for nothing - `decay::DecayContext::
+    /// is_stale` ignores a verdict on a pinned item outright, so nothing
+    /// downstream of that verdict was ever going to change. See this
+    /// function's own doc comment, "A PINNED ITEM OWES NO VERDICT", for the
+    /// fuller history, including the earlier defect (`pinned_line`'s "44 of
+    /// 48 never reviewed") the brief 2026-09-08 inclusion was itself fixing.
     #[test]
-    fn an_unjudged_pinned_item_appears_in_the_debt_once() {
+    fn a_never_judged_pinned_item_is_never_asked_about() {
         let mut store = EventStore::in_memory().unwrap();
         declare(&mut store, "pinned-one", true);
         serve_it(&mut store, "pinned-one", JUDGEMENT_DEBT_AFTER + 5);
-        let asked = judgement_debt(&store, Path::new("no-watermark-for-this-test"), "s", None).expect("a never-judged pin must be offered a verdict once");
-        assert!(asked.contains("pinned-one"), "{asked}");
+        assert!(
+            judgement_debt(&store, Path::new("no-watermark-for-this-test"), "s", None).is_none(),
+            "a pinned item's own verdict changes nothing downstream, so asking for one is pure waste"
+        );
     }
 
-    /// THE OTHER HALF: once that one verdict is in, a pin is "left alone
-    /// unless it fires 40x elsewhere like any other item" - the exact
-    /// mechanism `a_judged_item_is_asked_about_again_in_a_new_session_once_
-    /// it_fires_that_many_times_more` already proves for a trigger-bound
-    /// item, now proven for a pin too, since neither gets a special case any
-    /// more. Pins are exactly the historically bitten case - see this same
-    /// section's own doc comment on `an_unjudged_pinned_item_appears_in_the_
-    /// debt_once` above, quoting `doctor`'s old "44 of 48 never reviewed" -
-    /// so the SAME-session floor (`oordeelschuld-komt-binnen-de-sessie-terug`)
-    /// is proven here too, from the session that gave the verdict, before the
-    /// "a new session is still asked" half.
+    /// THE OTHER HALF: a pin already served past the threshold stays silent
+    /// however many more times it fires, and regardless of which session is
+    /// asking - there is no session-scoped floor to prove here any more (a
+    /// pin never enters `owed` at all to be floored), only that the
+    /// exclusion holds no matter who is asking.
     #[test]
-    fn a_judged_pinned_item_does_not_reappear_until_it_fires_that_many_times_again() {
+    fn a_heavily_served_pinned_item_stays_silent_across_sessions() {
         let dir = tempfile::tempdir().unwrap();
         let db = dir.path().join("t.db");
         let mut store = EventStore::new(&db).unwrap();
         record_session_watermark(&db, "s");
         declare(&mut store, "pinned-two", true);
-        serve_it(&mut store, "pinned-two", JUDGEMENT_DEBT_AFTER);
-        assert!(judgement_debt(&store, &db, "s", None).is_some(), "fixture sanity: it is owed");
+        serve_it(&mut store, "pinned-two", JUDGEMENT_DEBT_AFTER * 3);
+        assert!(judgement_debt(&store, &db, "s", None).is_none(), "the session that saw it fire must not be asked");
 
-        serve::mark::record_useful(&mut store, "s", "s", "t", "2026-09-07T00:00:00Z", "pinned-two").unwrap();
+        serve_as(&mut store, "s2", "pinned-two", JUDGEMENT_DEBT_AFTER);
         assert!(
-            judgement_debt(&store, &db, "s", None).is_none(),
-            "a verdict must settle a pin for now, exactly like any other item"
+            judgement_debt(&store, &db, "s2", None).is_none(),
+            "a different session must not be asked either - pinned or not, a pin owes no verdict"
         );
-
-        // Back up to exactly the threshold again (the count is a GLOBAL
-        // since-last-verdict fold, not per-session - see `served` in
-        // `judgement_debt` - so this alone would normally earn a second
-        // question) and prove the session that gave the verdict stays quiet
-        // regardless.
-        serve_it(&mut store, "pinned-two", JUDGEMENT_DEBT_AFTER);
-        assert!(
-            judgement_debt(&store, &db, "s", None).is_none(),
-            "the SAME session that judged this pin must never be asked about it again, however many more times it fires"
-        );
-
-        // A DIFFERENT session - no SessionStart of its own recorded here, so
-        // it has no watermark at all and the floor above never applies to
-        // it in the first place - seeing the pin fire even once more on top
-        // of that same global count gets asked. It never judged this pin
-        // itself.
-        serve_as(&mut store, "s2", "pinned-two", 1);
-        let asked = judgement_debt(&store, &db, "s2", None)
-            .expect("a new session must be asked once it too sees this pin fire past the threshold, pinned or not");
-        assert!(asked.contains("pinned-two"), "{asked}");
     }
 
-    /// THE CAP STILL HOLDS with pins mixed in: unpinning used to be the one
-    /// way a backlog could arrive all at once (see
-    /// `the_batch_is_capped_and_names_how_many_it_held_back` below); a store
-    /// with many long-unjudged pins is now the same shape, and must be
-    /// spread over turns the same way, never flooded into one block.
+    /// A large pinned backlog produces NO ask at all - not merely a capped
+    /// one. Before this fix, unpinning a batch of long-pinned items was the
+    /// one way a backlog could arrive all at once (see
+    /// `the_batch_is_capped_and_names_how_many_it_held_back` below, still
+    /// true for a TRIGGER-bound backlog); a store with many long-served pins
+    /// is no longer that shape at all, because none of them ever reach
+    /// `owed` in the first place.
     #[test]
-    fn a_backlog_of_unjudged_pins_is_capped_the_same_as_any_other_backlog() {
+    fn a_large_pinned_backlog_produces_no_ask_at_all() {
         let mut store = EventStore::in_memory().unwrap();
         let n = JUDGEMENT_DEBT_BATCH_MAX + 3;
         for i in 0..n {
@@ -3902,10 +3910,10 @@ mod judgement_debt_tests {
             serve_it(&mut store, &id, JUDGEMENT_DEBT_AFTER);
         }
 
-        let asked = judgement_debt(&store, Path::new("no-watermark-for-this-test"), "s", None).expect("a large pinned backlog is still owed");
-        let shown = (0..n).filter(|i| asked.contains(&format!("pinned-owed-{i}"))).count();
-        assert_eq!(shown, JUDGEMENT_DEBT_BATCH_MAX, "the block must show exactly the cap, not more: {asked}");
-        assert!(asked.contains(&format!("{} more", n - JUDGEMENT_DEBT_BATCH_MAX)), "{asked}");
+        assert!(
+            judgement_debt(&store, Path::new("no-watermark-for-this-test"), "s", None).is_none(),
+            "an all-pinned backlog, however large, must never hold the turn"
+        );
     }
 
     /// And the mechanism is still armed for what fires because a TRIGGER

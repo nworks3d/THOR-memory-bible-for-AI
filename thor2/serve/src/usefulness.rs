@@ -126,11 +126,31 @@ pub fn served_since_last_verdict(store: &EventStore) -> HashMap<String, usize> {
     counts
 }
 
-/// One live item over the judgement-debt threshold, before any checkout
-/// scoping - the single fold `judgement_debt_counts` and `judgement_debt_named`
-/// below both build on, so a store-wide count and a checkout's own named list
-/// can never quietly disagree about what "owed" means the way two independent
-/// folds could drift apart.
+/// Whether `bindings` carries the `Always` binding - THE one definition of
+/// "pinned" every judgement-debt surface now shares, so the four places that
+/// ask "is this owed a verdict" (the Stop-time ask, doctor's two judgement-
+/// debt lines, and the evaluation debt's own owed count) can never drift
+/// apart about what "pinned" means. `owed_items` below routes three of the
+/// four through this directly; `bin/serve.rs`'s own `judgement_debt` (the
+/// Stop-time ask) calls it too, since it cannot call `owed_items` itself -
+/// see that function's own doc comment for why its session-scoped filters
+/// keep it a separate fold - but must still exclude the identical set.
+///
+/// The identical literal test already lives, unshared, in
+/// `serve::decay::DecayContext::is_stale`, `ops::health::unjudged_line`/
+/// `pinned_line`, and the `pin`/`unpin` tools (`mcp::lib`); none of those are
+/// part of the judgement debt this closes, so none of them are routed
+/// through this function today - left as they are, on purpose, rather than
+/// widening this change to a repository-wide rename.
+pub fn is_pinned(bindings: &[model::item::Binding]) -> bool {
+    bindings.iter().any(|b| matches!(b, model::item::Binding::Always))
+}
+
+/// One live, non-pinned item over the judgement-debt threshold, before any
+/// checkout scoping - the single fold `judgement_debt_counts` and
+/// `judgement_debt_named` below both build on, so a store-wide count and a
+/// checkout's own named list can never quietly disagree about what "owed"
+/// means the way two independent folds could drift apart.
 struct Owed {
     id: String,
     count: usize,
@@ -139,13 +159,25 @@ struct Owed {
     bindings: Vec<model::item::Binding>,
 }
 
-/// Every live item served `JUDGEMENT_DEBT_AFTER`+ times since its own last
-/// verdict, unscoped by project. Extracted (2026-09-12) out of
+/// Every live, non-pinned item served `JUDGEMENT_DEBT_AFTER`+ times since its
+/// own last verdict, unscoped by project. Extracted (2026-09-12) out of
 /// `judgement_debt_counts`'s own body so `judgement_debt_named` can share the
 /// exact same "owed" definition instead of re-deriving it and risking a
 /// second copy that silently drifts from the first - the same reasoning
 /// `served_since_last_verdict`'s own doc comment already gives for why it is
 /// one fold with two callers rather than two folds.
+///
+/// PINNED (`Always`-bound) ITEMS EXCLUDED HERE, since 2026-09-12 - reversed
+/// back from the brief window (2026-09-08 to today) where `judgement_debt`
+/// counted them on purpose (see that function's own doc comment for the full
+/// history of both defects). `serve::decay::DecayContext::is_stale` already
+/// ignores a verdict on an `Always`-bound item outright ("an Always-bound
+/// item is NEVER stale... it is what Always means"), so a verdict recorded
+/// here would change nothing anywhere in the system: asking for one, and
+/// spending a whole evaluation judging one, is pure waste. Measured the day
+/// this reversed: the named list carried more than thirty Always-bound
+/// items, two of them pinned by the owner on purpose, and an evaluation was
+/// spent judging every one of them for nothing.
 fn owed_items(store: &EventStore) -> Vec<Owed> {
     let served = served_since_last_verdict(store);
     let live = crate::live::live_items(store);
@@ -157,6 +189,7 @@ fn owed_items(store: &EventStore) -> Vec<Owed> {
             let li = live_by_id.get(id.as_str())?;
             Some(Owed { id, count, project: li.item.project.clone(), kind: li.item.kind, bindings: li.item.bindings.clone() })
         })
+        .filter(|o| !is_pinned(&o.bindings))
         .collect()
 }
 
@@ -176,13 +209,12 @@ fn owed_items(store: &EventStore) -> Vec<Owed> {
 /// make it more honest, it would make it silent - there is no session here
 /// to scope to.
 ///
-/// PINNED ITEMS ARE INCLUDED, unlike the older `ops::health::unjudged_line`:
-/// `judgement_debt` itself stopped excluding them (see that function's own
-/// "A PINNED ITEM GETS ONE VERDICT, NOT A STANDING EXEMPTION" doc comment) -
-/// a doctor line still built on the old exclusion would silently disagree
-/// with the mechanism it exists to report on, the exact drift this function
-/// exists to close by sharing `served_since_last_verdict` instead of
-/// re-deriving its own count.
+/// PINNED ITEMS ARE EXCLUDED, the same as `ops::health::unjudged_line`
+/// already excludes them - the two disagreeing, for the few days
+/// `judgement_debt` (`bin/serve.rs`) counted them, was exactly the drift
+/// `owed_items` now exists to close: this count and `judgement_debt_named`
+/// below both read the exclusion from that one shared fold, so a doctor line
+/// can never again silently disagree with the mechanism it reports on.
 pub fn judgement_debt_counts(store: &EventStore, checkout_project: Option<&str>) -> (usize, usize) {
     let owed = owed_items(store);
     let total = owed.len();
@@ -357,6 +389,82 @@ mod judgement_debt_counting_tests {
         assert_eq!(for_acme.len(), 1);
         assert_eq!(for_acme[0].id, "acme-owed");
     }
+
+    // ------------------------------------------------- pinned exclusion
+
+    fn declare_pinned(store: &mut EventStore, id: &str, project: Option<&str>) {
+        let item = Item {
+            id: id.to_string(),
+            kind: Kind::Rule,
+            text: format!("something worth knowing about {id}"),
+            bindings: vec![Binding::Always],
+            severity: None,
+            project: project.map(str::to_string),
+            tags: vec![],
+            expires: None,
+            key: None,
+            falsifier: Some("it stops being true".to_string()),
+            check: None,
+        };
+        model::store::declare(store, "t", "t", "t", &item).expect("fixture must store");
+    }
+
+    /// THE DEFECT THIS PREVENTS. An Always-bound item's own verdicts are
+    /// already inert - `decay::DecayContext::is_stale` never reads them for
+    /// a pinned item ("an Always-bound item is NEVER stale... it is what
+    /// Always means") - so asking for one, and spending a whole evaluation
+    /// judging one, is pure waste. Measured 2026-09-12: an evaluation was
+    /// spent judging more than thirty of these for nothing, two of them
+    /// pinned by the owner on purpose.
+    #[test]
+    fn an_always_bound_item_served_past_the_threshold_is_never_owed() {
+        let mut store = EventStore::in_memory().unwrap();
+        declare_pinned(&mut store, "pinned-owed", None);
+        serve_n(&mut store, "pinned-owed", JUDGEMENT_DEBT_AFTER);
+        assert_eq!(judgement_debt_counts(&store, None), (0, 0));
+    }
+
+    /// The control: change only the binding, keep everything else about the
+    /// fixture identical, and the same shape of item becomes owed - proving
+    /// the exclusion above is about the binding, not some other accident of
+    /// the fixture.
+    #[test]
+    fn the_identical_item_without_always_is_owed() {
+        let mut store = EventStore::in_memory().unwrap();
+        declare(&mut store, "not-pinned-owed", None);
+        serve_n(&mut store, "not-pinned-owed", JUDGEMENT_DEBT_AFTER);
+        assert_eq!(judgement_debt_counts(&store, None), (1, 1));
+    }
+
+    #[test]
+    fn the_named_list_never_contains_an_always_bound_item() {
+        let mut store = EventStore::in_memory().unwrap();
+        declare_pinned(&mut store, "pinned-named", None);
+        serve_n(&mut store, "pinned-named", JUDGEMENT_DEBT_AFTER + 5);
+        declare(&mut store, "trigger-named", None);
+        serve_n(&mut store, "trigger-named", JUDGEMENT_DEBT_AFTER);
+
+        let named = judgement_debt_named(&store, None);
+        let ids: Vec<&str> = named.iter().map(|i| i.id.as_str()).collect();
+        assert_eq!(ids, vec!["trigger-named"], "an Always-bound item must never be named: {ids:?}");
+    }
+
+    /// The evaluation debt's own owed count is `judgement_debt_counts`'s
+    /// `in_project` half (see `eval_debt_owed`'s own doc comment) - an
+    /// all-pinned backlog large enough to have crossed `EVAL_DEBT_CEILING`,
+    /// were pinned items still counted, must instead read as zero.
+    #[test]
+    fn the_eval_debt_owed_count_ignores_always_bound_items() {
+        let mut store = EventStore::in_memory().unwrap();
+        for i in 0..EVAL_DEBT_CEILING {
+            let id = format!("pinned-eval-{i}");
+            declare_pinned(&mut store, &id, None);
+            serve_n(&mut store, &id, JUDGEMENT_DEBT_AFTER);
+        }
+        let owed_in_project = judgement_debt_counts(&store, None).1;
+        assert_eq!(owed_in_project, 0, "an all-pinned backlog must never feed the evaluation debt's own ceiling");
+        assert!(!eval_debt_owed(owed_in_project, None, 0), "zero owed can never meet the ceiling");
+    }
 }
 
 /// Noise judgements recorded SINCE each item's most recent mark of
@@ -485,6 +593,15 @@ struct MarkedAt {
 /// `entity_id` - so this reads that back from the CURRENT live item, and an
 /// id no longer live (retracted since) has no current scope to check at all,
 /// so it is excluded rather than guessed at.
+///
+/// NOT PINNED-EXCLUDED, unlike `owed_items` above (and so unlike
+/// `judgement_debt_counts`/`judgement_debt_named`, which both read that
+/// exclusion from it): a verdict is a verdict regardless of what the item is
+/// bound to today, and a mark given while it was trigger-bound, or given
+/// after it is later unpinned, is exactly the honest evidence the evaluation
+/// debt asks this function for. The waste this whole change removes is
+/// asking for a NEW verdict nobody needs, never discounting a real one
+/// already on record.
 pub fn newest_verdict_unix(store: &EventStore, checkout_project: Option<&str>) -> Option<i64> {
     let live = crate::live::live_items(store);
     let project_of: HashMap<&str, Option<&str>> =

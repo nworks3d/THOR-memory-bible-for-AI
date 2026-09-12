@@ -57,8 +57,10 @@ mcp__thor__ server is the authority.
 
 Start by pulling the debt: run the health check (its full path is at the
 bottom, by the report) and read the items it lists under `judgement debt`
-for this checkout - with `--full` if there are more than it shows. Every
-item on that list gets a verdict: useful if it belonged where it fired,
+for this checkout - with `--full` if there are more than it shows. A pinned
+item never appears on that list: the owner already answered whether it
+belongs there by pinning it. Every item on that list gets a verdict: useful
+if it belonged where it fired,
 noise if it did not. On top of that: every fact you recognised as noise
 this session, and every useful fact the Stop hook itself never asked about.
 Do not re-mark something that already carries a verdict - that would count

@@ -1854,7 +1854,7 @@ impl ThorMcpServer {
     /// go through `model::store::revise`, so the write gate still governs
     /// what may carry an `Always` binding (a Report or Chunk carrying any
     /// binding at all is refused there, exactly as it is for `remember`).
-    #[tool(description = "Code lane: adds the Always binding to an existing item, so it is served in full at every session start; every other binding and field stays untouched. Use revise instead when anything besides the binding needs to change. Idempotent - pinning an already-pinned item changes nothing and is not an error. On a replica this queues instead of writing ('queued for the main machine' is not an error). Refused, loudly, when the item's kind may carry no binding at all (a Report or Chunk). Replies 'pinned' with the event sequence, 'already pinned', or the refusal text.", annotations(title = "Pin an item", read_only_hint = false, destructive_hint = false, idempotent_hint = true, open_world_hint = false))]
+    #[tool(description = "Code lane: adds the Always binding to an existing item, so it is served in full at every session start; every other binding and field stays untouched. A pinned item owes no verdict from that point on - mark refuses it and points back here to unpin. Use revise instead when anything besides the binding needs to change. Idempotent - pinning an already-pinned item changes nothing and is not an error. On a replica this queues instead of writing ('queued for the main machine' is not an error). Refused, loudly, when the item's kind may carry no binding at all (a Report or Chunk). Replies 'pinned' with the event sequence, 'already pinned', or the refusal text.", annotations(title = "Pin an item", read_only_hint = false, destructive_hint = false, idempotent_hint = true, open_world_hint = false))]
     async fn pin(&self, Parameters(args): Parameters<PinArgs>) -> String {
         if let Some(queued) = self.capture("pin", &args) {
             return queued;
@@ -2145,7 +2145,7 @@ impl ThorMcpServer {
         }
     }
 
-    #[tool(description = "Code lane: judges an item you were served or looked up. Default records that it HELPED, which clears noise recorded before it (a later noise mark still counts - the newest verdict wins). Pass noise:true for the opposite; two noise marks since the last useful one retire the item from the injection surfaces, though it stays fully findable via lookup. A second call THIS SESSION for the same id with the same verdict writes nothing and says so; a different verdict is written and the earlier one is named in the reply. On a replica this queues instead of writing ('queued for the main machine' is not an error). Refused when the item is not live (retracted or archived) - there is nothing to judge. Replies with the verdict recorded, or the refusal text.", annotations(title = "Record a verdict", read_only_hint = false, destructive_hint = false, idempotent_hint = false, open_world_hint = false))]
+    #[tool(description = "Code lane: judges an item you were served or looked up. Default records that it HELPED, which clears noise recorded before it (a later noise mark still counts - the newest verdict wins). Pass noise:true for the opposite; two noise marks since the last useful one retire the item from the injection surfaces, though it stays fully findable via lookup. A second call THIS SESSION for the same id with the same verdict writes nothing and says so; a different verdict is written and the earlier one is named in the reply. On a replica this queues instead of writing ('queued for the main machine' is not an error). Refused when the item is not live (retracted or archived) - there is nothing to judge. Also refused, with nothing written, when the item is pinned (Always-bound): the owner already answered by pinning it, so a verdict changes nothing - unpin it first if it should be judged instead. Replies with the verdict recorded, or the refusal text.", annotations(title = "Record a verdict", read_only_hint = false, destructive_hint = false, idempotent_hint = false, open_world_hint = false))]
     async fn mark(&self, Parameters(args): Parameters<MarkArgs>) -> String {
         // A repeat of the SAME verdict on the SAME id, from THIS process, is
         // caught before anything else runs - before even a replica's own
@@ -2194,11 +2194,33 @@ impl ThorMcpServer {
             // debt could be paid with the dead, which makes the number
             // worthless - and the question itself ("did it belong where it
             // fired") has no honest answer for an item nobody serves any more.
-            if !serve::live::live_items(s).iter().any(|li| li.id == args.id) {
+            let live = serve::live::live_items(s);
+            let Some(live_item) = live.iter().find(|li| li.id == args.id) else {
                 return Err(format!(
                     "'{}' is not live - it was retracted or archived, so it fires nowhere and there is nothing \
                      to judge. Nothing was recorded. If it should fire again, that is a fresh remember; if you \
                      meant a different item, check the id in the block you were served.",
+                    args.id
+                ));
+            };
+            // A VERDICT ON A PINNED ITEM CHANGES NOTHING. `serve::decay::
+            // DecayContext::is_stale` ignores every verdict on an
+            // `Always`-bound item outright ("an Always-bound item is NEVER
+            // stale... it is what Always means"), so writing one here would
+            // be recorded and then read by nothing - the owner already
+            // answered "did it belong where it fired" the moment he pinned
+            // it. Measured 2026-09-12: an evaluation was spent judging more
+            // than thirty of these for nothing, two of them pinned on
+            // purpose. Checked before any write, and before `mark_history`
+            // is ever touched, so a repeat of this same refusal never reads
+            // as "already judged this session" (see `mark_history`'s own
+            // doc comment above `mark` itself). Only a Rule or Orientation
+            // can carry `Always` at all, so this branch is simply never
+            // reached for a Report or Chunk.
+            if serve::usefulness::is_pinned(&live_item.item.bindings) {
+                return Err(format!(
+                    "pinned: '{}' is served at every session start by the owner's choice, so a verdict changes \
+                     nothing - `unpin` it if it should stop appearing",
                     args.id
                 ));
             }
@@ -6086,7 +6108,14 @@ mod tests {
         #[tokio::test]
     async fn mark_is_queryable_immediately_after_the_write() {
         let srv = server();
-        srv.remember(Parameters(base_remember("mark-1"))).await;
+        // NOT `base_remember`'s own default (Always-bound, i.e. pinned): a
+        // pinned item now refuses `mark` outright (see the pinned-mark tests
+        // below), so this needs a trigger-bound item to exercise what this
+        // test is actually about.
+        let mut args = base_remember("mark-1");
+        args.always = false;
+        args.targets = vec![TargetArg { kind: "command".to_string(), value: "force-push".to_string() }];
+        srv.remember(Parameters(args)).await;
         let reply = srv.mark(Parameters(MarkArgs { id: "mark-1".to_string(), noise: false })).await;
         assert!(reply.contains("marked useful: mark-1"), "{reply}");
 
@@ -6094,6 +6123,66 @@ mod tests {
         assert!(serve::usefulness::ever_marked_useful(&store).contains("mark-1"));
     }
 
+    // ------------------------------------------------- mark on a pinned item
+
+    /// THE DEFECT THIS PREVENTS: `serve::decay::DecayContext::is_stale`
+    /// ignores every verdict on an `Always`-bound item outright, so a
+    /// verdict written here would be recorded and then read by nothing.
+    /// Measured 2026-09-12: an evaluation was spent judging more than thirty
+    /// of these for nothing, two of them pinned by the owner on purpose.
+    #[tokio::test]
+    async fn marking_a_pinned_item_writes_no_event_and_names_unpin() {
+        let srv = server();
+        // base_remember is Always-bound by default (see the pin/unpin tests
+        // above) - exactly the shape this refusal exists for.
+        srv.remember(Parameters(base_remember("pinned-mark-1"))).await;
+
+        let reply = srv.mark(Parameters(MarkArgs { id: "pinned-mark-1".to_string(), noise: false })).await;
+        assert!(reply.starts_with("pinned:"), "{reply}");
+        assert!(reply.contains("pinned-mark-1"), "{reply}");
+        assert!(reply.contains("unpin"), "must point at the way out: {reply}");
+
+        let store = srv.store.lock().unwrap();
+        let events = store.get_events_by_entity("pinned-mark-1").unwrap();
+        assert!(
+            events.iter().all(|e| {
+                e.kind != thor_core::event_store::EventKind::ItemMarkedUseful
+                    && e.kind != thor_core::event_store::EventKind::ItemMarkedNoise
+            }),
+            "a pinned item must receive no verdict event at all: {events:?}"
+        );
+    }
+
+    /// THE OTHER HALF: a trigger-bound item is unaffected by the refusal
+    /// above - `mark` still writes exactly as it always has.
+    #[tokio::test]
+    async fn marking_a_trigger_bound_item_still_writes() {
+        let srv = server();
+        let mut args = base_remember("trigger-mark-1");
+        args.always = false;
+        args.targets = vec![TargetArg { kind: "command".to_string(), value: "force-push".to_string() }];
+        srv.remember(Parameters(args)).await;
+
+        let reply = srv.mark(Parameters(MarkArgs { id: "trigger-mark-1".to_string(), noise: false })).await;
+        assert!(reply.contains("marked useful: trigger-mark-1"), "{reply}");
+    }
+
+    /// THE REPEAT MAP MUST STAY UNTOUCHED by the pinned branch specifically:
+    /// a second call reaches the SAME pinned refusal again, never "already
+    /// judged this session" - proving the first call never wrote into
+    /// `mark_history`.
+    #[tokio::test]
+    async fn marking_a_pinned_item_twice_never_reads_as_a_repeat() {
+        let srv = server();
+        srv.remember(Parameters(base_remember("pinned-mark-2"))).await;
+
+        let first = srv.mark(Parameters(MarkArgs { id: "pinned-mark-2".to_string(), noise: false })).await;
+        assert!(first.starts_with("pinned:"), "{first}");
+
+        let second = srv.mark(Parameters(MarkArgs { id: "pinned-mark-2".to_string(), noise: true })).await;
+        assert!(second.starts_with("pinned:"), "the repeat map must not have recorded the first call: {second}");
+        assert!(!second.contains("already judged"), "{second}");
+    }
 
     /// The noise side, end to end through the tool: two judgements take an
     /// item off the injection surfaces while leaving it in lookup. This is the
@@ -6174,7 +6263,13 @@ mod tests {
     #[tokio::test]
     async fn a_repeated_identical_verdict_this_session_writes_nothing_and_says_so() {
         let srv = server();
-        srv.remember(Parameters(base_remember("repeat-noise"))).await;
+        // NOT `base_remember`'s own default (Always-bound): see the pinned-
+        // mark tests below for why a pinned item no longer belongs in a
+        // fixture that means to exercise a real write.
+        let mut args = base_remember("repeat-noise");
+        args.always = false;
+        args.targets = vec![TargetArg { kind: "command".to_string(), value: "force-push".to_string() }];
+        srv.remember(Parameters(args)).await;
 
         let first = srv.mark(Parameters(MarkArgs { id: "repeat-noise".to_string(), noise: true })).await;
         assert!(first.contains("marked noise"), "{first}");
@@ -6198,7 +6293,13 @@ mod tests {
     #[tokio::test]
     async fn a_different_verdict_this_session_is_written_and_names_the_earlier_one() {
         let srv = server();
-        srv.remember(Parameters(base_remember("change-of-mind"))).await;
+        // NOT `base_remember`'s own default (Always-bound): see the pinned-
+        // mark tests below for why a pinned item no longer belongs in a
+        // fixture that means to exercise a real write.
+        let mut args = base_remember("change-of-mind");
+        args.always = false;
+        args.targets = vec![TargetArg { kind: "command".to_string(), value: "force-push".to_string() }];
+        srv.remember(Parameters(args)).await;
 
         let first = srv.mark(Parameters(MarkArgs { id: "change-of-mind".to_string(), noise: false })).await;
         assert!(first.contains("marked useful"), "{first}");
@@ -6228,8 +6329,18 @@ mod tests {
     /// writes again exactly as a genuinely first judgement would.
     #[tokio::test]
     async fn a_fresh_server_instance_has_no_memory_of_another_ones_verdicts() {
+        // NOT `base_remember`'s own default (Always-bound): see the pinned-
+        // mark tests below for why a pinned item no longer belongs in a
+        // fixture that means to exercise a real write.
+        fn trigger_bound(id: &str) -> RememberArgs {
+            let mut args = base_remember(id);
+            args.always = false;
+            args.targets = vec![TargetArg { kind: "command".to_string(), value: "force-push".to_string() }];
+            args
+        }
+
         let srv1 = server();
-        srv1.remember(Parameters(base_remember("fresh-process-1"))).await;
+        srv1.remember(Parameters(trigger_bound("fresh-process-1"))).await;
         let on_first = srv1.mark(Parameters(MarkArgs { id: "fresh-process-1".to_string(), noise: false })).await;
         assert!(on_first.contains("marked useful"), "{on_first}");
         let repeat_same_instance =
@@ -6237,7 +6348,7 @@ mod tests {
         assert!(repeat_same_instance.contains("already judged"), "{repeat_same_instance}");
 
         let srv2 = server();
-        srv2.remember(Parameters(base_remember("fresh-process-1"))).await;
+        srv2.remember(Parameters(trigger_bound("fresh-process-1"))).await;
         let on_fresh_instance =
             srv2.mark(Parameters(MarkArgs { id: "fresh-process-1".to_string(), noise: false })).await;
         assert!(

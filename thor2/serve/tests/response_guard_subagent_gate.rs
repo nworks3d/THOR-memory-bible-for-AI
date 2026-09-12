@@ -331,7 +331,14 @@ fn declare_watched_rule(store: &mut thor_core::event_store::EventStore, id: &str
         id: id.to_string(),
         kind: model::item::Kind::Rule,
         text: "a rule this fixture serves over and over".to_string(),
-        bindings: vec![model::item::Binding::Always],
+        // NOT `Binding::Always`: a pinned item is excluded from the
+        // judgement debt entirely since 2026-09-12 (see
+        // `serve::usefulness::is_pinned`), so it can no longer stand in for
+        // an "owed" item in either test below.
+        bindings: vec![model::item::Binding::Target {
+            kind: model::item::TargetKind::Command,
+            value: "fixture-watched-command".to_string(),
+        }],
         severity: None,
         project: None,
         tags: vec![],

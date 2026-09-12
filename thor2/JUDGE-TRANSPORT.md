@@ -153,9 +153,11 @@ records a "decision" the owner never made: a deadlock in the exact
 delegated-task workflow this project runs on.
 
 **`setup_debt`, the evaluation debt, and three memory-upkeep debts -
-`crowding_debt`, `judgement_debt` and the stale-rule (false-proof) debt -
-are gated off for a subagent too**, each independently, at its own call
-site in `hook_once`'s `Stop` arm. `setup_debt` never walks a subagent
+`crowding_debt`, `judgement_debt` (which owes nothing for an item the owner
+has pinned - a pin already answered "did it belong where it fired") and the
+stale-rule (false-proof) debt - are gated off for a subagent too**, each
+independently, at its own call site in `hook_once`'s `Stop` arm. `setup_debt`
+never walks a subagent
 through AGENTS.md's setup questions, because there is no owner in the room
 for that conversation either. The evaluation debt (added 2026-09-12,
 `serve/src/bin/serve.rs`'s `evaluation_debt`) is silent for the identical

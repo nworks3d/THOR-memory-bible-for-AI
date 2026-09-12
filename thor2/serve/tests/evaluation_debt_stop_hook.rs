@@ -20,7 +20,7 @@ use std::io::Write as _;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
-use model::item::{Binding, Item, Kind};
+use model::item::{Binding, Item, Kind, TargetKind};
 use thor_core::event_store::{EventKind, EventStore};
 
 const CEILING: usize = serve::usefulness::EVAL_DEBT_CEILING;
@@ -102,6 +102,15 @@ fn subagent_stop_payload(session_id: &str) -> String {
 /// so all `n` sit in this checkout's own judgement debt - the evaluation
 /// debt's first condition needs a real backlog, not a single item, and a
 /// GLOBAL one so no `cwd`/project resolution is needed for it to apply here.
+///
+/// TARGET-BOUND, EACH ON ITS OWN UNIQUE COMMAND ANCHOR - never `Binding::
+/// Always`, since `judgement_debt_counts` (and so this debt's own owed
+/// count) excludes pinned items since 2026-09-12: an all-pinned fixture here
+/// would silently stop testing the evaluation debt at all. A `Command`
+/// target, not `Path`: ground 19 (`model::gate`) refuses a GLOBAL item
+/// anchored at a source file, and a unique value per item (rather than one
+/// shared anchor) keeps every one of them clear of `model::item::MAX_ITEMS`
+/// crowding regardless of how large `n` is.
 fn declare_owed_items(store: &mut EventStore, n: usize) {
     for i in 0..n {
         let id = format!("owed-{i:02}");
@@ -109,7 +118,7 @@ fn declare_owed_items(store: &mut EventStore, n: usize) {
             id: id.clone(),
             kind: Kind::Rule,
             text: format!("fixture evaluation debt item number {i}"),
-            bindings: vec![Binding::Always],
+            bindings: vec![Binding::Target { kind: TargetKind::Command, value: format!("fixture-eval-debt-command-{i:02}") }],
             severity: None,
             project: None,
             tags: vec![],

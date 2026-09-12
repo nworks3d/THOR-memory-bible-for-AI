@@ -204,9 +204,9 @@ having checked something with no evidence, a claim that something could
 not be reached without trying), and a subagent that lies about either is
 the same lazy-agent behaviour this whole project exists to catch,
 regardless of who reads the lie. That default - applies to everyone unless
-a rule opts out - is the opposite of the five debts above, which stay
+a rule opts out - is the opposite of the six debts above, which stay
 silent for a subagent by default; that is deliberate, not an
-inconsistency: for the five debts, going quiet for a subagent is the
+inconsistency: for the six debts, going quiet for a subagent is the
 settled behaviour, but for a rulebook rule, going quiet by default is
 exactly the failure this field exists to prevent (see `respond.rs`'s own
 "THE DEFAULT MATTERS" reasoning). Measured 2026-09-09 on 25 real agent

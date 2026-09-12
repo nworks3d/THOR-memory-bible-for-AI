@@ -496,8 +496,8 @@ pub struct ServeInput {
     /// see `project::applies_to` for why that is the safe direction.
     pub project: Option<String>,
     /// The verbatim string last handed to `add_command`, kept ONLY so
-    /// `render::render_text` can echo back a `serve why --command "..."`
-    /// that re-asks this exact question - `targets`/`context` already hold
+    /// `render::render_text` can echo back a `why --command "..."` that
+    /// re-asks this exact question - `targets`/`context` already hold
     /// this same text, derived and mixed with other signals, which is right
     /// for ranking but wrong for a hint that must be copy-pasteable as one
     /// flag's value. See `render::why_invocation`'s own doc comment for the

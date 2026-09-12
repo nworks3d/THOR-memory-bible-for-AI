@@ -171,8 +171,27 @@ fn the_flag_named_in_the_withheld_hint_actually_reproduces_the_withheld_items() 
     assert!(check_out.status.success());
     let check_text = String::from_utf8(check_out.stdout).unwrap();
     assert!(
-        check_text.contains("run `serve why --file \"app/.env\"` to see them"),
+        check_text.contains("why --file \"app/.env\"` to see them"),
         "expected the exact working invocation in the hint: {check_text}"
+    );
+    // THE DEFECT THIS PREVENTS, reported 2026-09-12: the hint named the
+    // right flag but still opened with the bare word `serve`, which is
+    // never on PATH for this deployment - following it verbatim answered
+    // "command not found" on every machine, this one included. The real
+    // compiled binary must now name ITS OWN absolute path (exactly the path
+    // this test used to spawn it, `CARGO_BIN_EXE_serve`, since
+    // `std::env::current_exe` inside that spawned process resolves to the
+    // same path it was launched from) and the exact `--db` it was opened
+    // with - not a unit-level plausible string, the real running program's
+    // own answer.
+    let expected_self_invocation = if cfg!(windows) {
+        format!("& \"{}\" --db \"{}\" why --file \"app/.env\"", env!("CARGO_BIN_EXE_serve"), db.display())
+    } else {
+        format!("\"{}\" --db \"{}\" why --file \"app/.env\"", env!("CARGO_BIN_EXE_serve"), db.display())
+    };
+    assert!(
+        check_text.contains(&expected_self_invocation),
+        "expected the real binary's own absolute path and its real --db in the hint: {check_text}"
     );
 
     let why_out = run_why(&db, &["--file", "app/.env"]);

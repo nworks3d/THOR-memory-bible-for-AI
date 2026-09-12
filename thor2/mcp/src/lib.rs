@@ -160,6 +160,45 @@ fn edited_text(current: &str, args: &ReviseArgs) -> Result<String, String> {
     Ok(current.to_string())
 }
 
+/// Merges a `clear_<field>` boolean into that field's own raw argument, so
+/// `revise` below reads exactly what it always read - `None` keeps the
+/// field, `Some("")` (or whitespace) clears it, `Some(v)` replaces it -
+/// whichever of the two ways asked for it. The flag is never a second
+/// clearing mechanism: it is turned into the SAME `Some("")` the empty
+/// string has always meant, right here, before the one `match` per field in
+/// `revise` (and the `is_clear` check beside it) ever sees either.
+///
+/// THE DEFECT THIS FIXES, bitten twice (2026-09-09 and 2026-09-11): the
+/// empty-string clear `ReviseArgs`' own doc comments have always documented
+/// does not survive an assistant's tool-call layer - the argument is dropped
+/// before this server ever sees it (it arrives as though never mentioned, or
+/// the call itself is rejected), and a literal `'""'` arrives as two quote
+/// characters, not an empty value. So the one documented way to clear a
+/// field was never actually reachable from an assistant, and both sessions
+/// gave up, retracted the rule they meant to correct, and stored a fresh one
+/// with no check - silently losing its history instead of fixing it. A plain
+/// JSON boolean survives every tool-call layer this crate has measured a
+/// string getting dropped by, which is the whole reason the six `clear_*`
+/// fields exist.
+///
+/// Refused, naming both `field` and `flag_name`, when `flag` is true and
+/// `value` is real (non-empty, non-whitespace): asking to both clear a field
+/// and set it to something is a contradiction, never a "last one wins".
+fn merge_clear_flag(field: &str, flag_name: &str, value: Option<&str>, flag: bool) -> Result<Option<String>, String> {
+    if !flag {
+        return Ok(value.map(str::to_string));
+    }
+    if let Some(v) = value {
+        if !v.trim().is_empty() {
+            return Err(format!(
+                "invalid '{field}': {flag_name} was true but '{field}' was also given as {v:?} - \
+                 give one or the other, never both"
+            ));
+        }
+    }
+    Ok(Some(String::new()))
+}
+
 /// Append `model::gate::warnings` to a write that already SUCCEEDED.
 ///
 /// A warning is not a refusal and must never read like one: the item is
@@ -818,31 +857,80 @@ pub struct ReviseArgs {
     #[serde(default)]
     pub replace_to: Option<String>,
     /// One of: irreversible, costly, house_style. Omit to keep the current
-    /// value; pass "" to clear it.
+    /// value; pass "" to clear it (see `clear_severity` below for the
+    /// spelling of a clear that actually reaches this server from an
+    /// assistant).
     #[serde(default)]
     pub severity: Option<String>,
-    /// Omit to keep the current project; pass "" to make it global.
+    /// Set true to clear severity - the same clear `severity: ""` above
+    /// documents, run through the identical code path, never a second
+    /// mechanism. THE DEFECT THIS FIXES, bitten twice (2026-09-09 and
+    /// 2026-09-11): an assistant's tool-call layer drops an empty-string
+    /// argument before it ever reaches this server (the field arrives as
+    /// though it was never mentioned, or the call itself is rejected before
+    /// that), and a literal '""' arrives as two quote characters, not an
+    /// empty value - so the one documented way to clear a field was never
+    /// actually reachable from an assistant. Both sessions gave up,
+    /// retracted the rule and stored a fresh one with no check, silently
+    /// losing its history. This flag is the one that works from an
+    /// assistant; the empty string above still works for a caller that can
+    /// send one (the JSON-RPC harness). Refused, naming the conflict, if
+    /// `severity` is ALSO given here as a real, non-empty value - say one or
+    /// the other, never both.
+    #[serde(default)]
+    pub clear_severity: bool,
+    /// Omit to keep the current project; pass "" to make it global (see
+    /// `clear_project` below for the spelling that reaches this server from
+    /// an assistant).
     #[serde(default)]
     pub project: Option<String>,
+    /// Set true to clear project (make it global) - same fix and convention
+    /// as `clear_severity` above. Refused, naming the conflict, if `project`
+    /// is also given here as a real, non-empty value.
+    #[serde(default)]
+    pub clear_project: bool,
     /// Replaces the whole tag list. Omit to keep the current tags; pass an empty list to clear them
     /// on purpose - the same omit-keeps/empty-clears convention as
     /// severity/project/expires/key/falsifier, spelled with a list: omitted means unmentioned, an
     /// empty array means deliberately cleared, a real list replaces the whole set.
     #[serde(default)]
     pub tags: Option<Vec<String>>,
-    /// Omit to keep the current expiry; pass "" to clear it.
+    /// Omit to keep the current expiry; pass "" to clear it (see
+    /// `clear_expires` below for the spelling that reaches this server from
+    /// an assistant).
     #[serde(default)]
     pub expires: Option<String>,
-    /// Omit to keep the current key; pass "" to clear it.
+    /// Set true to clear expires - same fix and convention as
+    /// `clear_severity` above. Refused, naming the conflict, if `expires` is
+    /// also given here as a real, non-empty value.
+    #[serde(default)]
+    pub clear_expires: bool,
+    /// Omit to keep the current key; pass "" to clear it (see `clear_key`
+    /// below for the spelling that reaches this server from an assistant).
     #[serde(default)]
     pub key: Option<String>,
+    /// Set true to clear key - same fix and convention as `clear_severity`
+    /// above. Refused, naming the conflict, if `key` is also given here as a
+    /// real, non-empty value.
+    #[serde(default)]
+    pub clear_key: bool,
     /// Omit to keep the current falsifier; pass "" to clear it (a Rule or
-    /// Orientation left with none is refused, same as at creation).
+    /// Orientation left with none is refused, same as at creation - see
+    /// `clear_falsifier` below for the spelling that reaches this server
+    /// from an assistant).
     #[serde(default)]
     pub falsifier: Option<String>,
+    /// Set true to clear falsifier - same fix and convention as
+    /// `clear_severity` above (still refused outright on a Rule/Orientation,
+    /// same as `falsifier: ""` above, by the same ground that guards
+    /// creation). Refused, naming the conflict, if `falsifier` is also given
+    /// here as a real, non-empty value.
+    #[serde(default)]
+    pub clear_falsifier: bool,
     /// One of: path_exists, contains, absent, absent_all, forbidden, requires. Omit all four
     /// check_* fields to keep the current check untouched; pass check_kind as "" to clear it
-    /// (refused if check_path/check_literal/check_literals is also given). Give check_kind plus
+    /// (refused if check_path/check_literal/check_literals is also given) - see `clear_check`
+    /// below for the spelling that reaches this server from an assistant. Give check_kind plus
     /// whichever of check_path/check_literal/check_literals the kind takes, together, to replace
     /// the check wholesale - see RememberArgs' own check_kind note for what each kind needs and
     /// which to prefer.
@@ -864,6 +952,15 @@ pub struct ReviseArgs {
     /// it, since a list has no separate way to say 'given, but deliberately empty'.
     #[serde(default)]
     pub check_literals: Vec<String>,
+    /// Set true to clear the check - the same clear `check_kind: ""` above
+    /// documents, same fix and convention as `clear_severity`'s own doc
+    /// comment (see there for the defect and the evidence). Refused, naming
+    /// the conflict, together with a non-empty check_kind, or with
+    /// check_path/check_literal/check_literals - clearing takes none of the
+    /// four; give a real check_kind (plus whatever it needs) to replace the
+    /// check instead.
+    #[serde(default)]
+    pub clear_check: bool,
     /// Replaces the moment bindings. Give this, `targets`, and/or `always`
     /// TOGETHER to replace the WHOLE binding list in one call - when none of
     /// the three are given, the existing bindings are kept untouched. See
@@ -1386,7 +1483,7 @@ impl ThorMcpServer {
         .await
     }
 
-    #[tool(description = "Code lane: corrects an EXISTING item by id, through the same write gate as remember, plus: a field left unmentioned keeps its current value, and none may silently vanish - clear one on purpose with an empty string (severity, project, expires, key, falsifier) or check_kind \"\" (clears the check). Weakening a checked rule (clearing/changing the check, lowering/clearing severity, dropping a binding, or narrowing scope to a project) needs because: one sentence, kept in history. On a replica this queues instead of writing ('queued for the main machine' is not an error). Prefer this over remember for an existing item that merely changed; retract, with its own reason, is for one that is simply wrong. Refuses, with the exact reason, on remember's grounds, plus a dropped field or an unexplained weakening. Replies with the revised id and event sequence, or the refusal text.", annotations(title = "Revise an item", read_only_hint = false, destructive_hint = false, idempotent_hint = false, open_world_hint = false))]
+    #[tool(description = "Code lane: corrects an EXISTING item by id through the same write gate as remember; a field left unmentioned keeps its current value, and none may silently vanish - clear one with clear_severity/clear_project/clear_expires/clear_key/clear_falsifier/clear_check; an empty string on the field is the harness-only equivalent, and a flag plus a real value for that field is refused. Weakening a checked rule (its check, severity, a binding, or scope) needs because: one sentence, kept in history. On a replica this queues instead of writing ('queued for the main machine' is not an error). Prefer this over remember for an existing item that merely changed; retract, with its own reason, is for one that is simply wrong. Refuses, with the exact reason, on remember's grounds, plus a dropped field or an unexplained weakening. Replies with the revised id and event sequence, or the refusal text.", annotations(title = "Revise an item", read_only_hint = false, destructive_hint = false, idempotent_hint = false, open_world_hint = false))]
     async fn revise(&self, Parameters(args): Parameters<ReviseArgs>) -> String {
         if let Some(queued) = self.capture("revise", &args) {
             return queued;
@@ -1409,8 +1506,9 @@ impl ThorMcpServer {
                 existing.bindings.clone()
             };
             // Each field below also records whether THIS call is what
-            // cleared it - an explicit empty string, never merely omitted -
-            // so `cleared` (built further down) can carry that intent to
+            // cleared it - a deliberate clear (the flag, or an explicit
+            // empty string), never merely omitted - so `cleared` (built
+            // further down) can carry that intent to
             // the write gate. `model::gate::revise`'s field-preservation
             // check (ground 9) compares two finished `Item`s and cannot
             // tell "the caller forgot to mention this" from "the caller
@@ -1421,50 +1519,63 @@ impl ThorMcpServer {
             // the difference without weakening it for anyone who never
             // asked for a clear at all - see that function's own doc
             // comment for the full reasoning, and this task's own report.
-            // WHAT COUNTS AS A CLEAR, and why it is not just the empty string.
-            // The documented convention is "pass an empty string to clear",
-            // and it was unreachable: measured six times on 2026-08-06, an
-            // empty string does not survive the MCP call layer - the value
-            // disappears and the request never arrives as valid JSON. So the
-            // one documented way to clear a field could not be used by the
-            // very agent the documentation is written for, while the code
-            // underneath supported it and had a test per field proving so.
-            // A whitespace-only value now clears too. None of these five
-            // fields has any use for a value made of spaces: a project named
-            // " ", a key of a tab, a falsifier of nothing. Reading it as the
-            // clear it obviously is costs no legitimate case and makes the
-            // promise reachable through any transport.
+            // WHAT COUNTS AS A CLEAR, and why an empty string is not the only
+            // spelling. The documented convention has always been "pass an
+            // empty string to clear", and for a caller that can actually send
+            // one - the JSON-RPC harness - it still works exactly as before.
+            // For an ASSISTANT it never worked: measured six times on
+            // 2026-08-06, an empty string does not survive the MCP call
+            // layer, and bitten twice more since (2026-09-09, 2026-09-11) by
+            // sessions that never found a way around it and gave up,
+            // retracting the rule they meant to correct instead - see
+            // `merge_clear_flag`'s own doc comment for the fix, the six
+            // `clear_*` booleans on `ReviseArgs` that reach this server from
+            // an assistant. Each field below merges its own flag with its own
+            // raw argument FIRST, so everything from here down reads one
+            // value exactly as it always read `args.<field>` - this match,
+            // and the `is_clear` check beside it, never change. A
+            // whitespace-only value still clears too, same as before: none of
+            // these five fields has any use for a value made of spaces.
             let is_clear = |v: Option<&str>| matches!(v, Some(s) if s.trim().is_empty());
-            let severity = match args.severity.as_deref() {
+            let severity_arg =
+                merge_clear_flag("severity", "clear_severity", args.severity.as_deref(), args.clear_severity)?;
+            let severity = match severity_arg.as_deref() {
                 None => existing.severity,
                 Some(v) if v.trim().is_empty() => None,
                 Some(v) => Some(Severity::from_str(v).map_err(|e| format!("invalid 'severity': {e}"))?),
             };
-            let severity_cleared = is_clear(args.severity.as_deref());
-            let project = match args.project.as_deref() {
+            let severity_cleared = is_clear(severity_arg.as_deref());
+            let project_arg =
+                merge_clear_flag("project", "clear_project", args.project.as_deref(), args.clear_project)?;
+            let project = match project_arg.as_deref() {
                 None => existing.project.clone(),
                 Some(p) if p.trim().is_empty() => None,
                 Some(p) => Some(p.to_string()),
             };
-            let project_cleared = is_clear(args.project.as_deref());
-            let expires = match args.expires.as_deref() {
+            let project_cleared = is_clear(project_arg.as_deref());
+            let expires_arg =
+                merge_clear_flag("expires", "clear_expires", args.expires.as_deref(), args.clear_expires)?;
+            let expires = match expires_arg.as_deref() {
                 None => existing.expires.clone(),
                 Some(e) if e.trim().is_empty() => None,
                 Some(e) => Some(e.to_string()),
             };
-            let expires_cleared = is_clear(args.expires.as_deref());
-            let key = match args.key.as_deref() {
+            let expires_cleared = is_clear(expires_arg.as_deref());
+            let key_arg = merge_clear_flag("key", "clear_key", args.key.as_deref(), args.clear_key)?;
+            let key = match key_arg.as_deref() {
                 None => existing.key.clone(),
                 Some(k) if k.trim().is_empty() => None,
                 Some(k) => Some(k.to_string()),
             };
-            let key_cleared = is_clear(args.key.as_deref());
-            let falsifier = match args.falsifier.as_deref() {
+            let key_cleared = is_clear(key_arg.as_deref());
+            let falsifier_arg =
+                merge_clear_flag("falsifier", "clear_falsifier", args.falsifier.as_deref(), args.clear_falsifier)?;
+            let falsifier = match falsifier_arg.as_deref() {
                 None => existing.falsifier.clone(),
                 Some(f) if f.trim().is_empty() => None,
                 Some(f) => Some(f.to_string()),
             };
-            let falsifier_cleared = is_clear(args.falsifier.as_deref());
+            let falsifier_cleared = is_clear(falsifier_arg.as_deref());
             // Same "omit keeps, empty clears" convention as the five string
             // fields above, but `tags` is a LIST: `Option<Vec<String>>`
             // already tells "omitted" (`None`) apart from "given, but
@@ -1493,36 +1604,54 @@ impl ThorMcpServer {
             // an empty list for check_kind absent_all (see that function's
             // own doc comment). check_kind "" clears it, refused if
             // check_path/check_literal/check_literals are also given (a
-            // self-contradictory request: clear AND set at once). Anything
-            // else runs through the same gate::build_check remember uses,
-            // replacing the check wholesale.
-            let check = if args.check_kind.is_none()
+            // self-contradictory request: clear AND set at once).
+            // `clear_check` (see its own doc comment on `ReviseArgs` for the
+            // defect it fixes) is folded into `check_kind` right here, before
+            // any of that runs, so a caller that sends the flag is refused by
+            // the exact same check_path/check_literal/check_literals branch
+            // below, for the exact same reason. Anything else runs through
+            // the same gate::build_check remember uses, replacing the check
+            // wholesale.
+            let check_kind_arg = if args.clear_check {
+                if let Some(k) = args.check_kind.as_deref() {
+                    if !k.trim().is_empty() {
+                        return Err(format!(
+                            "invalid 'check_kind': clear_check was true but check_kind was also \
+                             given as {k:?} - give one or the other, never both"
+                        ));
+                    }
+                }
+                Some(String::new())
+            } else {
+                args.check_kind.clone()
+            };
+            let check = if check_kind_arg.is_none()
                 && args.check_path.is_none()
                 && args.check_literal.is_none()
                 && args.check_literals.is_empty()
             {
                 existing.check.clone()
-            } else if args.check_kind.as_deref() == Some("") {
+            } else if check_kind_arg.as_deref() == Some("") {
                 if args.check_path.is_some() || args.check_literal.is_some() || !args.check_literals.is_empty() {
                     return Err(
-                        "invalid check: check_kind was cleared (\"\") but check_path, check_literal \
-                         or check_literals was also given - clearing a check takes none of them; \
-                         drop them to clear the check, or give a real check_kind to replace it \
-                         instead"
+                        "invalid check: the check was cleared (check_kind \"\" or clear_check) but \
+                         check_path, check_literal or check_literals was also given - clearing a \
+                         check takes none of them; drop them to clear the check, or give a real \
+                         check_kind to replace it instead"
                             .to_string(),
                     );
                 }
                 None
             } else {
                 model::gate::build_check(
-                    args.check_kind.as_deref(),
+                    check_kind_arg.as_deref(),
                     args.check_path.clone(),
                     args.check_literal.clone(),
                     args.check_literals.clone(),
                 )
                 .map_err(|e| format!("invalid check: {e}"))?
             };
-            let check_cleared = args.check_kind.as_deref() == Some("");
+            let check_cleared = check_kind_arg.as_deref() == Some("");
             // Prefixed like every other refusal on this surface: a caller
             // that keys on "REFUSED" must not have to learn a second shape
             // just because the reason came from the edit modes.
@@ -2600,6 +2729,12 @@ mod tests {
             moments: Some(vec![]),
             targets: Some(vec![]),
             always: Some(false),
+            clear_severity: false,
+            clear_project: false,
+            clear_expires: false,
+            clear_key: false,
+            clear_falsifier: false,
+            clear_check: false,
         };
         let reply = srv.revise(Parameters(revise_args)).await;
         assert!(reply.contains("REFUSED"), "expected a loud refusal, got: {reply}");
@@ -2917,6 +3052,12 @@ mod tests {
             moments: None,
             targets: None,
             always: None,
+            clear_severity: false,
+            clear_project: false,
+            clear_expires: false,
+            clear_key: false,
+            clear_falsifier: false,
+            clear_check: false,
         };
         let reply = srv.revise(Parameters(revise_args)).await;
         assert!(reply.starts_with("revised"), "{reply}");
@@ -3088,6 +3229,12 @@ mod tests {
             moments: None,
             targets: None,
             always: None,
+            clear_severity: false,
+            clear_project: false,
+            clear_expires: false,
+            clear_key: false,
+            clear_falsifier: false,
+            clear_check: false,
         };
         let reply = srv.revise(Parameters(revise_args)).await;
         assert!(reply.starts_with("revised"), "{reply}");
@@ -3132,6 +3279,12 @@ mod tests {
             moments: None,
             targets: None,
             always: None,
+            clear_severity: false,
+            clear_project: false,
+            clear_expires: false,
+            clear_key: false,
+            clear_falsifier: false,
+            clear_check: false,
         };
         let reply = srv.revise(Parameters(revise_args)).await;
         assert!(reply.starts_with("revised"), "{reply}");
@@ -3181,6 +3334,12 @@ mod tests {
             moments: None,
             targets: None,
             always: None,
+            clear_severity: false,
+            clear_project: false,
+            clear_expires: false,
+            clear_key: false,
+            clear_falsifier: false,
+            clear_check: false,
         };
         let reply = srv.revise(Parameters(revise_args)).await;
         assert!(reply.starts_with("revised"), "{reply}");
@@ -3220,6 +3379,12 @@ mod tests {
             moments: None,
             targets: None,
             always: None,
+            clear_severity: false,
+            clear_project: false,
+            clear_expires: false,
+            clear_key: false,
+            clear_falsifier: false,
+            clear_check: false,
         };
         let reply = srv.revise(Parameters(revise_args)).await;
         assert!(reply.contains("invalid check"), "{reply}");
@@ -3279,6 +3444,12 @@ mod tests {
             moments: None,
             targets: None,
             always: None,
+            clear_severity: false,
+            clear_project: false,
+            clear_expires: false,
+            clear_key: false,
+            clear_falsifier: false,
+            clear_check: false,
         };
         let reply = srv.revise(Parameters(revise_args)).await;
         assert!(reply.starts_with("revised"), "expected a deliberate clear to succeed, got: {reply}");
@@ -3492,6 +3663,12 @@ mod tests {
             moments: None,
             targets: None,
             always: None,
+            clear_severity: false,
+            clear_project: false,
+            clear_expires: false,
+            clear_key: false,
+            clear_falsifier: false,
+            clear_check: false,
         };
         let reply = srv.revise(Parameters(revise_args)).await;
         assert!(reply.starts_with("revised"), "{reply}");
@@ -3544,6 +3721,12 @@ mod tests {
             moments: None,
             targets: None,
             always: None,
+            clear_severity: false,
+            clear_project: false,
+            clear_expires: false,
+            clear_key: false,
+            clear_falsifier: false,
+            clear_check: false,
         };
         let reply = srv.revise(Parameters(revise_args)).await;
         assert!(reply.starts_with("revised"), "{reply}");
@@ -3666,6 +3849,12 @@ mod tests {
             moments: None,
             targets: None,
             always: None,
+            clear_severity: false,
+            clear_project: false,
+            clear_expires: false,
+            clear_key: false,
+            clear_falsifier: false,
+            clear_check: false,
         };
         let reply = srv.revise(Parameters(revise_args)).await;
         assert!(reply.starts_with("revised"), "{reply}");
@@ -3720,6 +3909,12 @@ mod tests {
             moments: None,
             targets: None,
             always: None,
+            clear_severity: false,
+            clear_project: false,
+            clear_expires: false,
+            clear_key: false,
+            clear_falsifier: false,
+            clear_check: false,
         };
         let reply = srv.revise(Parameters(revise_args)).await;
         assert!(reply.starts_with("revised"), "{reply}");
@@ -3763,6 +3958,12 @@ mod tests {
             moments: None,
             targets: None,
             always: None,
+            clear_severity: false,
+            clear_project: false,
+            clear_expires: false,
+            clear_key: false,
+            clear_falsifier: false,
+            clear_check: false,
         };
         let reply = srv.revise(Parameters(revise_args)).await;
         assert!(reply.starts_with("revised"), "{reply}");
@@ -3816,6 +4017,12 @@ mod tests {
             moments: None,
             targets: None,
             always: None,
+            clear_severity: false,
+            clear_project: false,
+            clear_expires: false,
+            clear_key: false,
+            clear_falsifier: false,
+            clear_check: false,
         };
         let reply = srv.revise(Parameters(revise_args)).await;
         assert!(reply.starts_with("revised"), "expected a deliberate clear to succeed, got: {reply}");
@@ -3861,6 +4068,12 @@ mod tests {
             moments: None,
             targets: None,
             always: None,
+            clear_severity: false,
+            clear_project: false,
+            clear_expires: false,
+            clear_key: false,
+            clear_falsifier: false,
+            clear_check: false,
         };
         let reply = srv.revise(Parameters(revise_args)).await;
         assert!(reply.starts_with("revised"), "expected a deliberate clear to succeed, got: {reply}");
@@ -3906,6 +4119,12 @@ mod tests {
             moments: None,
             targets: None,
             always: None,
+            clear_severity: false,
+            clear_project: false,
+            clear_expires: false,
+            clear_key: false,
+            clear_falsifier: false,
+            clear_check: false,
         };
         let reply = srv.revise(Parameters(revise_args)).await;
         assert!(reply.starts_with("revised"), "a whitespace-only value must clear, got: {reply}");
@@ -3943,6 +4162,12 @@ mod tests {
             moments: None,
             targets: None,
             always: None,
+            clear_severity: false,
+            clear_project: false,
+            clear_expires: false,
+            clear_key: false,
+            clear_falsifier: false,
+            clear_check: false,
         };
         let reply = srv.revise(Parameters(revise_args)).await;
         assert!(reply.starts_with("revised"), "expected a deliberate clear to succeed, got: {reply}");
@@ -3986,6 +4211,12 @@ mod tests {
             moments: None,
             targets: None,
             always: None,
+            clear_severity: false,
+            clear_project: false,
+            clear_expires: false,
+            clear_key: false,
+            clear_falsifier: false,
+            clear_check: false,
         };
         let reply = srv.revise(Parameters(revise_args)).await;
         assert!(reply.starts_with("revised"), "expected a deliberate clear to succeed, got: {reply}");
@@ -4028,6 +4259,12 @@ mod tests {
             moments: None,
             targets: None,
             always: None,
+            clear_severity: false,
+            clear_project: false,
+            clear_expires: false,
+            clear_key: false,
+            clear_falsifier: false,
+            clear_check: false,
         };
         let reply = srv.revise(Parameters(revise_args)).await;
         assert!(reply.starts_with("revised"), "expected a deliberate clear to succeed, got: {reply}");
@@ -4090,6 +4327,12 @@ mod tests {
             moments: Some(vec![]),
             targets: Some(vec![]),
             always: Some(false),
+            clear_severity: false,
+            clear_project: false,
+            clear_expires: false,
+            clear_key: false,
+            clear_falsifier: false,
+            clear_check: false,
         };
         let reply = srv.revise(Parameters(revise_args)).await;
         assert!(reply.contains("REFUSED"), "expected the bindings drop to still be refused, got: {reply}");
@@ -4156,6 +4399,12 @@ mod tests {
             moments: None,
             targets: None,
             always: None,
+            clear_severity: false,
+            clear_project: false,
+            clear_expires: false,
+            clear_key: false,
+            clear_falsifier: false,
+            clear_check: false,
         };
         let reply = srv.revise(Parameters(revise_args)).await;
         assert!(reply.starts_with("revised"), "{reply}");
@@ -4202,6 +4451,12 @@ mod tests {
             moments: None,
             targets: None,
             always: None,
+            clear_severity: false,
+            clear_project: false,
+            clear_expires: false,
+            clear_key: false,
+            clear_falsifier: false,
+            clear_check: false,
         };
         let reply = srv.revise(Parameters(revise_args)).await;
         assert!(reply.starts_with("revised"), "expected a deliberate clear to succeed, got: {reply}");
@@ -4242,6 +4497,12 @@ mod tests {
             moments: None,
             targets: None,
             always: None,
+            clear_severity: false,
+            clear_project: false,
+            clear_expires: false,
+            clear_key: false,
+            clear_falsifier: false,
+            clear_check: false,
         };
         let reply = srv.revise(Parameters(revise_args)).await;
         assert!(reply.starts_with("revised"), "{reply}");
@@ -4254,6 +4515,462 @@ mod tests {
             item.tags,
             vec!["reviewed".to_string(), "ci".to_string()],
             "a new list must replace the whole set, old tags included"
+        );
+    }
+
+    // -------------------------------------------------------- clear_* flags
+    //
+    // THE DEFECT THESE CLOSE, bitten twice through this real tool surface
+    // (2026-09-09 and 2026-09-11): every clearing test above types the
+    // field's own empty string, the one spelling `ReviseArgs`' doc comments
+    // have ever documented - and an assistant's own tool-call layer drops
+    // that empty-string argument before it ever reaches this server, so the
+    // documented clear was never actually reachable from the very caller the
+    // documentation is written for. Both sessions gave up, retracted the
+    // rule they meant to correct, and stored a fresh one with no check -
+    // silently losing its history instead of fixing it. `clear_severity`,
+    // `clear_project`, `clear_expires`, `clear_key`, `clear_falsifier` and
+    // `clear_check` (see `merge_clear_flag`'s own doc comment) are the fix: a
+    // plain JSON boolean survives every tool-call layer this crate has
+    // measured a string getting dropped by, folded into the exact same
+    // `ClearedFields` handling the empty string has always used - never a
+    // second mechanism. Each test below is named after the exact property it
+    // pins, and fails when the fix it names is reverted.
+
+    #[tokio::test]
+    async fn clear_severity_flag_clears_a_populated_severity() {
+        // The flag-spelled twin of `revise_clearing_a_populated_severity_
+        // succeeds` above. Fails if `clear_severity` regresses to a no-op
+        // (the merge dropped, or never wired into `severity_arg`): the reply
+        // would still say "revised" (the call is otherwise valid) but
+        // `item.severity` would still read back as `irreversible`.
+        let srv = server_knowing(&["thor2"]);
+        let mut args = base_remember("clear-severity-flag-1");
+        args.project = Some("thor2".to_string());
+        assert!(srv.remember(Parameters(args)).await.starts_with("stored"));
+
+        let reply = srv
+            .revise(Parameters(ReviseArgs {
+                id: "clear-severity-flag-1".to_string(),
+                clear_severity: true,
+                ..Default::default()
+            }))
+            .await;
+        assert!(reply.starts_with("revised"), "expected the flag to clear it, got: {reply}");
+
+        let get_reply = srv.get(Parameters(GetArgs { id: "clear-severity-flag-1".to_string() })).await;
+        let item: Item = serde_json::from_str(&get_reply).unwrap();
+        assert_eq!(item.severity, None, "clear_severity must actually clear the field");
+        assert_eq!(item.project, Some("thor2".to_string()), "a field nobody asked to clear must survive untouched");
+    }
+
+    #[tokio::test]
+    async fn clear_project_flag_clears_a_populated_project() {
+        // The flag-spelled twin of `revise_clearing_a_populated_project_
+        // succeeds` above. Fails the same way: a reverted `clear_project`
+        // still replies "revised" but leaves `item.project` at "thor2".
+        let srv = server_knowing(&["thor2"]);
+        let mut args = base_remember("clear-project-flag-1");
+        args.project = Some("thor2".to_string());
+        assert!(srv.remember(Parameters(args)).await.starts_with("stored"));
+
+        let reply = srv
+            .revise(Parameters(ReviseArgs {
+                id: "clear-project-flag-1".to_string(),
+                clear_project: true,
+                ..Default::default()
+            }))
+            .await;
+        assert!(reply.starts_with("revised"), "expected the flag to clear it, got: {reply}");
+
+        let get_reply = srv.get(Parameters(GetArgs { id: "clear-project-flag-1".to_string() })).await;
+        let item: Item = serde_json::from_str(&get_reply).unwrap();
+        assert_eq!(item.project, None, "clear_project must actually clear the field");
+    }
+
+    #[tokio::test]
+    async fn clear_expires_flag_clears_a_populated_expires() {
+        // The flag-spelled twin of `revise_clearing_a_populated_expires_
+        // succeeds` above; same Report fixture, for the same reason (only a
+        // Report may carry expires at all).
+        let srv = server_knowing(&["test-project"]);
+        assert!(srv.remember(Parameters(blank_report("clear-expires-flag-1"))).await.starts_with("stored"));
+
+        let reply = srv
+            .revise(Parameters(ReviseArgs {
+                id: "clear-expires-flag-1".to_string(),
+                clear_expires: true,
+                ..Default::default()
+            }))
+            .await;
+        assert!(reply.starts_with("revised"), "expected the flag to clear it, got: {reply}");
+
+        let get_reply = srv.get(Parameters(GetArgs { id: "clear-expires-flag-1".to_string() })).await;
+        let item: Item = serde_json::from_str(&get_reply).unwrap();
+        assert_eq!(item.expires, None, "clear_expires must actually clear the field");
+    }
+
+    #[tokio::test]
+    async fn clear_key_flag_clears_a_populated_key() {
+        // The flag-spelled twin of `revise_clearing_a_populated_key_
+        // succeeds` above; a Rule on purpose, not a Lookup, for the same
+        // reason that sibling test gives (a Lookup REQUIRES a key, which
+        // would confound this test with a different refusal).
+        let srv = server();
+        let mut args = base_remember("clear-key-flag-1");
+        args.key = Some("some-lookup-key".to_string());
+        assert!(srv.remember(Parameters(args)).await.starts_with("stored"));
+
+        let reply = srv
+            .revise(Parameters(ReviseArgs {
+                id: "clear-key-flag-1".to_string(),
+                clear_key: true,
+                ..Default::default()
+            }))
+            .await;
+        assert!(reply.starts_with("revised"), "expected the flag to clear it, got: {reply}");
+
+        let get_reply = srv.get(Parameters(GetArgs { id: "clear-key-flag-1".to_string() })).await;
+        let item: Item = serde_json::from_str(&get_reply).unwrap();
+        assert_eq!(item.key, None, "clear_key must actually clear the field");
+    }
+
+    #[tokio::test]
+    async fn clear_falsifier_flag_clears_a_populated_falsifier() {
+        // The flag-spelled twin of `revise_clearing_a_populated_falsifier_
+        // succeeds` above; a Report on purpose, not a Rule/Orientation
+        // (those two REQUIRE a falsifier, which would confound this test).
+        let srv = server_knowing(&["test-project"]);
+        let mut args = blank_report("clear-falsifier-flag-1");
+        args.falsifier = Some("this incident happens again within a week".to_string());
+        assert!(srv.remember(Parameters(args)).await.starts_with("stored"));
+
+        let reply = srv
+            .revise(Parameters(ReviseArgs {
+                id: "clear-falsifier-flag-1".to_string(),
+                clear_falsifier: true,
+                ..Default::default()
+            }))
+            .await;
+        assert!(reply.starts_with("revised"), "expected the flag to clear it, got: {reply}");
+
+        let get_reply = srv.get(Parameters(GetArgs { id: "clear-falsifier-flag-1".to_string() })).await;
+        let item: Item = serde_json::from_str(&get_reply).unwrap();
+        assert_eq!(item.falsifier, None, "clear_falsifier must actually clear the field");
+    }
+
+    // `clear_check` has no standalone "clears the field" test of its own:
+    // clearing a POPULATED check on a Rule/Orientation is always a
+    // weakening (see `weakenings` in model::gate), so the two tests right
+    // below - refused with no `because`, accepted and named with one - are
+    // that test, and a third copy would prove nothing the second does not.
+
+    #[tokio::test]
+    async fn clear_check_flag_on_a_checked_rule_with_no_because_is_refused_by_ground_28() {
+        // The flag-spelled twin of `revise_refuses_weakening_a_checked_
+        // rule_with_no_because` above: GROUND 28 must fire identically
+        // whichever spelling asked for the clear, because `clear_check` is
+        // folded into `check_kind` (see the `revise` handler's own comment
+        // on `check_kind_arg`) before `weakenings` ever runs - the two
+        // spellings build the exact same `updated` item. Fails if
+        // `clear_check` bypassed that fold instead of joining it: the reply
+        // would start with "revised" instead of "REFUSED", proving a clear
+        // could take the teeth off a proof-backed rule with no reason
+        // recorded anywhere - the whole hole ground 28 exists to close.
+        let srv = server();
+        let mut args = base_remember("clear-check-flag-no-because-1");
+        args.text = "the roadmap lives in ROADMAP.md at the repo root".to_string();
+        args.check_kind = Some("path_exists".to_string());
+        args.check_path = Some("ROADMAP.md".to_string());
+        assert!(srv.remember(Parameters(args)).await.starts_with("stored"));
+
+        let reply = srv
+            .revise(Parameters(ReviseArgs {
+                id: "clear-check-flag-no-because-1".to_string(),
+                clear_check: true,
+                ..Default::default()
+            }))
+            .await;
+        assert!(reply.starts_with("REFUSED"), "{reply}");
+        assert!(
+            reply.contains("this clears the check of a rule that can refuse a write"),
+            "the refusal must name the weakening GROUND 28 saw: {reply}"
+        );
+        assert!(reply.to_lowercase().contains("because"), "the refusal must say to give `because`: {reply}");
+
+        let get_reply = srv.get(Parameters(GetArgs { id: "clear-check-flag-no-because-1".to_string() })).await;
+        let item: Item = serde_json::from_str(&get_reply).unwrap();
+        assert!(item.check.is_some(), "a refused weakening must change nothing");
+    }
+
+    #[tokio::test]
+    async fn clear_check_flag_on_a_checked_rule_with_a_because_is_accepted_and_named() {
+        // The flag-spelled twin of `revise_accepts_weakening_a_checked_
+        // rule_with_a_because_and_the_reply_names_it` above, and also this
+        // flag's own "clears the field" proof (see the comment above these
+        // two tests on why that is one test, not two).
+        let srv = server();
+        let mut args = base_remember("clear-check-flag-with-because-1");
+        args.text = "the roadmap lives in ROADMAP.md at the repo root".to_string();
+        args.check_kind = Some("path_exists".to_string());
+        args.check_path = Some("ROADMAP.md".to_string());
+        assert!(srv.remember(Parameters(args)).await.starts_with("stored"));
+
+        let reply = srv
+            .revise(Parameters(ReviseArgs {
+                id: "clear-check-flag-with-because-1".to_string(),
+                clear_check: true,
+                because: Some("the roadmap file check is redundant now that CI verifies it".to_string()),
+                ..Default::default()
+            }))
+            .await;
+        assert!(reply.starts_with("revised"), "{reply}");
+        assert!(reply.contains("weakened: check cleared"), "the reply must name the weakening: {reply}");
+        assert!(
+            reply.contains("because: the roadmap file check is redundant now that CI verifies it"),
+            "the reply must echo the reason back: {reply}"
+        );
+
+        let get_reply = srv.get(Parameters(GetArgs { id: "clear-check-flag-with-because-1".to_string() })).await;
+        let item: Item = serde_json::from_str(&get_reply).unwrap();
+        assert_eq!(item.check, None, "clear_check must actually clear the field");
+    }
+
+    #[tokio::test]
+    async fn clear_severity_together_with_a_real_severity_is_refused_naming_the_conflict() {
+        // Fails if `merge_clear_flag`'s own conflict check is reverted (or
+        // its call site stops passing `args.clear_severity` through): the
+        // flag and the value would stop contradicting each other, and this
+        // reply would start with "revised" - silently picking a winner
+        // instead of refusing the contradiction outright.
+        let srv = server();
+        assert!(srv.remember(Parameters(base_remember("clear-severity-conflict-1"))).await.starts_with("stored"));
+
+        let reply = srv
+            .revise(Parameters(ReviseArgs {
+                id: "clear-severity-conflict-1".to_string(),
+                clear_severity: true,
+                severity: Some("costly".to_string()),
+                ..Default::default()
+            }))
+            .await;
+        assert!(reply.contains("invalid 'severity'"), "{reply}");
+        assert!(reply.contains("clear_severity"), "the refusal must name the flag: {reply}");
+
+        let get_reply = srv.get(Parameters(GetArgs { id: "clear-severity-conflict-1".to_string() })).await;
+        let item: Item = serde_json::from_str(&get_reply).unwrap();
+        assert_eq!(item.severity, Some(ItemSeverity::Irreversible), "a refused revise must change nothing");
+    }
+
+    #[tokio::test]
+    async fn clear_project_together_with_a_real_project_is_refused_naming_the_conflict() {
+        let srv = server_knowing(&["thor2", "other-project"]);
+        let mut args = base_remember("clear-project-conflict-1");
+        args.project = Some("thor2".to_string());
+        assert!(srv.remember(Parameters(args)).await.starts_with("stored"));
+
+        let reply = srv
+            .revise(Parameters(ReviseArgs {
+                id: "clear-project-conflict-1".to_string(),
+                clear_project: true,
+                project: Some("other-project".to_string()),
+                ..Default::default()
+            }))
+            .await;
+        assert!(reply.contains("invalid 'project'"), "{reply}");
+        assert!(reply.contains("clear_project"), "the refusal must name the flag: {reply}");
+
+        let get_reply = srv.get(Parameters(GetArgs { id: "clear-project-conflict-1".to_string() })).await;
+        let item: Item = serde_json::from_str(&get_reply).unwrap();
+        assert_eq!(item.project, Some("thor2".to_string()), "a refused revise must change nothing");
+    }
+
+    #[tokio::test]
+    async fn clear_expires_together_with_a_real_expires_is_refused_naming_the_conflict() {
+        let srv = server_knowing(&["test-project"]);
+        assert!(srv.remember(Parameters(blank_report("clear-expires-conflict-1"))).await.starts_with("stored"));
+
+        let reply = srv
+            .revise(Parameters(ReviseArgs {
+                id: "clear-expires-conflict-1".to_string(),
+                clear_expires: true,
+                expires: Some("2028-01-01".to_string()),
+                ..Default::default()
+            }))
+            .await;
+        assert!(reply.contains("invalid 'expires'"), "{reply}");
+        assert!(reply.contains("clear_expires"), "the refusal must name the flag: {reply}");
+
+        let get_reply = srv.get(Parameters(GetArgs { id: "clear-expires-conflict-1".to_string() })).await;
+        let item: Item = serde_json::from_str(&get_reply).unwrap();
+        assert_eq!(item.expires, Some("2027-01-01".to_string()), "a refused revise must change nothing");
+    }
+
+    #[tokio::test]
+    async fn clear_key_together_with_a_real_key_is_refused_naming_the_conflict() {
+        let srv = server();
+        let mut args = base_remember("clear-key-conflict-1");
+        args.key = Some("some-lookup-key".to_string());
+        assert!(srv.remember(Parameters(args)).await.starts_with("stored"));
+
+        let reply = srv
+            .revise(Parameters(ReviseArgs {
+                id: "clear-key-conflict-1".to_string(),
+                clear_key: true,
+                key: Some("another-key".to_string()),
+                ..Default::default()
+            }))
+            .await;
+        assert!(reply.contains("invalid 'key'"), "{reply}");
+        assert!(reply.contains("clear_key"), "the refusal must name the flag: {reply}");
+
+        let get_reply = srv.get(Parameters(GetArgs { id: "clear-key-conflict-1".to_string() })).await;
+        let item: Item = serde_json::from_str(&get_reply).unwrap();
+        assert_eq!(item.key, Some("some-lookup-key".to_string()), "a refused revise must change nothing");
+    }
+
+    #[tokio::test]
+    async fn clear_falsifier_together_with_a_real_falsifier_is_refused_naming_the_conflict() {
+        let srv = server_knowing(&["test-project"]);
+        let mut args = blank_report("clear-falsifier-conflict-1");
+        args.falsifier = Some("this incident happens again within a week".to_string());
+        assert!(srv.remember(Parameters(args)).await.starts_with("stored"));
+
+        let reply = srv
+            .revise(Parameters(ReviseArgs {
+                id: "clear-falsifier-conflict-1".to_string(),
+                clear_falsifier: true,
+                falsifier: Some("a different falsifier entirely".to_string()),
+                ..Default::default()
+            }))
+            .await;
+        assert!(reply.contains("invalid 'falsifier'"), "{reply}");
+        assert!(reply.contains("clear_falsifier"), "the refusal must name the flag: {reply}");
+
+        let get_reply = srv.get(Parameters(GetArgs { id: "clear-falsifier-conflict-1".to_string() })).await;
+        let item: Item = serde_json::from_str(&get_reply).unwrap();
+        assert_eq!(
+            item.falsifier,
+            Some("this incident happens again within a week".to_string()),
+            "a refused revise must change nothing"
+        );
+    }
+
+    #[tokio::test]
+    async fn clear_check_together_with_a_real_check_kind_is_refused_naming_the_conflict() {
+        // `clear_check`'s own conflict check, separate from the
+        // check_path/check_literal/check_literals one below: asking to
+        // clear the check while also naming a REAL check_kind to replace it
+        // with is the same contradiction the other five flags refuse, just
+        // spelled on the one field whose empty-string convention lives on
+        // `check_kind` rather than on a field of its own.
+        let srv = server();
+        let mut args = base_remember("clear-check-conflict-1");
+        args.text = "the roadmap lives in ROADMAP.md at the repo root".to_string();
+        args.check_kind = Some("path_exists".to_string());
+        args.check_path = Some("ROADMAP.md".to_string());
+        assert!(srv.remember(Parameters(args)).await.starts_with("stored"));
+
+        let reply = srv
+            .revise(Parameters(ReviseArgs {
+                id: "clear-check-conflict-1".to_string(),
+                clear_check: true,
+                check_kind: Some("forbidden".to_string()),
+                ..Default::default()
+            }))
+            .await;
+        assert!(reply.contains("invalid 'check_kind'"), "{reply}");
+        assert!(reply.contains("clear_check"), "the refusal must name the flag: {reply}");
+
+        let get_reply = srv.get(Parameters(GetArgs { id: "clear-check-conflict-1".to_string() })).await;
+        let item: Item = serde_json::from_str(&get_reply).unwrap();
+        assert_eq!(
+            item.check,
+            Some(Check::PathExists { path: "ROADMAP.md".to_string() }),
+            "a refused revise must change nothing"
+        );
+    }
+
+    #[tokio::test]
+    async fn clear_check_together_with_a_check_path_is_refused_and_changes_nothing() {
+        // The flag-spelled twin of `revise_clearing_check_kind_while_also_
+        // giving_check_path_is_refused_and_changes_nothing` above: proves
+        // `clear_check` is folded into `check_kind` BEFORE that same
+        // check_path/check_literal/check_literals conflict branch runs,
+        // rather than a second, separate check that might disagree with it.
+        // Fails if `clear_check` skipped that fold: the reply would start
+        // with "revised" and check_path would silently replace the check
+        // instead of being refused alongside the clear. The reply is checked
+        // against the CONFLICT branch's own wording, not merely "invalid
+        // check" - `check_kind: None, check_path: Some(_)` alone is ALSO
+        // refused, by a different ground with the same "invalid check"
+        // prefix, which would let this test pass for the wrong reason if
+        // `clear_check` silently stopped reaching this branch at all.
+        let srv = server();
+        let mut args = base_remember("clear-check-path-conflict-1");
+        args.text = "the roadmap lives in ROADMAP.md at the repo root".to_string();
+        args.check_kind = Some("path_exists".to_string());
+        args.check_path = Some("ROADMAP.md".to_string());
+        assert!(srv.remember(Parameters(args)).await.starts_with("stored"));
+
+        let reply = srv
+            .revise(Parameters(ReviseArgs {
+                id: "clear-check-path-conflict-1".to_string(),
+                clear_check: true,
+                check_path: Some("OTHER.md".to_string()),
+                ..Default::default()
+            }))
+            .await;
+        assert!(reply.contains("clearing a check takes none of them"), "{reply}");
+
+        let get_reply = srv.get(Parameters(GetArgs { id: "clear-check-path-conflict-1".to_string() })).await;
+        let item: Item = serde_json::from_str(&get_reply).unwrap();
+        assert_eq!(
+            item.check,
+            Some(Check::PathExists { path: "ROADMAP.md".to_string() }),
+            "a refused clear attempt must change nothing"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_plain_revise_with_no_clear_flags_leaves_every_field_unchanged() {
+        // THE PROPERTY THAT MAKES THE SIX FLAGS SAFE TO ADD: a revise that
+        // never mentions any of them must behave EXACTLY as it did before
+        // they existed - every `clear_*` bool defaults to `false`, and
+        // `merge_clear_flag` must be a true no-op on `false`. Fails if any
+        // default flipped to `true`, or if the merge changed a value it was
+        // never asked to touch: the text edit below would still land
+        // (proving the call itself works) but one of severity/project/key/
+        // check would no longer match the fixture's own values.
+        let srv = server_knowing(&["thor2"]);
+        let mut args = base_remember("plain-revise-no-flags-1");
+        args.project = Some("thor2".to_string());
+        args.key = Some("some-key".to_string());
+        args.check_kind = Some("path_exists".to_string());
+        args.check_path = Some("ROADMAP.md".to_string());
+        args.text = "the roadmap lives in ROADMAP.md at the repo root".to_string();
+        assert!(srv.remember(Parameters(args)).await.starts_with("stored"));
+
+        let reply = srv
+            .revise(Parameters(ReviseArgs {
+                id: "plain-revise-no-flags-1".to_string(),
+                text: Some("the roadmap lives in ROADMAP.md, updated every quarter".to_string()),
+                ..Default::default()
+            }))
+            .await;
+        assert!(reply.starts_with("revised"), "{reply}");
+        assert!(!reply.contains("weakened"), "an ordinary edit must not be read as a weakening: {reply}");
+
+        let get_reply = srv.get(Parameters(GetArgs { id: "plain-revise-no-flags-1".to_string() })).await;
+        let item: Item = serde_json::from_str(&get_reply).unwrap();
+        assert_eq!(item.text, "the roadmap lives in ROADMAP.md, updated every quarter");
+        assert_eq!(item.severity, Some(ItemSeverity::Irreversible), "untouched field must be kept");
+        assert_eq!(item.project, Some("thor2".to_string()), "untouched field must be kept");
+        assert_eq!(item.key, Some("some-key".to_string()), "untouched field must be kept");
+        assert_eq!(
+            item.check,
+            Some(Check::PathExists { path: "ROADMAP.md".to_string() }),
+            "untouched field must be kept"
         );
     }
 

@@ -21,6 +21,7 @@
 
 use crate::input::ServeInput;
 use crate::rank::RankedItem;
+use std::path::Path;
 
 /// Re-exported, not redeclared. The write gate has to ask "would this item
 /// ever be shown", which needs this number, and `model` cannot read it from
@@ -103,7 +104,7 @@ pub fn cap(ranked: Vec<RankedItem>) -> Selection {
 /// reason (same one `session_start::render` gives for its own block): a
 /// surface that pushes at a reader stays minimal, a surface a reader asks
 /// carries everything.
-pub fn render_text(selection: &Selection, input: &ServeInput) -> Option<String> {
+pub fn render_text(selection: &Selection, input: &ServeInput, db_path: &Path) -> Option<String> {
     if selection.shown.is_empty() {
         return None;
     }
@@ -127,7 +128,7 @@ pub fn render_text(selection: &Selection, input: &ServeInput) -> Option<String> 
         lines.push(format!(
             "({} more item(s) apply here - run `{}` to see them.)",
             selection.withheld,
-            why_invocation(input)
+            why_invocation(input, db_path)
         ));
     }
     Some(lines.join("\n"))
@@ -168,7 +169,26 @@ pub fn render_text(selection: &Selection, input: &ServeInput) -> Option<String> 
 /// (should not occur: a shown item needed at least one binding to match, and
 /// every binding but `Always` implies a moment or a target), which is never
 /// worse than the defect this replaces.
-fn why_invocation(input: &ServeInput) -> String {
+///
+/// A SECOND DEFECT THIS ALSO CLOSES, reported 2026-09-12. Even a hint that
+/// named the right flag still opened with the bare word `serve` - nothing
+/// this project ships is ever installed onto PATH, on this machine or any
+/// new one (`bin/serve.rs`'s own `sibling` doc comment already makes the
+/// same argument for `doctor`) - so following it verbatim answered "command
+/// not found", and an agent that took that literally reported the command
+/// itself as unavailable instead of the empty-question defect above: that
+/// one asked the wrong question, this one could not be asked at all. Fixed
+/// by naming the ACTUAL running program - `std::env::current_exe` at the
+/// point the hint is built, which is correct no matter which binary ends up
+/// calling this function, because it reads the calling process's own path,
+/// never a hardcoded name - plus the same `--db` this process itself was
+/// opened with (`Cli::db` is a required flag read before the subcommand, so
+/// a bare `why` would not know which store to open either).
+/// `render_self_invocation` does the actual formatting, kept separate and
+/// taking the resolved exe as a plain `Option<&Path>` rather than calling
+/// `current_exe` itself, so the one branch a test cannot force for
+/// real - `current_exe` failing - can still be exercised directly.
+fn why_invocation(input: &ServeInput, db_path: &Path) -> String {
     let mut flags = Vec::new();
     if let Some(file) = &input.file {
         flags.push(format!("--file \"{file}\""));
@@ -180,10 +200,44 @@ fn why_invocation(input: &ServeInput) -> String {
             flags.push(format!("--moment {}", action.as_str()));
         }
     }
-    if flags.is_empty() {
-        "serve why".to_string()
+    let why_suffix = if flags.is_empty() { String::new() } else { format!(" {}", flags.join(" ")) };
+    render_self_invocation(std::env::current_exe().ok().as_deref(), db_path, &why_suffix, cfg!(windows))
+}
+
+/// The formatting half of `why_invocation`, split out so the one branch a
+/// test cannot force for real - `std::env::current_exe` erroring, which its
+/// own docs describe but nothing in this process can trigger on demand - is
+/// still provable: pass `exe: None` directly. `why_invocation` only ever
+/// calls this with `std::env::current_exe().ok()`, so `None` here is exactly
+/// and only that fallback, never a distinct third case to keep in sync.
+///
+/// `windows` is a parameter rather than this function reading `cfg!(windows)`
+/// itself for the identical reason: `cfg!` bakes into whichever platform
+/// compiled the test binary, so a suite built on Windows could otherwise
+/// never prove the non-Windows form was even reachable. `why_invocation`
+/// passes the real `cfg!(windows)` at its own call site, so production
+/// behaviour is unchanged; only the test's ability to ask for either
+/// branch on demand is new.
+///
+/// On Windows a quoted path is a call EXPRESSION to PowerShell, not a
+/// command - typing `"C:\...\serve.exe" why` at a PowerShell prompt fails
+/// with "is not recognized", the exact defect this whole fix exists to
+/// close, just moved one token over - so the Windows form leads with the
+/// `&` call operator PowerShell requires for exactly this shape. Every
+/// other target gets the plain quoted path, which a POSIX shell already
+/// runs as a command with no operator needed.
+fn render_self_invocation(exe: Option<&Path>, db_path: &Path, why_suffix: &str, windows: bool) -> String {
+    let Some(exe) = exe else {
+        // Never worse than the defect this function exists to close: the
+        // exact bare text this hint carried before today's fix.
+        return format!("serve why{why_suffix}");
+    };
+    let exe = exe.display();
+    let db = db_path.display();
+    if windows {
+        format!("& \"{exe}\" --db \"{db}\" why{why_suffix}")
     } else {
-        format!("serve why {}", flags.join(" "))
+        format!("\"{exe}\" --db \"{db}\" why{why_suffix}")
     }
 }
 
@@ -191,6 +245,13 @@ fn why_invocation(input: &ServeInput) -> String {
 mod tests {
     use super::*;
     use model::item::{Binding, Item, Kind, Severity};
+
+    /// A fixed, never-opened path standing in for `Cli::db` in every test
+    /// below - `render_text`/`why_invocation` only ever print it as text, so
+    /// a real store would prove nothing a literal does not already prove.
+    fn test_db() -> &'static Path {
+        Path::new("/tmp/thor-render-tests/store.db")
+    }
 
     fn ranked(id: &str, text_len: usize) -> RankedItem {
         RankedItem {
@@ -235,14 +296,14 @@ mod tests {
     fn a_capped_block_always_states_how_many_it_withheld() {
         let items: Vec<RankedItem> = (0..6).map(|i| ranked(&format!("i{i}"), 10)).collect();
         let sel = cap(items);
-        let text = render_text(&sel, &ServeInput::default()).unwrap();
+        let text = render_text(&sel, &ServeInput::default(), test_db()).unwrap();
         assert!(text.contains("2 more item(s) apply here"), "block: {text}");
     }
 
     #[test]
     fn nothing_shown_renders_no_block() {
         let sel = cap(Vec::new());
-        assert!(render_text(&sel, &ServeInput::default()).is_none());
+        assert!(render_text(&sel, &ServeInput::default(), test_db()).is_none());
     }
 
     #[test]
@@ -265,14 +326,14 @@ mod tests {
             },
         }];
         let sel = cap(items);
-        let text = render_text(&sel, &ServeInput::default()).unwrap();
+        let text = render_text(&sel, &ServeInput::default(), test_db()).unwrap();
         assert!(text.contains(&long), "the full 300-char text must appear unmodified");
     }
 
     #[test]
     fn no_moments_gives_a_generic_header() {
         let sel = cap(vec![ranked("i0", 10)]);
-        let text = render_text(&sel, &ServeInput::default()).unwrap();
+        let text = render_text(&sel, &ServeInput::default(), test_db()).unwrap();
         // The framing line opens every block (see `a_block_always_opens_with_the_framing_line`
         // below); the surface-specific header is the line right after it.
         let second_line = text.lines().nth(1).unwrap_or("");
@@ -283,7 +344,7 @@ mod tests {
     fn moments_are_named_in_the_header() {
         let sel = cap(vec![ranked("i0", 10)]);
         let input = ServeInput { moments: vec![intent::Action::Push], ..Default::default() };
-        let text = render_text(&sel, &input).unwrap();
+        let text = render_text(&sel, &input, test_db()).unwrap();
         let second_line = text.lines().nth(1).unwrap_or("");
         assert_eq!(second_line, "Before you do this - push:", "{text}");
     }
@@ -299,7 +360,7 @@ mod tests {
     #[test]
     fn a_block_always_opens_with_the_framing_line() {
         let sel = cap(vec![ranked("i0", 10)]);
-        let text = render_text(&sel, &ServeInput::default()).unwrap();
+        let text = render_text(&sel, &ServeInput::default(), test_db()).unwrap();
         assert!(
             text.starts_with(FRAMING_LINE),
             "the moment/prompt block must open with the framing line: {text}"
@@ -317,7 +378,7 @@ mod tests {
         let mut item = ranked("i0", 10);
         item.item.falsifier = Some("this stops holding once the store is retired".to_string());
         let sel = cap(vec![item]);
-        let text = render_text(&sel, &ServeInput::default()).unwrap();
+        let text = render_text(&sel, &ServeInput::default(), test_db()).unwrap();
         assert!(!text.contains("falsified by"), "a pushed surface must not carry it: {text}");
         assert!(
             !text.contains("this stops holding once the store is retired"),
@@ -334,8 +395,8 @@ mod tests {
         let without = ranked("i1", 10);
         assert_eq!(without.item.falsifier, None, "fixture sanity");
 
-        let a = render_text(&cap(vec![with]), &ServeInput::default()).unwrap();
-        let b = render_text(&cap(vec![without]), &ServeInput::default()).unwrap();
+        let a = render_text(&cap(vec![with]), &ServeInput::default(), test_db()).unwrap();
+        let b = render_text(&cap(vec![without]), &ServeInput::default(), test_db()).unwrap();
         assert_eq!(a.lines().count(), b.lines().count(), "same shape either way\nA:{a}\nB:{b}");
     }
 
@@ -349,7 +410,7 @@ mod tests {
     #[test]
     fn a_served_item_shows_its_id() {
         let sel = cap(vec![ranked("i0", 10)]);
-        let text = render_text(&sel, &ServeInput::default()).unwrap();
+        let text = render_text(&sel, &ServeInput::default(), test_db()).unwrap();
         assert!(text.contains("i0"), "the block must carry the item's id: {text}");
     }
 
@@ -363,7 +424,7 @@ mod tests {
     #[test]
     fn the_shown_id_is_in_a_form_that_can_be_passed_straight_to_revise() {
         let sel = cap(vec![ranked("thor2:01ARZ3NDEKTSV4RRFFQ69G5FAV", 10)]);
-        let text = render_text(&sel, &ServeInput::default()).unwrap();
+        let text = render_text(&sel, &ServeInput::default(), test_db()).unwrap();
         assert!(
             text.contains("[thor2:01ARZ3NDEKTSV4RRFFQ69G5FAV]"),
             "the id must appear whole, inside brackets, exactly as `revise` expects it: {text}"
@@ -386,7 +447,7 @@ mod tests {
         let sel = cap(items);
         assert_eq!(sel.shown.len(), 4, "a long id must not change how many items the same budget selects");
         assert_eq!(sel.withheld, 0);
-        let text = render_text(&sel, &ServeInput::default()).unwrap();
+        let text = render_text(&sel, &ServeInput::default(), test_db()).unwrap();
         for shown in &sel.shown {
             assert!(
                 text.contains(&shown.item.text),
@@ -419,9 +480,9 @@ mod tests {
     fn a_file_backed_block_hints_the_file_flag_the_parser_accepts() {
         let sel = withheld_selection();
         let input = ServeInput { file: Some("src/main.rs".to_string()), ..Default::default() };
-        let text = render_text(&sel, &input).unwrap();
+        let text = render_text(&sel, &input, test_db()).unwrap();
         assert!(
-            text.contains("run `serve why --file \"src/main.rs\"` to see them"),
+            text.contains("why --file \"src/main.rs\"` to see them"),
             "the hint must carry the exact --file invocation: {text}"
         );
     }
@@ -430,9 +491,9 @@ mod tests {
     fn a_command_backed_block_hints_the_command_flag_the_parser_accepts() {
         let sel = withheld_selection();
         let input = ServeInput { command: Some("git push --force origin main".to_string()), ..Default::default() };
-        let text = render_text(&sel, &input).unwrap();
+        let text = render_text(&sel, &input, test_db()).unwrap();
         assert!(
-            text.contains("run `serve why --command \"git push --force origin main\"` to see them"),
+            text.contains("why --command \"git push --force origin main\"` to see them"),
             "the hint must carry the exact --command invocation: {text}"
         );
     }
@@ -449,7 +510,7 @@ mod tests {
             file: Some("src/main.rs".to_string()),
             ..Default::default()
         };
-        let text = render_text(&sel, &input).unwrap();
+        let text = render_text(&sel, &input, test_db()).unwrap();
         assert!(text.contains("--file \"src/main.rs\""), "{text}");
         assert!(!text.contains("--command"), "a file hint must not also name the command: {text}");
     }
@@ -463,9 +524,9 @@ mod tests {
     fn a_prompt_only_block_hints_the_moment_flag_when_neither_file_nor_command_apply() {
         let sel = withheld_selection();
         let input = ServeInput { moments: vec![intent::Action::Push], ..Default::default() };
-        let text = render_text(&sel, &input).unwrap();
+        let text = render_text(&sel, &input, test_db()).unwrap();
         assert!(
-            text.contains("run `serve why --moment push` to see them"),
+            text.contains("why --moment push` to see them"),
             "the hint must fall back to a real, accepted flag: {text}"
         );
     }
@@ -476,7 +537,107 @@ mod tests {
     #[test]
     fn the_bare_fallback_never_panics_with_nothing_to_name() {
         let sel = withheld_selection();
-        let text = render_text(&sel, &ServeInput::default()).unwrap();
-        assert!(text.contains("run `serve why` to see them"), "{text}");
+        let text = render_text(&sel, &ServeInput::default(), test_db()).unwrap();
+        assert!(text.contains("why` to see them"), "{text}");
+    }
+
+    // ------------------------------------------ the self-invocation path
+    //
+    // THE DEFECT THESE PREVENT, reported 2026-09-12: even a hint that named
+    // the right flag (the block above) still opened with the bare word
+    // `serve`. Nothing this project ships is ever installed onto PATH, on
+    // this machine or a fresh one, so following it verbatim answered
+    // "command not found" - an agent that took that literally reported the
+    // command itself as unavailable, a worse failure than the empty-question
+    // defect the tests above guard: that one could be answered wrong, this
+    // one could not be run at all.
+
+    /// THE CORE PROOF, at the level `why_invocation` itself is wired: the
+    /// real `std::env::current_exe` (this very test binary, since that is
+    /// the process actually running) and the real `db_path` argument both
+    /// reach the final rendered block, not just `render_self_invocation` in
+    /// isolation below.
+    #[test]
+    fn the_rendered_hint_names_the_real_running_binary_and_the_real_db_path() {
+        let sel = withheld_selection();
+        let db = test_db();
+        let text = render_text(&sel, &ServeInput::default(), db).unwrap();
+        let exe = std::env::current_exe().expect("this process must have a real exe path while running");
+        assert!(
+            text.contains(&exe.display().to_string()),
+            "the hint must name the real running binary's own absolute path, never the bare word 'serve': {text}"
+        );
+        assert!(
+            text.contains(&format!("--db \"{}\"", db.display())),
+            "the hint must carry the exact --db this process itself was opened with: {text}"
+        );
+    }
+
+    /// Proves the real wiring on THIS host: `why_invocation` passes the
+    /// real `cfg!(windows)` (not a caller-chosen value) into
+    /// `render_self_invocation`, so on a Windows build the rendered hint
+    /// actually takes the `&`-prefixed form - not merely that the pure
+    /// formatter can produce it when asked (see the two tests below).
+    #[cfg(windows)]
+    #[test]
+    fn on_windows_the_real_hint_leads_with_the_ampersand_call_operator() {
+        let sel = withheld_selection();
+        let text = render_text(&sel, &ServeInput::default(), test_db()).unwrap();
+        let exe = std::env::current_exe().unwrap();
+        assert!(
+            text.contains(&format!("& \"{}\"", exe.display())),
+            "a quoted path is a call EXPRESSION to PowerShell, not a command, without the leading '&': {text}"
+        );
+    }
+
+    /// `render_self_invocation`'s own two platform forms, proven directly
+    /// with fixed inputs rather than through `cfg!(windows)` (which bakes
+    /// into whichever platform compiled this test binary and so could never
+    /// let a Windows-built suite prove the non-Windows form was reachable at
+    /// all) - see the function's own doc comment for why `windows` is a
+    /// parameter rather than read from `cfg!` internally.
+    #[test]
+    fn the_windows_form_leads_with_the_call_operator_and_quotes_both_paths() {
+        let text = render_self_invocation(
+            Some(Path::new("C:\\thor2\\bin\\serve.exe")),
+            Path::new("C:\\thor2\\store.db"),
+            " --file \"src/main.rs\"",
+            true,
+        );
+        assert_eq!(
+            text,
+            "& \"C:\\thor2\\bin\\serve.exe\" --db \"C:\\thor2\\store.db\" why --file \"src/main.rs\"",
+            "PowerShell needs the '&' call operator before a quoted path"
+        );
+    }
+
+    /// The non-Windows counterpart: no call operator, since a POSIX shell
+    /// already runs a quoted path as a command.
+    #[test]
+    fn the_non_windows_form_has_no_call_operator() {
+        let text = render_self_invocation(
+            Some(Path::new("/opt/thor2/bin/serve")),
+            Path::new("/opt/thor2/store.db"),
+            "",
+            false,
+        );
+        assert_eq!(text, "\"/opt/thor2/bin/serve\" --db \"/opt/thor2/store.db\" why");
+    }
+
+    /// THE DEFECT THIS PREVENTS: `std::env::current_exe` failing (its own
+    /// docs describe this as possible, e.g. the running binary was since
+    /// deleted or replaced) crashing the hint, or the hint silently
+    /// disappearing, instead of degrading to the one thing that is always
+    /// true - the bare command name. Exercised directly via
+    /// `render_self_invocation(None, ..)` because a real failure cannot be
+    /// forced from inside a running test. Never worse than the defect this
+    /// whole fix exists to close: exactly the text every hint carried before
+    /// today, on either platform - the fallback does not vary by `windows`.
+    #[test]
+    fn a_current_exe_that_cannot_be_resolved_falls_back_to_the_bare_name() {
+        let with_flag = render_self_invocation(None, test_db(), " --file \"src/main.rs\"", true);
+        assert_eq!(with_flag, "serve why --file \"src/main.rs\"");
+        let bare = render_self_invocation(None, test_db(), "", false);
+        assert_eq!(bare, "serve why");
     }
 }

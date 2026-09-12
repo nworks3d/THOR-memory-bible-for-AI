@@ -26,7 +26,7 @@
     "owner_reading_only": true,
     "any_of": [],
     "none_of": ["\n> ", "```"],
-    "list_request_any_of": ["lijst", "overzicht", "rapport", "list", "overview", "report", "all the"],
+    "list_request_any_of": ["lijst", "overzicht", "rapport", "list", "overview", "report", "all the", "eval", "evaluatie"],
     "min_chars": 1000,
     "reminder": "This answer is over 1000 characters. Keep it short and in plain language, not just the summary - no ids, no filenames, no test counts, no code names unless asked. Say what happened and what it means, then stop. Quoted material the user asked to see does not count - a reply built around a blockquote is exempt. A list or overview the user explicitly asked for is exempt too, when the reply actually is one, not merely because the prompt asked for one."
   },

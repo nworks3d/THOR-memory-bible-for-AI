@@ -689,6 +689,35 @@ pub fn unjudged_line(db: &Path) -> String {
     )
 }
 
+/// One binding, rendered as short plain text for a report line - never the
+/// enum's own `{:?}` spelling, which would leak Rust syntax into a line meant
+/// for a person: the raw value for a path, a command, or any other `Target`
+/// kind, `moment <name>` for a `Moment`, and `Always` for the pinned layer.
+/// Same three-way shape `bin/anchorprobe.rs`'s own `list_armed` already
+/// renders a binding as (that binary is untouched by this change; the shape
+/// is worth keeping identical for a reader who has seen either report, not
+/// worth sharing code over one match expression).
+fn binding_short(binding: &model::item::Binding) -> String {
+    match binding {
+        model::item::Binding::Always => "Always".to_string(),
+        model::item::Binding::Moment(action) => format!("moment {}", action.as_str()),
+        model::item::Binding::Target { value, .. } => value.clone(),
+    }
+}
+
+/// Every binding an item carries, short and joined - WHERE a named
+/// judgement-debt item fires, so the owner can judge "did it belong where it
+/// fired" without opening the store. `+`-joined, the same joiner
+/// `anchorprobe`'s `list_armed` already uses for the identical list; "unbound"
+/// is defensive only - `rank::eligible` never selects a bindingless item, so
+/// `served_since_last_verdict` should never hand `judgement_debt_named` one.
+fn bindings_short(bindings: &[model::item::Binding]) -> String {
+    if bindings.is_empty() {
+        return "unbound".to_string();
+    }
+    bindings.iter().map(binding_short).collect::<Vec<_>>().join(" + ")
+}
+
 /// Component: the judgement debt's own two-number backlog - store-wide, and
 /// how much of it belongs to the checkout this run stands in - built on the
 /// exact same fold the Stop hook's own `judgement_debt` acts on
@@ -712,17 +741,30 @@ pub fn unjudged_line(db: &Path) -> String {
 /// checkout specifically - without re-introducing the nagging the session
 /// floor exists to stop.
 ///
+/// NAMED, not just counted, since 2026-09-12 - `doctor` counted this backlog
+/// from the day above, but never listed it, so the owner's end-of-session
+/// evaluation had a number and nothing to walk: neither `audit` nor the MCP
+/// tools can turn "35 owed" into which 35, the same gap `Rot` above was built
+/// to close for decay. `serve::usefulness::judgement_debt_named` names every
+/// item that applies to this checkout, sorted by count descending; this line
+/// prints them exactly the way `decay_line`'s "dead anchor"/"false proof" and
+/// `crowding_line`'s "outranked" lists already do - `NAMES_AT_MOST` by
+/// default, all of them with `--full` (`name_cap`, shared, not a second cap).
+/// An item owed only to another project is never named here at all (see
+/// `judgement_debt_named`'s own doc comment); that is why the named lines
+/// always total exactly `in_project`, never `total`.
+///
 /// SILENT AT ZERO, the same convention as `ship_line` above: a clean backlog
 /// is not a finding, and a permanent "0 owed" line on every quiet run would
 /// be exactly the noise that trains a reader to stop reading this report.
-pub fn judgement_debt_line(db: &Path, checkout_project: Option<&str>) -> Option<String> {
+pub fn judgement_debt_line(db: &Path, checkout_project: Option<&str>, full: bool) -> Option<String> {
     let store = EventStore::open_existing(db).ok()?;
     let (total, in_project) = serve::usefulness::judgement_debt_counts(&store, checkout_project);
     if total == 0 {
         return None;
     }
     let threshold = serve::usefulness::JUDGEMENT_DEBT_AFTER;
-    Some(match checkout_project {
+    let mut out = vec![match checkout_project {
         Some(project) => format!(
             "judgement debt: {total} item(s) store-wide are owed a verdict (fired {threshold}+ times since \
              the last one, or never judged at all) - {in_project} of them apply to this checkout ('{project}', \
@@ -734,7 +776,22 @@ pub fn judgement_debt_line(db: &Path, checkout_project: Option<&str>) -> Option<
              {in_project} global one(s) among them would ever be asked about here; `mark` each once it is \
              next served to settle it"
         ),
-    })
+    }];
+    let named = serve::usefulness::judgement_debt_named(&store, checkout_project);
+    let cap = name_cap(full);
+    for item in named.iter().take(cap) {
+        out.push(format!(
+            "  judgement debt: {} ({}x, {:?}) at {}",
+            item.id,
+            item.count,
+            item.kind,
+            bindings_short(&item.bindings)
+        ));
+    }
+    if named.len() > cap {
+        out.push(format!("  judgement debt: and {} more, not named here", named.len() - cap));
+    }
+    Some(out.join("\n"))
 }
 
 fn short(hash: &str) -> &str {
@@ -1458,8 +1515,9 @@ pub fn report(
     ]);
     // Silent unless something is actually owed - see `judgement_debt_line`'s
     // own doc comment for why this exists alongside `unjudged_line` above
-    // rather than in place of it.
-    lines.extend(judgement_debt_line(db, checkout_project));
+    // rather than in place of it. `full` also lifts its named-items cap, the
+    // same flag `decay_line`/`crowding_line` already take it from.
+    lines.extend(judgement_debt_line(db, checkout_project, full));
     // Silent unless two live checks on the same file actually disagree right
     // now - see `contradiction_line`'s own doc comment for how this differs
     // from GROUND 29 (`model::gate::opposing_literals`), which refuses a
@@ -1734,39 +1792,54 @@ mod tests {
     // session (`oordeelschuld-komt-binnen-de-sessie-terug`, 2026-09-08).
 
     /// Silent at zero, the same convention `ship_line` already uses above: a
-    /// clean backlog is not a finding.
+    /// clean backlog is not a finding - `--full` must not change that.
     #[test]
     fn judgement_debt_line_is_silent_when_nothing_is_owed() {
         let dir = tempfile::tempdir().unwrap();
         let db = dir.path().join("t.db");
         EventStore::new(&db).unwrap();
-        assert_eq!(judgement_debt_line(&db, None), None);
-        assert_eq!(judgement_debt_line(&db, Some("thor")), None);
+        assert_eq!(judgement_debt_line(&db, None, false), None);
+        assert_eq!(judgement_debt_line(&db, Some("thor"), false), None);
+        assert_eq!(judgement_debt_line(&db, Some("thor"), true), None);
     }
 
     /// Once something is owed, the line names both the store-wide count and
     /// this checkout's own share of it - built on the exact same fold the
-    /// Stop hook acts on, so it can never disagree with what it reports on.
+    /// Stop hook acts on, so it can never disagree with what it reports on -
+    /// and, since 2026-09-12, NAMES the item itself: id, how many times it
+    /// fired, its kind, and WHERE it fires, so an evaluation has a place to
+    /// judge "did it belong there" against rather than only a number.
     #[test]
     fn judgement_debt_line_names_both_numbers_once_something_is_owed() {
         let dir = tempfile::tempdir().unwrap();
         let db = dir.path().join("t.db");
         {
             let mut store = EventStore::new(&db).unwrap();
-            store::declare(&mut store, "s", "l", "a", &rule("owed-global")).unwrap();
+            let mut item = rule("owed-global");
+            item.bindings = vec![Binding::Target { kind: TargetKind::Path, value: "src/lib.rs".to_string() }];
+            // A source-file anchor needs a project, same reason
+            // `a_retracted_item_is_no_longer_counted_as_owing_a_judgement`
+            // above already gives: a global one would fire in every
+            // repository that happens to have a file by that name.
+            item.project = Some("thor".to_string());
+            store::declare(&mut store, "s", "l", "a", &item).unwrap();
             for _ in 0..serve::usefulness::JUDGEMENT_DEBT_AFTER {
                 serve::deliver::record_delivery(&mut store, "s", "l", "t", "2026-09-08T00:00:00Z", &["owed-global".to_string()]);
             }
         }
-        let line = judgement_debt_line(&db, Some("thor")).expect("something is owed, the line must speak");
+        let line = judgement_debt_line(&db, Some("thor"), false).expect("something is owed, the line must speak");
         assert!(line.starts_with("judgement debt: "), "{line}");
         assert!(line.contains("1 item"), "{line}");
         assert!(line.contains("thor"), "must name this checkout's own project: {line}");
+        assert!(
+            line.contains(&format!("  judgement debt: owed-global ({}x, Rule) at src/lib.rs", serve::usefulness::JUDGEMENT_DEBT_AFTER)),
+            "must name the item, its count, its kind and where it fires: {line}"
+        );
     }
 
     /// A checkout that resolves to no project at all still gets an honest
     /// answer - the global share of the backlog, said plainly rather than
-    /// silently dropped.
+    /// silently dropped - and still gets the item itself named.
     #[test]
     fn judgement_debt_line_still_speaks_for_a_checkout_with_no_project() {
         let dir = tempfile::tempdir().unwrap();
@@ -1778,9 +1851,76 @@ mod tests {
                 serve::deliver::record_delivery(&mut store, "s", "l", "t", "2026-09-08T00:00:00Z", &["owed-global-2".to_string()]);
             }
         }
-        let line = judgement_debt_line(&db, None).expect("a global item is still owed with no project resolved");
+        let line = judgement_debt_line(&db, None, false).expect("a global item is still owed with no project resolved");
         assert!(line.contains("resolves to no project"), "{line}");
         assert!(line.contains("1 global"), "{line}");
+        assert!(line.contains("  judgement debt: owed-global-2 ("), "must name the global item too: {line}");
+    }
+
+    /// THE TWENTY-ITEM CAP, the same `NAMES_AT_MOST`/`name_cap` mechanism
+    /// `decay_line`'s "dead anchor"/"false proof" lists and `crowding_line`'s
+    /// "outranked" list already use: past twenty, the rest are held back and
+    /// counted in a tail line rather than printed - `--full` (tested next)
+    /// is the only way to see them all.
+    #[test]
+    fn judgement_debt_line_caps_named_items_at_twenty_with_a_tail() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("t.db");
+        {
+            let mut store = EventStore::new(&db).unwrap();
+            for n in 0..25 {
+                let id = format!("owed-{n:02}");
+                // Distinct text per item - `rule`'s own fixture text is
+                // identical for every id, and 25 near-identical rules trip
+                // the write gate's own near-duplicate check (Jaccard word
+                // overlap >= 0.8, see `model::store::NEAR_DUPLICATE_JACCARD_
+                // THRESHOLD`); this fixture's own words are common on
+                // purpose except the one that carries `n`, which keeps every
+                // pair's overlap well under that bar.
+                let mut item = rule(&id);
+                item.text = format!("fixture debt case {n:02}");
+                store::declare(&mut store, "s", "l", "a", &item).unwrap();
+                for _ in 0..serve::usefulness::JUDGEMENT_DEBT_AFTER {
+                    serve::deliver::record_delivery(&mut store, "s", "l", "t", "2026-09-08T00:00:00Z", &[id.clone()]);
+                }
+            }
+        }
+        let line = judgement_debt_line(&db, Some("thor"), false).expect("25 items are owed, the line must speak");
+        assert!(line.contains("25 item"), "{line}");
+        let named_lines = line.lines().filter(|l| l.starts_with("  judgement debt: owed-")).count();
+        assert_eq!(named_lines, NAMES_AT_MOST, "must name at most twenty: {line}");
+        assert!(line.contains("  judgement debt: and 5 more, not named here"), "{line}");
+    }
+
+    /// `--full` LIFTS THE CAP: the same 25-item store as above, but every one
+    /// of them named and no tail line at all.
+    #[test]
+    fn judgement_debt_line_names_all_items_with_full() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("t.db");
+        {
+            let mut store = EventStore::new(&db).unwrap();
+            for n in 0..25 {
+                let id = format!("owed-{n:02}");
+                // Distinct text per item - `rule`'s own fixture text is
+                // identical for every id, and 25 near-identical rules trip
+                // the write gate's own near-duplicate check (Jaccard word
+                // overlap >= 0.8, see `model::store::NEAR_DUPLICATE_JACCARD_
+                // THRESHOLD`); this fixture's own words are common on
+                // purpose except the one that carries `n`, which keeps every
+                // pair's overlap well under that bar.
+                let mut item = rule(&id);
+                item.text = format!("fixture debt case {n:02}");
+                store::declare(&mut store, "s", "l", "a", &item).unwrap();
+                for _ in 0..serve::usefulness::JUDGEMENT_DEBT_AFTER {
+                    serve::deliver::record_delivery(&mut store, "s", "l", "t", "2026-09-08T00:00:00Z", &[id.clone()]);
+                }
+            }
+        }
+        let line = judgement_debt_line(&db, Some("thor"), true).expect("25 items are owed, the line must speak");
+        let named_lines = line.lines().filter(|l| l.starts_with("  judgement debt: owed-")).count();
+        assert_eq!(named_lines, 25, "--full must name every one of them: {line}");
+        assert!(!line.contains("not named here"), "--full must leave no tail: {line}");
     }
 
     // ----------------------------------------------------- contradiction_line

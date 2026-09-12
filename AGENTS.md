@@ -41,6 +41,11 @@ It also points git at a shared set of hooks that run in every repository on
 this machine, not only this one - each one still finishes by running that
 repository's own hook, so nothing already there stops working.
 
+It also writes an end-of-session routine, `/thor-eval`, to your own commands
+folder. Run it at the end of a session: it walks through everything the
+memory has been served without a verdict and settles that debt in one pass,
+rather than leaving it for the next session to inherit.
+
 Nothing to type in the normal case. For an unusual setup: `--settings` and
 `--mcp-json` point it at other files, `--db` and `--serve-exe` override the
 rest, and `--no-mcp` installs a memory the agent can read but not write, on
@@ -238,7 +243,9 @@ the same way a full set of preferences would.
 - **That the memory is theirs to correct.** A changed fact is corrected with
   `revise`, never stored a second time - though taking teeth away from a rule
   that can already block a mistake (its check, its severity, a binding, its
-  reach) needs a reason too, the same as removing one. A fact that is simply
+  reach) needs a reason too, the same as removing one. Clearing one of those
+  fields outright uses its own `clear_*` flag on `revise` (`clear_check`,
+  `clear_severity`, and so on), not an empty value. A fact that is simply
   wrong is removed with `retract` and a reason. A true fact that fired in the
   wrong place is marked as noise with `mark`, instead of being deleted.
 

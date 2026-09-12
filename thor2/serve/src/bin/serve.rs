@@ -1079,7 +1079,7 @@ fn hook_once(db_path: &Path) -> Option<HookOutput> {
             let decay = DecayContext::load(&store);
             let all = serve::decay::retain_live(serve::rank::select(&candidates, &input), &decay);
             let selection = render::cap(all);
-            let block = render::render_text(&selection, &input)?;
+            let block = render::render_text(&selection, &input, db_path)?;
             let ids: Vec<String> = selection.shown.iter().map(|r| r.id.clone()).collect();
             deliver::record_delivery(&mut store, &session_id, &session_id, "hook", &time::now_iso8601(), &ids);
             Some(HookOutput::Context { event_name, block })
@@ -1228,7 +1228,7 @@ fn hook_once(db_path: &Path) -> Option<HookOutput> {
                 return sink_warning.map(|block| HookOutput::Context { event_name, block });
             }
             let served = serve::serve(&store, &input);
-            let rendered = render::render_text(&served.selection, &input);
+            let rendered = render::render_text(&served.selection, &input, db_path);
             let block = match (sink_warning, rendered) {
                 (Some(warning), Some(rendered)) => Some(format!("{warning}\n\n{rendered}")),
                 (Some(warning), None) => Some(warning),
@@ -4111,7 +4111,7 @@ fn cmd_check(db_path: &Path, input: &ServeInput) {
     }
     let store = open_store_or_die(db_path);
     let served = serve::serve(&store, input);
-    match render::render_text(&served.selection, input) {
+    match render::render_text(&served.selection, input, db_path) {
         Some(block) => println!("\n{block}"),
         None => println!("\n(no item governs this)"),
     }
@@ -4187,7 +4187,7 @@ fn cmd_prompt(db_path: &Path, text: &str) {
     let decay = DecayContext::load(&store);
     let all = serve::decay::retain_live(serve::rank::select(&candidates, &input), &decay);
     let selection = render::cap(all);
-    match render::render_text(&selection, &input) {
+    match render::render_text(&selection, &input, db_path) {
         Some(block) => println!("{block}"),
         None => println!("(no item governs this)"),
     }

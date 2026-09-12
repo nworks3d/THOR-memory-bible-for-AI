@@ -20,9 +20,10 @@ use clap::Parser;
 use std::path::Path;
 use ops::githooks;
 use ops::install::{
-    default_data_dir, default_settings_path, default_user_mcp_path, ensure_store, install_hooks,
-    install_tool_server, seed_response_rulebook, seed_working_contract, standard_hooks, write_project_marker,
-    HookOutcome, MarkerOutcome, RulebookOutcome, ServerOutcome, StoreOutcome,
+    default_data_dir, default_eval_command_path, default_settings_path, default_user_mcp_path, ensure_store,
+    install_hooks, install_tool_server, seed_eval_command, seed_response_rulebook, seed_working_contract,
+    standard_hooks, write_project_marker, EvalCommandOutcome, HookOutcome, MarkerOutcome, RulebookOutcome,
+    ServerOutcome, StoreOutcome,
 };
 use std::path::PathBuf;
 use std::process::ExitCode;
@@ -252,6 +253,31 @@ fn main() -> ExitCode {
             }
         },
         Err(e) => println!("  ! could not write the response-guard rulebook: {e}"),
+    }
+
+    // 1c. The end-of-session evaluation command. THOR holds a turn open for a
+    // verdict on one served note at a time; this is how that debt gets
+    // settled in bulk. Written regardless of --no-mcp (see
+    // seed_eval_command's own doc comment for why), and never overwrites a
+    // copy that is already there - the owner's own edited version, or one an
+    // earlier install already wrote.
+    match default_eval_command_path() {
+        Some(path) => {
+            let bin_dir = serve_exe.parent().map(|p| p.to_path_buf()).unwrap_or_else(|| PathBuf::from("."));
+            match seed_eval_command(&path, &bin_dir, &db) {
+                Ok(report) => match report.outcome {
+                    EvalCommandOutcome::Written => println!(
+                        "+ wrote the evaluation routine to {} - run /thor-eval at the end of a session",
+                        report.path.display()
+                    ),
+                    EvalCommandOutcome::AlreadyThere => {
+                        println!("= eval command already at {}", report.path.display())
+                    }
+                },
+                Err(e) => println!("  ! could not write the evaluation routine: {e}"),
+            }
+        }
+        None => println!("  ! could not find your home directory to place the evaluation routine"),
     }
 
     // 2. The hooks: what lets the memory speak at all.

@@ -209,6 +209,14 @@ guards nothing. That is why the health check reports two different numbers - how
 many notes could refuse something, and how many ever actually did. Trust the
 second one.
 
+Asking about one note at a time is a brake, not a broom: it keeps the pile
+from growing while you work, not a way to clear it in one sitting. For that,
+run `/thor-eval` at the end of a session. It walks through everything the
+memory has been served without a verdict, repairs what has quietly drifted
+out of date, and settles the debt in one pass instead of one note a day. A
+session that never runs it simply leaves that debt for the next one to
+inherit.
+
 ## A memory with a spine
 
 Version 1 remembered well and never argued. It would hand your assistant a note

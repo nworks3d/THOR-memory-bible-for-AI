@@ -19,7 +19,15 @@ use model::item::{Binding, Item, Kind, Severity, TargetKind};
 use model::store;
 use serve::input::ServeInput;
 use serve::{live, prompt, rank, render, session_start};
+use std::path::Path;
 use thor_core::event_store::EventStore;
+
+/// A fixed, never-opened path standing in for `Cli::db` - `render_text` only
+/// ever prints it as text, and every call site here uses the same literal,
+/// so it cannot itself explain a difference between two captures.
+fn test_db() -> &'static Path {
+    Path::new("/tmp/thor-injection-surfaces-tests/store.db")
+}
 
 fn rule_always(id: &str) -> Item {
     Item {
@@ -92,13 +100,13 @@ fn capture(db: &EventStore) -> (String, String, String) {
     moment_input.add_moment(Action::Push);
     let moment_all = rank::select(&candidates, &moment_input);
     let moment_selection = render::cap(moment_all);
-    let moment_block = render::render_text(&moment_selection, &moment_input).unwrap_or_default();
+    let moment_block = render::render_text(&moment_selection, &moment_input, test_db()).unwrap_or_default();
 
     let prompt_text = "please run git push --force origin main right now";
     let prompt_input = prompt::resolve(prompt_text, &candidates);
     let prompt_all = rank::select(&candidates, &prompt_input);
     let prompt_selection = render::cap(prompt_all);
-    let prompt_block = render::render_text(&prompt_selection, &prompt_input).unwrap_or_default();
+    let prompt_block = render::render_text(&prompt_selection, &prompt_input, test_db()).unwrap_or_default();
 
     (start_block, moment_block, prompt_block)
 }
@@ -213,7 +221,7 @@ fn a_prompt_that_resolves_to_nothing_gets_an_empty_block() {
 
     let all = rank::select(&candidates, &input);
     let selection = render::cap(all);
-    let block = render::render_text(&selection, &input);
+    let block = render::render_text(&selection, &input, test_db());
     assert!(block.is_none(), "an ordinary prompt must render to nothing, never a ranked fallback");
     assert_eq!(block.map(|s| s.len()).unwrap_or(0), 0, "zero bytes, not almost zero");
 }

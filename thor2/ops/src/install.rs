@@ -173,6 +173,101 @@ pub fn seed_response_rulebook(db: &Path) -> anyhow::Result<RulebookReport> {
     Ok(RulebookReport { outcome: RulebookOutcome::Written, path })
 }
 
+/// What happened to the end-of-session evaluation command on this run.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EvalCommandOutcome {
+    Written,
+    AlreadyThere,
+}
+
+#[derive(Debug, Clone)]
+pub struct EvalCommandReport {
+    pub outcome: EvalCommandOutcome,
+    pub path: PathBuf,
+}
+
+/// The generic end-of-session evaluation routine this installer ships, its
+/// one placeholder still in it: baked in at compile time so a copied-out
+/// binary carries it too, the same way `RESPONSE_RULEBOOK_TEMPLATE` does.
+const EVAL_COMMAND_TEMPLATE: &str = include_str!("../../eval-command.example.md");
+
+/// The command line the eval routine's own report tells a reader to run for
+/// THOR's own health check: `doctor` is a separate program, not on the PATH,
+/// so it is always invoked by its full path next to the other binaries.
+///
+/// Windows gets PowerShell's own call-operator form, because a quoted path
+/// alone is a call EXPRESSION there, not a command - the identical defect
+/// `serve::render::render_self_invocation` exists to fix for `why`, and the
+/// identical fix. Every other platform gets a plain quoted path, which a
+/// POSIX shell already runs as a command with no operator needed, and no
+/// `.exe` suffix, which is a Windows-only convention.
+///
+/// `windows` is a parameter rather than this function reading `cfg!(windows)`
+/// itself, for the same reason `render_self_invocation` takes it as one:
+/// `cfg!` bakes into whichever platform compiled the test binary, so a suite
+/// built on one platform could otherwise never prove the other form was even
+/// reachable. `render_eval_command` passes the real `cfg!(windows)` at its
+/// own call site, so production behaviour is unchanged; only the test's
+/// ability to ask for either branch on demand is new.
+pub fn doctor_invocation(bin_dir: &Path, db: &Path, windows: bool) -> String {
+    if windows {
+        format!("& \"{}\\doctor.exe\" --db \"{}\"", bin_dir.display(), db.display())
+    } else {
+        format!("\"{}/doctor\" --db \"{}\"", bin_dir.display(), db.display())
+    }
+}
+
+/// Fill in the template's one placeholder, `{{THOR_DOCTOR}}`, with the
+/// doctor invocation this install run has already resolved for the current
+/// platform (see `doctor_invocation`).
+fn render_eval_command(bin_dir: &Path, db: &Path) -> String {
+    EVAL_COMMAND_TEMPLATE.replace("{{THOR_DOCTOR}}", &doctor_invocation(bin_dir, db, cfg!(windows)))
+}
+
+/// Claude Code's per-user commands folder: `~/.claude/commands`. Same base
+/// directory as `default_settings_path` - one documented per-user location,
+/// not a guess, so a file placed here is exactly where typing `/thor-eval`
+/// looks.
+pub fn default_eval_command_path() -> Option<PathBuf> {
+    home_dir().map(|h| h.join(".claude").join("commands").join("thor-eval.md"))
+}
+
+/// Write THOR's end-of-session evaluation routine to `path`, with its two
+/// placeholders filled in from `bin_dir` and `db`.
+///
+/// THE GAP THIS CLOSES. THOR holds a turn open for a verdict on one served
+/// note at a time (see the working-contract notes on judgement, and the
+/// `Stop` hook this whole install wires up), but that debt still needs a way
+/// to be settled in bulk, deliberately, at the end of a session - not one
+/// item at a time forever. That routine used to exist only as the
+/// maintainer's own private slash command: written for one person, in one
+/// language, naming one machine's paths. A fresh install had no copy of it
+/// and no way to write one, so every debt THOR ever accrues for a new user
+/// had nowhere generic to be settled. This ships the same method, generic,
+/// with this run's own paths filled in.
+///
+/// Written even with `--no-mcp`. A read-only memory cannot itself act on
+/// anything the routine would ask it to judge, so there is nothing yet for
+/// it to settle - but the file still belongs on disk from the first run, so
+/// it is already there the day writes are turned on, instead of a second
+/// install being needed just to fetch it.
+///
+/// An existing file - the owner's own edited copy, or one an earlier install
+/// already wrote - is never opened, merged or overwritten: the same "only
+/// ever write into an absence" stance as `seed_response_rulebook`.
+pub fn seed_eval_command(path: &Path, bin_dir: &Path, db: &Path) -> anyhow::Result<EvalCommandReport> {
+    if path.exists() {
+        return Ok(EvalCommandReport { outcome: EvalCommandOutcome::AlreadyThere, path: path.to_path_buf() });
+    }
+    if let Some(parent) = path.parent() {
+        if !parent.as_os_str().is_empty() {
+            fs::create_dir_all(parent)?;
+        }
+    }
+    fs::write(path, render_eval_command(bin_dir, db))?;
+    Ok(EvalCommandReport { outcome: EvalCommandOutcome::Written, path: path.to_path_buf() })
+}
+
 /// One hook this installer knows how to place: which event fires it, an
 /// optional matcher (Claude Code's PreToolUse groups carry one; SessionStart
 /// and UserPromptSubmit do not), and the exact command line to run.
@@ -1494,6 +1589,96 @@ mod tests {
             fs::read_to_string(&path).unwrap(),
             owners_own,
             "an existing rulebook must never be overwritten, seeded or not"
+        );
+    }
+
+    /// `doctor_invocation`'s own two platform forms, proven directly with
+    /// fixed inputs rather than through `cfg!(windows)` (which bakes into
+    /// whichever platform compiled this test binary and so could never let a
+    /// single suite prove the other form was even reachable) - see the
+    /// function's own doc comment for why `windows` is a parameter rather
+    /// than read from `cfg!` internally. Mirrors `serve::render`'s own
+    /// `the_windows_form_leads_with_the_call_operator_and_quotes_both_paths`,
+    /// the same pattern for the same reason.
+    #[test]
+    fn doctor_invocation_windows_form_uses_the_call_operator_backslash_and_exe_suffix() {
+        assert_eq!(
+            doctor_invocation(Path::new("C:\\thor2\\bin"), Path::new("C:\\thor2\\thor.db"), true),
+            "& \"C:\\thor2\\bin\\doctor.exe\" --db \"C:\\thor2\\thor.db\""
+        );
+    }
+
+    #[test]
+    fn doctor_invocation_non_windows_form_uses_a_forward_slash_and_no_suffix() {
+        assert_eq!(
+            doctor_invocation(Path::new("/home/user/thor2/bin"), Path::new("/home/user/thor2/thor.db"), false),
+            "\"/home/user/thor2/bin/doctor\" --db \"/home/user/thor2/thor.db\""
+        );
+    }
+
+    /// Proves the real wiring on THIS host: `render_eval_command` passes the
+    /// real `cfg!(windows)` (not a caller-chosen value) into
+    /// `doctor_invocation`, so a Windows build's own rendered eval command
+    /// actually carries the `&`-prefixed, `.exe`-suffixed PowerShell form -
+    /// not merely that the pure formatter can produce it when asked (see the
+    /// two form tests above). Mirrors `serve::render`'s own
+    /// `on_windows_the_real_hint_leads_with_the_ampersand_call_operator`.
+    #[cfg(windows)]
+    #[test]
+    fn on_windows_the_real_doctor_line_leads_with_the_call_operator_and_exe_suffix() {
+        let rendered = render_eval_command(Path::new("C:\\thor2\\bin"), Path::new("C:\\thor2\\thor.db"));
+        let line = rendered
+            .lines()
+            .find(|l| l.contains("doctor"))
+            .expect("the rendered eval command must carry a line naming doctor");
+        let trimmed = line.trim();
+        assert!(trimmed.starts_with("& \""), "the windows doctor line must start with the call operator: {trimmed}");
+        assert!(
+            trimmed.ends_with(".exe\" --db \"C:\\thor2\\thor.db\""),
+            "the windows doctor line must end with the exe suffix and --db: {trimmed}"
+        );
+    }
+
+    /// THE GAP THIS GUARDS AGAINST: a template shipped with `{{THOR_DOCTOR}}`
+    /// still sitting in it is worse than no file at all - it reads as
+    /// finished and silently tells a new user to run a command that can
+    /// never resolve. The placeholder must be gone, replaced by the real
+    /// doctor invocation this run resolved, which itself names both the bin
+    /// directory and the store path.
+    #[test]
+    fn seed_eval_command_writes_with_the_doctor_placeholder_substituted() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("commands").join("thor-eval.md");
+        let bin_dir = Path::new("C:\\fake\\thor2\\bin");
+        let db = Path::new("C:\\fake\\thor2\\thor.db");
+
+        let report = seed_eval_command(&path, bin_dir, db).unwrap();
+        assert_eq!(report.outcome, EvalCommandOutcome::Written);
+        assert_eq!(report.path, path);
+        let written = fs::read_to_string(&path).unwrap();
+        assert!(written.contains("C:\\fake\\thor2\\bin"), "the programs folder must be substituted in: {written}");
+        assert!(written.contains("C:\\fake\\thor2\\thor.db"), "the store path must be substituted in: {written}");
+        assert!(!written.contains("{{"), "no placeholder may survive substitution: {written}");
+    }
+
+    /// The defect this guards against: an installer that "refreshes" the
+    /// eval command on every run would silently overwrite an owner's own
+    /// edited copy the next time a binary gets rebuilt - the same failure
+    /// `seed_response_rulebook_leaves_an_existing_file_untouched` guards
+    /// against for the rulebook.
+    #[test]
+    fn seed_eval_command_leaves_an_edited_copy_untouched() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("thor-eval.md");
+        let owners_own = "the owner's own edited routine\n";
+        fs::write(&path, owners_own).unwrap();
+
+        let report = seed_eval_command(&path, Path::new("bin"), Path::new("thor.db")).unwrap();
+        assert_eq!(report.outcome, EvalCommandOutcome::AlreadyThere);
+        assert_eq!(
+            fs::read_to_string(&path).unwrap(),
+            owners_own,
+            "an edited copy must never be overwritten, seeded or not"
         );
     }
 

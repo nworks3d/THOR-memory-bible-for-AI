@@ -138,6 +138,15 @@ backed up first. `--settings` and `--mcp-json` send them elsewhere (a project's
 own `.mcp.json`, say), `--no-mcp` installs a read-only memory on purpose, and
 `--db`, `--serve-exe`, `--mcp-exe` and `--code-index-root` override the rest.
 
+It also writes `thor-eval.md`, the end-of-session evaluation routine, to
+Claude Code's own commands folder, the first time it finds none there: a
+generic template with this run's own programs folder and store filled in,
+so running `/thor-eval` settles whatever the memory has been served without
+a verdict. Written even under `--no-mcp`, since the file should already be
+there the day writes are turned on. An existing copy - the owner's own
+edited version, or one an earlier install already wrote - is left exactly
+as it is.
+
 `--project <key>` additionally writes a `.thor-project` marker in the current
 directory to override the project name. By default, a checkout is scoped to the
 name of its repository folder. Pass `--project` only when you want a different
@@ -219,6 +228,11 @@ many rules still lack a falsifier, and how many live items are bound only to a
 moment that nothing in `serve` actually fires - `answer` and `claim_done` are
 the two that exist in the schema but nothing produces yet. It works on a store
 with nothing in it yet, which is what a first run looks like.
+
+When a rule or orientation has fired many times with no verdict either way,
+doctor also names each one that applies to this checkout - how often, what
+kind, and where it fires - so a review has a list to settle instead of only a
+count.
 
 Two of those checks - whether an old reference still points at a real file,
 and whether some facts never win a place - need to know where your other
@@ -415,6 +429,12 @@ One more thing `revise` refuses without asking first: weakening a rule that
 already carries a check - clearing or changing the check, lowering its
 severity, dropping a binding, or narrowing it from every project to one -
 needs a `because`, the same way `retract` has always needed a reason, and it
-lands in the item's own history right beside what changed.
+lands in the item's own history right beside what changed. Clear a field
+(severity, project, expires, key, falsifier, or the check) with its own
+`clear_*` flag on `revise` - `clear_severity`, `clear_check`, and so on -
+rather than the empty string a JSON-RPC caller would otherwise send: an
+assistant's own tool-call layer drops an empty-string argument before it
+ever reaches this server, so the flag is the one spelling that actually
+works from one.
 
 The store is the source. Every document, this one included, is a mirror of it.

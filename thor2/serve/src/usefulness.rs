@@ -125,6 +125,40 @@ pub fn served_since_last_verdict(store: &EventStore) -> HashMap<String, usize> {
     counts
 }
 
+/// One live item over the judgement-debt threshold, before any checkout
+/// scoping - the single fold `judgement_debt_counts` and `judgement_debt_named`
+/// below both build on, so a store-wide count and a checkout's own named list
+/// can never quietly disagree about what "owed" means the way two independent
+/// folds could drift apart.
+struct Owed {
+    id: String,
+    count: usize,
+    project: Option<String>,
+    kind: model::item::Kind,
+    bindings: Vec<model::item::Binding>,
+}
+
+/// Every live item served `JUDGEMENT_DEBT_AFTER`+ times since its own last
+/// verdict, unscoped by project. Extracted (2026-09-12) out of
+/// `judgement_debt_counts`'s own body so `judgement_debt_named` can share the
+/// exact same "owed" definition instead of re-deriving it and risking a
+/// second copy that silently drifts from the first - the same reasoning
+/// `served_since_last_verdict`'s own doc comment already gives for why it is
+/// one fold with two callers rather than two folds.
+fn owed_items(store: &EventStore) -> Vec<Owed> {
+    let served = served_since_last_verdict(store);
+    let live = crate::live::live_items(store);
+    let live_by_id: HashMap<&str, &crate::live::LiveItem> = live.iter().map(|li| (li.id.as_str(), li)).collect();
+    served
+        .into_iter()
+        .filter(|(_, count)| *count >= JUDGEMENT_DEBT_AFTER)
+        .filter_map(|(id, count)| {
+            let li = live_by_id.get(id.as_str())?;
+            Some(Owed { id, count, project: li.item.project.clone(), kind: li.item.kind, bindings: li.item.bindings.clone() })
+        })
+        .collect()
+}
+
 /// (store-wide count of items in judgement debt, how many of those this
 /// checkout's own project accounts for) - backs a `doctor` line naming both
 /// numbers.
@@ -149,15 +183,52 @@ pub fn served_since_last_verdict(store: &EventStore) -> HashMap<String, usize> {
 /// exists to close by sharing `served_since_last_verdict` instead of
 /// re-deriving its own count.
 pub fn judgement_debt_counts(store: &EventStore, checkout_project: Option<&str>) -> (usize, usize) {
-    let served = served_since_last_verdict(store);
-    let live: HashMap<String, Option<String>> =
-        crate::live::live_items(store).into_iter().map(|li| (li.id, li.item.project)).collect();
-    let owed: Vec<&String> =
-        served.iter().filter(|(id, n)| **n >= JUDGEMENT_DEBT_AFTER && live.contains_key(*id)).map(|(id, _)| id).collect();
+    let owed = owed_items(store);
     let total = owed.len();
     let in_project =
-        owed.iter().filter(|id| crate::project::applies_to(live[id.as_str()].as_deref(), checkout_project)).count();
+        owed.iter().filter(|o| crate::project::applies_to(o.project.as_deref(), checkout_project)).count();
     (total, in_project)
+}
+
+/// One item over the judgement-debt threshold, NAMED rather than merely
+/// counted: its id, how many times it fired since its own last verdict, its
+/// kind, and the bindings that say WHERE it fires - the place an evaluation
+/// must judge "did it belong there" against.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct JudgementDebtItem {
+    pub id: String,
+    pub count: usize,
+    pub kind: model::item::Kind,
+    pub bindings: Vec<model::item::Binding>,
+}
+
+/// THE GAP THIS CLOSES. `judgement_debt_counts` above tells `doctor` how big
+/// the backlog is, but never which items make it up - an end-of-session
+/// evaluation meant to settle "did it belong where it fired" had only a
+/// number to work from, never a list to walk, and the only other route was
+/// reading the store by hand (see `ops::health::judgement_debt_line`'s own
+/// doc comment for the rest of that history).
+///
+/// Every item over the threshold that applies to `checkout_project` - its own
+/// project, or global - by the exact same `project::applies_to` rule
+/// `judgement_debt_counts` already uses for its `in_project` half, so the two
+/// can never disagree about which items are this checkout's business. AN ITEM
+/// OWED ONLY TO ANOTHER PROJECT IS EXCLUDED HERE, not merely left uncounted:
+/// `ops::health::judgement_debt_line` can only ever show one checkout's own
+/// worklist, and naming another project's items would send this checkout's
+/// owner looking for a place outside his own working copy.
+///
+/// SORTED BY COUNT DESCENDING, ties broken by id for a deterministic order
+/// across runs, so the busiest item - the one a single verdict pays down the
+/// most - is always named first.
+pub fn judgement_debt_named(store: &EventStore, checkout_project: Option<&str>) -> Vec<JudgementDebtItem> {
+    let mut named: Vec<JudgementDebtItem> = owed_items(store)
+        .into_iter()
+        .filter(|o| crate::project::applies_to(o.project.as_deref(), checkout_project))
+        .map(|o| JudgementDebtItem { id: o.id, count: o.count, kind: o.kind, bindings: o.bindings })
+        .collect();
+    named.sort_by(|a, b| b.count.cmp(&a.count).then_with(|| a.id.cmp(&b.id)));
+    named
 }
 
 #[cfg(test)]
@@ -244,6 +315,46 @@ mod judgement_debt_counting_tests {
         assert_eq!(judgement_debt_counts(&store, None).0, 1);
         crate::mark::record_useful(&mut store, "s", "s", "t", "2026-09-08T00:00:00Z", "settled").unwrap();
         assert_eq!(judgement_debt_counts(&store, None).0, 0);
+    }
+
+    // ------------------------------------------------- judgement_debt_named
+
+    /// Exactly the items over the threshold that apply to this checkout (its
+    /// own project, plus global), and nothing under the threshold - sorted by
+    /// count descending so the busiest debt leads.
+    #[test]
+    fn named_list_contains_exactly_the_items_over_threshold_for_this_checkout_sorted_by_count_descending() {
+        let mut store = EventStore::in_memory().unwrap();
+        declare(&mut store, "rarely", None);
+        serve_n(&mut store, "rarely", JUDGEMENT_DEBT_AFTER - 1);
+        declare(&mut store, "quiet-debt", None);
+        serve_n(&mut store, "quiet-debt", JUDGEMENT_DEBT_AFTER);
+        declare(&mut store, "loud-debt", Some("thor"));
+        serve_n(&mut store, "loud-debt", JUDGEMENT_DEBT_AFTER + 5);
+
+        let named = judgement_debt_named(&store, Some("thor"));
+        let ids: Vec<&str> = named.iter().map(|i| i.id.as_str()).collect();
+        assert_eq!(ids, vec!["loud-debt", "quiet-debt"], "under-threshold item must be absent: {ids:?}");
+        assert_eq!(named[0].count, JUDGEMENT_DEBT_AFTER + 5);
+        assert_eq!(named[1].count, JUDGEMENT_DEBT_AFTER);
+    }
+
+    /// The same exclusion `a_project_scoped_item_counts_only_for_its_own_checkout`
+    /// proves for the count - here proved for the named list: an item owed
+    /// only to a DIFFERENT project must not be named for this checkout, even
+    /// though it is still real store-wide debt.
+    #[test]
+    fn named_list_excludes_an_item_owed_only_to_another_project() {
+        let mut store = EventStore::in_memory().unwrap();
+        declare(&mut store, "acme-owed", Some("acme"));
+        serve_n(&mut store, "acme-owed", JUDGEMENT_DEBT_AFTER);
+
+        let for_thor = judgement_debt_named(&store, Some("thor"));
+        assert!(for_thor.is_empty(), "a different checkout's project must not see it named: {for_thor:?}");
+
+        let for_acme = judgement_debt_named(&store, Some("acme"));
+        assert_eq!(for_acme.len(), 1);
+        assert_eq!(for_acme[0].id, "acme-owed");
     }
 }
 

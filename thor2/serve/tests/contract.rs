@@ -17,6 +17,7 @@ use model::item::{Binding, Item, Kind, Severity};
 use model::store;
 use serve::input::ServeInput;
 use serve::{live, lookup, prompt, rank, render, session_start};
+use std::path::Path;
 use thor_core::event_store::{EventKind, EventStore};
 
 // --------------------------------------------------------------- fixtures
@@ -101,6 +102,13 @@ fn tempting_chunk(id: &str) -> Item {
     }
 }
 
+/// A fixed, never-opened path standing in for `Cli::db` - `render_text` only
+/// ever prints it as text, and both calls below (before/after growth) use
+/// the same literal, so it cannot itself explain any difference between them.
+fn test_db() -> &'static Path {
+    Path::new("/tmp/thor-contract-tests/store.db")
+}
+
 /// Capture the exact rendered output of the three injection surfaces for a
 /// fixed set of inputs, so growth of the store can be compared byte for
 /// byte. Empty string stands for "nothing rendered" (0 bytes).
@@ -114,13 +122,13 @@ fn capture_three_surfaces(db: &EventStore) -> (String, String, String) {
     moment_input.add_moment(Action::Push);
     let moment_all = rank::select(&candidates, &moment_input);
     let moment_selection = render::cap(moment_all);
-    let moment_block = render::render_text(&moment_selection, &moment_input).unwrap_or_default();
+    let moment_block = render::render_text(&moment_selection, &moment_input, test_db()).unwrap_or_default();
 
     let prompt_text = "please run git push --force origin main right now";
     let prompt_input = prompt::resolve(prompt_text, &candidates);
     let prompt_all = rank::select(&candidates, &prompt_input);
     let prompt_selection = render::cap(prompt_all);
-    let prompt_block = render::render_text(&prompt_selection, &prompt_input).unwrap_or_default();
+    let prompt_block = render::render_text(&prompt_selection, &prompt_input, test_db()).unwrap_or_default();
 
     (start_block, moment_block, prompt_block)
 }
@@ -336,7 +344,8 @@ fn the_moment_surface_still_fires_for_a_real_action() {
         served.selection.shown.iter().any(|r| r.id == "push-guard"),
         "a real, matching action must still make the moment surface fire"
     );
-    let block = render::render_text(&served.selection, &input).expect("a real match must render a block");
+    let block =
+        render::render_text(&served.selection, &input, test_db()).expect("a real match must render a block");
     assert!(block.contains("never push without checking first"), "expected the rule's own text in the block: {block}");
 }
 

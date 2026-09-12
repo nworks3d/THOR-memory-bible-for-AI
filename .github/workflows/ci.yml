@@ -77,3 +77,14 @@ jobs:
       - uses: actions/checkout@v4
       - name: Scan tracked files
         run: sh scripts/check-private-data.sh
+
+  # A version bump with nothing to say about it is not a release. This catches
+  # the gap on the push that bumps thor2/Cargo.toml, before a tag ever exists -
+  # cheaper than finding out from the release workflow's own refusal.
+  changelog:
+    name: changelog has a section for the current version
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Check
+        run: sh scripts/changelog-check.sh

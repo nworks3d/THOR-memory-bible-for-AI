@@ -579,6 +579,7 @@ code lane:
 | [thor2/CONTRACT.md](thor2/CONTRACT.md) | the standard version 2 is judged against, and the test enforcing each rule |
 | [thor2/SPEC-ENFORCEMENT.md](thor2/SPEC-ENFORCEMENT.md) | how a note proves itself, in detail |
 | [CONTRIBUTING.md](CONTRIBUTING.md) | changing THOR: the bar for a pull request |
+| [CHANGELOG.md](CHANGELOG.md) | what changed in each release: the section every release opens with |
 
 ## Thanks
 

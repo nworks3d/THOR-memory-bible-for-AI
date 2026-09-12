@@ -147,6 +147,21 @@ jobs:
       - name: List what will be published
         run: ls -la dist
 
+      # A release that does not say what changed does not ship. CHANGELOG.md
+      # carries one section per version; this pulls out the section for the
+      # tag being built and fails the job when there is none, rather than
+      # publishing silently the way generate_release_notes alone would.
+      - name: Extract changelog section
+        id: changelog
+        run: |
+          TAG="${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}"
+          sh scripts/changelog-section.sh "$TAG" CHANGELOG.md > changelog-section.md
+          {
+            echo "section<<CHANGELOG_SECTION_EOF"
+            cat changelog-section.md
+            echo "CHANGELOG_SECTION_EOF"
+          } >> "$GITHUB_OUTPUT"
+
       # The notes state what the download does NOT include, because that is what
       # generates issues otherwise: no embedding model ships with it, and the
       # meaning-search build needs the MSVC runtime on Windows.
@@ -157,6 +172,8 @@ jobs:
           draft: true
           generate_release_notes: true
           body: |
+            ${{ steps.changelog.outputs.section }}
+
             Built by CI from this tag on clean runners. Verify with the `.sha256` next to each asset.
 
             **Which download**

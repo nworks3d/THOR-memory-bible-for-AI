@@ -107,25 +107,38 @@ fn main() -> ExitCode {
             );
             Ok(())
         }),
-        Command::Ship { db, to, batch } => require_token().and_then(|token| {
-            let store = thor_core::event_store::EventStore::open_existing(&db)?;
-            let summary = transport::push_once(&store, &to, &token, batch)?;
-            println!(
-                "shipped: {} applied, {} already present, {} batch(es), receiver now at seq {}",
-                summary.applied, summary.skipped, summary.batches, summary.final_cursor
-            );
-            // Reaching here means `push_once` returned Ok: the receiver
-            // agreed with everything shipped, including the "nothing to
-            // ship" case (see `push_once`'s own doc comment on the AHEAD/
-            // DIFFERENT-tip checks that guard that case from a false
-            // success). Record it even though nothing else here reads it
-            // this run - see `ops::ship_state`'s own doc comment for the
-            // four-week silence this exists to close.
-            if let Err(e) = ops::ship_state::record_success(&db, summary.final_cursor) {
-                eprintln!("ship state NOT recorded ({e}) - the shipment above still succeeded");
+        Command::Ship { db, to, batch } => {
+            let outcome = require_token().and_then(|token| {
+                let store = thor_core::event_store::EventStore::open_existing(&db)?;
+                let summary = transport::push_once(&store, &to, &token, batch)?;
+                println!(
+                    "shipped: {} applied, {} already present, {} batch(es), receiver now at seq {}",
+                    summary.applied, summary.skipped, summary.batches, summary.final_cursor
+                );
+                // Reaching here means `push_once` returned Ok: the receiver
+                // agreed with everything shipped, including the "nothing to
+                // ship" case (see `push_once`'s own doc comment on the AHEAD/
+                // DIFFERENT-tip checks that guard that case from a false
+                // success). Record it even though nothing else here reads it
+                // this run - see `ops::ship_state`'s own doc comment for the
+                // four-week silence this exists to close.
+                if let Err(e) = ops::ship_state::record_success(&db, summary.final_cursor) {
+                    eprintln!("ship state NOT recorded ({e}) - the shipment above still succeeded");
+                }
+                Ok(())
+            });
+            // A failed attempt is recorded too - every error path above,
+            // not just `push_once`'s own (a missing token, an unopenable
+            // store) - so `ops::health::ship_line` can alarm on a broken
+            // hourly ship exactly like it does on a refused or timed-out
+            // push, instead of the sidecar simply not moving.
+            if let Err(e) = &outcome {
+                if let Err(e2) = ops::ship_state::record_failure(&db, &e.to_string()) {
+                    eprintln!("ship state NOT recorded ({e2}) - the failure above still stands");
+                }
             }
-            Ok(())
-        }),
+            outcome
+        }
         Command::Status { db, to } => {
             let remote_token = if to.is_some() { Some(require_token()) } else { None };
             let outcome = (|| -> anyhow::Result<()> {

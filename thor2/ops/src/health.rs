@@ -156,7 +156,33 @@ pub fn replica_line(db: &Path, replica: Option<(&str, &str)>) -> String {
 pub const SHIP_STALE_CEILING_HOURS: u64 = 3;
 
 /// Component: how long ago `sync ship` last completed without error, read
-/// from the sidecar `ops::ship_state` writes beside `db` on every success.
+/// from the sidecar `ops::ship_state` writes beside `db` on every attempt.
+///
+/// FOUR SHAPES, CHECKED IN THIS ORDER, once a sidecar carries the newer
+/// per-attempt fields (`ShipState::last_attempt_unix` is `Some` - see below
+/// for the sidecar that does not):
+///   1. THE MOST RECENT ATTEMPT FAILED (`last_attempt_error` is `Some`) - an
+///      alarm naming when it failed, the one-line reason, and when the last
+///      success was (or that there has never been one).
+///   2. NOTHING HAS BEEN WRITTEN TO THE STORE SINCE THE LAST SUCCESS (our
+///      current local tip is no further than `covered_seq`) - fresh, no
+///      matter how many hours old, because nothing is waiting to be lost.
+///   3. CHANGES ARE WAITING and the last success is still within
+///      `SHIP_STALE_CEILING_HOURS` - fresh, the same line this has always
+///      printed for a healthy hourly cadence.
+///   4. CHANGES ARE WAITING and the last success is OLDER than the ceiling -
+///      never worded as a failure, because it may not be one: the hourly
+///      task simply may not have had a chance to run (the machine could be
+///      asleep, not broken). Says how much is waiting, how long ago the
+///      last ship was, and that the hourly ship has not run since, so the
+///      owner can tell a sleeping PC from a broken task.
+///
+/// A SIDECAR WRITTEN BEFORE THIS SPLIT EXISTED (`last_attempt_unix` is
+/// `None`) falls back to exactly the two-shape (fresh/STALE) text this line
+/// always printed - old data cannot support the newer distinction, so this
+/// does not try to guess one. The same fallback covers the rare case where
+/// the newer fields ARE present but the local store cannot be opened to
+/// compare against `covered_seq`: best effort, never a hard failure.
 ///
 /// `None`, ON PURPOSE, WHEN THIS MACHINE HAS NEVER SHIPPED. Shipping is a
 /// per-machine role - only the one machine with the hourly task cares, and
@@ -164,19 +190,54 @@ pub const SHIP_STALE_CEILING_HOURS: u64 = 3;
 /// cloud sandbox) were never meant to ship anywhere. A permanent "ship: not
 /// configured" line on every one of them would be exactly the alarm that
 /// cries wolf `gate_verdict`'s own doc comment already refuses to become
-/// elsewhere - so this line simply does not exist until the first
-/// successful ship writes the sidecar that makes it meaningful.
+/// elsewhere - so this line simply does not exist until the first ship
+/// attempt writes the sidecar that makes it meaningful.
 pub fn ship_line(db: &Path) -> Option<String> {
     let state = crate::ship_state::read(db)?;
     let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).ok()?.as_secs();
     let age_hours = now.saturating_sub(state.completed_unix) / 3600;
-    Some(if age_hours >= SHIP_STALE_CEILING_HOURS {
+    let stale_text = || {
         format!(
             "ship: last succeeded {age_hours}h ago - STALE (ceiling {SHIP_STALE_CEILING_HOURS}h): the \
              hourly ship may be stuck or failing silently; check it by hand"
         )
-    } else {
-        format!("ship: last succeeded {age_hours}h ago - fresh")
+    };
+    let fresh_text = || format!("ship: last succeeded {age_hours}h ago - fresh");
+
+    // Old sidecar, written before attempts were tracked separately from
+    // successes: keep printing exactly what this line always printed.
+    let Some(last_attempt_unix) = state.last_attempt_unix else {
+        return Some(if age_hours >= SHIP_STALE_CEILING_HOURS { stale_text() } else { fresh_text() });
+    };
+
+    if let Some(reason) = &state.last_attempt_error {
+        let attempt_age = now.saturating_sub(last_attempt_unix) / 3600;
+        return Some(if state.completed_unix == 0 {
+            format!("ship: last attempt FAILED {attempt_age}h ago: {reason} - no successful ship yet")
+        } else {
+            format!("ship: last attempt FAILED {attempt_age}h ago: {reason} - last succeeded {age_hours}h ago")
+        });
+    }
+
+    // The last attempt succeeded. Compare what it covered to our current
+    // local tip to tell "nothing waiting" from "changes waiting" - best
+    // effort: a store that cannot be opened here falls back to the plain
+    // age, the same text this line printed before it could compare at all.
+    let waiting = state.covered_seq.and_then(|covered| {
+        let store = EventStore::open_existing(db).ok()?;
+        let (local_seq, _) = store.contiguous_tip().ok()?;
+        Some(local_seq.saturating_sub(covered).max(0))
+    });
+
+    Some(match waiting {
+        Some(0) => format!("ship: last succeeded {age_hours}h ago - fresh, nothing new has been written since"),
+        Some(n) if age_hours >= SHIP_STALE_CEILING_HOURS => format!(
+            "ship: {n} change(s) not yet on the replica - last succeeded {age_hours}h ago and the hourly \
+             ship has not run since (the machine may be asleep, or the task is not firing)"
+        ),
+        Some(_) => fresh_text(),
+        None if age_hours >= SHIP_STALE_CEILING_HOURS => stale_text(),
+        None => fresh_text(),
     })
 }
 
@@ -1642,6 +1703,7 @@ mod tests {
     use super::*;
     use model::item::{Binding, Check, Item, Kind, TargetKind};
     use model::store;
+    use thor_core::event_store::EventKind;
 
     // ------------------------------------------------------------ identity
 
@@ -2251,6 +2313,12 @@ mod tests {
         assert_eq!(ship_line(&db), None, "a machine that never shipped must print nothing, not an alarm");
     }
 
+    /// A success on a store with nothing MORE written since (the common
+    /// case in this fixture: the store never grew past whatever
+    /// `record_success_at` claimed as `covered_seq`) is FRESH and says so -
+    /// this doubles as the proof for "nothing written since the last
+    /// successful ship" (case 2 of `ship_line`'s own doc comment), since an
+    /// empty store immediately after a success is exactly that case.
     #[test]
     fn ship_line_reports_fresh_just_after_a_successful_ship() {
         let dir = tempfile::tempdir().unwrap();
@@ -2262,28 +2330,117 @@ mod tests {
         let line = ship_line(&db).expect("a recorded ship must produce a line");
         assert!(line.starts_with("ship:"), "{line}");
         assert!(line.contains("fresh"), "{line}");
+        assert!(line.contains("nothing new has been written since"), "{line}");
         assert!(!line.contains("STALE"), "just-completed must never read as stale: {line}");
     }
 
-    /// THE EXACT CASE THE DEFECT NEEDS CAUGHT: a ship well past the hourly
-    /// schedule's own ceiling must say so, with both the age and the ceiling
-    /// it was measured against - never a bare number.
+    /// Changes are waiting (the store grew past `covered_seq`) but the last
+    /// success is still within the ceiling - fresh, same as a healthy
+    /// hourly cadence has always read, even though something IS queued.
     #[test]
-    fn ship_line_reports_stale_past_the_ceiling() {
+    fn ship_line_stays_fresh_when_changes_are_waiting_but_within_the_ceiling() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("t.db");
+        let mut s = EventStore::new(&db).unwrap();
+        s.append_event("s", "l", "act", EventKind::FactCreated, "e1", None, "body").unwrap();
+        drop(s);
+        let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs();
+        // Covered only seq 0 (nothing) - the one event above is waiting.
+        crate::ship_state::record_success_at(&db, 0, now).unwrap();
+
+        let line = ship_line(&db).expect("a recorded ship must produce a line");
+        assert!(line.contains("fresh"), "{line}");
+        assert!(!line.contains("STALE"), "{line}");
+        assert!(!line.contains("not yet on the replica"), "still within the ceiling: {line}");
+    }
+
+    /// THE EXACT CASE THE DEFECT NEEDS CAUGHT, UPDATED FOR THE SHIP ALARM
+    /// COUNTING WHAT IS WAITING: a ship well past the hourly ceiling, WITH
+    /// real changes queued behind it, must say how many, how long ago the
+    /// last success was, and that the hourly ship has not run since - and
+    /// it must NOT read as a failure (no "STALE", no "failing silently"):
+    /// the machine may simply be asleep, which this line can no longer tell
+    /// apart from a broken task if it panics at the first sign of age.
+    #[test]
+    fn ship_line_names_waiting_changes_past_the_ceiling_without_calling_it_a_failure() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("t.db");
+        let mut s = EventStore::new(&db).unwrap();
+        s.append_event("s", "l", "act", EventKind::FactCreated, "e1", None, "body").unwrap();
+        s.append_event("s", "l", "act", EventKind::FactCreated, "e2", None, "body").unwrap();
+        drop(s);
+        let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs();
+        let stale_by_a_day = now - 24 * 3600;
+        // Covered only seq 0 - both events above are waiting.
+        crate::ship_state::record_success_at(&db, 0, stale_by_a_day).unwrap();
+
+        let line = ship_line(&db).expect("a recorded ship must produce a line even when stale");
+        assert!(line.contains("2 change"), "the count must be named: {line}");
+        assert!(line.contains("not yet on the replica"), "{line}");
+        assert!(line.contains("24h"), "the age must be named: {line}");
+        assert!(line.contains("has not run since"), "{line}");
+        assert!(!line.contains("STALE"), "waiting changes are not worded as a failure: {line}");
+        assert!(!line.contains("failing silently"), "waiting changes are not worded as a failure: {line}");
+    }
+
+    /// BACKWARD COMPATIBILITY: a sidecar written before this split existed
+    /// (no `last_attempt_unix` at all) must still fall back to exactly the
+    /// STALE wording this line always printed - old data cannot support the
+    /// newer "changes waiting" distinction, so this does not try to guess.
+    #[test]
+    fn ship_line_falls_back_to_stale_wording_for_an_old_two_field_sidecar() {
         let dir = tempfile::tempdir().unwrap();
         let db = dir.path().join("t.db");
         EventStore::new(&db).unwrap();
         let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs();
         let stale_by_a_day = now - 24 * 3600;
-        crate::ship_state::record_success_at(&db, 3, stale_by_a_day).unwrap();
+        std::fs::write(
+            crate::ship_state::path_for(&db),
+            format!(r#"{{"completed_unix":{stale_by_a_day},"receiver_seq":3}}"#),
+        )
+        .unwrap();
 
-        let line = ship_line(&db).expect("a recorded ship must produce a line even when stale");
+        let line = ship_line(&db).expect("an old sidecar must still produce a line");
         assert!(line.contains("STALE"), "{line}");
         assert!(line.contains("24h"), "the age must be named: {line}");
         assert!(
             line.contains(&SHIP_STALE_CEILING_HOURS.to_string()),
             "the ceiling must be named, never a bare number: {line}"
         );
+    }
+
+    /// THE ALARM CASE: the most recent attempt failed. Names when it
+    /// failed, the reason, and when the last success was - never silence,
+    /// and never confused with a healthy "nothing waiting" line.
+    #[test]
+    fn ship_line_alarms_on_a_failed_attempt_and_names_the_last_success() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("t.db");
+        EventStore::new(&db).unwrap();
+        let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs();
+        crate::ship_state::record_success_at(&db, 5, now - 5 * 3600).unwrap();
+        crate::ship_state::record_failure_at(&db, "receiver rejected the shared secret (401)", now).unwrap();
+
+        let line = ship_line(&db).expect("a failed attempt must still produce a line");
+        assert!(line.contains("FAILED"), "{line}");
+        assert!(line.contains("receiver rejected the shared secret (401)"), "{line}");
+        assert!(line.contains("last succeeded 5h ago"), "{line}");
+    }
+
+    /// The edge of the alarm case: a machine whose FIRST EVER attempt
+    /// failed has no last success to name - it must say so plainly instead
+    /// of printing a nonsense age computed from an unset timestamp.
+    #[test]
+    fn ship_line_alarms_on_a_failed_first_attempt_with_no_prior_success() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("t.db");
+        EventStore::new(&db).unwrap();
+        crate::ship_state::record_failure_at(&db, "connection refused", 1_000_000).unwrap();
+
+        let line = ship_line(&db).expect("a failed attempt must still produce a line");
+        assert!(line.contains("FAILED"), "{line}");
+        assert!(line.contains("connection refused"), "{line}");
+        assert!(line.contains("no successful ship yet"), "{line}");
     }
 
     #[test]

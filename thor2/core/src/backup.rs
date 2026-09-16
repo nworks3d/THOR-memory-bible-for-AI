@@ -27,16 +27,58 @@ fn git(repo: &Path, args: &[&str]) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Age in hours of the last commit that touched `subdir`, or None if there is none.
+/// Age in hours of the last commit reachable from local `HEAD` that touched
+/// `subdir`, or None if there is none. Used only when there is no upstream
+/// to measure from instead - see `last_commit_age_hours_at`.
 fn last_commit_age_hours(repo: &Path, subdir: &str) -> Option<u64> {
+    last_commit_age_hours_at(repo, subdir, "HEAD")
+}
+
+/// `last_commit_age_hours`, measured from an arbitrary `rev` instead of
+/// always `HEAD` - the seam `backup_to_repo` uses to measure the debounce
+/// from `origin/main` (what the REMOTE actually has) rather than the local
+/// branch. A commit that was made locally but never pushed must not make
+/// the NEXT run think a backup just landed - see this file's own doc
+/// comment on the defect this closes.
+fn last_commit_age_hours_at(repo: &Path, subdir: &str, rev: &str) -> Option<u64> {
     let pathspec = format!("{subdir}/");
     let out = Command::new("git")
         .arg("-C").arg(repo)
-        .args(["log", "-1", "--format=%ct", "--", &pathspec])
+        .args(["log", "-1", "--format=%ct", rev, "--", &pathspec])
         .output().ok()?;
     let ts: u64 = String::from_utf8_lossy(&out.stdout).trim().parse().ok()?;
     let now = SystemTime::now().duration_since(UNIX_EPOCH).ok()?.as_secs();
     Some(now.saturating_sub(ts) / 3600)
+}
+
+/// Whether `repo` has an `origin/main` ref at all - a repo with no `origin`
+/// remote configured, or one whose `main` was never fetched, has no
+/// upstream to compare against, and every check below falls back to
+/// today's LOCAL-only behaviour rather than guessing at one.
+fn has_upstream(repo: &Path) -> bool {
+    Command::new("git")
+        .arg("-C").arg(repo)
+        .args(["rev-parse", "--verify", "-q", "origin/main"])
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false)
+}
+
+/// How many commits local `HEAD` carries that `origin/main` does not - the
+/// exact count of backup commits a previous run made but could not push.
+/// `None` when it cannot be determined (git failed to run at all) - callers
+/// already gate this behind `has_upstream`, so an unparseable count here is
+/// treated the same as "nothing to catch up" rather than guessed at.
+fn commits_ahead_of_upstream(repo: &Path) -> Option<u64> {
+    let out = Command::new("git")
+        .arg("-C").arg(repo)
+        .args(["rev-list", "--count", "origin/main..HEAD"])
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    String::from_utf8_lossy(&out.stdout).trim().parse().ok()
 }
 
 /// Automated backup: export the log to <repo>/<subdir>/events.jsonl, then commit
@@ -64,10 +106,43 @@ pub fn backup_to_repo(
             && subdir != "..",
         "backup subdirectory must be a single plain directory name, got {subdir:?}"
     );
+
+    // A previous run may have committed and then failed to PUSH (network
+    // down, the NAS asleep, whatever) - that commit is still sitting on the
+    // local branch, invisible to anyone who only ever reads the remote.
+    // Push it now, before anything else and regardless of the debounce
+    // below: the data is only actually backed up once it leaves this
+    // machine, and the debounce exists to limit how often we commit, never
+    // to sit on a commit that already happened.
+    let upstream = has_upstream(repo);
+    let mut pushed_note: Option<String> = None;
+    if upstream {
+        if let Some(ahead) = commits_ahead_of_upstream(repo) {
+            if ahead > 0 {
+                git(repo, &["push", "origin", "main"])?;
+                pushed_note = Some(format!("pushed {ahead} backup commit(s) that had not reached the remote"));
+            }
+        }
+    }
+    let prefix = |msg: String| match &pushed_note {
+        Some(note) => format!("{note}; {msg}"),
+        None => msg,
+    };
+
     if !force {
-        if let Some(age) = last_commit_age_hours(repo, subdir) {
+        // Measured from what the REMOTE has, not the local branch - a local
+        // commit that never reached origin must not make the NEXT run think
+        // a backup just landed (see this file's own doc comment). With no
+        // upstream configured at all, there is nothing to measure from but
+        // the local branch, so that stays today's behaviour unchanged.
+        let age = if upstream {
+            last_commit_age_hours_at(repo, subdir, "origin/main")
+        } else {
+            last_commit_age_hours(repo, subdir)
+        };
+        if let Some(age) = age {
             if age < DEBOUNCE_HOURS {
-                return Ok(format!("backup is {age}h old (< {DEBOUNCE_HOURS}h) - skipping"));
+                return Ok(prefix(format!("backup is {age}h old (< {DEBOUNCE_HOURS}h) - skipping")));
             }
         }
     }
@@ -85,11 +160,11 @@ pub fn backup_to_repo(
     let clean = Command::new("git").arg("-C").arg(repo)
         .args(["diff", "--cached", "--quiet", "--", &pathspec]).status()?.success();
     if clean {
-        return Ok(format!("no change since last backup ({n} events) - nothing to commit"));
+        return Ok(prefix(format!("no change since last backup ({n} events) - nothing to commit")));
     }
     git(repo, &["commit", "-m", &format!("{subdir} backup ({n} events)")])?;
     git(repo, &["push", "origin", "main"])?;
-    Ok(format!("pushed {subdir} backup ({n} events)"))
+    Ok(prefix(format!("pushed {subdir} backup ({n} events)")))
 }
 
 /// Write the whole event log as one JSON object per line, ordered by seq.
@@ -261,5 +336,144 @@ mod tests {
                 "subdir {bad:?} must be refused before any git command runs"
             );
         }
+    }
+
+    // ---------------------------------------------- real-git fixture tests
+    //
+    // Everything below runs the real `git` binary against a throwaway bare
+    // remote plus a working clone - the only way to prove the catch-up push
+    // (step 2) against the actual failure shape it exists to heal: a commit
+    // that landed locally while a push to origin failed.
+
+    /// Run `git <args>` in `dir`, panicking with stdout+stderr on failure -
+    /// test fixture plumbing only. Production code never panics on a failed
+    /// git call; see `git` above, which turns failure into an `Err`.
+    fn git_ok(dir: &Path, args: &[&str]) {
+        let out = Command::new("git").arg("-C").arg(dir).args(args).output().unwrap();
+        assert!(
+            out.status.success(),
+            "git {args:?} in {} failed:\nstdout: {}\nstderr: {}",
+            dir.display(),
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+
+    /// A bare remote plus a working clone tracking it on `main`, with one
+    /// initial (empty) commit already pushed so `origin/main` exists - the
+    /// smallest fixture every test below builds on.
+    struct GitFixture {
+        _dir: tempfile::TempDir,
+        remote: std::path::PathBuf,
+        work: std::path::PathBuf,
+    }
+
+    fn make_git_fixture() -> GitFixture {
+        let dir = tempfile::tempdir().unwrap();
+        let remote = dir.path().join("remote.git");
+        let work = dir.path().join("work");
+        git_ok(dir.path(), &["init", "--bare", remote.to_str().unwrap()]);
+        let out = Command::new("git")
+            .args(["clone", remote.to_str().unwrap(), work.to_str().unwrap()])
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "clone failed: {}", String::from_utf8_lossy(&out.stderr));
+        git_ok(&work, &["checkout", "-b", "main"]);
+        git_ok(&work, &["config", "user.email", "test@example.invalid"]);
+        git_ok(&work, &["config", "user.name", "Test"]);
+        git_ok(&work, &["commit", "--allow-empty", "-m", "initial"]);
+        git_ok(&work, &["push", "-u", "origin", "main"]);
+        GitFixture { _dir: dir, remote, work }
+    }
+
+    /// THE EXACT DEFECT, end to end: a run whose commit lands locally but
+    /// whose push fails (here, a broken PUSH url - the deterministic way to
+    /// get "pull succeeds, push fails" without racing a real network) must
+    /// leave that commit stuck ahead of `origin/main`. The NEXT run, even
+    /// well inside the debounce window, must push the stuck commit first
+    /// and say so - never silently wait out another DEBOUNCE_HOURS while
+    /// origin stays behind.
+    #[test]
+    fn a_commit_that_never_reached_origin_is_pushed_on_the_next_run_and_reported() {
+        let fx = make_git_fixture();
+        let mut store = EventStore::in_memory().unwrap();
+        seed(&mut store);
+
+        // Break ONLY the push URL: `pull` (fetch) still reaches the real
+        // remote and succeeds, so the run gets all the way to `commit`
+        // before `push` fails - exactly the shape backup_to_repo's own doc
+        // comment on this defect describes.
+        git_ok(&fx.work, &["remote", "set-url", "--push", "origin", "/no/such/path"]);
+
+        let first = backup_to_repo(&store, &fx.work, "thor2", true);
+        assert!(first.is_err(), "a broken push URL must fail the run: {first:?}");
+        assert_eq!(
+            commits_ahead_of_upstream(&fx.work),
+            Some(1),
+            "the commit must land locally even though the push failed"
+        );
+
+        // Restore connectivity, then run again well inside the debounce
+        // window (force = false): the catch-up push must still happen.
+        git_ok(&fx.work, &["remote", "set-url", "--push", "origin", fx.remote.to_str().unwrap()]);
+        let second = backup_to_repo(&store, &fx.work, "thor2", false).unwrap();
+        assert!(
+            second.contains("pushed 1 backup commit(s) that had not reached the remote"),
+            "must say what it caught up: {second}"
+        );
+        assert_eq!(commits_ahead_of_upstream(&fx.work), Some(0), "origin must now have the commit");
+    }
+
+    /// The two "nothing to catch up" shapes together: right after a clean
+    /// push, local and upstream are equal, so the new catch-up logic must
+    /// add nothing to the output and must read exactly as it always has -
+    /// and a second, forced run with nothing new to commit must still
+    /// succeed rather than fail.
+    #[test]
+    fn local_equal_to_upstream_is_unchanged_and_a_forced_no_op_run_still_succeeds() {
+        let fx = make_git_fixture();
+        let mut store = EventStore::in_memory().unwrap();
+        seed(&mut store);
+
+        let out = backup_to_repo(&store, &fx.work, "thor2", true).unwrap();
+        assert!(
+            out.starts_with("pushed thor2 backup ("),
+            "a first real backup with nothing ahead of origin must read exactly as before: {out}"
+        );
+        assert!(!out.contains("had not reached the remote"));
+        assert_eq!(commits_ahead_of_upstream(&fx.work), Some(0));
+
+        // Forced again, nothing changed: must not fail, and must read
+        // exactly as the existing "nothing to commit" line always has.
+        let out2 = backup_to_repo(&store, &fx.work, "thor2", true);
+        assert!(out2.is_ok(), "a forced run with nothing new to commit must not fail: {out2:?}");
+        assert_eq!(out2.unwrap(), "no change since last backup (3 events) - nothing to commit");
+    }
+
+    /// A repo with no `origin` remote at all (or one whose `main` was never
+    /// fetched) has nothing to catch up and nothing to measure the debounce
+    /// against upstream with - the debounce must keep working from local
+    /// history alone, exactly as it did before this file learned about
+    /// upstreams, and it must never attempt a push that would only fail
+    /// loudly against a remote that does not exist.
+    #[test]
+    fn no_upstream_configured_keeps_todays_local_only_debounce() {
+        let dir = tempfile::tempdir().unwrap();
+        let work = dir.path().join("work");
+        git_ok(dir.path(), &["init", "-b", "main", work.to_str().unwrap()]);
+        git_ok(&work, &["config", "user.email", "test@example.invalid"]);
+        git_ok(&work, &["config", "user.name", "Test"]);
+        std::fs::create_dir_all(work.join("thor2")).unwrap();
+        std::fs::write(work.join("thor2").join("events.jsonl"), "{}\n").unwrap();
+        git_ok(&work, &["add", "thor2/"]);
+        git_ok(&work, &["commit", "-m", "prior local backup, no remote configured yet"]);
+
+        let store = EventStore::in_memory().unwrap();
+        let out = backup_to_repo(&store, &work, "thor2", false).unwrap();
+        assert!(
+            out.contains("h old (< 20h) - skipping"),
+            "with no origin at all, the debounce must still work from local history alone: {out}"
+        );
+        assert!(!out.contains("had not reached the remote"));
     }
 }

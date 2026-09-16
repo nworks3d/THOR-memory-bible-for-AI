@@ -303,7 +303,14 @@ that run loudly - a bounded timeout so it cannot hang, one line on stderr
 naming what went wrong, and a non-zero exit code - instead of leaving a
 scheduled task stuck and silent for weeks; and `doctor` names a copy whose
 last successful ship has gone stale, so a broken schedule shows up there even
-if nobody is watching the task itself.
+if nobody is watching the task itself. That line also tells a sleeping
+machine apart from a real problem: events waiting behind an old success are
+named as waiting, never as a failure, while an attempt that actually failed
+is named with its own reason. The off-site copy the `backup` command keeps in
+git behaves the same way about its own commits - one that could not reach the
+remote is pushed again on the very next run, before that run's own
+once-a-day schedule is even checked, instead of sitting unpushed for up to a
+day.
 
 So a write arriving at the copy is not applied there. It is queued, and the
 authority applies it later. Three commands, in the order you set them up:

@@ -87,8 +87,13 @@ fn run_ship(db: &Path, to: &str, token: &str) -> std::process::Output {
 /// must fail the CLI loudly - a non-zero exit and one line on stderr naming
 /// what happened - never hang and never exit 0. This is `sync.rs`'s `main`
 /// exercised for real, not just `push_once` in isolation.
+///
+/// It also doubles as the CLI-level proof for step 1's alarm case: the real
+/// `sync ship` binary must record the failure it just printed, with a
+/// one-line reason, so `ops::health::ship_line` has something to alarm on
+/// afterwards - never silence, and never mistaken for a success.
 #[test]
-fn a_refused_ship_exits_non_zero_with_one_clear_message_and_records_nothing() {
+fn a_refused_ship_exits_non_zero_with_one_clear_message_and_records_the_failure() {
     let dir = tempfile::tempdir().unwrap();
     let receiver_db = dir.path().join("receiver.db");
     let shipper_db = dir.path().join("shipper.db");
@@ -97,7 +102,9 @@ fn a_refused_ship_exits_non_zero_with_one_clear_message_and_records_nothing() {
     let _receiver = start_receiver(&receiver_db, port);
     let to = format!("http://127.0.0.1:{port}");
 
+    let before = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs();
     let out = run_ship(&shipper_db, &to, "the-WRONG-token");
+    let after = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs();
 
     assert!(!out.status.success(), "a refused ship must exit non-zero, got {:?}", out.status);
     let stderr = String::from_utf8_lossy(&out.stderr);
@@ -106,9 +113,21 @@ fn a_refused_ship_exits_non_zero_with_one_clear_message_and_records_nothing() {
         "stderr must name what the receiver said, not just fail silently: {stderr:?}"
     );
     assert_eq!(stderr.lines().count(), 1, "the CLI promises ONE clear line on stderr, got: {stderr:?}");
+
+    let state = ops::ship_state::read(&shipper_db).expect("a failed attempt must still be recorded");
+    assert_eq!(state.completed_unix, 0, "a refused ship must never be recorded as a success");
+    assert_eq!(state.receiver_seq, 0);
+    assert_eq!(state.covered_seq, None);
+    let reason = state.last_attempt_error.expect("the failure must carry a reason");
+    assert_eq!(reason.lines().count(), 1, "the sidecar promises a ONE-line reason, got: {reason:?}");
     assert!(
-        ops::ship_state::read(&shipper_db).is_none(),
-        "a refused ship must never be recorded as a success"
+        reason.contains("401") || reason.to_lowercase().contains("reject"),
+        "the recorded reason must name what happened, same as stderr: {reason:?}"
+    );
+    let attempt_unix = state.last_attempt_unix.expect("a failed attempt must record when it happened");
+    assert!(
+        attempt_unix >= before && attempt_unix <= after,
+        "recorded attempt time {attempt_unix} must fall within [{before}, {after}]"
     );
 }
 

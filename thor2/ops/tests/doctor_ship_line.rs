@@ -8,7 +8,7 @@
 
 use std::path::Path;
 use std::process::Command;
-use thor_core::event_store::EventStore;
+use thor_core::event_store::{EventKind, EventStore};
 
 fn run_doctor(db: &Path) -> String {
     let out = Command::new(env!("CARGO_BIN_EXE_doctor")).arg("--db").arg(db).output().unwrap();
@@ -58,23 +58,78 @@ fn doctor_names_a_fresh_ship_briefly() {
 }
 
 /// THE EXACT INCIDENT THIS CLOSES, echoed almost to the day: a ship that
-/// last succeeded four weeks ago must be named, with both the age and the
-/// ceiling it was measured against - never a bare number.
+/// last succeeded four weeks ago, with real changes waiting behind it, must
+/// be named - how many are waiting, the age, and that the hourly ship has
+/// not run since. Never worded as a failure (no "STALE", no "failing
+/// silently"): the machine may simply be asleep, and this line's whole job
+/// is to let the owner tell that apart from a broken task.
 #[test]
-fn doctor_names_a_stale_ship_with_its_age_and_the_ceiling() {
+fn doctor_names_waiting_changes_past_the_ceiling_without_calling_it_a_failure() {
     let dir = tempfile::tempdir().unwrap();
     let db = dir.path().join("thor.db");
-    EventStore::new(&db).unwrap();
+    let mut store = EventStore::new(&db).unwrap();
+    store.append_event("s", "l", "act", EventKind::FactCreated, "e1", None, "body").unwrap();
+    store.append_event("s", "l", "act", EventKind::FactCreated, "e2", None, "body").unwrap();
+    drop(store);
     let four_weeks_ago = now_unix() - 28 * 24 * 3600;
-    ops::ship_state::record_success_at(&db, 5, four_weeks_ago).unwrap();
+    // Covered only seq 0 - both events above are still waiting.
+    ops::ship_state::record_success_at(&db, 0, four_weeks_ago).unwrap();
 
     let stdout = run_doctor(&db);
     let line = stdout.lines().find(|l| l.starts_with("ship:"));
     assert!(line.is_some(), "a recorded (if stale) ship must still produce a line:\n{stdout}");
+    let line = line.unwrap();
+    assert!(line.contains("2 change"), "the count must be named: {line}");
+    assert!(line.contains("not yet on the replica"), "{line}");
+    assert!(line.contains("has not run since"), "{line}");
+    assert!(!line.contains("STALE"), "waiting changes are not worded as a failure: {line}");
+    assert!(!line.contains("failing silently"), "waiting changes are not worded as a failure: {line}");
+}
+
+/// BACKWARD COMPATIBILITY, through the real binary: a sidecar written before
+/// this split existed has no `last_attempt_unix` at all, and must still fall
+/// back to exactly the STALE wording `doctor` has always printed.
+#[test]
+fn doctor_falls_back_to_stale_wording_for_an_old_two_field_sidecar() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("thor.db");
+    EventStore::new(&db).unwrap();
+    let four_weeks_ago = now_unix() - 28 * 24 * 3600;
+    std::fs::write(
+        ops::ship_state::path_for(&db),
+        format!(r#"{{"completed_unix":{four_weeks_ago},"receiver_seq":5}}"#),
+    )
+    .unwrap();
+
+    let stdout = run_doctor(&db);
+    let line = stdout.lines().find(|l| l.starts_with("ship:"));
+    assert!(line.is_some(), "an old sidecar must still produce a line:\n{stdout}");
     let line = line.unwrap();
     assert!(line.contains("STALE"), "{line}");
     assert!(
         line.contains(&ops::health::SHIP_STALE_CEILING_HOURS.to_string()),
         "the ceiling must be named, never a bare number: {line}"
     );
+}
+
+/// THE ALARM CASE, through the real binary: the most recent attempt failed,
+/// and `doctor` must say so - when, the reason, and that a success is on
+/// record (not the plain fresh/STALE text a healthy or merely-quiet ship
+/// would print).
+#[test]
+fn doctor_alarms_on_a_failed_attempt() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("thor.db");
+    EventStore::new(&db).unwrap();
+    let now = now_unix();
+    ops::ship_state::record_success_at(&db, 5, now - 5 * 3600).unwrap();
+    ops::ship_state::record_failure_at(&db, "receiver rejected the shared secret (401)", now).unwrap();
+
+    let stdout = run_doctor(&db);
+    let line = stdout.lines().find(|l| l.starts_with("ship:"));
+    assert!(line.is_some(), "a failed attempt must still produce a line:\n{stdout}");
+    let line = line.unwrap();
+    assert!(line.contains("FAILED"), "{line}");
+    assert!(line.contains("receiver rejected the shared secret (401)"), "{line}");
+    assert!(line.contains("last succeeded 5h ago"), "{line}");
 }

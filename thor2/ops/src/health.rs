@@ -820,17 +820,23 @@ fn bindings_short(bindings: &[model::item::Binding]) -> String {
 /// is not a finding, and a permanent "0 owed" line on every quiet run would
 /// be exactly the noise that trains a reader to stop reading this report.
 ///
-/// CARRIES THE EVALUATION DEBT'S OWN TWO SIGNALS TOO, since 2026-09-12,
-/// appended to this same first line rather than a separate one: the age of
-/// this checkout's own newest verdict (`serve::usefulness::
-/// newest_verdict_unix`, the identical project scope `in_project` above
-/// already uses) and, only once the Stop hook's own obligation
-/// (`serve::usefulness::eval_debt_owed`) actually holds, a note that it will
-/// ask for the evaluation once this session. Built on the exact same
-/// numbers the Stop hook acts on (`bin/serve.rs`'s `evaluation_debt`), so
-/// this can never silently disagree with what it reports on - the same
-/// reasoning this whole line already exists for (see this doc comment's own
-/// history above).
+/// CARRIES THE EVALUATION DEBT'S OWN SIGNALS TOO, since 2026-09-12 (the
+/// trigger itself rewritten 2026-09-16 - see `serve::usefulness`'s own
+/// "evaluation debt" section for why), appended to this same first line
+/// rather than a separate one: how long this checkout's own backlog has sat
+/// at or over the ceiling, or that it currently does not; the last
+/// evaluation report seen for this project and how long ago it was first
+/// seen, or that none ever was; and, only once the Stop hook's own
+/// obligation (`serve::usefulness::eval_debt_owed`) actually holds, a note
+/// that it will ask for the evaluation once this session. READ-ONLY: this
+/// reads the evaluation debt's own sidecar (`serve::usefulness::
+/// project_eval_state`) but, unlike the Stop hook's own `update_eval_debt_
+/// state`, never writes it - a diagnostic that mutated state on every run
+/// would make the two facts depend on whichever tool happened to run last.
+/// Built on the exact same numbers and the exact same sidecar the Stop hook
+/// acts on (`bin/serve.rs`'s `evaluation_debt`), so this can never silently
+/// disagree with what it reports on - the same reasoning this whole line
+/// already exists for (see this doc comment's own history above).
 pub fn judgement_debt_line(db: &Path, checkout_project: Option<&str>, full: bool) -> Option<String> {
     let store = EventStore::open_existing(db).ok()?;
     let (total, in_project) = serve::usefulness::judgement_debt_counts(&store, checkout_project);
@@ -852,14 +858,24 @@ pub fn judgement_debt_line(db: &Path, checkout_project: Option<&str>, full: bool
              among them would ever be asked about here; `mark` each once it is next served to settle it"
         ),
     }];
-    let newest = serve::usefulness::newest_verdict_unix(&store, checkout_project);
+    let state = serve::usefulness::project_eval_state(db, checkout_project);
     let now = serve::time::now_unix();
-    let age = match newest {
-        Some(t) => format!("{} day(s) ago", serve::usefulness::days_ago(now, t)),
-        None => "never".to_string(),
+    let over_ceiling_clause = if in_project >= serve::usefulness::EVAL_DEBT_CEILING {
+        match state.over_ceiling_since {
+            Some(t) => format!("over the judgement-debt ceiling for {} day(s)", serve::usefulness::days_ago(now, t)),
+            None => "over the judgement-debt ceiling - the clock starts at the first Stop in this project".to_string(),
+        }
+    } else {
+        "not over the judgement-debt ceiling".to_string()
     };
-    out[0].push_str(&format!(" - newest verdict in this checkout: {age}"));
-    if serve::usefulness::eval_debt_owed(in_project, newest, now) {
+    let report_clause = match (&state.last_evaluation_report_id, state.last_evaluation_seen) {
+        (Some(id), Some(seen)) => {
+            format!("last evaluation report '{id}', first seen {} day(s) ago", serve::usefulness::days_ago(now, seen))
+        }
+        _ => "no evaluation report seen yet for this project".to_string(),
+    };
+    out[0].push_str(&format!(" - {over_ceiling_clause}; {report_clause}"));
+    if serve::usefulness::eval_debt_owed(in_project, state.over_ceiling_since, state.last_evaluation_seen, now) {
         out[0].push_str("; the Stop hook asks for the evaluation once per session");
     }
     let named = serve::usefulness::judgement_debt_named(&store, checkout_project);
@@ -2036,79 +2052,136 @@ mod tests {
         assert!(!line.contains("not named here"), "--full must leave no tail: {line}");
     }
 
-    /// THE EVALUATION DEBT'S OWN TAIL, since 2026-09-12: once the backlog for
-    /// this checkout reaches `EVAL_DEBT_CEILING` and none of it has ever been
-    /// judged, the line names "never" for the newest verdict and adds the
-    /// note that the Stop hook will ask for the evaluation itself.
+    /// Declares `n` never-judged, trigger-bound items owed to `project` -
+    /// shared by every evaluation-debt tail test below. NOT `rule()`'s own
+    /// default `Always` binding - pinned since 2026-09-12 means excluded
+    /// from the judgement debt (and so from the evaluation debt's own
+    /// ceiling) entirely, which is exactly the count these fixtures need to
+    /// actually reach.
+    fn declare_owed_for_eval_debt(store: &mut EventStore, n: usize, project: &str) {
+        for i in 0..n {
+            let id = format!("owed-{project}-{i:02}");
+            let mut item = rule(&id);
+            item.text = format!("fixture eval debt case {project} {i:02}");
+            item.project = Some(project.to_string());
+            item.bindings =
+                vec![Binding::Target { kind: TargetKind::Command, value: format!("fixture-eval-command-{project}-{i:02}") }];
+            store::declare(store, "s", "l", "a", &item).unwrap();
+            for _ in 0..serve::usefulness::JUDGEMENT_DEBT_AFTER {
+                serve::deliver::record_delivery(store, "s", "l", "t", "2026-09-08T00:00:00Z", &[id.clone()]);
+            }
+        }
+    }
+
+    /// Write the evaluation-debt sidecar directly, the same JSON shape
+    /// `serve::usefulness::update_eval_debt_state` itself writes - `doctor`
+    /// must read it read-only, so these tests seed it by hand rather than
+    /// through the Stop hook's own write path.
+    fn seed_eval_debt_state(db: &Path, project: &str, state: serve::usefulness::ProjectEvalState) {
+        let mut all: serve::usefulness::EvalDebtState = Default::default();
+        all.insert(project.to_string(), state);
+        std::fs::write(serve::usefulness::eval_debt_state_path(db), serde_json::to_string(&all).unwrap()).unwrap();
+    }
+
+    /// THE EVALUATION DEBT'S OWN TAIL, since 2026-09-12 (trigger rewritten
+    /// 2026-09-16): with no sidecar at all yet, a backlog at the ceiling
+    /// still reads as "over the ceiling", but says plainly that the clock
+    /// has not started - and the Stop-hook note must not yet appear, since
+    /// nothing has been stale long enough.
     #[test]
-    fn judgement_debt_line_names_never_and_the_stop_hook_note_once_the_obligation_holds() {
+    fn judgement_debt_line_says_the_clock_starts_at_the_first_stop_with_no_sidecar_yet() {
         let dir = tempfile::tempdir().unwrap();
         let db = dir.path().join("t.db");
         {
             let mut store = EventStore::new(&db).unwrap();
-            for n in 0..serve::usefulness::EVAL_DEBT_CEILING {
-                let id = format!("owed-{n:02}");
-                let mut item = rule(&id);
-                item.text = format!("fixture eval debt case {n:02}");
-                item.project = Some("thor".to_string());
-                // NOT `rule()`'s own default `Always` binding - pinned since
-                // 2026-09-12 means excluded from the judgement debt (and so
-                // from the evaluation debt's own ceiling) entirely, which is
-                // exactly the number this fixture needs to actually reach.
-                item.bindings =
-                    vec![Binding::Target { kind: TargetKind::Command, value: format!("fixture-eval-command-{n:02}") }];
-                store::declare(&mut store, "s", "l", "a", &item).unwrap();
-                for _ in 0..serve::usefulness::JUDGEMENT_DEBT_AFTER {
-                    serve::deliver::record_delivery(&mut store, "s", "l", "t", "2026-09-08T00:00:00Z", &[id.clone()]);
-                }
-            }
+            declare_owed_for_eval_debt(&mut store, serve::usefulness::EVAL_DEBT_CEILING, "thor");
         }
         let line =
             judgement_debt_line(&db, Some("thor"), false).expect("a backlog at the ceiling, the line must speak");
-        assert!(line.contains("newest verdict in this checkout: never"), "{line}");
-        assert!(line.contains("the Stop hook asks for the evaluation once per session"), "{line}");
+        assert!(line.contains("over the judgement-debt ceiling"), "{line}");
+        assert!(line.contains("the clock starts at the first Stop in this project"), "{line}");
+        assert!(line.contains("no evaluation report seen yet for this project"), "{line}");
+        assert!(!line.contains("the Stop hook asks for the evaluation"), "{line}");
     }
 
-    /// Below the ceiling, the newest-verdict age still prints (it is
-    /// unconditional whenever the line speaks at all), but the Stop-hook
-    /// note must not appear - proving the note is genuinely conditional on
-    /// the obligation, not merely glued to the age.
+    /// Once the sidecar shows the crossing is old enough, and no report was
+    /// ever seen, the tail names the age in days and the Stop-hook note
+    /// appears.
     #[test]
-    fn judgement_debt_line_names_the_verdict_age_without_the_note_below_the_ceiling() {
+    fn judgement_debt_line_names_the_ceiling_age_and_the_stop_hook_note_once_stale() {
         let dir = tempfile::tempdir().unwrap();
         let db = dir.path().join("t.db");
         {
             let mut store = EventStore::new(&db).unwrap();
-            let mut owed = rule("owed-alone");
-            owed.text = "fixture rule that stays owed".to_string();
-            owed.project = Some("thor".to_string());
-            // NOT `rule()`'s own default `Always` binding - see the eval-debt
-            // fixture above for why a pinned item can no longer stand in for
-            // an "owed" one.
-            owed.bindings =
-                vec![Binding::Target { kind: TargetKind::Command, value: "fixture-owed-alone-command".to_string() }];
-            store::declare(&mut store, "s", "l", "a", &owed).unwrap();
-            for _ in 0..serve::usefulness::JUDGEMENT_DEBT_AFTER {
-                serve::deliver::record_delivery(&mut store, "s", "l", "t", "2026-09-08T00:00:00Z", &["owed-alone".to_string()]);
-            }
-            // A second, GLOBAL item, never served enough to be owed itself -
-            // only marked, three days ago, so it never affects the count
-            // above and exists purely to give this checkout a real, aged
-            // verdict to report. Distinct text from `owed` above: two
-            // near-identical rules trip the write gate's own duplicate check.
-            let mut marked = rule("marked-elsewhere");
-            marked.text = "fixture rule that only ever gets a verdict".to_string();
-            store::declare(&mut store, "s", "l", "a", &marked).unwrap();
-            let three_days_ago = serve::time::iso8601_from_unix(serve::time::now_unix() - 3 * 86400);
-            serve::mark::record_useful(&mut store, "s", "l", "a", &three_days_ago, "marked-elsewhere").unwrap();
+            declare_owed_for_eval_debt(&mut store, serve::usefulness::EVAL_DEBT_CEILING, "thor");
         }
-        assert_eq!(
-            serve::usefulness::judgement_debt_counts(&EventStore::open_existing(&db).unwrap(), Some("thor")).1,
-            1,
-            "fixture sanity: only one item is owed, well under the ceiling"
+        let two_days_ago = serve::time::now_unix() - 2 * 86400;
+        seed_eval_debt_state(
+            &db,
+            "thor",
+            serve::usefulness::ProjectEvalState { over_ceiling_since: Some(two_days_ago), ..Default::default() },
+        );
+        let line =
+            judgement_debt_line(&db, Some("thor"), false).expect("a stale backlog at the ceiling, the line must speak");
+        assert!(line.contains("over the judgement-debt ceiling for 2 day(s)"), "{line}");
+        assert!(line.contains("no evaluation report seen yet for this project"), "{line}");
+        assert!(line.contains("the Stop hook asks for the evaluation once per session"), "{line}");
+    }
+
+    /// A report that has been seen, but only recently, still names itself
+    /// and its age - and, since it is not yet stale, the Stop-hook note is
+    /// absent even though the ceiling crossing itself is old.
+    #[test]
+    fn judgement_debt_line_names_a_recently_seen_report_and_leaves_out_the_note() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("t.db");
+        {
+            let mut store = EventStore::new(&db).unwrap();
+            declare_owed_for_eval_debt(&mut store, serve::usefulness::EVAL_DEBT_CEILING, "thor");
+        }
+        let now = serve::time::now_unix();
+        seed_eval_debt_state(
+            &db,
+            "thor",
+            serve::usefulness::ProjectEvalState {
+                over_ceiling_since: Some(now - 5 * 86400),
+                last_evaluation_seen: Some(now - 10 * 3600),
+                last_evaluation_report_id: Some("eval-thor-2026-09-14".to_string()),
+                ..Default::default()
+            },
+        );
+        let line = judgement_debt_line(&db, Some("thor"), false).expect("still over the ceiling, the line must speak");
+        assert!(line.contains("over the judgement-debt ceiling for 5 day(s)"), "{line}");
+        assert!(line.contains("last evaluation report 'eval-thor-2026-09-14', first seen 0 day(s) ago"), "{line}");
+        assert!(!line.contains("the Stop hook asks for the evaluation"), "a fresh report must silence the note: {line}");
+    }
+
+    /// Below the ceiling, the line says so plainly, regardless of any
+    /// lingering sidecar state from a streak that has since ended - and the
+    /// Stop-hook note must not appear, proving the note is genuinely
+    /// conditional on the CURRENT count, not merely glued to the tail.
+    #[test]
+    fn judgement_debt_line_says_not_over_the_ceiling_and_ignores_a_stale_sidecar_entry() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("t.db");
+        {
+            let mut store = EventStore::new(&db).unwrap();
+            // Exactly one owed item: real judgement debt (the line must
+            // still speak), but nowhere near the evaluation debt's ceiling.
+            declare_owed_for_eval_debt(&mut store, 1, "thor");
+        }
+        // A lingering sidecar entry from an earlier streak that has since
+        // ended - `doctor` must never trust it over the current count.
+        seed_eval_debt_state(
+            &db,
+            "thor",
+            serve::usefulness::ProjectEvalState {
+                over_ceiling_since: Some(serve::time::now_unix() - 30 * 86400),
+                ..Default::default()
+            },
         );
         let line = judgement_debt_line(&db, Some("thor"), false).expect("one item is still owed, the line must speak");
-        assert!(line.contains("newest verdict in this checkout: 3 day(s) ago"), "{line}");
+        assert!(line.contains("not over the judgement-debt ceiling"), "{line}");
         assert!(!line.contains("the Stop hook asks for the evaluation"), "{line}");
     }
 

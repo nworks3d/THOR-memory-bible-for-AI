@@ -25,9 +25,10 @@ item, once per turn. That is the same debt this routine pays; here you
 settle it deliberately, over the whole session, instead of one item at a
 time.
 
-Once per session, when this project's own debt reaches at least ten items
-and none of them has been judged in a day, the Stop hook also asks for this
-evaluation itself, by name, instead of one more item.
+Once per session, when this project's own debt has stayed at ten items or
+more for a whole day and no evaluation report was filed for it in that time,
+the Stop hook also asks for this evaluation itself, by name, instead of one
+more item - filing the report below is what silences it.
 
 ---
 
@@ -292,9 +293,20 @@ stays silent when there is no copy, and speaks up when one has gone stale),
 `judgement debt` (how many items still owe a verdict, store-wide and for
 this project), and `contradictions` (how many pairs of notes carry a proof
 that cannot both be true right now; this line stays silent when there are
-none). Do not copy those numbers into a fact - point to them instead.
+none). Do not copy those numbers into a Rule or Orientation - point to them
+instead; they may appear in the dated evaluation report itself (below).
+
+Save the whole report in THOR when you are done, so a later session can find
+it and hunt it for real THOR defects: `mcp__thor__remember` with kind
+report, id `eval-<project>-<YYYY-MM-DD>` (a second one the same day gets
+`-2`), project set to the project you evaluated, tags `evaluation-report`,
+and text the full report exactly as you gave it to the owner. This is a
+dated record, not a rule - the health-check numbers may appear in it, and it
+never fires on its own. It is also what tells THOR the evaluation happened:
+the Stop hook reads it back, and filing it is what stops the hook from
+asking again for a day.
 
 Do not store or change anything else unless the owner asks for it. The
 exceptions are the work the steps themselves call for: the verdicts, the
-revisions of rotten facts, the checks you attach to heavy facts, and the
-captures of what was missing.
+revisions of rotten facts, the checks you attach to heavy facts, the
+captures of what was missing, and filing the report itself.

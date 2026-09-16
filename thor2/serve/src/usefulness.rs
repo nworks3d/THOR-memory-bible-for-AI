@@ -6,7 +6,7 @@
 //! item, not a score.
 
 use std::collections::{HashMap, HashSet};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use thor_core::event_store::{EventKind, EventStore};
 
 /// Every entity id with at least one `ItemMarkedUseful` event in the log.
@@ -463,7 +463,7 @@ mod judgement_debt_counting_tests {
         }
         let owed_in_project = judgement_debt_counts(&store, None).1;
         assert_eq!(owed_in_project, 0, "an all-pinned backlog must never feed the evaluation debt's own ceiling");
-        assert!(!eval_debt_owed(owed_in_project, None, 0), "zero owed can never meet the ceiling");
+        assert!(!eval_debt_owed(owed_in_project, None, None, 0), "zero owed can never meet the ceiling");
     }
 }
 
@@ -500,15 +500,31 @@ pub fn noise_since_last_useful(store: &EventStore) -> HashMap<String, usize> {
 }
 
 // ------------------------------------------------------------------------
-// The evaluation debt (2026-09-12): `bin/serve.rs`'s Stop hook, once per
-// session, asks the owner to run the WHOLE end-of-session evaluation
-// (`ops::install::seed_eval_command`'s routine) rather than judging one more
-// item, once this checkout's own judgement-debt backlog is both large and
-// stale. See `bin/serve.rs`'s own `evaluation_debt` for the Stop-hook wiring;
-// everything below is the pure/reusable half, kept here for the same reason
-// `JUDGEMENT_DEBT_AFTER` and `judgement_debt_counts` already are: `doctor`
-// (`ops::health::judgement_debt_line`) needs the exact same numbers, never a
-// second copy that can silently drift from what the hook actually acts on.
+// The evaluation debt (2026-09-12, trigger rewritten 2026-09-16): `bin/
+// serve.rs`'s Stop hook, once per session, asks the owner to run the WHOLE
+// end-of-session evaluation (`ops::install::seed_eval_command`'s routine)
+// rather than judging one more item, once this checkout's own judgement-debt
+// backlog is both large and stale. See `bin/serve.rs`'s own `evaluation_debt`
+// for the Stop-hook wiring; everything below is the pure/reusable half, kept
+// here for the same reason `JUDGEMENT_DEBT_AFTER` and `judgement_debt_counts`
+// already are: `doctor` (`ops::health::judgement_debt_line`) needs the exact
+// same numbers and the exact same sidecar, never a second copy that can
+// silently drift from what the hook actually acts on.
+//
+// THE CLOCK THIS REPLACES. Until 2026-09-16, "stale" meant "this checkout's
+// own newest verdict (`newest_verdict_unix`, removed) is more than a day
+// old" - but a verdict on a GLOBAL item resets that one clock for every
+// project at once, whether or not the project actually over the ceiling saw
+// a verdict of its own. Measured on a copy of the owner's own store,
+// 2026-09-12 to 2026-09-16: the longest true gap between verdicts anywhere
+// reached only 23.35 to 23.90 hours, so "nothing judged for 24 hours" was
+// never once true in four days, while the backlog sat at or over the
+// ceiling 56% to 100% of the measured hours across all nine projects. The
+// debt never fired once. Two facts kept per project in a sidecar
+// (`ProjectEvalState` below) replace it: how long the backlog has
+// CONTINUOUSLY sat at or over the ceiling, and how long since an evaluation
+// report was last (first) seen for that project - neither one moves just
+// because some unrelated global rule happened to get judged.
 
 /// How many items this checkout's own judgement debt must hold before the
 /// evaluation debt can even be considered - `judgement_debt_counts`'s own
@@ -527,24 +543,38 @@ pub const EVAL_DEBT_CEILING: usize = 10;
 /// backlog that crossed the ceiling five minutes ago is not yet a pattern.
 pub const EVAL_DEBT_STALE_HOURS: i64 = 24;
 
-/// THE PURE PREDICATE. Both inputs are already resolved elsewhere
-/// (`owed_in_project` from `judgement_debt_counts`, `newest_verdict_unix`
-/// from the fold of the same name below, `now_unix` from `crate::time::
-/// now_unix`) so this is nothing but the two conditions themselves,
+/// THE PURE PREDICATE, rewritten 2026-09-16 (see this section's own doc
+/// comment for the defect the old verdict-age version could never close).
+/// All three inputs are already resolved elsewhere (`owed_in_project` from
+/// `judgement_debt_counts`, `over_ceiling_since`/`last_evaluation_seen` from
+/// this project's own `ProjectEvalState` below, `now_unix` from `crate::
+/// time::now_unix`), so this stays nothing but the conditions themselves,
 /// unit-testable with plain integers and no store, no clock, no filesystem.
 ///
-/// `newest_verdict_unix` is `None` for "never" (this checkout has not
-/// recorded a single verdict on anything that applies to it) and `Some(t)`
-/// for the instant of the newest one - see that function's own doc comment
-/// for exactly which verdicts count. `now_unix.saturating_sub(t)` rather than
-/// plain subtraction: `t` is read from a stored, human-editable timestamp,
-/// and a clock skew that put it in the future must read as "not yet stale"
-/// rather than underflow.
-pub fn eval_debt_owed(owed_in_project: usize, newest_verdict_unix: Option<i64>, now_unix: i64) -> bool {
+/// Holds when the backlog is at or over the ceiling, AND it has stayed there
+/// for at least `EVAL_DEBT_STALE_HOURS` (`over_ceiling_since` of `None` -
+/// the sidecar has not yet recorded a Stop that saw the crossing - reads as
+/// "just now", i.e. not yet stale, never as "forever"), AND no evaluation
+/// report has silenced it since: either none was ever seen for this
+/// project, or the last one seen is itself at least `EVAL_DEBT_STALE_HOURS`
+/// old. `now_unix.saturating_sub(..)` throughout rather than plain
+/// subtraction: both timestamps are read from a stored, human-editable
+/// sidecar, and a clock skew that put either in the future must read as
+/// "not yet stale" rather than underflow.
+pub fn eval_debt_owed(
+    owed_in_project: usize,
+    over_ceiling_since: Option<i64>,
+    last_evaluation_seen: Option<i64>,
+    now_unix: i64,
+) -> bool {
     if owed_in_project < EVAL_DEBT_CEILING {
         return false;
     }
-    match newest_verdict_unix {
+    let Some(since) = over_ceiling_since else { return false };
+    if now_unix.saturating_sub(since) <= EVAL_DEBT_STALE_HOURS * 3600 {
+        return false;
+    }
+    match last_evaluation_seen {
         None => true,
         Some(t) => now_unix.saturating_sub(t) > EVAL_DEBT_STALE_HOURS * 3600,
     }
@@ -558,64 +588,163 @@ pub fn days_ago(now_unix: i64, then_unix: i64) -> i64 {
     (now_unix - then_unix).max(0) / 86400
 }
 
-/// The body shape `ItemMarkedUseful` and `ItemMarkedNoise` both carry
-/// (`model::marked`) - only the one field this fold needs, read generically
-/// so one parse serves both event kinds.
-#[derive(serde::Deserialize)]
-struct MarkedAt {
-    marked_at: String,
+/// The sidecar's own map key for a project - `""` stands for "no project" (a
+/// checkout that resolves to no project at all, `None`). Never a real
+/// project's own key: `project::resolve_project` never returns `Some("")` -
+/// a blank marker line falls through to the git root instead (see that
+/// function's own doc comment) - so this can never collide with a real one.
+fn project_key(project: Option<&str>) -> &str {
+    project.unwrap_or("")
 }
 
-/// The most recent verdict - a mark of usefulness OR of noise, either one
-/// settles a review the same way `judged_since` (`bin/serve.rs`) already
-/// treats them - among items that apply to `checkout_project` (project-scoped
-/// to it, or global: `crate::project::applies_to`, the exact filter
-/// `judgement_debt_counts`/`judgement_debt_named` already use for their own
-/// `in_project` half), as Unix seconds. `None` when no such item has ever
-/// been marked at all.
+/// This project's own two facts for the evaluation debt's trigger (see this
+/// section's own doc comment for why a per-project sidecar replaced a single
+/// global verdict clock). `#[serde(default)]` on every field: a sidecar
+/// written by an earlier partial run, or hand-written for a test, must still
+/// parse, with "nothing known yet" rather than a parse failure - the same
+/// fail-open stance `capture::Marker`'s own fields already take.
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct ProjectEvalState {
+    /// The first time a main-session Stop in this project saw its own owed
+    /// count at or over `EVAL_DEBT_CEILING` - `None` before that has ever
+    /// happened, or once a Stop has since seen the count drop back under the
+    /// ceiling (the crossing is forgotten outright, not merely paused: the
+    /// next crossing starts its own new clock).
+    #[serde(default)]
+    pub over_ceiling_since: Option<i64>,
+    /// Every id this project has ever had for a live Report carrying the
+    /// `evaluation-report` tag, as of the most recent Stop that looked - the
+    /// membership `last_evaluation_seen` below is measured against. Grows
+    /// only: an id is never removed just because the report was later
+    /// retracted, since a `Report`, once filed, has already done the one
+    /// thing this sidecar cares about - existed, and was seen.
+    #[serde(default)]
+    pub known_report_ids: std::collections::BTreeSet<String>,
+    /// The time a Stop first saw an id that was not yet in
+    /// `known_report_ids` - `None` when no evaluation report has ever been
+    /// seen for this project. Deliberately NOT the report's own filing time:
+    /// the event log records no creation time for a live item, only when
+    /// each revision was appended, and a Report can be revised - "first seen
+    /// by a Stop" is the only time source this sidecar has, and it is
+    /// exactly the instant that matters here, since it is what a LATER Stop
+    /// compares "now" against to decide whether the silence it bought has
+    /// worn off.
+    #[serde(default)]
+    pub last_evaluation_seen: Option<i64>,
+    /// The id that set `last_evaluation_seen` - named so a reader (`doctor`,
+    /// the Stop hook's own message) can point at which report actually
+    /// silenced this, not only when. When more than one new id appears in
+    /// the same Stop (rare: reports are filed one at a time in practice),
+    /// the lexicographically greatest wins - a deterministic, testable
+    /// tie-break, and `eval-<project>-<date>`'s own shape means that is
+    /// usually also the newest by date.
+    #[serde(default)]
+    pub last_evaluation_report_id: Option<String>,
+}
+
+/// The whole sidecar: one [`ProjectEvalState`] per project key (see
+/// [`project_key`]).
+pub type EvalDebtState = std::collections::BTreeMap<String, ProjectEvalState>;
+
+/// Where the evaluation debt's trigger state lives, next to the store - the
+/// same directory and the same naming convention as every other sidecar on
+/// this boundary (`eval-debt-asked.json`, `teeth-asked.json`, `session-
+/// watermark.json`, all in `bin/serve.rs`).
+pub fn eval_debt_state_path(db: &Path) -> PathBuf {
+    db.parent().unwrap_or_else(|| Path::new(".")).join("eval-debt-state.json")
+}
+
+/// Read the whole sidecar. FAIL-OPEN, the same stance every sidecar on this
+/// boundary already takes (`capture::read_markers`, `bin/serve.rs`'s own
+/// session-watermark reader): a missing file, an unreadable one, or one that
+/// fails to parse all come back as an empty map - "nothing known yet", never
+/// an error, since this backs a Stop-time read/write path that must never
+/// block and a `doctor` read path that must never speak on failure.
+pub fn read_eval_debt_state(db: &Path) -> EvalDebtState {
+    std::fs::read_to_string(eval_debt_state_path(db)).ok().and_then(|t| serde_json::from_str(&t).ok()).unwrap_or_default()
+}
+
+/// This project's own two facts, or the all-default "nothing known yet"
+/// state when the sidecar - or just this project's own entry in it - does
+/// not exist. READ-ONLY: `doctor` (`ops::health::judgement_debt_line`) calls
+/// this, and only this, never [`update_eval_debt_state`] below - a read-only
+/// diagnostic must never write, or the two facts it reports would depend on
+/// whichever tool happened to run last.
+pub fn project_eval_state(db: &Path, project: Option<&str>) -> ProjectEvalState {
+    read_eval_debt_state(db).remove(project_key(project)).unwrap_or_default()
+}
+
+/// Every id of a live Report, scoped to EXACTLY `project` (not
+/// `project::applies_to`'s "or global" rule: a report filed for one project
+/// must never silence a different project's own debt, and - moot in
+/// practice, since `model::gate`'s ground 21 refuses a scopeless Report
+/// outright except for one exempt id - a global report would otherwise only
+/// ever have silenced a checkout that itself resolves to no project),
+/// carrying the `evaluation-report` tag. The set [`update_eval_debt_state`]
+/// below compares each Stop's own live set against.
+fn evaluation_report_ids(store: &EventStore, project: Option<&str>) -> Vec<String> {
+    crate::live::live_items(store)
+        .into_iter()
+        .filter(|li| li.item.kind == model::item::Kind::Report)
+        .filter(|li| li.item.project.as_deref() == project)
+        .filter(|li| li.item.tags.iter().any(|t| t == "evaluation-report"))
+        .map(|li| li.id)
+        .collect()
+}
+
+/// Refresh this project's own two facts from `store` as it stands right
+/// now, and write the sidecar back if anything actually changed. Called
+/// ONCE PER MAIN-SESSION STOP in a project (`bin/serve.rs`'s `hook_once`,
+/// unconditionally within its own `!is_subagent` guard) - deliberately
+/// unconditioned by the once-per-session/served-this-session gates that
+/// decide whether the obligation is actually SHOWN (`eval_debt_not_yet_
+/// asked_this_session`, `session_served_in_project`): those two are about
+/// whether to SPEAK, this is about whether the RECORD stays true, and a
+/// session that is never asked must still leave the ceiling clock and the
+/// report sighting exactly as accurate as one that was.
 ///
-/// DELIBERATELY NOT SCOPED TO "CURRENTLY OWED" ITEMS ONLY, even though the
-/// evaluation debt's own ceiling condition (`eval_debt_owed`'s
-/// `owed_in_project`) is. A mark of usefulness or noise resets ITS OWN
-/// item's served-since-verdict count to zero (`served_since_last_verdict`),
-/// which drops that item OUT of the owed set the moment it is judged - so a
-/// verdict scoped to "still owed right now" could never see the very
-/// judgement that just happened, and a session that had just finished a real
-/// evaluation pass would be told nothing here was ever judged. What this
-/// asks instead is the plain question the debt's own message makes to the
-/// owner - "has anything in this project's scope been judged lately" - which
-/// is answered by ANY verdict on ANY item this checkout would ever be asked
-/// about, owed or not.
-///
-/// LIVE ITEMS ONLY, same reasoning `judgement_debt` (`bin/serve.rs`) already
-/// gives for its own "AND ONLY WHAT IS STILL LIVE" filter: a verdict's own
-/// event never says what project it was scoped to at the time, only
-/// `entity_id` - so this reads that back from the CURRENT live item, and an
-/// id no longer live (retracted since) has no current scope to check at all,
-/// so it is excluded rather than guessed at.
-///
-/// NOT PINNED-EXCLUDED, unlike `owed_items` above (and so unlike
-/// `judgement_debt_counts`/`judgement_debt_named`, which both read that
-/// exclusion from it): a verdict is a verdict regardless of what the item is
-/// bound to today, and a mark given while it was trigger-bound, or given
-/// after it is later unpinned, is exactly the honest evidence the evaluation
-/// debt asks this function for. The waste this whole change removes is
-/// asking for a NEW verdict nobody needs, never discounting a real one
-/// already on record.
-pub fn newest_verdict_unix(store: &EventStore, checkout_project: Option<&str>) -> Option<i64> {
-    let live = crate::live::live_items(store);
-    let project_of: HashMap<&str, Option<&str>> =
-        live.iter().map(|li| (li.id.as_str(), li.item.project.as_deref())).collect();
-    let events = store.get_all_events().ok()?;
-    events
-        .iter()
-        .filter(|e| matches!(e.kind, EventKind::ItemMarkedUseful | EventKind::ItemMarkedNoise))
-        .filter(|e| {
-            project_of.get(e.entity_id.as_str()).is_some_and(|p| crate::project::applies_to(*p, checkout_project))
-        })
-        .filter_map(|e| serde_json::from_str::<MarkedAt>(&e.body).ok())
-        .filter_map(|m| crate::time::unix_from_iso8601(&m.marked_at))
-        .max()
+/// NEVER CALLED BY `doctor` (`ops::health::judgement_debt_line`), which
+/// reads this same state through [`project_eval_state`] but must stay
+/// read-only - see that function's own doc comment.
+pub fn update_eval_debt_state(store: &EventStore, db: &Path, project: Option<&str>, now_unix: i64) -> ProjectEvalState {
+    let mut all = read_eval_debt_state(db);
+    let key = project_key(project).to_string();
+    let before = all.get(&key).cloned().unwrap_or_default();
+    let mut entry = before.clone();
+
+    // `over_ceiling_since`: set on the first Stop that sees the crossing,
+    // left untouched on every Stop after that (`get_or_insert` never
+    // overwrites a `Some`) so the clock measures the WHOLE streak, not just
+    // the most recent Stop - and cleared outright the first time a Stop sees
+    // the count fall back under the ceiling, so the next crossing starts
+    // fresh rather than inheriting a streak that already ended.
+    let (_, owed_in_project) = judgement_debt_counts(store, project);
+    if owed_in_project >= EVAL_DEBT_CEILING {
+        entry.over_ceiling_since.get_or_insert(now_unix);
+    } else {
+        entry.over_ceiling_since = None;
+    }
+
+    // `last_evaluation_seen`/`last_evaluation_report_id`: any id live right
+    // now that this sidecar has not seen before is "new" - stamp the moment
+    // and grow the known set, so the SAME report never re-triggers this on a
+    // later Stop just for still existing.
+    let new_ids: Vec<String> =
+        evaluation_report_ids(store, project).into_iter().filter(|id| !entry.known_report_ids.contains(id)).collect();
+    if let Some(newest) = new_ids.iter().max().cloned() {
+        entry.last_evaluation_seen = Some(now_unix);
+        entry.last_evaluation_report_id = Some(newest);
+    }
+    entry.known_report_ids.extend(new_ids);
+
+    if entry == before {
+        return entry;
+    }
+    all.insert(key, entry.clone());
+    if let Ok(text) = serde_json::to_string(&all) {
+        let _ = std::fs::write(eval_debt_state_path(db), text);
+    }
+    entry
 }
 
 /// The pure resolution rule behind `default_eval_command_path` below:
@@ -649,39 +778,67 @@ mod eval_debt_predicate_tests {
     use super::*;
 
     // Fixed reference instant - any value works, since the predicate only
-    // ever looks at the DIFFERENCE between it and a verdict's own timestamp.
+    // ever looks at the DIFFERENCE between it and a stored instant.
     const NOW: i64 = 1_800_000_000;
+    const HOUR: i64 = 3600;
 
     #[test]
-    fn fires_at_exactly_the_ceiling_with_a_verdict_25_hours_old() {
-        let verdict = NOW - 25 * 3600;
-        assert!(eval_debt_owed(EVAL_DEBT_CEILING, Some(verdict), NOW));
+    fn silent_below_the_ceiling_regardless_of_how_stale_everything_else_is() {
+        // Both other inputs are maximally "fire me" (long over the ceiling,
+        // no report ever) - proving the ceiling alone still holds the line.
+        assert!(!eval_debt_owed(EVAL_DEBT_CEILING - 1, Some(NOW - 100 * HOUR), None, NOW));
+    }
+
+    /// Case named in the build brief: over the ceiling for 23 hours -> silent.
+    #[test]
+    fn silent_over_the_ceiling_for_only_23_hours() {
+        let since = NOW - 23 * HOUR;
+        assert!(!eval_debt_owed(EVAL_DEBT_CEILING, Some(since), None, NOW));
+    }
+
+    /// Case named in the build brief: 25 hours and no report -> fires.
+    #[test]
+    fn fires_over_the_ceiling_for_25_hours_with_no_report_ever() {
+        let since = NOW - 25 * HOUR;
+        assert!(eval_debt_owed(EVAL_DEBT_CEILING, Some(since), None, NOW));
+    }
+
+    /// Case named in the build brief: report first seen 10 hours ago -> silent.
+    #[test]
+    fn silent_when_a_report_was_first_seen_10_hours_ago() {
+        let since = NOW - 48 * HOUR;
+        let seen = NOW - 10 * HOUR;
+        assert!(!eval_debt_owed(EVAL_DEBT_CEILING, Some(since), Some(seen), NOW));
+    }
+
+    /// Case named in the build brief: report first seen 30 hours ago and
+    /// still over -> fires.
+    #[test]
+    fn fires_when_the_report_first_seen_30_hours_ago_is_itself_stale() {
+        let since = NOW - 48 * HOUR;
+        let seen = NOW - 30 * HOUR;
+        assert!(eval_debt_owed(EVAL_DEBT_CEILING, Some(since), Some(seen), NOW));
+    }
+
+    /// `over_ceiling_since` is `None` on exactly the Stop that first crosses
+    /// the ceiling, before `update_eval_debt_state` has written anything for
+    /// this project yet - that Stop must never fire on the spot.
+    #[test]
+    fn a_crossing_the_sidecar_has_not_recorded_yet_is_not_yet_stale() {
+        assert!(!eval_debt_owed(EVAL_DEBT_CEILING, None, None, NOW));
     }
 
     #[test]
-    fn silent_one_below_the_ceiling() {
-        // A verdict that is "never" (None) would otherwise satisfy the
-        // staleness half outright - proving the ceiling alone still holds
-        // the line even against the most permissive possible staleness input.
-        assert!(!eval_debt_owed(EVAL_DEBT_CEILING - 1, None, NOW));
-    }
-
-    #[test]
-    fn silent_with_a_verdict_23_hours_old() {
-        let verdict = NOW - 23 * 3600;
-        assert!(!eval_debt_owed(EVAL_DEBT_CEILING, Some(verdict), NOW));
-    }
-
-    #[test]
-    fn fires_with_no_verdict_ever() {
-        assert!(eval_debt_owed(EVAL_DEBT_CEILING + 5, None, NOW));
-    }
-
-    #[test]
-    fn a_verdict_from_the_future_is_not_yet_stale() {
-        // Clock skew, or a hand-edited timestamp: must not underflow into a
+    fn a_future_over_ceiling_since_is_not_yet_stale() {
+        // Clock skew, or a hand-edited sidecar: must not underflow into a
         // huge apparent age via `saturating_sub` reading the wrong direction.
-        assert!(!eval_debt_owed(EVAL_DEBT_CEILING, Some(NOW + 3600), NOW));
+        assert!(!eval_debt_owed(EVAL_DEBT_CEILING, Some(NOW + HOUR), None, NOW));
+    }
+
+    #[test]
+    fn a_future_last_evaluation_seen_is_not_yet_stale() {
+        let since = NOW - 48 * HOUR;
+        assert!(!eval_debt_owed(EVAL_DEBT_CEILING, Some(since), Some(NOW + HOUR), NOW));
     }
 
     #[test]
@@ -693,7 +850,7 @@ mod eval_debt_predicate_tests {
 }
 
 #[cfg(test)]
-mod newest_verdict_tests {
+mod eval_debt_state_tests {
     use super::*;
     use model::item::{Binding, Item, Kind};
 
@@ -714,63 +871,169 @@ mod newest_verdict_tests {
         model::store::declare(store, "t", "t", "t", &item).expect("fixture must store");
     }
 
+    fn serve_n(store: &mut EventStore, id: &str, times: usize) {
+        for _ in 0..times {
+            crate::deliver::record_delivery(store, "s", "s", "t", "2026-09-08T00:00:00Z", &[id.to_string()]);
+        }
+    }
+
+    /// A live evaluation-report Report, correctly tagged and scoped - ground
+    /// 21 (`model::gate`) refuses a Report with no project at all except one
+    /// exempt id, so every fixture Report here needs a real project.
+    fn declare_report(store: &mut EventStore, id: &str, project: &str, tags: &[&str]) {
+        let item = Item {
+            id: id.to_string(),
+            kind: Kind::Report,
+            text: format!("fixture evaluation report {id}"),
+            bindings: vec![],
+            severity: None,
+            project: Some(project.to_string()),
+            tags: tags.iter().map(|t| t.to_string()).collect(),
+            expires: None,
+            key: None,
+            falsifier: None,
+            check: None,
+        };
+        model::store::declare(store, "t", "t", "t", &item).expect("fixture must store");
+    }
+
+    fn owe(store: &mut EventStore, n: usize, project: Option<&str>) {
+        for i in 0..n {
+            let id = format!("owed-{}-{i}", project.unwrap_or("global"));
+            declare(store, &id, project);
+            serve_n(store, &id, JUDGEMENT_DEBT_AFTER);
+        }
+    }
+
+    // ----------------------------------------------------------- round trip
+
     #[test]
-    fn an_empty_store_has_no_newest_verdict() {
-        let store = EventStore::in_memory().unwrap();
-        assert_eq!(newest_verdict_unix(&store, None), None);
+    fn a_missing_sidecar_reads_as_the_all_default_state() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("t.db");
+        assert_eq!(project_eval_state(&db, Some("thor")), ProjectEvalState::default());
     }
 
     #[test]
-    fn a_single_mark_is_the_newest_verdict() {
-        let mut store = EventStore::in_memory().unwrap();
-        declare(&mut store, "a", None);
-        crate::mark::record_useful(&mut store, "s", "l", "a", "2026-08-02T00:00:00Z", "a").unwrap();
+    fn a_corrupt_sidecar_reads_as_the_all_default_state_not_an_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("t.db");
+        std::fs::write(eval_debt_state_path(&db), "{ this is not json").unwrap();
+        assert_eq!(project_eval_state(&db, Some("thor")), ProjectEvalState::default());
+    }
+
+    #[test]
+    fn a_written_state_reads_back_identical() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("t.db");
+        let mut store = EventStore::new(&db).unwrap();
+        owe(&mut store, EVAL_DEBT_CEILING, None);
+        let written = update_eval_debt_state(&store, &db, None, 1_800_000_000);
+        let read_back = project_eval_state(&db, None);
+        assert_eq!(written, read_back);
+        assert_eq!(read_back.over_ceiling_since, Some(1_800_000_000));
+    }
+
+    #[test]
+    fn writing_only_happens_when_something_actually_changed() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("t.db");
+        let store = EventStore::new(&db).unwrap();
+        update_eval_debt_state(&store, &db, None, 1_000);
+        assert!(!eval_debt_state_path(&db).exists(), "an all-default state must never write an empty sidecar");
+    }
+
+    #[test]
+    fn two_projects_keep_separate_entries_in_one_sidecar_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("t.db");
+        let mut store = EventStore::new(&db).unwrap();
+        owe(&mut store, EVAL_DEBT_CEILING, Some("thor"));
+        update_eval_debt_state(&store, &db, Some("thor"), 1_000);
+        update_eval_debt_state(&store, &db, Some("acme"), 2_000);
+        assert_eq!(project_eval_state(&db, Some("thor")).over_ceiling_since, Some(1_000));
         assert_eq!(
-            newest_verdict_unix(&store, None),
-            crate::time::unix_from_iso8601("2026-08-02T00:00:00Z")
+            project_eval_state(&db, Some("acme")).over_ceiling_since,
+            None,
+            "acme's own backlog never crossed the ceiling"
         );
     }
 
+    // ------------------------------------------------- over_ceiling_since
+
     #[test]
-    fn the_later_of_two_verdicts_wins_regardless_of_kind() {
-        let mut store = EventStore::in_memory().unwrap();
-        declare(&mut store, "a", None);
-        declare(&mut store, "b", None);
-        crate::mark::record_useful(&mut store, "s", "l", "a", "2026-08-02T00:00:00Z", "a").unwrap();
-        crate::mark::record_noise(&mut store, "s", "l", "a", "2026-08-05T00:00:00Z", "b").unwrap();
+    fn over_ceiling_since_is_set_on_the_first_crossing_and_never_moves_after() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("t.db");
+        let mut store = EventStore::new(&db).unwrap();
+        owe(&mut store, EVAL_DEBT_CEILING, None);
+        let first = update_eval_debt_state(&store, &db, None, 1_000);
+        assert_eq!(first.over_ceiling_since, Some(1_000));
+        let second = update_eval_debt_state(&store, &db, None, 50_000);
         assert_eq!(
-            newest_verdict_unix(&store, None),
-            crate::time::unix_from_iso8601("2026-08-05T00:00:00Z"),
-            "a later NOISE mark still counts as the newest verdict"
+            second.over_ceiling_since,
+            Some(1_000),
+            "the clock must not restart on a later Stop that is still over the ceiling"
         );
     }
 
+    /// Case named in the build brief: owed below the ceiling resets the clock.
     #[test]
-    fn a_verdict_owed_only_to_another_project_is_excluded() {
-        let mut store = EventStore::in_memory().unwrap();
-        declare(&mut store, "acme-item", Some("acme"));
-        crate::mark::record_useful(&mut store, "s", "l", "a", "2026-08-02T00:00:00Z", "acme-item").unwrap();
-        assert_eq!(newest_verdict_unix(&store, Some("thor")), None, "a different checkout must not see it");
-        assert!(newest_verdict_unix(&store, Some("acme")).is_some(), "fixture sanity: acme's own checkout does");
+    fn over_ceiling_since_is_cleared_the_first_time_a_stop_sees_the_count_drop_back_under() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("t.db");
+        let mut store = EventStore::new(&db).unwrap();
+        owe(&mut store, EVAL_DEBT_CEILING, None);
+        let over = update_eval_debt_state(&store, &db, None, 1_000);
+        assert!(over.over_ceiling_since.is_some(), "fixture sanity: over the ceiling");
+        crate::mark::record_useful(&mut store, "s", "s", "t", "2026-09-08T00:00:00Z", "owed-global-0").unwrap();
+        let dropped = update_eval_debt_state(&store, &db, None, 2_000);
+        assert_eq!(dropped.over_ceiling_since, None, "a verdict that drops the count under the ceiling resets the clock");
+    }
+
+    // --------------------------------------------------- evaluation reports
+
+    #[test]
+    fn a_new_live_evaluation_report_stamps_last_evaluation_seen_and_names_its_id() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("t.db");
+        let mut store = EventStore::new(&db).unwrap();
+        declare_report(&mut store, "eval-thor-2026-09-01", "thor", &["evaluation-report"]);
+        let state = update_eval_debt_state(&store, &db, Some("thor"), 5_000);
+        assert_eq!(state.last_evaluation_seen, Some(5_000));
+        assert_eq!(state.last_evaluation_report_id.as_deref(), Some("eval-thor-2026-09-01"));
+        assert!(state.known_report_ids.contains("eval-thor-2026-09-01"));
     }
 
     #[test]
-    fn a_global_verdict_counts_toward_every_project() {
-        let mut store = EventStore::in_memory().unwrap();
-        declare(&mut store, "global-item", None);
-        crate::mark::record_useful(&mut store, "s", "l", "a", "2026-08-02T00:00:00Z", "global-item").unwrap();
-        assert!(newest_verdict_unix(&store, Some("thor")).is_some());
-        assert!(newest_verdict_unix(&store, Some("acme")).is_some());
+    fn the_same_report_seen_again_never_restamps_last_evaluation_seen() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("t.db");
+        let mut store = EventStore::new(&db).unwrap();
+        declare_report(&mut store, "eval-thor-2026-09-01", "thor", &["evaluation-report"]);
+        update_eval_debt_state(&store, &db, Some("thor"), 5_000);
+        let again = update_eval_debt_state(&store, &db, Some("thor"), 9_000);
+        assert_eq!(again.last_evaluation_seen, Some(5_000), "the same, already-known report must not restamp the clock");
     }
 
     #[test]
-    fn a_verdict_on_a_since_retracted_item_is_excluded() {
-        let mut store = EventStore::in_memory().unwrap();
-        declare(&mut store, "gone", None);
-        crate::mark::record_useful(&mut store, "s", "l", "a", "2026-08-02T00:00:00Z", "gone").unwrap();
-        assert!(newest_verdict_unix(&store, None).is_some(), "fixture sanity: live and judged");
-        model::store::retract(&mut store, "t", "t", "t", "gone", "no longer needed").unwrap();
-        assert_eq!(newest_verdict_unix(&store, None), None, "a verdict on a dead item proves nothing current");
+    fn a_report_missing_the_tag_is_never_counted() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("t.db");
+        let mut store = EventStore::new(&db).unwrap();
+        declare_report(&mut store, "eval-thor-2026-09-01", "thor", &["some-other-tag"]);
+        let state = update_eval_debt_state(&store, &db, Some("thor"), 5_000);
+        assert_eq!(state.last_evaluation_seen, None);
+    }
+
+    #[test]
+    fn a_report_filed_for_a_different_project_never_silences_this_one() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("t.db");
+        let mut store = EventStore::new(&db).unwrap();
+        declare_report(&mut store, "eval-acme-2026-09-01", "acme", &["evaluation-report"]);
+        let state = update_eval_debt_state(&store, &db, Some("thor"), 5_000);
+        assert_eq!(state.last_evaluation_seen, None, "acme's own report must not silence thor's debt");
     }
 }
 

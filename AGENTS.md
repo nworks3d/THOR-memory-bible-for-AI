@@ -278,11 +278,12 @@ nothing - the fix has to be a real change to the note, or the tag that records
 the decision.
 
 Once in a while it asks for something bigger instead of one more note: when a
-project has built up ten or more notes still waiting on a verdict and none of
-them has been looked at in a whole day, it asks you to run the full
-end-of-session review in one pass rather than judging notes one at a time.
-That only happens once per conversation, even if the backlog is still there
-afterward.
+project has built up ten or more notes still waiting on a verdict, and that
+has stayed true for a whole day with no evaluation report filed for it in
+that time, it asks you to run the full end-of-session review in one pass
+rather than judging notes one at a time. That only happens once per
+conversation, even if the backlog is still there afterward - and filing the
+report at the end of that review is what silences the ask for a day.
 
 The first of those only ever names a note THIS session actually saw fire -
 never one that only ever showed up during other, unrelated work. Answer for

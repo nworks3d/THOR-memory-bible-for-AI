@@ -23,12 +23,12 @@ fn civil_from_days(z: i64) -> (i64, u32, u32) {
 
 /// (year, month, day), proleptic Gregorian -> days since the Unix epoch: the
 /// exact inverse of `civil_from_days` above, same source algorithm
-/// (`days_from_civil`). Needed by `unix_from_iso8601` - the evaluation debt
-/// (`usefulness::newest_verdict_unix`) has to turn a stored `marked_at` back
-/// into an instant it can compare against "now", and every timestamp this
-/// codebase ever writes is already in this exact `YYYY-MM-DDTHH:MM:SSZ`
-/// shape (`ItemMarkedUseful`/`ItemMarkedNoise`'s own `marked_at`, `ItemServed`'s
-/// `served_at`), so no other format needs to be understood.
+/// (`days_from_civil`). Needed by `unix_from_iso8601` below, which turns a
+/// stored timestamp back into an instant something can compare against
+/// "now" - every timestamp this codebase ever writes is already in this
+/// exact `YYYY-MM-DDTHH:MM:SSZ` shape (`ItemMarkedUseful`/`ItemMarkedNoise`'s
+/// own `marked_at`, `ItemServed`'s `served_at`), so no other format needs to
+/// be understood.
 fn days_from_civil(y: i64, m: u32, d: u32) -> i64 {
     let y = if m <= 2 { y - 1 } else { y };
     let era = if y >= 0 { y } else { y - 399 } / 400;
@@ -56,9 +56,8 @@ pub fn iso8601_from_unix(total_secs: i64) -> String {
 /// writes into a `marked_at`/`served_at` field - back into Unix seconds.
 /// `None` on anything that does not match that exact shape, rather than
 /// guessing at a looser one: a malformed or foreign timestamp must read as
-/// "unknown" to its one caller (`usefulness::newest_verdict_unix`), never as
-/// a wrong instant silently accepted, since that reader's whole job is
-/// deciding whether an instant is recent enough to cancel a debt.
+/// "unknown", never as a wrong instant silently accepted. Its own exact
+/// inverse of `iso8601_from_unix`, proven by the round-trip tests below.
 pub fn unix_from_iso8601(s: &str) -> Option<i64> {
     let s = s.strip_suffix('Z')?;
     let (date, time) = s.split_once('T')?;

@@ -94,10 +94,33 @@ fn run_hook(db: &Path, payload: &str) -> String {
     String::from_utf8(out.stdout).unwrap()
 }
 
+/// A real, empty directory with no marker and no `.git` anywhere above it,
+/// so `project::resolve_project` reliably resolves it to `None` for every
+/// payload in this file - added 2026-09-16 alongside the evaluation debt's
+/// own fourth rewrite (see `judgement_debt_excludes_pinned_stop_hook.rs`'s
+/// own module doc comment for the identical reasoning): without this, a
+/// payload would resolve to wherever `cargo test` itself was invoked from -
+/// inside this very repository, and so a REAL project - and this file's own
+/// fixtures serve items far enough in the past to clear the evaluation
+/// debt's own minutes-worked floor, which would otherwise fire before ever
+/// reaching the debt each test below actually means to prove. A single
+/// shared path under the OS temp directory, not a fresh one per test: every
+/// test in this file wants the identical no-project resolution and nothing
+/// here ever writes INTO this directory, so sharing it (idempotently
+/// created - `create_dir_all` succeeds when the directory already exists,
+/// safe under parallel test threads) is simpler than threading a `cwd`
+/// parameter through eleven call sites for no behavioural difference.
+fn no_project_cwd() -> std::path::PathBuf {
+    let dir = std::env::temp_dir().join("thor-response-guard-subagent-gate-fixture-cwd");
+    std::fs::create_dir_all(&dir).unwrap();
+    dir
+}
+
 fn session_start_payload(session_id: &str) -> String {
     serde_json::json!({
         "hook_event_name": "SessionStart",
         "session_id": session_id,
+        "cwd": no_project_cwd().to_string_lossy(),
     })
     .to_string()
 }
@@ -110,6 +133,7 @@ fn subagent_stop_payload(session_id: &str, last_assistant_message: &str) -> Stri
         "last_assistant_message": last_assistant_message,
         "agent_id": "a1dca2c0feb7f44fb",
         "agent_type": "general-purpose",
+        "cwd": no_project_cwd().to_string_lossy(),
     })
     .to_string()
 }
@@ -120,6 +144,7 @@ fn main_session_stop_payload(session_id: &str, last_assistant_message: &str) -> 
         "session_id": session_id,
         "stop_hook_active": false,
         "last_assistant_message": last_assistant_message,
+        "cwd": no_project_cwd().to_string_lossy(),
     })
     .to_string()
 }

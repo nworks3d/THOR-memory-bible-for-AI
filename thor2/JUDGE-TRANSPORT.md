@@ -160,16 +160,29 @@ independently, at its own call site in `hook_once`'s `Stop` arm. `setup_debt`
 never walks a subagent
 through AGENTS.md's setup questions, because there is no owner in the room
 for that conversation either. The evaluation debt (added 2026-09-12, trigger
-rewritten twice on 2026-09-16: first to a per-project sidecar rather than a
-single verdict clock, then to drop the item-count ceiling entirely in favour
-of a daily, per-project ask once a session has worked there long enough -
+rewritten four times, three of them on 2026-09-16: first to a per-project
+sidecar rather than a single verdict clock, then to drop the item-count
+ceiling entirely in favour of a daily, per-project ask once a session has
+worked there long enough, then to never ask outside a project at all, then
+- the owner's decision that day, "he does not want to ever have to run an
+evaluation himself" - to a UTC CALENDAR DAY with no once-per-session limit:
 `serve/src/bin/serve.rs`'s `evaluation_debt`, `serve::usefulness`'s own
-"evaluation debt" section - holds once a full day has passed since the later
-of this project's own tracking clock and its last evaluation report, AND
-this session has worked in the project for at least an hour, AND the
-checkout resolves to a real project at all - never for one that resolves to
-no project, since 2026-09-16, since no project means no Report can ever be
-filed to silence it) is silent for a
+"evaluation debt" section - holds when no evaluation report for this
+project has been first seen on the current UTC calendar day
+(`serve::usefulness::eval_done_today`, `crate::time::same_utc_day` - UTC,
+never the owner's own local day, since this workspace has no dependency
+capable of resolving a local UTC offset), AND this session has worked in
+the project for at least an hour, AND the checkout resolves to a real
+project at all - never for one that resolves to no project, since no
+project means no Report can ever be filed to silence it. It now BLOCKS THE
+FIRST STOP OF EVERY TURN for as long as it holds, not merely once per
+session - relying entirely on Claude Code's own `stop_hook_active` (the
+`already_fired` branch at the very top of `hook_once`'s `Stop` arm, shared
+by every debt in this function) for the "at most once per turn" safety,
+adding no second copy of that mechanism - and counts every ask on the
+project's own sidecar entry (`ProjectEvalState`'s `asked_count`/`first_
+asked_since_report`, reset the moment a new report is seen), replacing the
+retired session-keyed `eval-debt-asked.json`. It is silent for a
 subagent for the identical reason: a subagent cannot itself type
 `/thor-eval`, so holding its turn over a routine only the owner can run
 would spend a whole agent run asking for something it has no way to do. The

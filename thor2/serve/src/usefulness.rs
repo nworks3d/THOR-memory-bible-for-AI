@@ -559,6 +559,38 @@ pub fn noise_since_last_useful(store: &EventStore) -> HashMap<String, usize> {
 // owner's own live sidecar held exactly one, started 2026-09-16 21:56,
 // from before this gate existed - is left exactly as it is: inert, never
 // read for a no-project checkout any more, never deleted either.
+//
+// A FOURTH REWRITE, THE SAME DAY (owner's decision, 2026-09-16: he does not
+// want to ever have to run an evaluation himself, so a debt that could still
+// be waited out - once per session, or once every 24 rolling hours from
+// whichever of `tracking_since`/`last_evaluation_seen` was later - was not
+// enough). The rule is now "once a day, per project, and it does not let
+// go": once this session has worked here for `EVAL_MIN_SESSION_MINUTES`,
+// the obligation holds for as long as no evaluation report for this project
+// has been FIRST SEEN on the current UTC CALENDAR DAY (`eval_done_today`,
+// `crate::time::same_utc_day`) - a report seen yesterday no longer buys
+// today's silence, the way a report seen 23 hours ago used to.
+// `tracking_since` drops out of the predicate entirely: still written, on
+// the very first Stop a project is ever seen at (`update_eval_debt_state`'s
+// own `get_or_insert`, unchanged), and an old sidecar still reads it under
+// either its current name or its pre-2026-09-16 `over_ceiling_since` alias
+// - just never again compared against "now" to decide anything. The
+// once-per-SESSION gate (`bin/serve.rs`'s old `eval_debt_asked_path`/
+// `eval_debt_not_yet_asked_this_session`/`record_eval_debt_asked`, a
+// session-keyed sidecar file distinct from this one, all three retired by
+// this rewrite) is gone too: the debt now blocks the first Stop of EVERY
+// turn for as long as it holds, with Claude Code's own `stop_hook_active`
+// (`bin/serve.rs`'s `hook_once`, the `already_fired` branch at the very top
+// of its `Stop` arm) the only thing standing between that and blocking a
+// retry of the same turn too - this debt adds no second copy of that
+// safety, it relies on the one already there, same as every other debt in
+// that function. Every ask is now counted on THIS PROJECT's own sidecar
+// entry instead of a session's (`asked_count`, `first_asked_since_report`
+// below) - "once per session" stopped meaning anything once the debt could
+// fire more than once in one, so what a reader needs instead is how many
+// times, and since when, this project has gone unanswered; both reset to
+// zero/`None` the moment `update_eval_debt_state` below next sees a new
+// report, the same Stop that already stamps `last_evaluation_seen`.
 
 /// How many minutes THIS session must have worked in a project - measured
 /// from the earliest `item_served` event it recorded for an item that
@@ -569,64 +601,45 @@ pub fn noise_since_last_useful(store: &EventStore) -> HashMap<String, usize> {
 /// first question of a session before there was anything to evaluate yet.
 pub const EVAL_MIN_SESSION_MINUTES: i64 = 60;
 
-/// How many hours may pass since the later of a project's own `tracking_
-/// since` and its `last_evaluation_seen` before the evaluation debt is
-/// willing to speak at all - the grace period that keeps it from asking
-/// again minutes after an evaluation actually happened. A day, not an hour:
-/// an evaluation is deliberate, occasional work, and a project this memory
-/// only just started tracking, or one evaluated an hour ago, is not yet
-/// overdue for another.
-pub const EVAL_DEBT_STALE_HOURS: i64 = 24;
-
 /// THE TIME HALF OF THE PURE PREDICATE, factored out of `eval_debt_owed`
 /// below so `doctor` (`ops::health::judgement_debt_line`), which runs cold
 /// outside any session and so can never evaluate the minutes-worked half,
 /// can still report accurately on the half it CAN evaluate - without
-/// duplicating the "later of the two" rule a second time and risking it
-/// drift from the one `eval_debt_owed` actually acts on.
+/// duplicating the "is this the current UTC day" rule a second time and
+/// risking it drift from the one `eval_debt_owed` actually acts on. Replaces
+/// `eval_debt_stale` and the retired `EVAL_DEBT_STALE_HOURS` (2026-09-16,
+/// fourth rewrite, this section's own doc comment): a rolling 24 hours
+/// measured against the LATER of `tracking_since`/`last_evaluation_seen`
+/// gave way to a UTC calendar day measured against `last_evaluation_seen`
+/// alone.
 ///
-/// Holds when at least `EVAL_DEBT_STALE_HOURS` have passed since the LATER
-/// of `tracking_since` and `last_evaluation_seen` (`tracking_since` of
-/// `None` - no main-session Stop has ever been recorded for this project -
-/// reads as "just now", i.e. not yet stale, never as "forever"; `last_
-/// evaluation_seen` of `None` simply drops out of the "later of the two",
-/// leaving `tracking_since` alone, which is exactly "no evaluation report
-/// was ever seen for this project" as the doc comment above promises).
-/// `now_unix.saturating_sub(..)` throughout rather than plain subtraction:
-/// both timestamps are read from a stored, human-editable sidecar, and a
-/// clock skew that put either in the future must read as "not yet stale"
-/// rather than underflow.
-pub fn eval_debt_stale(tracking_since: Option<i64>, last_evaluation_seen: Option<i64>, now_unix: i64) -> bool {
-    let Some(since) = tracking_since else { return false };
-    let baseline = match last_evaluation_seen {
-        Some(seen) => seen.max(since),
-        None => since,
-    };
-    now_unix.saturating_sub(baseline) > EVAL_DEBT_STALE_HOURS * 3600
+/// Holds (today's evaluation IS done) when `last_evaluation_seen` is
+/// `Some`, AND it falls on the same UTC calendar day as `now_unix`
+/// (`crate::time::same_utc_day`). `None` - no evaluation report has ever
+/// been seen for this project - reads as "not done today", never as "done
+/// forever": there is no instant for a report that was never seen, so there
+/// is nothing for `same_utc_day` to agree with.
+pub fn eval_done_today(last_evaluation_seen: Option<i64>, now_unix: i64) -> bool {
+    last_evaluation_seen.is_some_and(|seen| crate::time::same_utc_day(seen, now_unix))
 }
 
-/// THE WHOLE PURE PREDICATE, rewritten 2026-09-16 to drop the ceiling (see
-/// this section's own doc comment for why). All four inputs are already
-/// resolved elsewhere (`minutes_worked_this_session` from `minutes_ago`
-/// applied to `bin/serve.rs`'s own session-scoped read, `tracking_since`/
+/// THE WHOLE PURE PREDICATE, rewritten 2026-09-16 to drop `tracking_since`
+/// and the 24-hour rolling window entirely in favour of a UTC calendar day
+/// (see this section's own doc comment, fourth rewrite, for why). Both
+/// inputs are already resolved elsewhere (`minutes_worked_this_session`
+/// from `minutes_ago` applied to `bin/serve.rs`'s own session-scoped read,
 /// `last_evaluation_seen` from this project's own `ProjectEvalState` below,
 /// `now_unix` from `crate::time::now_unix`), so this stays nothing but the
 /// conditions themselves, unit-testable with plain integers and no store,
 /// no clock, no filesystem.
 ///
 /// Holds when THIS session has worked in the project for at least
-/// `EVAL_MIN_SESSION_MINUTES`, AND `eval_debt_stale` above holds. The
-/// minutes check is first and cheapest, and short-circuits the common case
-/// (a session that only just started here) without even looking at the
-/// sidecar's own two timestamps.
-pub fn eval_debt_owed(
-    minutes_worked_this_session: i64,
-    tracking_since: Option<i64>,
-    last_evaluation_seen: Option<i64>,
-    now_unix: i64,
-) -> bool {
-    minutes_worked_this_session >= EVAL_MIN_SESSION_MINUTES
-        && eval_debt_stale(tracking_since, last_evaluation_seen, now_unix)
+/// `EVAL_MIN_SESSION_MINUTES`, AND `eval_done_today` above does NOT hold.
+/// The minutes check is first and cheapest, and short-circuits the common
+/// case (a session that only just started here) without even looking at
+/// the sidecar's own timestamp.
+pub fn eval_debt_owed(minutes_worked_this_session: i64, last_evaluation_seen: Option<i64>, now_unix: i64) -> bool {
+    minutes_worked_this_session >= EVAL_MIN_SESSION_MINUTES && !eval_done_today(last_evaluation_seen, now_unix)
 }
 
 /// Whole days between `then_unix` and `now_unix`, floored, never negative -
@@ -702,6 +715,26 @@ pub struct ProjectEvalState {
     /// usually also the newest by date.
     #[serde(default)]
     pub last_evaluation_report_id: Option<String>,
+    /// How many times the Stop hook has blocked a turn for this project's
+    /// evaluation debt since the last report was seen - added 2026-09-16
+    /// (fourth rewrite, this section's own doc comment) to replace the old
+    /// once-per-SESSION sidecar (`bin/serve.rs`'s retired `eval-debt-
+    /// asked.json`) now that the debt blocks every turn instead of at most
+    /// one per session, so a reader needs to know how many times THIS
+    /// PROJECT has been asked, not merely whether one particular session
+    /// already heard it once. Reset to 0 the moment a new report is seen
+    /// (`update_eval_debt_state` below, the same branch that stamps `last_
+    /// evaluation_seen`) - counts asks SINCE THE LAST REPORT, never a
+    /// lifetime total.
+    #[serde(default)]
+    pub asked_count: u32,
+    /// The instant the FIRST of those asks happened - `None` when nothing
+    /// is currently unanswered (no report is owed right now, or the debt
+    /// has never fired since the last one was seen). Set once
+    /// (`record_eval_debt_asked`'s own `get_or_insert`) and reset to `None`
+    /// alongside `asked_count` the moment a new report is seen.
+    #[serde(default)]
+    pub first_asked_since_report: Option<i64>,
 }
 
 /// The whole sidecar: one [`ProjectEvalState`] per project key (see
@@ -785,21 +818,20 @@ pub fn newest_evaluation_report(store: &EventStore, project: Option<&str>) -> Op
         .max_by_key(|(_, seq)| *seq)
 }
 
-/// Refresh this project's own two facts from `store` as it stands right
-/// now, and write the sidecar back if anything actually changed. Called
-/// ONCE PER MAIN-SESSION STOP in a project (`bin/serve.rs`'s `hook_once`,
+/// Refresh this project's own facts from `store` as it stands right now,
+/// and write the sidecar back if anything actually changed. Called ONCE PER
+/// MAIN-SESSION STOP in a project (`bin/serve.rs`'s `hook_once`,
 /// unconditionally within its own `!is_subagent && stop_project.is_some()`
-/// guard) - deliberately unconditioned by the once-per-session/enough-
-/// time-worked-here gates that decide whether the obligation is actually
-/// SHOWN (`eval_debt_not_yet_asked_this_session`, the minutes-worked half
-/// of `eval_debt_owed`): those are about whether to SPEAK, this is about
-/// whether the RECORD stays true, and a session that is never asked must
-/// still leave the tracking clock and the report sighting exactly as
-/// accurate as one that was. NEVER called at all for a checkout with no
-/// project (`stop_project.is_some()`, added 2026-09-16) - see this file's
-/// own "evaluation debt" section doc comment, third rewrite, for why: no
-/// project means no Report can ever be filed to silence this, so there is
-/// nothing honest for a `""`-keyed entry to track.
+/// guard) - deliberately unconditioned by the enough-time-worked-here gate
+/// that decides whether the obligation is actually SHOWN (the minutes-
+/// worked half of `eval_debt_owed`): that is about whether to SPEAK, this
+/// is about whether the RECORD stays true, and a session that is never
+/// asked must still leave the tracking clock and the report sighting
+/// exactly as accurate as one that was. NEVER called at all for a checkout
+/// with no project (`stop_project.is_some()`, added 2026-09-16) - see this
+/// file's own "evaluation debt" section doc comment, third rewrite, for
+/// why: no project means no Report can ever be filed to silence this, so
+/// there is nothing honest for a `""`-keyed entry to track.
 ///
 /// NEVER CALLED BY `doctor` (`ops::health::judgement_debt_line`), which
 /// reads this same state through [`project_eval_state`] but must stay
@@ -812,23 +844,32 @@ pub fn update_eval_debt_state(store: &EventStore, db: &Path, project: Option<&st
 
     // `tracking_since`: set on the FIRST main-session Stop this project was
     // ever seen at (`get_or_insert` never overwrites a `Some`), and left
-    // untouched on every Stop after that, forever - unlike the ceiling-
-    // crossing clock this replaced, nothing about the current backlog size
-    // ever clears it again. `store` is intentionally unread here now: the
-    // old version needed `judgement_debt_counts` to decide whether to set or
-    // clear this field; the new rule needs neither the store nor the count,
-    // only "has this project been seen before".
+    // untouched on every Stop after that, forever. No longer read by
+    // anything that decides whether the debt fires (`eval_debt_owed`, since
+    // 2026-09-16's fourth rewrite - see this section's own doc comment) but
+    // still written, unchanged: a project's own "how long has THOR known
+    // about it" is still honest, still cheap to keep true, and an old
+    // sidecar already carries it under either name (see the `serde(alias)`
+    // above).
     entry.tracking_since.get_or_insert(now_unix);
 
     // `last_evaluation_seen`/`last_evaluation_report_id`: any id live right
     // now that this sidecar has not seen before is "new" - stamp the moment
     // and grow the known set, so the SAME report never re-triggers this on a
-    // later Stop just for still existing.
+    // later Stop just for still existing. THE SAME MOMENT ALSO SILENCES THE
+    // ASK COUNTER (2026-09-16, fourth rewrite): a new report is exactly the
+    // event that answers every unanswered ask since the last one, so
+    // `asked_count`/`first_asked_since_report` reset together with it -
+    // never on a quiet day, never on the calendar rolling over, only ever
+    // on a report actually being seen (see `record_eval_debt_asked` below
+    // for the other half, incrementing these on an ask).
     let new_ids: Vec<String> =
         evaluation_report_ids(store, project).into_iter().filter(|id| !entry.known_report_ids.contains(id)).collect();
     if let Some(newest) = new_ids.iter().max().cloned() {
         entry.last_evaluation_seen = Some(now_unix);
         entry.last_evaluation_report_id = Some(newest);
+        entry.asked_count = 0;
+        entry.first_asked_since_report = None;
     }
     entry.known_report_ids.extend(new_ids);
 
@@ -840,6 +881,37 @@ pub fn update_eval_debt_state(store: &EventStore, db: &Path, project: Option<&st
         let _ = std::fs::write(eval_debt_state_path(db), text);
     }
     entry
+}
+
+/// Record one more Stop-hook ask for this project's evaluation debt -
+/// called only when the debt actually fires and the turn is about to be
+/// blocked for it (`bin/serve.rs`'s `hook_once`, right where the old
+/// session-keyed `record_eval_debt_asked` used to write `eval-debt-
+/// asked.json`, retired 2026-09-16 alongside the once-per-session gate - see
+/// this section's own doc comment, fourth rewrite). Increments this
+/// project's own `asked_count` and, if nothing is currently unanswered,
+/// stamps `first_asked_since_report` with `now_unix` - `get_or_insert`,
+/// exactly like `tracking_since` above, so a repeat ask never moves the
+/// clock a later reader measures "how long has this gone unanswered"
+/// against. Both are reset together the moment `update_eval_debt_state`
+/// above next sees a new report.
+///
+/// UNCONDITIONAL WRITE, unlike `update_eval_debt_state` above: every call
+/// here is a real state change (the count always goes up by at least one),
+/// so there is no "nothing changed" case to short-circuit.
+///
+/// Best effort, like every sidecar here: a write that fails leaves the next
+/// ask to try again, never breaks a turn.
+pub fn record_eval_debt_asked(db: &Path, project: Option<&str>, now_unix: i64) {
+    let mut all = read_eval_debt_state(db);
+    let key = project_key(project).to_string();
+    let mut entry = all.get(&key).cloned().unwrap_or_default();
+    entry.asked_count += 1;
+    entry.first_asked_since_report.get_or_insert(now_unix);
+    all.insert(key, entry);
+    if let Ok(text) = serde_json::to_string(&all) {
+        let _ = std::fs::write(eval_debt_state_path(db), text);
+    }
 }
 
 /// The pure resolution rule behind `default_eval_command_path` below:
@@ -872,105 +944,98 @@ pub fn default_eval_command_path() -> Option<PathBuf> {
 mod eval_debt_predicate_tests {
     use super::*;
 
-    // Fixed reference instant - any value works, since the predicate only
-    // ever looks at the DIFFERENCE between it and a stored instant.
-    const NOW: i64 = 1_800_000_000;
+    // A fixed reference instant, deliberately at NOON UTC (43_200 seconds
+    // past midnight) so "still today" and "a full day earlier" are both
+    // obviously correct by eye: anything within 12 hours either side of NOW
+    // stays on the same UTC calendar day, and anything a full DAY or more
+    // away always crosses into a different one, regardless of what time of
+    // day NOW itself happens to be.
+    const NOW: i64 = 1_800_014_400;
     const HOUR: i64 = 3600;
+    const DAY: i64 = 86400;
+
+    // ------------------------------------------------------- eval_done_today
+
+    #[test]
+    fn no_report_ever_seen_is_never_done_today() {
+        assert!(!eval_done_today(None, NOW));
+    }
+
+    #[test]
+    fn a_report_seen_earlier_today_is_done_today() {
+        assert!(eval_done_today(Some(NOW - HOUR), NOW), "an hour ago, same UTC day");
+        assert!(eval_done_today(Some(NOW), NOW), "this very instant");
+    }
+
+    /// Case named in the build brief: a report first seen today silences it
+    /// for the rest of the day.
+    #[test]
+    fn a_report_seen_yesterday_is_not_done_today() {
+        assert!(!eval_done_today(Some(NOW - DAY), NOW), "exactly one day earlier is always a different UTC day");
+    }
+
+    /// NOW is noon; 23 hours earlier is 13:00 the day before - still
+    /// "yesterday" even though less than a full 24 hours have passed. This
+    /// is exactly the behaviour the retired rolling-24-hour window did NOT
+    /// have (see this file's "evaluation debt" section, fourth rewrite).
+    #[test]
+    fn a_report_seen_23_hours_ago_that_crossed_midnight_is_not_done_today() {
+        assert!(!eval_done_today(Some(NOW - 23 * HOUR), NOW));
+    }
+
+    #[test]
+    fn a_report_seen_at_a_future_instant_on_a_different_day_is_not_done_today() {
+        // Clock skew or a hand-edited sidecar: a future timestamp on a
+        // DIFFERENT day must not spuriously agree with "today" either.
+        assert!(!eval_done_today(Some(NOW + DAY), NOW));
+    }
+
+    // --------------------------------------------------------- eval_debt_owed
 
     /// Case named in the build brief: 59 minutes worked this session ->
-    /// silent, 61 -> fires - the project itself is maximally stale in both
-    /// cases (tracking started long ago, no report ever), proving the
-    /// minutes-worked floor alone decides the difference.
+    /// silent, 61 -> fires - no report has ever been seen in either case,
+    /// proving the minutes-worked floor alone decides the difference.
     #[test]
     fn fifty_nine_minutes_worked_is_silent_sixty_one_fires() {
-        let since = NOW - 100 * HOUR;
-        assert!(!eval_debt_owed(59, Some(since), None, NOW), "59 minutes must not yet be enough");
-        assert!(eval_debt_owed(61, Some(since), None, NOW), "61 minutes must be enough");
+        assert!(!eval_debt_owed(59, None, NOW), "59 minutes must not yet be enough");
+        assert!(eval_debt_owed(61, None, NOW), "61 minutes must be enough");
     }
 
     #[test]
     fn exactly_the_minimum_minutes_worked_is_enough() {
         // The gate is "at least" `EVAL_MIN_SESSION_MINUTES`, not strictly more.
-        let since = NOW - 100 * HOUR;
-        assert!(eval_debt_owed(EVAL_MIN_SESSION_MINUTES, Some(since), None, NOW));
+        assert!(eval_debt_owed(EVAL_MIN_SESSION_MINUTES, None, NOW));
     }
 
     #[test]
-    fn one_minute_under_the_minimum_is_silent_regardless_of_how_stale_everything_else_is() {
-        assert!(!eval_debt_owed(EVAL_MIN_SESSION_MINUTES - 1, Some(NOW - 100 * HOUR), None, NOW));
+    fn one_minute_under_the_minimum_is_silent_regardless_of_the_report_history() {
+        assert!(!eval_debt_owed(EVAL_MIN_SESSION_MINUTES - 1, Some(NOW - DAY), NOW));
     }
 
-    /// Case named in the build brief: never evaluated, `tracking_since` 23
-    /// hours ago -> silent.
+    /// Case named in the build brief: a report first seen today silences
+    /// the obligation, however long the session has worked.
     #[test]
-    fn never_evaluated_with_tracking_since_23_hours_ago_is_silent() {
-        let since = NOW - 23 * HOUR;
-        assert!(!eval_debt_owed(EVAL_MIN_SESSION_MINUTES, Some(since), None, NOW));
+    fn a_report_first_seen_today_silences_it() {
+        assert!(!eval_debt_owed(EVAL_MIN_SESSION_MINUTES, Some(NOW - HOUR), NOW));
     }
 
-    /// Case named in the build brief: never evaluated, `tracking_since` 25
-    /// hours ago -> fires.
+    /// Case named in the build brief: a report first seen yesterday does
+    /// not silence today's obligation.
     #[test]
-    fn never_evaluated_with_tracking_since_25_hours_ago_fires() {
-        let since = NOW - 25 * HOUR;
-        assert!(eval_debt_owed(EVAL_MIN_SESSION_MINUTES, Some(since), None, NOW));
-    }
-
-    /// Case named in the build brief: an evaluation report first seen 23
-    /// hours ago -> silent.
-    #[test]
-    fn silent_when_a_report_was_first_seen_23_hours_ago() {
-        let since = NOW - 48 * HOUR;
-        let seen = NOW - 23 * HOUR;
-        assert!(!eval_debt_owed(EVAL_MIN_SESSION_MINUTES, Some(since), Some(seen), NOW));
-    }
-
-    /// Case named in the build brief: an evaluation report first seen 25
-    /// hours ago, itself now stale again -> fires.
-    #[test]
-    fn fires_when_the_report_first_seen_25_hours_ago_is_itself_stale() {
-        let since = NOW - 48 * HOUR;
-        let seen = NOW - 25 * HOUR;
-        assert!(eval_debt_owed(EVAL_MIN_SESSION_MINUTES, Some(since), Some(seen), NOW));
-    }
-
-    /// The later-of-the-two rule: a project tracked for a very long time but
-    /// evaluated recently must read as fresh, even though `tracking_since`
-    /// alone is long stale - `last_evaluation_seen`, the more recent of the
-    /// two, must be the one that wins.
-    #[test]
-    fn a_recent_evaluation_silences_an_old_tracking_since() {
-        let since = NOW - 365 * 24 * HOUR;
-        let seen = NOW - HOUR;
-        assert!(!eval_debt_owed(EVAL_MIN_SESSION_MINUTES, Some(since), Some(seen), NOW));
-    }
-
-    /// `tracking_since` is `None` on exactly the Stop that first sees this
-    /// project at all, before `update_eval_debt_state` has written anything
-    /// for it yet - that Stop must never fire on the spot.
-    #[test]
-    fn a_project_the_sidecar_has_not_recorded_yet_is_not_yet_stale() {
-        assert!(!eval_debt_owed(EVAL_MIN_SESSION_MINUTES, None, None, NOW));
+    fn a_report_first_seen_yesterday_does_not_silence_today() {
+        assert!(eval_debt_owed(EVAL_MIN_SESSION_MINUTES, Some(NOW - DAY), NOW));
     }
 
     #[test]
-    fn a_future_tracking_since_is_not_yet_stale() {
-        // Clock skew, or a hand-edited sidecar: must not underflow into a
-        // huge apparent age via `saturating_sub` reading the wrong direction.
-        assert!(!eval_debt_owed(EVAL_MIN_SESSION_MINUTES, Some(NOW + HOUR), None, NOW));
-    }
-
-    #[test]
-    fn a_future_last_evaluation_seen_is_not_yet_stale() {
-        let since = NOW - 48 * HOUR;
-        assert!(!eval_debt_owed(EVAL_MIN_SESSION_MINUTES, Some(since), Some(NOW + HOUR), NOW));
+    fn never_evaluated_at_all_fires_once_enough_time_is_worked() {
+        assert!(eval_debt_owed(EVAL_MIN_SESSION_MINUTES, None, NOW));
     }
 
     #[test]
     fn days_ago_floors_and_never_goes_negative() {
-        assert_eq!(days_ago(NOW, NOW - 3 * 86400), 3);
-        assert_eq!(days_ago(NOW, NOW - 3 * 86400 - 1), 3, "not yet a fourth full day");
-        assert_eq!(days_ago(NOW, NOW + 3600), 0, "a future timestamp reads as 0, never negative");
+        assert_eq!(days_ago(NOW, NOW - 3 * DAY), 3);
+        assert_eq!(days_ago(NOW, NOW - 3 * DAY - 1), 3, "not yet a fourth full day");
+        assert_eq!(days_ago(NOW, NOW + HOUR), 0, "a future timestamp reads as 0, never negative");
     }
 
     #[test]
@@ -978,23 +1043,6 @@ mod eval_debt_predicate_tests {
         assert_eq!(minutes_ago(NOW, NOW - 3 * 60), 3);
         assert_eq!(minutes_ago(NOW, NOW - 3 * 60 - 1), 3, "not yet a fourth full minute");
         assert_eq!(minutes_ago(NOW, NOW + 60), 0, "a future timestamp reads as 0, never negative");
-    }
-
-    // `eval_debt_stale` is the time-only half `doctor` calls directly (it
-    // has no session to measure minutes worked against) - covered above
-    // indirectly through every `eval_debt_owed` case at or over the minutes
-    // floor, and directly here for the cases that matter to a caller with
-    // no minutes input at all.
-    #[test]
-    fn eval_debt_stale_agrees_with_eval_debt_owed_once_minutes_are_satisfied() {
-        let since = NOW - 25 * HOUR;
-        assert!(eval_debt_stale(Some(since), None, NOW));
-        assert!(eval_debt_owed(EVAL_MIN_SESSION_MINUTES, Some(since), None, NOW));
-    }
-
-    #[test]
-    fn eval_debt_stale_is_false_with_no_tracking_since_at_all() {
-        assert!(!eval_debt_stale(None, None, NOW));
     }
 }
 
@@ -1167,6 +1215,13 @@ mod eval_debt_state_tests {
     /// owner's machine already started keeps running under the new name
     /// instead of silently resetting to `None` on the first read after the
     /// upgrade.
+    ///
+    /// ALSO PROVES the same for `asked_count`/`first_asked_since_report`
+    /// (added by the fourth rewrite, this file's own "evaluation debt"
+    /// section) the OTHER direction: a sidecar entry written before those
+    /// two fields existed at all - this exact JSON shape, with neither key
+    /// present - must still parse, reading them as their all-default
+    /// "nothing asked yet" values rather than a parse failure.
     #[test]
     fn an_old_sidecar_field_name_carries_over_as_tracking_since() {
         let dir = tempfile::tempdir().unwrap();
@@ -1175,6 +1230,11 @@ mod eval_debt_state_tests {
         std::fs::write(eval_debt_state_path(&db), text).unwrap();
         let state = project_eval_state(&db, Some("thor"));
         assert_eq!(state.tracking_since, Some(1234), "the old field name must still populate tracking_since");
+        assert_eq!(state.asked_count, 0, "a sidecar written before asked_count existed must default it to zero");
+        assert_eq!(
+            state.first_asked_since_report, None,
+            "a sidecar written before first_asked_since_report existed must default it to None"
+        );
     }
 
     // --------------------------------------------------- evaluation reports
@@ -1220,6 +1280,92 @@ mod eval_debt_state_tests {
         declare_report(&mut store, "eval-acme-2026-09-01", "acme", &["evaluation-report"]);
         let state = update_eval_debt_state(&store, &db, Some("thor"), 5_000);
         assert_eq!(state.last_evaluation_seen, None, "acme's own report must not silence thor's debt");
+    }
+
+    // ------------------------------------------------------- the ask counter
+    //
+    // `record_eval_debt_asked` (called only when the Stop hook actually
+    // fires, never on every Stop the way `update_eval_debt_state` above is)
+    // and its own reset, added 2026-09-16 (fourth rewrite, this file's own
+    // "evaluation debt" section) to replace the retired once-per-session
+    // sidecar. Case named in the build brief: "the ask counter increments
+    // per blocked turn and resets when a report is seen".
+
+    #[test]
+    fn record_eval_debt_asked_increments_the_count_every_call() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("t.db");
+        record_eval_debt_asked(&db, Some("thor"), 1_000);
+        assert_eq!(project_eval_state(&db, Some("thor")).asked_count, 1);
+        record_eval_debt_asked(&db, Some("thor"), 2_000);
+        assert_eq!(project_eval_state(&db, Some("thor")).asked_count, 2);
+        record_eval_debt_asked(&db, Some("thor"), 3_000);
+        assert_eq!(project_eval_state(&db, Some("thor")).asked_count, 3, "every call is a real, new ask");
+    }
+
+    #[test]
+    fn record_eval_debt_asked_stamps_first_asked_since_report_only_on_the_first_call() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("t.db");
+        record_eval_debt_asked(&db, Some("thor"), 1_000);
+        assert_eq!(project_eval_state(&db, Some("thor")).first_asked_since_report, Some(1_000));
+        record_eval_debt_asked(&db, Some("thor"), 9_000);
+        assert_eq!(
+            project_eval_state(&db, Some("thor")).first_asked_since_report,
+            Some(1_000),
+            "a later ask must never move the first-asked clock"
+        );
+    }
+
+    #[test]
+    fn two_projects_keep_separate_ask_counts() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("t.db");
+        record_eval_debt_asked(&db, Some("thor"), 1_000);
+        record_eval_debt_asked(&db, Some("thor"), 2_000);
+        record_eval_debt_asked(&db, Some("acme"), 5_000);
+        assert_eq!(project_eval_state(&db, Some("thor")).asked_count, 2);
+        assert_eq!(project_eval_state(&db, Some("acme")).asked_count, 1, "a different project's own count is independent");
+    }
+
+    /// THE RESET: a new evaluation report silences not only `last_
+    /// evaluation_seen` (already proven above) but also this project's own
+    /// ask counter and first-asked clock, in the exact same Stop that first
+    /// sees it - the moment a report answers every unanswered ask since the
+    /// last one.
+    #[test]
+    fn a_new_live_evaluation_report_resets_the_ask_counter_and_first_asked_clock() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("t.db");
+        record_eval_debt_asked(&db, Some("thor"), 1_000);
+        record_eval_debt_asked(&db, Some("thor"), 2_000);
+        record_eval_debt_asked(&db, Some("thor"), 3_000);
+        let before = project_eval_state(&db, Some("thor"));
+        assert_eq!(before.asked_count, 3, "fixture sanity: three unanswered asks so far");
+        assert_eq!(before.first_asked_since_report, Some(1_000), "fixture sanity");
+
+        let mut store = EventStore::new(&db).unwrap();
+        declare_report(&mut store, "eval-thor-2026-09-16", "thor", &["evaluation-report"]);
+        let after = update_eval_debt_state(&store, &db, Some("thor"), 9_000);
+        assert_eq!(after.asked_count, 0, "a newly seen report must reset the ask counter to zero");
+        assert_eq!(after.first_asked_since_report, None, "and clear the first-asked clock, nothing is unanswered any more");
+    }
+
+    /// A second Stop that sees NOTHING new (no new report) must leave an
+    /// already-nonzero ask counter exactly as it was - `update_eval_debt_
+    /// state` only ever resets it as a SIDE EFFECT of a new report, never on
+    /// its own as a general "nothing changed" cleanup.
+    #[test]
+    fn a_stop_with_no_new_report_never_resets_an_existing_ask_count() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("t.db");
+        let store = EventStore::new(&db).unwrap();
+        record_eval_debt_asked(&db, Some("thor"), 1_000);
+        record_eval_debt_asked(&db, Some("thor"), 2_000);
+        update_eval_debt_state(&store, &db, Some("thor"), 3_000);
+        let state = project_eval_state(&db, Some("thor"));
+        assert_eq!(state.asked_count, 2, "no new report was seen, so the count must stay exactly as it was");
+        assert_eq!(state.first_asked_since_report, Some(1_000));
     }
 }
 

@@ -279,15 +279,17 @@ the decision.
 
 Once in a while it asks for something bigger instead of one more note: every
 day, in every project a session actually works in, once that session has put
-in at least an hour there and a full day has passed with no evaluation
-report filed for that project, it asks you to run the full end-of-session
-review in one pass rather than judging notes one at a time - regardless of
-how many notes currently owe a verdict. That only happens once per
-conversation, even if the project is still without an evaluation afterward -
-and filing the report at the end of that review is what silences the ask
-for a day. It only ever happens inside a project, and never in a checkout
-that resolves to no project at all - there, no report could ever be filed
-to silence it, so it is never asked in the first place.
+in at least an hour there and no evaluation report has yet been filed for
+that project TODAY (the current UTC calendar day), it asks you to run the
+full end-of-session review in one pass rather than judging notes one at a
+time - regardless of how many notes currently owe a verdict. THIS ONE DOES
+NOT GO QUIET AFTER ONE ASK: it holds the end of every turn, naming how many
+times it has already asked and since when, until a report is actually filed
+- and filing it at the end of that review is the only thing that lets a
+turn end and stays quiet until tomorrow. It only ever
+happens inside a project, and never in a checkout that resolves to no
+project at all - there, no report could ever be filed to silence it, so it
+is never asked in the first place.
 
 The first of those only ever names a note THIS session actually saw fire -
 never one that only ever showed up during other, unrelated work. Answer for

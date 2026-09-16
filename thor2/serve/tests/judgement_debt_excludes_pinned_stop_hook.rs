@@ -16,9 +16,27 @@
 //! throwaway sandbox directory, the same reason `evaluation_debt_stop_hook.rs`
 //! does: nothing here should depend on, or touch, the real user's own
 //! `~/.claude`.
+//!
+//! EVERY PAYLOAD BELOW ALSO NAMES AN EXPLICIT, NO-PROJECT `cwd` (added
+//! 2026-09-16, alongside the evaluation debt's own fourth rewrite): without
+//! one, a payload's `cwd` would resolve to wherever `cargo test` itself was
+//! invoked from - inside this very repository, and so a REAL project. That
+//! never mattered before the fourth rewrite, because a freshly created
+//! store's evaluation debt needed 24 real hours to go stale before it could
+//! ever fire; now that the debt fires the moment enough minutes are worked
+//! and no report has EVER been seen (see `serve::usefulness`'s own
+//! "evaluation debt" section), every fixture here - which serves its items
+//! under a `served_at` far enough in the past to clear that floor, same as
+//! `evaluation_debt_stop_hook.rs`'s own fixtures do on purpose - would
+//! otherwise trip the evaluation debt too, and its message would mask the
+//! judgement-debt behaviour this file actually exists to prove. A no-project
+//! `cwd` keeps the evaluation debt permanently out of scope (it is never
+//! asked outside a project at all), the same isolation this file's own
+//! "every fixture below declares only GLOBAL items" comment already
+//! intended for the judgement debt specifically.
 
 use std::io::Write as _;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
 use model::item::{Binding, Item, Kind, TargetKind};
@@ -46,6 +64,17 @@ impl Sandbox {
         cmd.env("HOME", self.home.path());
         cmd.env("USERPROFILE", self.home.path());
     }
+
+    /// A real, empty directory with no marker and no `.git` anywhere above
+    /// it (it lives under the OS temp directory, never inside this
+    /// repository), so `project::resolve_project` reliably resolves it to
+    /// `None` - see this file's own module doc comment for why every
+    /// payload here needs one.
+    fn global_cwd(&self) -> PathBuf {
+        let dir = self.home.path().join("no-project-cwd");
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
 }
 
 fn run_hook(db: &Path, payload: &str, sandbox: &Sandbox) -> String {
@@ -60,15 +89,17 @@ fn run_hook(db: &Path, payload: &str, sandbox: &Sandbox) -> String {
     String::from_utf8(out.stdout).unwrap()
 }
 
-/// A Stop payload with an EMPTY last assistant message and no `cwd` at all -
-/// the Response Guard has nothing to say, and every fixture below declares
-/// only GLOBAL items, so the debt under test is proven on its own.
-fn stop_payload(session_id: &str) -> String {
+/// A Stop payload with an EMPTY last assistant message and an explicit
+/// no-project `cwd` (see this file's own module doc comment for why) - the
+/// Response Guard has nothing to say, and every fixture below declares only
+/// GLOBAL items, so the judgement debt under test is proven on its own.
+fn stop_payload(session_id: &str, cwd: &Path) -> String {
     serde_json::json!({
         "hook_event_name": "Stop",
         "session_id": session_id,
         "stop_hook_active": false,
         "last_assistant_message": "",
+        "cwd": cwd.to_string_lossy(),
     })
     .to_string()
 }
@@ -140,7 +171,7 @@ fn a_store_of_only_pinned_items_produces_no_judgement_ask_and_no_evaluation_obli
     drop(store);
     let sandbox = Sandbox::new();
 
-    let out = run_hook(&db, &stop_payload("s1"), &sandbox);
+    let out = run_hook(&db, &stop_payload("s1", &sandbox.global_cwd()), &sandbox);
     assert!(
         out.trim().is_empty(),
         "an all-pinned backlog must hold no judgement ask and no evaluation obligation: {out}"
@@ -157,7 +188,7 @@ fn a_mixed_store_names_only_the_trigger_bound_items() {
     drop(store);
     let sandbox = Sandbox::new();
 
-    let out = run_hook(&db, &stop_payload("s1"), &sandbox);
+    let out = run_hook(&db, &stop_payload("s1", &sandbox.global_cwd()), &sandbox);
     let v: serde_json::Value =
         serde_json::from_str(&out).unwrap_or_else(|e| panic!("expected a decision JSON: {e}: {out}"));
     assert_eq!(v["decision"], "block", "{out}");

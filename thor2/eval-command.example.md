@@ -25,14 +25,17 @@ item, once per turn. That is the same debt this routine pays; here you
 settle it deliberately, over the whole session, instead of one item at a
 time.
 
-Once per session, when this project has gone a full day without an
-evaluation report and this session has worked in it for at least an hour,
-the Stop hook also asks for this evaluation itself, by name, instead of one
-more item. It asks every day, in every project a session actually works in,
-regardless of how many notes currently owe a verdict - filing the report
-below is what silences it for a day. It only ever asks inside a project:
-a checkout that resolves to no project is never asked, since there would
-be no way to file the report that silences it.
+Every day, in every project a session actually works in, once that session
+has put in at least an hour there, the Stop hook requires this evaluation
+before a turn can end - not once per session: it blocks the FIRST Stop of
+EVERY turn, regardless of how many notes currently owe a verdict, for as
+long as no evaluation report has yet been filed for this project TODAY (the
+current UTC calendar day - not the owner's own local day, since this
+workspace has no way to resolve his local time zone). It names how many
+times it has already asked, and since when. Filing the report below is what
+goes quiet - until the next UTC day, when the obligation returns. It only
+ever asks inside a project: a checkout that resolves to no project is never
+asked, since there would be no way to file the report that silences it.
 
 ---
 
@@ -307,8 +310,9 @@ report, id `eval-<project>-<YYYY-MM-DD>` (a second one the same day gets
 and text the full report exactly as you gave it to the owner. This is a
 dated record, not a rule - the health-check numbers may appear in it, and it
 never fires on its own. It is also what tells THOR the evaluation happened:
-the Stop hook reads it back, and filing it is what stops the hook from
-asking again for a day.
+the Stop hook reads it back, and filing it is what lets a blocked turn end
+and stays quiet until tomorrow (the next UTC day) - a report filed today
+never buys tomorrow's silence in advance.
 
 Do not store or change anything else unless the owner asks for it. The
 exceptions are the work the steps themselves call for: the verdicts, the

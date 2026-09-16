@@ -559,6 +559,57 @@ mod tests {
         server.abort();
     }
 
+    /// `covered_seq` must be what the receiver actually acknowledged
+    /// (`PushSummary::final_cursor`), never a fresh read of the local
+    /// store's tip taken after the ship has already returned - an event
+    /// written in that window was never sent, so counting it as covered
+    /// would let a later ship silently skip it forever. `sync.rs`'s `main`
+    /// calls exactly `ship_state::record_success(&db, summary.final_cursor)`
+    /// right after `push_once` returns; this reproduces that same two-call
+    /// sequence with a local write injected into the gap between them, and
+    /// proves the recorded state is immune to it.
+    #[tokio::test]
+    async fn covered_seq_ignores_an_event_written_after_the_ship_returns() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("shipper.db");
+        {
+            let mut seed = EventStore::new(&db).unwrap();
+            let e1 = seed.append_event("s", "l", "act", EventKind::FactCreated, "e1", None, "first").unwrap();
+            seed.append_event("s", "l", "act", EventKind::FactRevised, "e1", Some(&e1.this_hash), "second").unwrap();
+        }
+
+        let replica = Arc::new(Mutex::new(EventStore::in_memory().unwrap()));
+        let (base, server) = start_test_receiver(replica.clone(), "secret").await;
+
+        let summary = {
+            let db = db.clone();
+            let base = base.clone();
+            tokio::task::spawn_blocking(move || {
+                let store = EventStore::open_existing(&db).unwrap();
+                push_once(&store, &base, "secret", 256).unwrap()
+            })
+            .await
+            .unwrap()
+        };
+        assert_eq!(summary.final_cursor, 2, "fixture sanity: both seeded events shipped and were acked");
+
+        // The write `sync.rs` cannot see coming: it lands between `push_once`
+        // returning and `ship_state::record_success` being called with the
+        // value it returned.
+        let mut store = EventStore::open_existing(&db).unwrap();
+        store.append_event("s", "l", "act", EventKind::FactCreated, "e3", None, "third - written after the ship").unwrap();
+
+        crate::ship_state::record_success(&db, summary.final_cursor).unwrap();
+        let state = crate::ship_state::read(&db).expect("a successful ship must record its state");
+        assert_eq!(
+            state.covered_seq,
+            Some(2),
+            "covered_seq must be the receiver's own ack (2), not the local tip after a write the ship never sent (3)"
+        );
+
+        server.abort();
+    }
+
     /// The defect this guards against: an hourly scheduled ship writing
     /// "0 applied" into a log for weeks while the two stores are not related
     /// at all. The loop can only ever see "nothing to send" here, so the

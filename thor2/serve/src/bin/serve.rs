@@ -2228,10 +2228,16 @@ fn evaluation_debt(store: &EventStore, db_path: &Path, current_project: Option<&
         _ => "no evaluation routine is installed at `~/.claude/commands/thor-eval.md` - `install` writes one there (usable as /thor-eval), or the owner runs their own routine."
             .to_string(),
     };
+    // The sidecar only tracks how long the count has been at or above
+    // EVAL_DEBT_CEILING, never that it held at any one exact value - so the
+    // ceiling and the current count are named separately here rather than
+    // claiming the current count itself "stayed" for that whole age.
     Some(format!(
-        "[THOR] This project's judgement debt has stayed at {owed_in_project} item(s) or more for {ceiling_age} \
-         and no evaluation report was filed for it in that time. Run the THOR evaluation before you finish: {ask} \
-         Filing the evaluation report is what silences this for a day. This is asked once per session."
+        "[THOR] This project's judgement debt has stayed at the ceiling of {} or more for {ceiling_age} \
+         ({owed_in_project} item(s) now) and no evaluation report was filed for it in that time. \
+         Run the THOR evaluation before you finish: {ask} \
+         Filing the evaluation report is what silences this for a day. This is asked once per session.",
+        usefulness::EVAL_DEBT_CEILING
     ))
 }
 
@@ -4294,6 +4300,27 @@ mod evaluation_debt_tests {
         assert!(asked.contains("no evaluation report was filed"), "{asked}");
         assert!(asked.contains("once per session"), "{asked}");
         assert!(asked.contains("Filing the evaluation report is what silences this"), "{asked}");
+    }
+
+    #[test]
+    fn states_the_ceiling_and_the_current_count_separately() {
+        // The sidecar only ever tracks how long the count has been at or
+        // above EVAL_DEBT_CEILING - never that it held at any one exact
+        // value - so the message must not claim the current count itself
+        // "stayed" for the crossing's age. Use a count well past the
+        // ceiling (unlike the ceiling-exact fixture above) so the two
+        // numbers cannot be confused with each other in the assertions.
+        let (_dir, db, mut store) = new_store();
+        let owed = EVAL_DEBT_CEILING + 21;
+        owe(&mut store, owed);
+        seed_over_ceiling_since(&db, None, &store, 25);
+        let asked = evaluation_debt(&store, &db, None).expect("a stale, over-ceiling backlog must speak");
+        assert!(asked.contains(&format!("ceiling of {EVAL_DEBT_CEILING}")), "{asked}");
+        assert!(asked.contains(&format!("{owed} item(s) now")), "{asked}");
+        assert!(
+            !asked.contains(&format!("stayed at {owed} item")),
+            "must not claim the current count itself stayed constant, only that it has been at or over the ceiling: {asked}"
+        );
     }
 
     #[test]

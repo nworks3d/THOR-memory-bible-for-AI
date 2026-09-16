@@ -36,7 +36,7 @@ fn last_commit_age_hours(repo: &Path, subdir: &str) -> Option<u64> {
 
 /// `last_commit_age_hours`, measured from an arbitrary `rev` instead of
 /// always `HEAD` - the seam `backup_to_repo` uses to measure the debounce
-/// from `origin/main` (what the REMOTE actually has) rather than the local
+/// from the upstream (what the REMOTE actually has) rather than the local
 /// branch. A commit that was made locally but never pushed must not make
 /// the NEXT run think a backup just landed - see this file's own doc
 /// comment on the defect this closes.
@@ -51,34 +51,61 @@ fn last_commit_age_hours_at(repo: &Path, subdir: &str, rev: &str) -> Option<u64>
     Some(now.saturating_sub(ts) / 3600)
 }
 
-/// Whether `repo` has an `origin/main` ref at all - a repo with no `origin`
-/// remote configured, or one whose `main` was never fetched, has no
-/// upstream to compare against, and every check below falls back to
-/// today's LOCAL-only behaviour rather than guessing at one.
+/// Whether the branch checked out in `repo` has a configured upstream at
+/// all (`@{u}`, git's own name for it) - a repo with no remote configured,
+/// or a branch never set to track one, has no upstream to compare against,
+/// and every check below falls back to today's LOCAL-only behaviour rather
+/// than guessing at one. Deliberately NOT hard-coded to `origin/main`: the
+/// branch actually checked out here may track a different remote, a
+/// different branch name, or both - see `upstream_remote_and_branch`.
 fn has_upstream(repo: &Path) -> bool {
     Command::new("git")
         .arg("-C").arg(repo)
-        .args(["rev-parse", "--verify", "-q", "origin/main"])
+        .args(["rev-parse", "--verify", "-q", "@{u}"])
         .output()
         .map(|o| o.status.success())
         .unwrap_or(false)
 }
 
-/// How many commits local `HEAD` carries that `origin/main` does not - the
-/// exact count of backup commits a previous run made but could not push.
-/// `None` when it cannot be determined (git failed to run at all) - callers
-/// already gate this behind `has_upstream`, so an unparseable count here is
-/// treated the same as "nothing to catch up" rather than guessed at.
+/// How many commits local `HEAD` carries that the upstream (`@{u}`) does
+/// not - the exact count of backup commits a previous run made but could
+/// not push. `None` when it cannot be determined (git failed to run at
+/// all) - callers already gate this behind `has_upstream`, so an
+/// unparseable count here is treated the same as "nothing to catch up"
+/// rather than guessed at.
 fn commits_ahead_of_upstream(repo: &Path) -> Option<u64> {
     let out = Command::new("git")
         .arg("-C").arg(repo)
-        .args(["rev-list", "--count", "origin/main..HEAD"])
+        .args(["rev-list", "--count", "@{u}..HEAD"])
         .output()
         .ok()?;
     if !out.status.success() {
         return None;
     }
     String::from_utf8_lossy(&out.stdout).trim().parse().ok()
+}
+
+/// The checked-out branch's configured upstream, split into (remote,
+/// branch) - e.g. `("origin", "main")` for a branch tracking `origin/main`,
+/// but just as well `("upstream", "release/2.0")` for one tracking
+/// `upstream/release/2.0` (a branch name may itself contain `/`, so only
+/// the FIRST `/` splits remote from branch - a remote name never does).
+/// `None` with no upstream configured, the same case `has_upstream` reports
+/// `false` for; callers fall back to today's `origin`/`main` pair then, so
+/// a repo with no upstream at all keeps behaving exactly as before this
+/// existed.
+fn upstream_remote_and_branch(repo: &Path) -> Option<(String, String)> {
+    let out = Command::new("git")
+        .arg("-C").arg(repo)
+        .args(["rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{u}"])
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let full = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    let (remote, branch) = full.split_once('/')?;
+    Some((remote.to_string(), branch.to_string()))
 }
 
 /// Automated backup: export the log to <repo>/<subdir>/events.jsonl, then commit
@@ -115,11 +142,16 @@ pub fn backup_to_repo(
     // machine, and the debounce exists to limit how often we commit, never
     // to sit on a commit that already happened.
     let upstream = has_upstream(repo);
+    // Resolved once, from the branch actually checked out here - falls back
+    // to today's `origin`/`main` pair only when no upstream is configured
+    // at all, so that case keeps behaving exactly as it did before this
+    // existed (see `upstream_remote_and_branch`'s own doc comment).
+    let (remote, branch) = upstream_remote_and_branch(repo).unwrap_or_else(|| ("origin".to_string(), "main".to_string()));
     let mut pushed_note: Option<String> = None;
     if upstream {
         if let Some(ahead) = commits_ahead_of_upstream(repo) {
             if ahead > 0 {
-                git(repo, &["push", "origin", "main"])?;
+                git(repo, &["push", &remote, &branch])?;
                 pushed_note = Some(format!("pushed {ahead} backup commit(s) that had not reached the remote"));
             }
         }
@@ -131,12 +163,12 @@ pub fn backup_to_repo(
 
     if !force {
         // Measured from what the REMOTE has, not the local branch - a local
-        // commit that never reached origin must not make the NEXT run think
-        // a backup just landed (see this file's own doc comment). With no
-        // upstream configured at all, there is nothing to measure from but
-        // the local branch, so that stays today's behaviour unchanged.
+        // commit that never reached the upstream must not make the NEXT run
+        // think a backup just landed (see this file's own doc comment). With
+        // no upstream configured at all, there is nothing to measure from
+        // but the local branch, so that stays today's behaviour unchanged.
         let age = if upstream {
-            last_commit_age_hours_at(repo, subdir, "origin/main")
+            last_commit_age_hours_at(repo, subdir, "@{u}")
         } else {
             last_commit_age_hours(repo, subdir)
         };
@@ -154,7 +186,7 @@ pub fn backup_to_repo(
     };
     // sync with the shared repo (other backups push here too), then stage ours only
     let pathspec = format!("{subdir}/");
-    git(repo, &["pull", "--rebase", "--autostash", "origin", "main"])?;
+    git(repo, &["pull", "--rebase", "--autostash", &remote, &branch])?;
     git(repo, &["add", &pathspec])?;
     // nothing changed? do not make an empty commit
     let clean = Command::new("git").arg("-C").arg(repo)
@@ -163,7 +195,7 @@ pub fn backup_to_repo(
         return Ok(prefix(format!("no change since last backup ({n} events) - nothing to commit")));
     }
     git(repo, &["commit", "-m", &format!("{subdir} backup ({n} events)")])?;
-    git(repo, &["push", "origin", "main"])?;
+    git(repo, &["push", &remote, &branch])?;
     Ok(prefix(format!("pushed {subdir} backup ({n} events)")))
 }
 
@@ -475,5 +507,58 @@ mod tests {
             "with no origin at all, the debounce must still work from local history alone: {out}"
         );
         assert!(!out.contains("had not reached the remote"));
+    }
+
+    /// THE DEFECT STEP 2c CLOSES: every upstream check here used to be
+    /// hard-coded to `origin/main`. A branch tracking a DIFFERENT remote
+    /// name AND a DIFFERENT branch name - so a hard-coded pair could not
+    /// accidentally still work - proves the catch-up push, the debounce
+    /// age check, and the final pull/push all resolve the REAL configured
+    /// upstream (`@{u}`) instead.
+    #[test]
+    fn catch_up_and_backup_work_against_an_upstream_that_is_not_origin_main() {
+        let dir = tempfile::tempdir().unwrap();
+        let remote = dir.path().join("remote.git");
+        let work = dir.path().join("work");
+        git_ok(dir.path(), &["init", "--bare", remote.to_str().unwrap()]);
+        let out = Command::new("git")
+            .args(["clone", remote.to_str().unwrap(), work.to_str().unwrap()])
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "clone failed: {}", String::from_utf8_lossy(&out.stderr));
+        git_ok(&work, &["checkout", "-b", "release"]);
+        git_ok(&work, &["config", "user.email", "test@example.invalid"]);
+        git_ok(&work, &["config", "user.name", "Test"]);
+        git_ok(&work, &["remote", "rename", "origin", "upstream"]);
+        git_ok(&work, &["commit", "--allow-empty", "-m", "initial"]);
+        git_ok(&work, &["push", "-u", "upstream", "release"]);
+
+        let mut store = EventStore::in_memory().unwrap();
+        seed(&mut store);
+
+        // Break ONLY the push URL, the same deterministic shape the
+        // origin/main fixture above uses: `pull` (fetch) still reaches the
+        // real remote and succeeds, so the run gets all the way to `commit`
+        // before `push` fails.
+        git_ok(&work, &["remote", "set-url", "--push", "upstream", "/no/such/path"]);
+        let first = backup_to_repo(&store, &work, "thor2", true);
+        assert!(first.is_err(), "a broken push URL must fail the run: {first:?}");
+        assert_eq!(
+            commits_ahead_of_upstream(&work),
+            Some(1),
+            "commits_ahead_of_upstream must resolve @{{u}} (upstream/release here), not a hard-coded \
+             origin/main that does not exist in this fixture"
+        );
+
+        // Restore connectivity, then run again well inside the debounce
+        // window (force = false): the catch-up push must still happen,
+        // against the real upstream/release, not origin/main.
+        git_ok(&work, &["remote", "set-url", "--push", "upstream", remote.to_str().unwrap()]);
+        let second = backup_to_repo(&store, &work, "thor2", false).unwrap();
+        assert!(
+            second.contains("pushed 1 backup commit(s) that had not reached the remote"),
+            "must catch up against the real upstream (upstream/release): {second}"
+        );
+        assert_eq!(commits_ahead_of_upstream(&work), Some(0), "the real upstream must now have the commit");
     }
 }

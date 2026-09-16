@@ -2,9 +2,16 @@
 
 What changed in each release, newest first. The release workflow copies the section for the tag being released to the top of the release notes and refuses to publish without one.
 
+## Unreleased
+
+- **The evaluation ask tracks the ceiling, not a global clock.** Once a project's own judgement-debt backlog has stayed at ten items or more for a day with no evaluation report filed for it, the Stop hook asks for the evaluation routine by name - before the judgement debt, when both are due. Only asked in a session that actually did work in that project; filing the evaluation report is what silences it.
+- **The shipped evaluation now files its own report into the memory**, so a later session (and `doctor`) can see one was done. The 2.4.0 notes below already claimed this; it arrives now.
+- **The ship line counts what is waiting and only alarms on a failed attempt.** A healthy hourly ship with nothing new to send still reads as fresh no matter its age; changes waiting behind an old success are named and counted, never mistaken for a failure; only an attempt that actually failed raises the alarm.
+- **A backup push that failed is retried.** A commit that landed locally but could not reach the remote is pushed again on the very next run, before that run's own once-a-day schedule is even checked.
+
 ## 2.4.0 (2026-09-12)
 
-- **The evaluation ships with the install.** `install` writes `/thor-eval` into your assistant's commands. Run it at the end of a session: it judges what fired, repairs what has rotted, gives teeth to what could stop nothing, and files its own report back into the memory so a later session can read it.
+- **The evaluation ships with the install.** `install` writes `/thor-eval` into your assistant's commands. Run it at the end of a session: it judges what fired, repairs what has rotted, and gives teeth to what could stop nothing.
 - **The memory asks for that evaluation.** Once per session, the Stop hook holds the turn when a project owes a verdict on ten or more notes and nothing there has been judged for a day.
 - **`doctor` names the debt.** The notes that owe a verdict are listed with the place they fired (all of them with `--full`), and the line says how long ago the newest verdict was.
 - **A fresh install opens the project it read.** The first note filed under your repository lands without being asked to name a new collection; the refusal text no longer points to `install --project`.

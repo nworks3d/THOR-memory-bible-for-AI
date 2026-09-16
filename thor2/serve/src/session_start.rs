@@ -73,6 +73,41 @@ pub fn render(items: &[RankedItem]) -> Option<String> {
     Some(lines.join("\n"))
 }
 
+/// Appended after the standing-rules block exactly once: right after Claude
+/// Code has just summarized the conversation. A replay on two real sessions
+/// found the one real miss was not a "tested" claim made carelessly, but one
+/// made right after a `/compact` with nothing re-checked - the summary reads
+/// like a fact but is a paraphrase, and paraphrases lose the difference
+/// between "I ran this" and "the summary says I ran this". This never
+/// blocks; it is additive text on the one surface that already fires at the
+/// top of a session, addressed to the assistant rather than framed as one of
+/// the owner's own stored rules (see `render::FRAMING_LINE`'s doc comment
+/// for that other, narrower framing problem - this text is THOR's own,
+/// not the owner's, so it does not need it).
+pub const COMPACT_REMINDER: &str = "[THOR] This session's context was just summarized, so the summary is not proof of anything in it. Before you call something done, tested, flashed, deployed or live, check it again now - run the check, read the file, or ask the machine.";
+
+/// `Some(COMPACT_REMINDER)` exactly when this SessionStart payload is the
+/// main session's own (`is_subagent` false) and its `source` field reads
+/// `"compact"`; `None` for every other source ("startup", "resume",
+/// "clear", absent, or anything else) and `None` for a subagent payload
+/// regardless of source.
+///
+/// The subagent check is defense in depth, not a live gate: Claude Code's
+/// `SessionStart` never actually fires inside a subagent at all (confirmed
+/// 2026-08-05, see `payload_is_from_a_subagent`'s own doc comment in
+/// `bin/serve.rs`, and `serve/tests/subagent_hook_behavior.rs` for the dead
+/// code this same fact already retired once). Kept here anyway because this
+/// function is a cheap, pure predicate that has no other way to prove its
+/// own "never for a subagent" half except by being handed one - the same
+/// reasoning `hook_once`'s other gates already apply at each of their own
+/// call sites (see the module-level rule against a shared early return).
+pub fn compact_reminder(source: Option<&str>, is_subagent: bool) -> Option<String> {
+    if is_subagent || source != Some("compact") {
+        return None;
+    }
+    Some(COMPACT_REMINDER.to_string())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -298,5 +333,37 @@ mod tests {
         let block = render(&select(&[c], None)).unwrap();
         assert!(block.contains(&long_text), "the full 300-char body must still appear unmodified: {block}");
         assert!(block.contains("[i0]"), "and the id must appear alongside it, not instead of any of it: {block}");
+    }
+
+    // --------------------------------------------------- compact reminder
+
+    #[test]
+    fn a_compact_source_in_the_main_session_returns_the_reminder() {
+        assert_eq!(compact_reminder(Some("compact"), false).as_deref(), Some(COMPACT_REMINDER));
+    }
+
+    #[test]
+    fn startup_resume_and_clear_sources_return_nothing() {
+        for source in ["startup", "resume", "clear"] {
+            assert!(
+                compact_reminder(Some(source), false).is_none(),
+                "source {source} must never return the reminder"
+            );
+        }
+    }
+
+    #[test]
+    fn a_missing_source_returns_nothing() {
+        assert!(compact_reminder(None, false).is_none());
+    }
+
+    #[test]
+    fn an_unrecognised_source_returns_nothing() {
+        assert!(compact_reminder(Some("something-future-claude-code-adds"), false).is_none());
+    }
+
+    #[test]
+    fn a_subagent_payload_never_returns_the_reminder_even_with_source_compact() {
+        assert!(compact_reminder(Some("compact"), true).is_none());
     }
 }

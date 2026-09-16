@@ -41,6 +41,14 @@ asked, since there would be no way to file the report that silences it.
 
 ## 1. Judge what fired
 
+Before any of that: look up the previous evaluation report for this project
+(`mcp__thor__lookup` for the tag `evaluation-report` and this project; take
+the newest one). Handle its open points first - what it left unjudged with a
+reason, the gaps it left open, and everything it listed as not verified or
+still to be probed. For each: settle it now, or carry it into this report's
+own open points with the reason it is still open. No previous report? Say so
+and move on.
+
 The test is not "was it useful" but **did it belong where it fired**.
 - `mcp__thor__mark(id: "<id>")` - it belonged there.
 - `mcp__thor__mark(id: "<id>", noise: true)` - it did not.

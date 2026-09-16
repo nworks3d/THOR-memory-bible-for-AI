@@ -138,7 +138,10 @@ Step 2 puts these into their memory as pinned notes, so from the next
 conversation onward they arrive on their own at every session start and you do
 not have to remember any of it. This section is the fuller version, and it is
 here because you are reading it *before* that restart, when the memory cannot
-tell you anything yet.
+tell you anything yet. One more thing arrives the same way, not a note either
+of you wrote: a session that starts right after a compaction gets a built-in
+reminder that the summary is not proof, so check again before calling
+anything done, tested, flashed, deployed or live.
 
 They are ordinary notes. If they decide one does not suit them, it can be
 unpinned, rewritten, or thrown out like any other.

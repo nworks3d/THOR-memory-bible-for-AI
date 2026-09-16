@@ -180,7 +180,11 @@ record exactly as it is too.
 The four hooks are `SessionStart` (what the agent is handed at the start),
 `PreToolUse` (the gate that can block a write), `UserPromptSubmit`, and `Stop`
 (the check on the reply itself). All four run the same `serve hook` command and
-tell themselves apart by the payload.
+tell themselves apart by the payload. When a `SessionStart` payload's own
+`source` field reads `"compact"` - right after a context compaction - the
+agent is handed one further line: a reminder that the summary is not proof,
+so anything it calls done, tested, flashed, deployed or live should be
+checked again first.
 
 A hook pointing at a binary that is not there fails OPEN: the agent carries on
 and the memory simply never speaks again, with no error anywhere. So the

@@ -1112,14 +1112,17 @@ fn hook_once(db_path: &Path) -> Option<HookOutput> {
             // must degrade rather than assume) falls back to this process'
             // own working directory.
             //
-            // No subagent gate here: confirmed 2026-08-05 against Claude
-            // Code's own hooks documentation that `SessionStart` fires ONLY
-            // in the main session and never inside a subagent at all, so a
-            // subagent check on this arm can never execute - it was removed
-            // as dead code that looked like protection (see
-            // `INJECTION-FRAMING.md`'s own addendum and
+            // No subagent gate on the standing-rules block below: confirmed
+            // 2026-08-05 against Claude Code's own hooks documentation that
+            // `SessionStart` fires ONLY in the main session and never inside
+            // a subagent at all, so a subagent check on that block can never
+            // execute - it was removed as dead code that looked like
+            // protection (see `INJECTION-FRAMING.md`'s own addendum and
             // `payload_is_from_a_subagent`'s doc comment, which now gates the
-            // three surfaces that actually DO fire inside a subagent).
+            // three surfaces that actually DO fire inside a subagent). The
+            // compact reminder below still checks it anyway, defensively -
+            // see `session_start::compact_reminder`'s own doc comment for
+            // why that is not the same dead code again.
             // Where the log stands right now, so the crowding debt at Stop can
             // tell what THIS session wrote from what was already there. It
             // cannot use the session id for that: every write through the tool
@@ -1133,7 +1136,28 @@ fn hook_once(db_path: &Path) -> Option<HookOutput> {
                 session_start::select(&candidates, session_project.as_deref()),
                 &decay,
             );
-            let block = session_start::render(&items)?;
+            let rules_block = session_start::render(&items);
+
+            // Its own gate, at its own call site, deliberately never chained
+            // onto `rules_block`'s own early return above: a session with no
+            // live Always item must still get this reminder when it just
+            // went through a compaction (see `session_start::compact_
+            // reminder`'s own doc comment) - letting the rules block's `?`
+            // swallow it would silence the reminder on exactly the sessions
+            // that have nothing else to show. `payload_is_from_a_subagent`
+            // is passed in rather than checked inside `compact_reminder`
+            // itself for the same reason every other gate in this match
+            // keeps that check local: see that function's own doc comment.
+            let source = payload.get("source").and_then(|v| v.as_str());
+            let reminder = session_start::compact_reminder(source, payload_is_from_a_subagent(&payload));
+
+            let block = match (rules_block, reminder) {
+                (Some(rules), Some(reminder)) => format!("{rules}\n\n{reminder}"),
+                (Some(rules), None) => rules,
+                (None, Some(reminder)) => reminder,
+                (None, None) => return None,
+            };
+
             let ids: Vec<String> = items.iter().map(|r| r.id.clone()).collect();
             deliver::record_delivery(&mut store, &session_id, &session_id, "hook", &time::now_iso8601(), &ids);
             match decay_notice(&store, db_path, session_cwd.as_deref()) {

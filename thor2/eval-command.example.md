@@ -25,10 +25,12 @@ item, once per turn. That is the same debt this routine pays; here you
 settle it deliberately, over the whole session, instead of one item at a
 time.
 
-Once per session, when this project's own debt has stayed at ten items or
-more for a whole day and no evaluation report was filed for it in that time,
+Once per session, when this project has gone a full day without an
+evaluation report and this session has worked in it for at least an hour,
 the Stop hook also asks for this evaluation itself, by name, instead of one
-more item - filing the report below is what silences it.
+more item. It asks every day, in every project a session actually works in,
+regardless of how many notes currently owe a verdict - filing the report
+below is what silences it for a day.
 
 ---
 

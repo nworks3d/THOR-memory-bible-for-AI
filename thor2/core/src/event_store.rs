@@ -1698,6 +1698,26 @@ impl EventStore {
         rows.collect()
     }
 
+    /// Every `item_served` event THIS session recorded, as `(entity_id,
+    /// body)` - the same WHERE clause as `served_ids_in_session` above
+    /// (kind = 'item_served' AND session_id = ?), minus its `DISTINCT` and
+    /// plus the body: the evaluation debt's own "how long has this session
+    /// worked here" clock (`serve::usefulness::EVAL_MIN_SESSION_MINUTES`)
+    /// needs the EARLIEST serving of an item that applies to the current
+    /// project, which needs every row's own `served_at` (carried in the
+    /// body - see `model::served::ItemServed`), not a deduplicated id set.
+    /// One row per serving, so a caller folds these down to a minimum
+    /// itself; kept as cheap as `served_ids_in_session` on purpose, since
+    /// both read the same two columns' worth of predicate and differ only
+    /// in which columns they project out.
+    pub fn served_events_in_session(&self, session_id: &str) -> SqlResult<Vec<(String, String)>> {
+        let mut stmt = self
+            .conn
+            .prepare_cached("SELECT entity_id, body FROM event WHERE kind = 'item_served' AND session_id = ?")?;
+        let rows = stmt.query_map([session_id], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)))?;
+        rows.collect()
+    }
+
     pub fn get_events_by_entity(&self, entity_id: &str) -> SqlResult<Vec<Event>> {
         let mut stmt = self.conn.prepare(&format!(
             "SELECT {} FROM event WHERE entity_id = ? ORDER BY seq",

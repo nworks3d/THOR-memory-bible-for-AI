@@ -25,7 +25,13 @@ use model::item::{Binding, Item, Kind, TargetKind};
 use thor_core::event_store::EventStore;
 
 const AFTER: usize = serve::usefulness::JUDGEMENT_DEBT_AFTER;
-const CEILING: usize = serve::usefulness::EVAL_DEBT_CEILING;
+/// A comfortably large pinned backlog - large enough that, were pinned
+/// items not excluded, it would obviously be a real judgement debt. Not
+/// tied to any evaluation-debt threshold any more: since 2026-09-16 that
+/// debt no longer gates on item count at all (see `serve::usefulness`'s own
+/// "evaluation debt" section), so this file no longer needs to reach, or
+/// even know about, any such number.
+const PINNED_BACKLOG: usize = 15;
 
 struct Sandbox {
     home: tempfile::TempDir,
@@ -68,10 +74,9 @@ fn stop_payload(session_id: &str) -> String {
 }
 
 /// `n` Always-bound (pinned) GLOBAL rules, each served `AFTER` times under
-/// `session_id` - enough on their own to have crossed both the judgement-
-/// debt threshold and, if pinned items still counted, the evaluation debt's
-/// own ceiling too, so a silent hook proves the exclusion rather than merely
-/// a backlog too small to speak.
+/// `session_id` - enough on their own to have crossed the judgement-debt
+/// threshold, were they not pinned, so a silent hook proves the exclusion
+/// rather than merely a backlog too small to speak.
 fn declare_pinned_items(store: &mut EventStore, n: usize, session_id: &str) {
     for i in 0..n {
         let id = format!("pinned-{i:02}");
@@ -128,10 +133,10 @@ fn a_store_of_only_pinned_items_produces_no_judgement_ask_and_no_evaluation_obli
     let dir = tempfile::tempdir().unwrap();
     let db = dir.path().join("thor.db");
     let mut store = EventStore::new(&db).unwrap();
-    // More than the evaluation debt's own ceiling, so a silent hook proves
-    // the exclusion actually holds rather than the backlog simply being too
-    // small to have spoken either way.
-    declare_pinned_items(&mut store, CEILING + 5, "s1");
+    // A real-sized pinned backlog, so a silent hook proves the exclusion
+    // actually holds rather than the backlog simply being too small to have
+    // spoken either way.
+    declare_pinned_items(&mut store, PINNED_BACKLOG, "s1");
     drop(store);
     let sandbox = Sandbox::new();
 

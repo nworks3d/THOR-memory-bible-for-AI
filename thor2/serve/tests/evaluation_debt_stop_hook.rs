@@ -7,25 +7,28 @@
 //! `eval_debt_predicate_tests`/`eval_debt_state_tests`, `bin/serve.rs`'s
 //! `evaluation_debt_tests`); this file proves the WIRING - the real event
 //! store, the real sidecar file on disk, the real hook JSON shape on
-//! stdout, the once-per-session sidecar, the "this session actually served
-//! something here" gate, and above all the one property that cannot be
-//! proven at the unit level at all, because it lives in `hook_once`'s
-//! payload dispatch rather than in `evaluation_debt` itself: this debt must
-//! NEVER hold a subagent's own Stop, and it must now speak BEFORE the
-//! judgement debt when both are due.
+//! stdout, the once-per-session sidecar, the "this session has actually
+//! worked here long enough" gate, and above all the one property that
+//! cannot be proven at the unit level at all, because it lives in `hook_
+//! once`'s payload dispatch rather than in `evaluation_debt` itself: this
+//! debt must NEVER hold a subagent's own Stop, and it must now speak
+//! BEFORE the judgement debt when both are due.
 //!
-//! THE TRIGGER ITSELF WAS REWRITTEN 2026-09-16: a single global "newest
-//! verdict" clock could never hold a per-project debt (a verdict on ANY
-//! item that applied to a checkout reset it, global items included), so it
-//! never once fired against a copy of the owner's own store across four
-//! days measured. The replacement is a per-project sidecar
-//! (`eval-debt-state.json`, `serve::usefulness::ProjectEvalState`) tracking
-//! how long this project's own backlog has sat at or over the ceiling, and
-//! whether an evaluation report has been seen for it since - see
-//! `usefulness.rs`'s own "evaluation debt" section for the full story.
-//! `seed_over_ceiling_since` below drives that clock directly (through the
-//! exact same production write the Stop hook itself uses), since these
-//! tests cannot make real wall-clock time pass.
+//! THE TRIGGER WAS REWRITTEN TWICE ON 2026-09-16. First, a single global
+//! "newest verdict" clock - which any verdict on ANY item applying to a
+//! checkout reset, global items included - was replaced with a per-project
+//! sidecar (`eval-debt-state.json`, `serve::usefulness::ProjectEvalState`)
+//! tracking how long a backlog of ten-or-more items had sat continuously at
+//! or over that ceiling, and whether an evaluation report had been seen for
+//! it since. Then, the same day, the ceiling itself was dropped entirely -
+//! decision by the owner - in favour of asking daily, per project actually
+//! worked in, once the session has put in at least `serve::usefulness::
+//! EVAL_MIN_SESSION_MINUTES` there. `seed_tracking_since` below drives the
+//! sidecar's `tracking_since` clock directly (through the exact same
+//! production write the Stop hook itself uses), and `serve_marker_in_
+//! session`/`serve_marker_in_session_minutes_ago` drive the minutes-worked
+//! clock by controlling a real `item_served` event's own `served_at`, since
+//! neither clock can be made to pass by waiting in a test.
 //!
 //! EVERY PAYLOAD BELOW NAMES AN EXPLICIT `cwd`, unlike this file's own
 //! earlier shape - the sidecar is keyed by the EXACT project a Stop
@@ -51,7 +54,11 @@ use std::process::{Command, Stdio};
 use model::item::{Binding, Item, Kind, TargetKind};
 use thor_core::event_store::{EventKind, EventStore};
 
-const CEILING: usize = serve::usefulness::EVAL_DEBT_CEILING;
+/// A comfortably-sized backlog for the message's own "N item(s) currently
+/// owe a verdict here" context line - no longer tied to any threshold the
+/// evaluation debt itself gates on (see this file's own module doc comment
+/// for why the ceiling is gone).
+const OWED_CONTEXT_COUNT: usize = 12;
 const AFTER: usize = serve::usefulness::JUDGEMENT_DEBT_AFTER;
 
 struct Sandbox {
@@ -154,9 +161,9 @@ fn subagent_stop_payload(session_id: &str, cwd: &Path) -> String {
 
 /// Declares `n` never-judged rules, scoped to `project` (`None` for
 /// global), and serves each one `AFTER` times under a throwaway fixture
-/// session id, so all `n` sit in this checkout's own judgement debt - the
-/// evaluation debt's first condition needs a real backlog, not a single
-/// item. Returns the ids.
+/// session id, so all `n` sit in this checkout's own judgement debt - feeds
+/// the evaluation debt's own message, "N item(s) currently owe a verdict
+/// here", never a condition for it to speak any more. Returns the ids.
 ///
 /// TARGET-BOUND, EACH ON ITS OWN UNIQUE COMMAND ANCHOR - never `Binding::
 /// Always`, since `judgement_debt_counts` (and so this debt's own owed
@@ -203,8 +210,12 @@ fn declare_owed_items(store: &mut EventStore, n: usize, project: Option<&str>) -
 }
 
 /// Declare a fresh, harmless item scoped to `project` and serve it EXACTLY
-/// ONCE, under the real `session_id` - satisfies `session_served_in_project`
-/// (`bin/serve.rs`) without ever approaching `JUDGEMENT_DEBT_AFTER`, so it
+/// ONCE, under the real `session_id`, timestamped 2026-09-08 - long enough
+/// before any real run of this test suite that it also satisfies the
+/// evaluation debt's own minutes-worked floor
+/// (`serve::usefulness::EVAL_MIN_SESSION_MINUTES`) for free, on top of its
+/// original job: giving `session_first_served_in_project` (`bin/serve.rs`)
+/// something to find, without ever approaching `JUDGEMENT_DEBT_AFTER`, so it
 /// never becomes owed itself and never gives `judgement_debt` anything to
 /// ask about. The id embeds `session_id` so two calls in the same test (a
 /// first session, then a second) never collide or trip the write gate's
@@ -229,14 +240,40 @@ fn serve_marker_in_session(store: &mut EventStore, session_id: &str, project: Op
     id
 }
 
-/// Seed the sidecar as though this project's own backlog first crossed the
-/// ceiling `hours_ago` hours before the real "now" - the only way to drive
-/// the sidecar-backed staleness clock from a test, since these tests cannot
-/// make real wall-clock time pass. Calls the exact same production write
-/// `bin/serve.rs`'s Stop arm itself uses
-/// (`usefulness::update_eval_debt_state`), so the sidecar this writes is
-/// byte-identical in shape to the real thing.
-fn seed_over_ceiling_since(store: &EventStore, db: &Path, project: Option<&str>, hours_ago: i64) {
+/// The same fixture as `serve_marker_in_session` above, but with a
+/// controllable, recent `served_at` - `minutes_ago` minutes before the real
+/// "now" - so a test can drive `session_first_served_in_project`'s own
+/// clock to land on EITHER side of `EVAL_MIN_SESSION_MINUTES`, which
+/// `serve_marker_in_session`'s fixed 2026-09-08 timestamp cannot do (it is
+/// always well past the floor).
+fn serve_marker_in_session_minutes_ago(store: &mut EventStore, session_id: &str, project: Option<&str>, minutes_ago: i64) {
+    let id = format!("marker-{session_id}-{minutes_ago}");
+    let item = Item {
+        id: id.clone(),
+        kind: Kind::Rule,
+        text: format!("fixture marker item for session {session_id}, {minutes_ago} minute(s) ago"),
+        bindings: vec![Binding::Always],
+        severity: None,
+        project: project.map(str::to_string),
+        tags: vec![],
+        expires: None,
+        key: None,
+        falsifier: Some("this marker fixture turns out to be wrong".to_string()),
+        check: None,
+    };
+    model::store::declare(store, "fixture", "fixture", "fixture", &item).unwrap();
+    let served_at = serve::time::iso8601_from_unix(serve::time::now_unix() - minutes_ago * 60);
+    serve::deliver::record_delivery(store, session_id, "fixture", "t", &served_at, &[id]);
+}
+
+/// Seed the sidecar as though THOR started tracking this project
+/// `hours_ago` hours before the real "now" - the only way to drive the
+/// sidecar-backed `tracking_since` clock from a test, since these tests
+/// cannot make real wall-clock time pass. Calls the exact same production
+/// write `bin/serve.rs`'s Stop arm itself uses (`usefulness::
+/// update_eval_debt_state`), so the sidecar this writes is byte-identical
+/// in shape to the real thing.
+fn seed_tracking_since(store: &EventStore, db: &Path, project: Option<&str>, hours_ago: i64) {
     let since = serve::time::now_unix() - hours_ago * 3600;
     serve::usefulness::update_eval_debt_state(store, db, project, since);
 }
@@ -316,9 +353,9 @@ fn fires_for_a_main_session_and_names_the_real_eval_path_when_it_exists() {
     let cwd = sandbox.global_cwd();
 
     let mut store = EventStore::new(&db).unwrap();
-    declare_owed_items(&mut store, CEILING, None);
+    declare_owed_items(&mut store, OWED_CONTEXT_COUNT, None);
     serve_marker_in_session(&mut store, "s1", None);
-    seed_over_ceiling_since(&store, &db, None, 25);
+    seed_tracking_since(&store, &db, None, 25);
     drop(store);
 
     let out = run_hook(&db, &stop_payload("s1", &cwd), &sandbox);
@@ -326,8 +363,12 @@ fn fires_for_a_main_session_and_names_the_real_eval_path_when_it_exists() {
     assert_eq!(v["decision"], "block", "{out}");
     let reason = v["reason"].as_str().unwrap();
     assert!(reason.contains("[THOR]"), "{reason}");
-    assert!(reason.contains(&format!("{CEILING} item")), "must name the count: {reason}");
-    assert!(reason.contains("no evaluation report was filed"), "{reason}");
+    assert!(
+        reason.contains("never had an evaluation since THOR started tracking it"),
+        "no report was ever seen here, so this branch of the message must speak: {reason}"
+    );
+    assert!(reason.contains("This session has worked here for"), "{reason}");
+    assert!(reason.contains(&format!("{OWED_CONTEXT_COUNT} item(s) currently owe a verdict here")), "{reason}");
     assert!(reason.contains("once per session"), "{reason}");
     let expected_path = sandbox.eval_command_path();
     assert!(
@@ -347,9 +388,9 @@ fn falls_back_to_the_generic_note_when_no_eval_file_exists() {
     let cwd = sandbox.global_cwd();
 
     let mut store = EventStore::new(&db).unwrap();
-    declare_owed_items(&mut store, CEILING, None);
+    declare_owed_items(&mut store, OWED_CONTEXT_COUNT, None);
     serve_marker_in_session(&mut store, "s1", None);
-    seed_over_ceiling_since(&store, &db, None, 25);
+    seed_tracking_since(&store, &db, None, 25);
     drop(store);
 
     let out = run_hook(&db, &stop_payload("s1", &cwd), &sandbox);
@@ -382,11 +423,11 @@ fn both_debts_due_shows_the_evaluation_first() {
     let cwd = sandbox.global_cwd();
 
     let mut store = EventStore::new(&db).unwrap();
-    let ids = declare_owed_items(&mut store, CEILING, None);
+    let ids = declare_owed_items(&mut store, OWED_CONTEXT_COUNT, None);
     for id in &ids {
         serve::deliver::record_delivery(&mut store, "s1", "fixture", "t", "2026-09-08T00:00:00Z", &[id.clone()]);
     }
-    seed_over_ceiling_since(&store, &db, None, 25);
+    seed_tracking_since(&store, &db, None, 25);
     drop(store);
 
     let out = run_hook(&db, &stop_payload("s1", &cwd), &sandbox);
@@ -407,9 +448,9 @@ fn is_silent_for_a_subagent_payload_on_the_same_store() {
     let cwd = sandbox.global_cwd();
 
     let mut store = EventStore::new(&db).unwrap();
-    declare_owed_items(&mut store, CEILING, None);
+    declare_owed_items(&mut store, OWED_CONTEXT_COUNT, None);
     serve_marker_in_session(&mut store, "s1", None);
-    seed_over_ceiling_since(&store, &db, None, 25);
+    seed_tracking_since(&store, &db, None, 25);
     drop(store);
 
     let out = run_hook(&db, &subagent_stop_payload("s1", &cwd), &sandbox);
@@ -424,9 +465,9 @@ fn is_silent_on_the_second_stop_of_the_same_session() {
     let cwd = sandbox.global_cwd();
 
     let mut store = EventStore::new(&db).unwrap();
-    declare_owed_items(&mut store, CEILING, None);
+    declare_owed_items(&mut store, OWED_CONTEXT_COUNT, None);
     serve_marker_in_session(&mut store, "s1", None);
-    seed_over_ceiling_since(&store, &db, None, 25);
+    seed_tracking_since(&store, &db, None, 25);
     drop(store);
 
     let first = run_hook(&db, &stop_payload("s1", &cwd), &sandbox);
@@ -437,21 +478,47 @@ fn is_silent_on_the_second_stop_of_the_same_session() {
     assert!(second.trim().is_empty(), "the same session must not be asked twice: {second}");
 }
 
+/// Case named in the build brief: zero items owed still fires once the day
+/// has passed and enough time has been worked - the item count is message
+/// context now (see `OWED_CONTEXT_COUNT`'s own doc comment), never a
+/// condition. Deliberately no `declare_owed_items` call at all.
 #[test]
-fn is_silent_below_the_ceiling() {
+fn fires_with_zero_items_owed_once_stale_and_worked_long_enough() {
     let dir = tempfile::tempdir().unwrap();
     let db = dir.path().join("thor.db");
     let sandbox = Sandbox::new();
     let cwd = sandbox.global_cwd();
 
     let mut store = EventStore::new(&db).unwrap();
-    declare_owed_items(&mut store, CEILING - 1, None);
     serve_marker_in_session(&mut store, "s1", None);
-    seed_over_ceiling_since(&store, &db, None, 100);
+    seed_tracking_since(&store, &db, None, 25);
     drop(store);
 
     let out = run_hook(&db, &stop_payload("s1", &cwd), &sandbox);
-    assert!(out.trim().is_empty(), "one below the ceiling must never speak, however stale: {out}");
+    let v: serde_json::Value = serde_json::from_str(&out).unwrap_or_else(|e| panic!("expected a decision JSON: {e}: {out}"));
+    assert_eq!(v["decision"], "block", "a zero-item backlog must still owe an evaluation: {out}");
+    let reason = v["reason"].as_str().unwrap();
+    assert!(reason.contains("0 item(s) currently owe a verdict here"), "{reason}");
+}
+
+/// Case named in the build brief: the session's first serving here was less
+/// than an hour ago -> silent, however stale the project's own tracking
+/// clock is.
+#[test]
+fn is_silent_when_the_session_has_worked_here_less_than_an_hour() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("thor.db");
+    let sandbox = Sandbox::new();
+    let cwd = sandbox.global_cwd();
+
+    let mut store = EventStore::new(&db).unwrap();
+    declare_owed_items(&mut store, OWED_CONTEXT_COUNT, None);
+    serve_marker_in_session_minutes_ago(&mut store, "s1", None, 30);
+    seed_tracking_since(&store, &db, None, 100);
+    drop(store);
+
+    let out = run_hook(&db, &stop_payload("s1", &cwd), &sandbox);
+    assert!(out.trim().is_empty(), "less than an hour worked here must never speak, however stale: {out}");
 }
 
 /// Case named in the build brief: a session that served nothing in the
@@ -465,10 +532,10 @@ fn is_silent_for_a_session_that_served_nothing_in_this_project() {
     let cwd = sandbox.global_cwd();
 
     let mut store = EventStore::new(&db).unwrap();
-    declare_owed_items(&mut store, CEILING, None);
+    declare_owed_items(&mut store, OWED_CONTEXT_COUNT, None);
     // Deliberately no `serve_marker_in_session` call: "s1" never had
     // anything served to it at all in this store.
-    seed_over_ceiling_since(&store, &db, None, 25);
+    seed_tracking_since(&store, &db, None, 25);
     drop(store);
 
     let out = run_hook(&db, &stop_payload("s1", &cwd), &sandbox);
@@ -486,9 +553,9 @@ fn a_new_evaluation_report_for_the_project_silences_it() {
     let project_dir = sandbox.project_dir("thor-fixture");
 
     let mut store = EventStore::new(&db).unwrap();
-    declare_owed_items(&mut store, CEILING, Some("thor-fixture"));
+    declare_owed_items(&mut store, OWED_CONTEXT_COUNT, Some("thor-fixture"));
     serve_marker_in_session(&mut store, "s1", Some("thor-fixture"));
-    seed_over_ceiling_since(&store, &db, Some("thor-fixture"), 25);
+    seed_tracking_since(&store, &db, Some("thor-fixture"), 25);
     drop(store);
 
     let first = run_hook(&db, &stop_payload("s1", &project_dir), &sandbox);
@@ -510,15 +577,17 @@ fn a_new_evaluation_report_for_the_project_silences_it() {
     assert!(second.trim().is_empty(), "a newly filed evaluation report must silence the obligation: {second}");
 }
 
-/// THE REGRESSION THIS WHOLE REWRITE EXISTS FOR, measured on a copy of the
-/// owner's own store 2026-09-12 to 2026-09-16: a clock fed by ANY verdict
-/// that applied to a checkout - global items included - reset itself every
-/// few hours from unrelated activity elsewhere, so "nothing judged for 24
-/// hours" was never once true in four days even while this project's own
-/// backlog sat over the ceiling 56% to 100% of the time. Marking a handful
-/// of totally unrelated global facts every few hours, right up to the edge
-/// of the window, must no longer stop the obligation from firing once this
-/// project's own crossing has genuinely stayed stale for a day.
+/// THE REGRESSION THE FIRST 2026-09-16 REWRITE EXISTED FOR: a clock fed by
+/// ANY verdict that applied to a checkout - global items included - reset
+/// itself every few hours from unrelated activity elsewhere, so "nothing
+/// judged for 24 hours" almost never came true. The per-project `tracking_
+/// since` clock this file now drives structurally cannot regress the same
+/// way: `update_eval_debt_state` never reads a verdict at all to decide
+/// this field, only whether the project has ever been seen before (`get_or_
+/// insert`) - so marking a handful of totally unrelated global facts, right
+/// up to the edge of the window, must not stop the obligation from firing
+/// once this project's own tracking clock has genuinely stayed stale for a
+/// day and this session has worked here long enough.
 #[test]
 fn regression_verdicts_on_unrelated_global_items_never_reset_the_clock() {
     let dir = tempfile::tempdir().unwrap();
@@ -527,9 +596,9 @@ fn regression_verdicts_on_unrelated_global_items_never_reset_the_clock() {
     let cwd = sandbox.global_cwd();
 
     let mut store = EventStore::new(&db).unwrap();
-    declare_owed_items(&mut store, CEILING, None);
+    declare_owed_items(&mut store, OWED_CONTEXT_COUNT, None);
     serve_marker_in_session(&mut store, "s1", None);
-    seed_over_ceiling_since(&store, &db, None, 25);
+    seed_tracking_since(&store, &db, None, 25);
 
     // Verdicts on OTHER global items, every few hours over the last day -
     // exactly the pattern that silenced the old clock forever. None of
@@ -583,9 +652,9 @@ fn setup_debt_still_fires_with_an_eval_eligible_backlog_also_present() {
 
     let mut store = EventStore::new(&db).unwrap();
     declare_setup_note(&mut store);
-    declare_owed_items(&mut store, CEILING, None);
+    declare_owed_items(&mut store, OWED_CONTEXT_COUNT, None);
     serve_marker_in_session(&mut store, "s1", None);
-    seed_over_ceiling_since(&store, &db, None, 25);
+    seed_tracking_since(&store, &db, None, 25);
     drop(store);
 
     let out = run_hook(&db, &stop_payload("s1", &cwd), &sandbox);
@@ -598,8 +667,8 @@ fn setup_debt_still_fires_with_an_eval_eligible_backlog_also_present() {
 
 /// THE OTHER HALF: a debt AFTER the new insertion point (the backlog burn,
 /// `teeth_debt`) must still fire on its own store, unaffected, when the
-/// evaluation debt itself has nothing to say (the backlog here never
-/// reaches `CEILING`).
+/// evaluation debt itself has nothing to say (no sidecar was ever seeded
+/// here, and the session served nothing applying to this project either).
 #[test]
 fn teeth_debt_still_fires_after_the_evaluation_debt_check() {
     let dir = tempfile::tempdir().unwrap();

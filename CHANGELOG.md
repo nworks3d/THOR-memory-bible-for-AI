@@ -4,7 +4,7 @@ What changed in each release, newest first. The release workflow copies the sect
 
 ## Unreleased
 
-- **The evaluation ask tracks the ceiling, not a global clock.** Once a project's own judgement-debt backlog has stayed at ten items or more for a day with no evaluation report filed for it, the Stop hook asks for the evaluation routine by name - before the judgement debt, when both are due. Only asked in a session that actually did work in that project; filing the evaluation report is what silences it.
+- **The evaluation ask runs every day, in every project you work in.** Once a session has worked in a project for an hour, and a full day has passed since that project's own tracking clock or its last evaluation report (whichever is later), the Stop hook asks for the evaluation routine by name - before the judgement debt, when both are due, and regardless of how many notes currently owe a verdict. Filing the evaluation report silences the ask for a day.
 - **The shipped evaluation now files its own report into the memory**, so a later session (and `doctor`) can see one was done. The 2.4.0 notes below already claimed this; it arrives now.
 - **The ship line counts what is waiting and only alarms on a failed attempt.** A healthy hourly ship with nothing new to send still reads as fresh no matter its age; changes waiting behind an old success are named and counted, never mistaken for a failure; only an attempt that actually failed raises the alarm.
 - **A backup push that failed is retried.** A commit that landed locally but could not reach the remote is pushed again on the very next run, before that run's own once-a-day schedule is even checked.

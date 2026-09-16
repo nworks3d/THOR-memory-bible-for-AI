@@ -147,14 +147,14 @@ there the day writes are turned on. An existing copy - the owner's own
 edited version, or one an earlier install already wrote - is left exactly
 as it is.
 
-Once a project's own backlog has stayed at ten items or more for a whole day,
-with no evaluation report filed for it in that time, the `Stop` hook asks for
-this whole routine by name, once per session, instead of one more item at a
-time - see the `judgement debt` line under "Check it" below for where that
-backlog is reported. A rule the owner has pinned to fire at every session
-start never counts toward that ten: pinning it already answered whether it
-belongs there. Filing the evaluation report - the last step of the routine
-above - is what silences the ask for a day.
+Once a project has gone a full day without an evaluation report, and the
+session has worked in that project for at least an hour, the `Stop` hook
+asks for this whole routine by name, once per session, instead of one more
+item at a time - see the `judgement debt` line under "Check it" below for
+where this checkout's own tracking clock and last evaluation report are
+named. It asks every day, in every project you actually work in, regardless
+of how many notes currently owe a verdict. Filing the evaluation report -
+the last step of the routine above - is what silences the ask for a day.
 
 `--project <key>` additionally writes a `.thor-project` marker in the current
 directory to override the project name. By default, a checkout is scoped to the
@@ -252,12 +252,13 @@ kind, and where it fires - so a review has a list to settle instead of only a
 count. A rule the owner has pinned to fire at every session start never
 appears on that list: pinning it already answered whether it belongs there,
 and a verdict on it would change nothing else in the memory. The same line
-also says how long this checkout's own backlog has sat at or over that
-ceiling, or that it currently has not, and names the last evaluation report
-seen for this project and how long ago it was first seen, or that none ever
-was; once the backlog has stayed over the ceiling a full day with no report
-to show for it, the line adds that the `Stop` hook will ask for the whole
-end-of-session routine over it.
+also says how long ago this checkout's own evaluation clock started
+tracking it, or that it starts at the first session worked in this project;
+names the newest evaluation report this store holds for the project and
+whether a session has seen it yet, or that none exists yet; and, once a full
+day has passed since the later of those two, adds that the `Stop` hook will
+ask for the whole end-of-session routine once a session has worked here for
+an hour.
 
 Two of those checks - whether an old reference still points at a real file,
 and whether some facts never win a place - need to know where your other

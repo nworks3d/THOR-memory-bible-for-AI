@@ -449,21 +449,22 @@ mod judgement_debt_counting_tests {
         assert_eq!(ids, vec!["trigger-named"], "an Always-bound item must never be named: {ids:?}");
     }
 
-    /// The evaluation debt's own owed count is `judgement_debt_counts`'s
-    /// `in_project` half (see `eval_debt_owed`'s own doc comment) - an
-    /// all-pinned backlog large enough to have crossed `EVAL_DEBT_CEILING`,
-    /// were pinned items still counted, must instead read as zero.
+    /// The evaluation debt's own "items currently owe a verdict" context
+    /// count (`bin/serve.rs`'s `evaluation_debt` message) is `judgement_
+    /// debt_counts`'s `in_project` half - an all-pinned backlog, however
+    /// large, must still read as zero, the same exclusion `an_always_
+    /// bound_item_served_past_the_threshold_is_never_owed` above already
+    /// proves for a single item.
     #[test]
-    fn the_eval_debt_owed_count_ignores_always_bound_items() {
+    fn a_large_all_pinned_backlog_still_reads_as_zero_owed() {
         let mut store = EventStore::in_memory().unwrap();
-        for i in 0..EVAL_DEBT_CEILING {
+        for i in 0..15 {
             let id = format!("pinned-eval-{i}");
             declare_pinned(&mut store, &id, None);
             serve_n(&mut store, &id, JUDGEMENT_DEBT_AFTER);
         }
         let owed_in_project = judgement_debt_counts(&store, None).1;
-        assert_eq!(owed_in_project, 0, "an all-pinned backlog must never feed the evaluation debt's own ceiling");
-        assert!(!eval_debt_owed(owed_in_project, None, None, 0), "zero owed can never meet the ceiling");
+        assert_eq!(owed_in_project, 0, "an all-pinned backlog must never feed the evaluation debt's own context count");
     }
 }
 
@@ -500,84 +501,113 @@ pub fn noise_since_last_useful(store: &EventStore) -> HashMap<String, usize> {
 }
 
 // ------------------------------------------------------------------------
-// The evaluation debt (2026-09-12, trigger rewritten 2026-09-16): `bin/
-// serve.rs`'s Stop hook, once per session, asks the owner to run the WHOLE
-// end-of-session evaluation (`ops::install::seed_eval_command`'s routine)
-// rather than judging one more item, once this checkout's own judgement-debt
-// backlog is both large and stale. See `bin/serve.rs`'s own `evaluation_debt`
-// for the Stop-hook wiring; everything below is the pure/reusable half, kept
+// The evaluation debt (2026-09-12, trigger rewritten twice on 2026-09-16):
+// `bin/serve.rs`'s Stop hook, once per session, asks the owner to run the
+// WHOLE end-of-session evaluation (`ops::install::seed_eval_command`'s
+// routine) rather than judging one more item, once this project has gone
+// long enough without one. See `bin/serve.rs`'s own `evaluation_debt` for
+// the Stop-hook wiring; everything below is the pure/reusable half, kept
 // here for the same reason `JUDGEMENT_DEBT_AFTER` and `judgement_debt_counts`
 // already are: `doctor` (`ops::health::judgement_debt_line`) needs the exact
 // same numbers and the exact same sidecar, never a second copy that can
 // silently drift from what the hook actually acts on.
 //
-// THE CLOCK THIS REPLACES. Until 2026-09-16, "stale" meant "this checkout's
-// own newest verdict (`newest_verdict_unix`, removed) is more than a day
-// old" - but a verdict on a GLOBAL item resets that one clock for every
-// project at once, whether or not the project actually over the ceiling saw
-// a verdict of its own. Measured on a copy of the owner's own store,
-// 2026-09-12 to 2026-09-16: the longest true gap between verdicts anywhere
-// reached only 23.35 to 23.90 hours, so "nothing judged for 24 hours" was
-// never once true in four days, while the backlog sat at or over the
-// ceiling 56% to 100% of the measured hours across all nine projects. The
-// debt never fired once. Two facts kept per project in a sidecar
-// (`ProjectEvalState` below) replace it: how long the backlog has
-// CONTINUOUSLY sat at or over the ceiling, and how long since an evaluation
-// report was last (first) seen for that project - neither one moves just
-// because some unrelated global rule happened to get judged.
+// THE FIRST REWRITE (earlier the same day) replaced a single global "newest
+// verdict" clock - reset by a verdict on ANY item that applied to a
+// checkout, global items included, so it went days without ever firing on a
+// copy of the owner's own store - with a per-project sidecar tracking how
+// long a backlog of ten-or-more items had sat continuously at or over that
+// ceiling, and whether an evaluation report had been seen since.
+//
+// THE SECOND REWRITE, THIS ONE, drops the ceiling entirely - decision by the
+// owner, 2026-09-16. A count of items owed was never actually the thing he
+// wanted to gate on: a project with a small, well-kept backlog could go
+// without an evaluation forever, and a project that crossed ten items for a
+// single busy hour got asked about regardless of how little time had
+// actually been spent there. What he wants instead is simpler - the
+// evaluation asked for once a day, per project a session actually works in,
+// once that session has put in enough time there for the ask to be worth
+// answering (half an hour was tried and rejected as too little; an hour
+// stands). Two facts kept per project in the sidecar now drive the "once a
+// day" half: `tracking_since` (when this project was first seen at a
+// main-session Stop at all - set once, never cleared, so a quiet day no
+// longer resets anything the way falling back under the old ceiling used
+// to) and `last_evaluation_seen` (unchanged - see `evaluation_report_ids`
+// below). A third fact, read fresh from the session rather than the
+// sidecar, drives the "enough time" half: how long THIS session has worked
+// in the project, from the earliest `item_served` event it recorded here to
+// now (`EVAL_MIN_SESSION_MINUTES` below) - a session that only just arrived
+// must not be told to stop and evaluate before it has done anything here
+// worth evaluating. The item count is still shown in the Stop hook's own
+// message, for context - never as a condition any more.
 
-/// How many items this checkout's own judgement debt must hold before the
-/// evaluation debt can even be considered - `judgement_debt_counts`'s own
-/// `in_project` half, the identical count `doctor` already names under
-/// "judgement debt" for this checkout. Ten is a backlog, not a rounding
-/// error: below it, walking the items one `mark` at a time (the per-item
-/// judgement debt above, or the owner simply noticing) is still the cheaper
-/// path, and asking for the whole routine over a handful of items would be
-/// the nag this ceiling exists to prevent.
-pub const EVAL_DEBT_CEILING: usize = 10;
+/// How many minutes THIS session must have worked in a project - measured
+/// from the earliest `item_served` event it recorded for an item that
+/// applies to that project, to now - before the evaluation debt is willing
+/// to speak at all, regardless of how long the project has gone without an
+/// evaluation. An hour, not the half hour first tried: the owner rejected
+/// half an hour as too little, on 2026-09-16, because it hijacked the very
+/// first question of a session before there was anything to evaluate yet.
+pub const EVAL_MIN_SESSION_MINUTES: i64 = 60;
 
-/// How many hours may pass since this checkout's own newest verdict before
-/// the evaluation debt is willing to speak at all - the grace period that
-/// keeps it from asking again minutes after an evaluation actually happened.
-/// A day, not an hour: an evaluation is deliberate, occasional work, and a
-/// backlog that crossed the ceiling five minutes ago is not yet a pattern.
+/// How many hours may pass since the later of a project's own `tracking_
+/// since` and its `last_evaluation_seen` before the evaluation debt is
+/// willing to speak at all - the grace period that keeps it from asking
+/// again minutes after an evaluation actually happened. A day, not an hour:
+/// an evaluation is deliberate, occasional work, and a project this memory
+/// only just started tracking, or one evaluated an hour ago, is not yet
+/// overdue for another.
 pub const EVAL_DEBT_STALE_HOURS: i64 = 24;
 
-/// THE PURE PREDICATE, rewritten 2026-09-16 (see this section's own doc
-/// comment for the defect the old verdict-age version could never close).
-/// All three inputs are already resolved elsewhere (`owed_in_project` from
-/// `judgement_debt_counts`, `over_ceiling_since`/`last_evaluation_seen` from
-/// this project's own `ProjectEvalState` below, `now_unix` from `crate::
-/// time::now_unix`), so this stays nothing but the conditions themselves,
-/// unit-testable with plain integers and no store, no clock, no filesystem.
+/// THE TIME HALF OF THE PURE PREDICATE, factored out of `eval_debt_owed`
+/// below so `doctor` (`ops::health::judgement_debt_line`), which runs cold
+/// outside any session and so can never evaluate the minutes-worked half,
+/// can still report accurately on the half it CAN evaluate - without
+/// duplicating the "later of the two" rule a second time and risking it
+/// drift from the one `eval_debt_owed` actually acts on.
 ///
-/// Holds when the backlog is at or over the ceiling, AND it has stayed there
-/// for at least `EVAL_DEBT_STALE_HOURS` (`over_ceiling_since` of `None` -
-/// the sidecar has not yet recorded a Stop that saw the crossing - reads as
-/// "just now", i.e. not yet stale, never as "forever"), AND no evaluation
-/// report has silenced it since: either none was ever seen for this
-/// project, or the last one seen is itself at least `EVAL_DEBT_STALE_HOURS`
-/// old. `now_unix.saturating_sub(..)` throughout rather than plain
-/// subtraction: both timestamps are read from a stored, human-editable
-/// sidecar, and a clock skew that put either in the future must read as
-/// "not yet stale" rather than underflow.
+/// Holds when at least `EVAL_DEBT_STALE_HOURS` have passed since the LATER
+/// of `tracking_since` and `last_evaluation_seen` (`tracking_since` of
+/// `None` - no main-session Stop has ever been recorded for this project -
+/// reads as "just now", i.e. not yet stale, never as "forever"; `last_
+/// evaluation_seen` of `None` simply drops out of the "later of the two",
+/// leaving `tracking_since` alone, which is exactly "no evaluation report
+/// was ever seen for this project" as the doc comment above promises).
+/// `now_unix.saturating_sub(..)` throughout rather than plain subtraction:
+/// both timestamps are read from a stored, human-editable sidecar, and a
+/// clock skew that put either in the future must read as "not yet stale"
+/// rather than underflow.
+pub fn eval_debt_stale(tracking_since: Option<i64>, last_evaluation_seen: Option<i64>, now_unix: i64) -> bool {
+    let Some(since) = tracking_since else { return false };
+    let baseline = match last_evaluation_seen {
+        Some(seen) => seen.max(since),
+        None => since,
+    };
+    now_unix.saturating_sub(baseline) > EVAL_DEBT_STALE_HOURS * 3600
+}
+
+/// THE WHOLE PURE PREDICATE, rewritten 2026-09-16 to drop the ceiling (see
+/// this section's own doc comment for why). All four inputs are already
+/// resolved elsewhere (`minutes_worked_this_session` from `minutes_ago`
+/// applied to `bin/serve.rs`'s own session-scoped read, `tracking_since`/
+/// `last_evaluation_seen` from this project's own `ProjectEvalState` below,
+/// `now_unix` from `crate::time::now_unix`), so this stays nothing but the
+/// conditions themselves, unit-testable with plain integers and no store,
+/// no clock, no filesystem.
+///
+/// Holds when THIS session has worked in the project for at least
+/// `EVAL_MIN_SESSION_MINUTES`, AND `eval_debt_stale` above holds. The
+/// minutes check is first and cheapest, and short-circuits the common case
+/// (a session that only just started here) without even looking at the
+/// sidecar's own two timestamps.
 pub fn eval_debt_owed(
-    owed_in_project: usize,
-    over_ceiling_since: Option<i64>,
+    minutes_worked_this_session: i64,
+    tracking_since: Option<i64>,
     last_evaluation_seen: Option<i64>,
     now_unix: i64,
 ) -> bool {
-    if owed_in_project < EVAL_DEBT_CEILING {
-        return false;
-    }
-    let Some(since) = over_ceiling_since else { return false };
-    if now_unix.saturating_sub(since) <= EVAL_DEBT_STALE_HOURS * 3600 {
-        return false;
-    }
-    match last_evaluation_seen {
-        None => true,
-        Some(t) => now_unix.saturating_sub(t) > EVAL_DEBT_STALE_HOURS * 3600,
-    }
+    minutes_worked_this_session >= EVAL_MIN_SESSION_MINUTES
+        && eval_debt_stale(tracking_since, last_evaluation_seen, now_unix)
 }
 
 /// Whole days between `then_unix` and `now_unix`, floored, never negative -
@@ -586,6 +616,14 @@ pub fn eval_debt_owed(
 /// neither ever rounds it differently from the other.
 pub fn days_ago(now_unix: i64, then_unix: i64) -> i64 {
     (now_unix - then_unix).max(0) / 86400
+}
+
+/// Whole minutes between `then_unix` and `now_unix`, floored, never
+/// negative - `days_ago`'s own rule in a different unit, for the evaluation
+/// debt's own "how long has this session worked here" clock
+/// (`EVAL_MIN_SESSION_MINUTES`).
+pub fn minutes_ago(now_unix: i64, then_unix: i64) -> i64 {
+    (now_unix - then_unix).max(0) / 60
 }
 
 /// The sidecar's own map key for a project - `""` stands for "no project" (a
@@ -605,13 +643,18 @@ fn project_key(project: Option<&str>) -> &str {
 /// fail-open stance `capture::Marker`'s own fields already take.
 #[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct ProjectEvalState {
-    /// The first time a main-session Stop in this project saw its own owed
-    /// count at or over `EVAL_DEBT_CEILING` - `None` before that has ever
-    /// happened, or once a Stop has since seen the count drop back under the
-    /// ceiling (the crossing is forgotten outright, not merely paused: the
-    /// next crossing starts its own new clock).
-    #[serde(default)]
-    pub over_ceiling_since: Option<i64>,
+    /// The first time a main-session Stop was ever seen in this project -
+    /// `None` before that has ever happened. Set once
+    /// (`update_eval_debt_state`'s `get_or_insert`) and never cleared again:
+    /// unlike the ceiling-crossing clock this replaced (`over_ceiling_since`,
+    /// still the name a sidecar written before 2026-09-16 carries - see the
+    /// `serde(alias)` below for why that value carries over unchanged), a
+    /// quiet day, or the judgement debt dropping to zero, no longer resets
+    /// anything: the question this field answers is no longer "how long has
+    /// a backlog sat over some line" but simply "how long has THOR been
+    /// tracking this project at all".
+    #[serde(alias = "over_ceiling_since", default)]
+    pub tracking_since: Option<i64>,
     /// Every id this project has ever had for a live Report carrying the
     /// `evaluation-report` tag, as of the most recent Stop that looked - the
     /// membership `last_evaluation_seen` below is measured against. Grows
@@ -692,16 +735,47 @@ fn evaluation_report_ids(store: &EventStore, project: Option<&str>) -> Vec<Strin
         .collect()
 }
 
+/// The newest live evaluation-report Report for `project`, paired with its
+/// own first event's seq - "newest" meaning highest creation seq, since a
+/// live item's own JSON body carries no creation timestamp anywhere in this
+/// system. `None` when the store holds none for this project.
+///
+/// WHY `doctor` (`ops::health::judgement_debt_line`) NEEDS THIS INSTEAD OF
+/// JUST READING THE SIDECAR'S OWN `last_evaluation_report_id`. The sidecar
+/// only learns about a report the next time a Stop runs in this project
+/// after it was filed - `update_eval_debt_state` above stamps it, but
+/// nothing runs that function outside a real Stop. A report filed and never
+/// yet followed by a Stop is real, live, and sitting in the store right
+/// now, but invisible to `project_eval_state`. `doctor` runs cold, with no
+/// Stop of its own, so reading only the sidecar would let it miss - and
+/// never even mention - a report that exists. This reads the store
+/// directly instead, the same store `judgement_debt_counts` already opens
+/// for the rest of this same doctor line.
+///
+/// One `get_events_by_entity` call per candidate id - cheap in practice,
+/// since a project rarely accumulates more than a handful of these over its
+/// life (one evaluation report a day, at most, is the entire point of the
+/// debt this backs).
+pub fn newest_evaluation_report(store: &EventStore, project: Option<&str>) -> Option<(String, i64)> {
+    evaluation_report_ids(store, project)
+        .into_iter()
+        .filter_map(|id| {
+            let seq = store.get_events_by_entity(&id).ok()?.first()?.seq;
+            Some((id, seq))
+        })
+        .max_by_key(|(_, seq)| *seq)
+}
+
 /// Refresh this project's own two facts from `store` as it stands right
 /// now, and write the sidecar back if anything actually changed. Called
 /// ONCE PER MAIN-SESSION STOP in a project (`bin/serve.rs`'s `hook_once`,
 /// unconditionally within its own `!is_subagent` guard) - deliberately
-/// unconditioned by the once-per-session/served-this-session gates that
+/// unconditioned by the once-per-session/enough-time-worked-here gates that
 /// decide whether the obligation is actually SHOWN (`eval_debt_not_yet_
-/// asked_this_session`, `session_served_in_project`): those two are about
-/// whether to SPEAK, this is about whether the RECORD stays true, and a
-/// session that is never asked must still leave the ceiling clock and the
-/// report sighting exactly as accurate as one that was.
+/// asked_this_session`, the minutes-worked half of `eval_debt_owed`): those
+/// are about whether to SPEAK, this is about whether the RECORD stays true,
+/// and a session that is never asked must still leave the tracking clock
+/// and the report sighting exactly as accurate as one that was.
 ///
 /// NEVER CALLED BY `doctor` (`ops::health::judgement_debt_line`), which
 /// reads this same state through [`project_eval_state`] but must stay
@@ -712,18 +786,15 @@ pub fn update_eval_debt_state(store: &EventStore, db: &Path, project: Option<&st
     let before = all.get(&key).cloned().unwrap_or_default();
     let mut entry = before.clone();
 
-    // `over_ceiling_since`: set on the first Stop that sees the crossing,
-    // left untouched on every Stop after that (`get_or_insert` never
-    // overwrites a `Some`) so the clock measures the WHOLE streak, not just
-    // the most recent Stop - and cleared outright the first time a Stop sees
-    // the count fall back under the ceiling, so the next crossing starts
-    // fresh rather than inheriting a streak that already ended.
-    let (_, owed_in_project) = judgement_debt_counts(store, project);
-    if owed_in_project >= EVAL_DEBT_CEILING {
-        entry.over_ceiling_since.get_or_insert(now_unix);
-    } else {
-        entry.over_ceiling_since = None;
-    }
+    // `tracking_since`: set on the FIRST main-session Stop this project was
+    // ever seen at (`get_or_insert` never overwrites a `Some`), and left
+    // untouched on every Stop after that, forever - unlike the ceiling-
+    // crossing clock this replaced, nothing about the current backlog size
+    // ever clears it again. `store` is intentionally unread here now: the
+    // old version needed `judgement_debt_counts` to decide whether to set or
+    // clear this field; the new rule needs neither the store nor the count,
+    // only "has this project been seen before".
+    entry.tracking_since.get_or_insert(now_unix);
 
     // `last_evaluation_seen`/`last_evaluation_report_id`: any id live right
     // now that this sidecar has not seen before is "new" - stamp the moment
@@ -782,63 +853,93 @@ mod eval_debt_predicate_tests {
     const NOW: i64 = 1_800_000_000;
     const HOUR: i64 = 3600;
 
+    /// Case named in the build brief: 59 minutes worked this session ->
+    /// silent, 61 -> fires - the project itself is maximally stale in both
+    /// cases (tracking started long ago, no report ever), proving the
+    /// minutes-worked floor alone decides the difference.
     #[test]
-    fn silent_below_the_ceiling_regardless_of_how_stale_everything_else_is() {
-        // Both other inputs are maximally "fire me" (long over the ceiling,
-        // no report ever) - proving the ceiling alone still holds the line.
-        assert!(!eval_debt_owed(EVAL_DEBT_CEILING - 1, Some(NOW - 100 * HOUR), None, NOW));
+    fn fifty_nine_minutes_worked_is_silent_sixty_one_fires() {
+        let since = NOW - 100 * HOUR;
+        assert!(!eval_debt_owed(59, Some(since), None, NOW), "59 minutes must not yet be enough");
+        assert!(eval_debt_owed(61, Some(since), None, NOW), "61 minutes must be enough");
     }
 
-    /// Case named in the build brief: over the ceiling for 23 hours -> silent.
     #[test]
-    fn silent_over_the_ceiling_for_only_23_hours() {
+    fn exactly_the_minimum_minutes_worked_is_enough() {
+        // The gate is "at least" `EVAL_MIN_SESSION_MINUTES`, not strictly more.
+        let since = NOW - 100 * HOUR;
+        assert!(eval_debt_owed(EVAL_MIN_SESSION_MINUTES, Some(since), None, NOW));
+    }
+
+    #[test]
+    fn one_minute_under_the_minimum_is_silent_regardless_of_how_stale_everything_else_is() {
+        assert!(!eval_debt_owed(EVAL_MIN_SESSION_MINUTES - 1, Some(NOW - 100 * HOUR), None, NOW));
+    }
+
+    /// Case named in the build brief: never evaluated, `tracking_since` 23
+    /// hours ago -> silent.
+    #[test]
+    fn never_evaluated_with_tracking_since_23_hours_ago_is_silent() {
         let since = NOW - 23 * HOUR;
-        assert!(!eval_debt_owed(EVAL_DEBT_CEILING, Some(since), None, NOW));
+        assert!(!eval_debt_owed(EVAL_MIN_SESSION_MINUTES, Some(since), None, NOW));
     }
 
-    /// Case named in the build brief: 25 hours and no report -> fires.
+    /// Case named in the build brief: never evaluated, `tracking_since` 25
+    /// hours ago -> fires.
     #[test]
-    fn fires_over_the_ceiling_for_25_hours_with_no_report_ever() {
+    fn never_evaluated_with_tracking_since_25_hours_ago_fires() {
         let since = NOW - 25 * HOUR;
-        assert!(eval_debt_owed(EVAL_DEBT_CEILING, Some(since), None, NOW));
+        assert!(eval_debt_owed(EVAL_MIN_SESSION_MINUTES, Some(since), None, NOW));
     }
 
-    /// Case named in the build brief: report first seen 10 hours ago -> silent.
+    /// Case named in the build brief: an evaluation report first seen 23
+    /// hours ago -> silent.
     #[test]
-    fn silent_when_a_report_was_first_seen_10_hours_ago() {
+    fn silent_when_a_report_was_first_seen_23_hours_ago() {
         let since = NOW - 48 * HOUR;
-        let seen = NOW - 10 * HOUR;
-        assert!(!eval_debt_owed(EVAL_DEBT_CEILING, Some(since), Some(seen), NOW));
+        let seen = NOW - 23 * HOUR;
+        assert!(!eval_debt_owed(EVAL_MIN_SESSION_MINUTES, Some(since), Some(seen), NOW));
     }
 
-    /// Case named in the build brief: report first seen 30 hours ago and
-    /// still over -> fires.
+    /// Case named in the build brief: an evaluation report first seen 25
+    /// hours ago, itself now stale again -> fires.
     #[test]
-    fn fires_when_the_report_first_seen_30_hours_ago_is_itself_stale() {
+    fn fires_when_the_report_first_seen_25_hours_ago_is_itself_stale() {
         let since = NOW - 48 * HOUR;
-        let seen = NOW - 30 * HOUR;
-        assert!(eval_debt_owed(EVAL_DEBT_CEILING, Some(since), Some(seen), NOW));
+        let seen = NOW - 25 * HOUR;
+        assert!(eval_debt_owed(EVAL_MIN_SESSION_MINUTES, Some(since), Some(seen), NOW));
     }
 
-    /// `over_ceiling_since` is `None` on exactly the Stop that first crosses
-    /// the ceiling, before `update_eval_debt_state` has written anything for
-    /// this project yet - that Stop must never fire on the spot.
+    /// The later-of-the-two rule: a project tracked for a very long time but
+    /// evaluated recently must read as fresh, even though `tracking_since`
+    /// alone is long stale - `last_evaluation_seen`, the more recent of the
+    /// two, must be the one that wins.
     #[test]
-    fn a_crossing_the_sidecar_has_not_recorded_yet_is_not_yet_stale() {
-        assert!(!eval_debt_owed(EVAL_DEBT_CEILING, None, None, NOW));
+    fn a_recent_evaluation_silences_an_old_tracking_since() {
+        let since = NOW - 365 * 24 * HOUR;
+        let seen = NOW - HOUR;
+        assert!(!eval_debt_owed(EVAL_MIN_SESSION_MINUTES, Some(since), Some(seen), NOW));
+    }
+
+    /// `tracking_since` is `None` on exactly the Stop that first sees this
+    /// project at all, before `update_eval_debt_state` has written anything
+    /// for it yet - that Stop must never fire on the spot.
+    #[test]
+    fn a_project_the_sidecar_has_not_recorded_yet_is_not_yet_stale() {
+        assert!(!eval_debt_owed(EVAL_MIN_SESSION_MINUTES, None, None, NOW));
     }
 
     #[test]
-    fn a_future_over_ceiling_since_is_not_yet_stale() {
+    fn a_future_tracking_since_is_not_yet_stale() {
         // Clock skew, or a hand-edited sidecar: must not underflow into a
         // huge apparent age via `saturating_sub` reading the wrong direction.
-        assert!(!eval_debt_owed(EVAL_DEBT_CEILING, Some(NOW + HOUR), None, NOW));
+        assert!(!eval_debt_owed(EVAL_MIN_SESSION_MINUTES, Some(NOW + HOUR), None, NOW));
     }
 
     #[test]
     fn a_future_last_evaluation_seen_is_not_yet_stale() {
         let since = NOW - 48 * HOUR;
-        assert!(!eval_debt_owed(EVAL_DEBT_CEILING, Some(since), Some(NOW + HOUR), NOW));
+        assert!(!eval_debt_owed(EVAL_MIN_SESSION_MINUTES, Some(since), Some(NOW + HOUR), NOW));
     }
 
     #[test]
@@ -846,6 +947,30 @@ mod eval_debt_predicate_tests {
         assert_eq!(days_ago(NOW, NOW - 3 * 86400), 3);
         assert_eq!(days_ago(NOW, NOW - 3 * 86400 - 1), 3, "not yet a fourth full day");
         assert_eq!(days_ago(NOW, NOW + 3600), 0, "a future timestamp reads as 0, never negative");
+    }
+
+    #[test]
+    fn minutes_ago_floors_and_never_goes_negative() {
+        assert_eq!(minutes_ago(NOW, NOW - 3 * 60), 3);
+        assert_eq!(minutes_ago(NOW, NOW - 3 * 60 - 1), 3, "not yet a fourth full minute");
+        assert_eq!(minutes_ago(NOW, NOW + 60), 0, "a future timestamp reads as 0, never negative");
+    }
+
+    // `eval_debt_stale` is the time-only half `doctor` calls directly (it
+    // has no session to measure minutes worked against) - covered above
+    // indirectly through every `eval_debt_owed` case at or over the minutes
+    // floor, and directly here for the cases that matter to a caller with
+    // no minutes input at all.
+    #[test]
+    fn eval_debt_stale_agrees_with_eval_debt_owed_once_minutes_are_satisfied() {
+        let since = NOW - 25 * HOUR;
+        assert!(eval_debt_stale(Some(since), None, NOW));
+        assert!(eval_debt_owed(EVAL_MIN_SESSION_MINUTES, Some(since), None, NOW));
+    }
+
+    #[test]
+    fn eval_debt_stale_is_false_with_no_tracking_since_at_all() {
+        assert!(!eval_debt_stale(None, None, NOW));
     }
 }
 
@@ -926,69 +1051,106 @@ mod eval_debt_state_tests {
     fn a_written_state_reads_back_identical() {
         let dir = tempfile::tempdir().unwrap();
         let db = dir.path().join("t.db");
-        let mut store = EventStore::new(&db).unwrap();
-        owe(&mut store, EVAL_DEBT_CEILING, None);
+        let store = EventStore::new(&db).unwrap();
         let written = update_eval_debt_state(&store, &db, None, 1_800_000_000);
         let read_back = project_eval_state(&db, None);
         assert_eq!(written, read_back);
-        assert_eq!(read_back.over_ceiling_since, Some(1_800_000_000));
+        assert_eq!(read_back.tracking_since, Some(1_800_000_000));
     }
 
+    /// UNLIKE THE OLD CEILING-GATED WRITE: `tracking_since` is set the very
+    /// first time this function ever runs for a project, regardless of how
+    /// large - or how small, even zero - its backlog is, so the sidecar is
+    /// written on this very first call rather than held back until some
+    /// later crossing.
     #[test]
-    fn writing_only_happens_when_something_actually_changed() {
+    fn the_first_call_for_a_project_always_writes_the_sidecar() {
         let dir = tempfile::tempdir().unwrap();
         let db = dir.path().join("t.db");
         let store = EventStore::new(&db).unwrap();
         update_eval_debt_state(&store, &db, None, 1_000);
-        assert!(!eval_debt_state_path(&db).exists(), "an all-default state must never write an empty sidecar");
+        assert!(eval_debt_state_path(&db).exists(), "tracking_since is set on the very first call, so the sidecar must exist");
+    }
+
+    #[test]
+    fn a_second_call_with_nothing_new_never_rewrites_the_sidecar() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("t.db");
+        let store = EventStore::new(&db).unwrap();
+        update_eval_debt_state(&store, &db, None, 1_000);
+        let path = eval_debt_state_path(&db);
+        let written_once = std::fs::read_to_string(&path).unwrap();
+        update_eval_debt_state(&store, &db, None, 2_000);
+        let written_twice = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(
+            written_once, written_twice,
+            "nothing changed (tracking_since stays, no new report), so the file must stay byte-identical"
+        );
     }
 
     #[test]
     fn two_projects_keep_separate_entries_in_one_sidecar_file() {
         let dir = tempfile::tempdir().unwrap();
         let db = dir.path().join("t.db");
-        let mut store = EventStore::new(&db).unwrap();
-        owe(&mut store, EVAL_DEBT_CEILING, Some("thor"));
+        let store = EventStore::new(&db).unwrap();
         update_eval_debt_state(&store, &db, Some("thor"), 1_000);
         update_eval_debt_state(&store, &db, Some("acme"), 2_000);
-        assert_eq!(project_eval_state(&db, Some("thor")).over_ceiling_since, Some(1_000));
+        assert_eq!(project_eval_state(&db, Some("thor")).tracking_since, Some(1_000));
         assert_eq!(
-            project_eval_state(&db, Some("acme")).over_ceiling_since,
-            None,
-            "acme's own backlog never crossed the ceiling"
+            project_eval_state(&db, Some("acme")).tracking_since,
+            Some(2_000),
+            "each project's own tracking clock starts at its own first Stop, independent of the other"
         );
     }
 
-    // ------------------------------------------------- over_ceiling_since
+    // ------------------------------------------------------- tracking_since
 
     #[test]
-    fn over_ceiling_since_is_set_on_the_first_crossing_and_never_moves_after() {
+    fn tracking_since_is_set_on_the_first_stop_and_never_moves_after() {
         let dir = tempfile::tempdir().unwrap();
         let db = dir.path().join("t.db");
-        let mut store = EventStore::new(&db).unwrap();
-        owe(&mut store, EVAL_DEBT_CEILING, None);
+        let store = EventStore::new(&db).unwrap();
         let first = update_eval_debt_state(&store, &db, None, 1_000);
-        assert_eq!(first.over_ceiling_since, Some(1_000));
+        assert_eq!(first.tracking_since, Some(1_000));
         let second = update_eval_debt_state(&store, &db, None, 50_000);
-        assert_eq!(
-            second.over_ceiling_since,
-            Some(1_000),
-            "the clock must not restart on a later Stop that is still over the ceiling"
-        );
+        assert_eq!(second.tracking_since, Some(1_000), "the clock must not restart on a later Stop in the same project");
     }
 
-    /// Case named in the build brief: owed below the ceiling resets the clock.
+    /// Case named in the build brief: a low debt never clears the clock -
+    /// the defect the old ceiling-gated version had by design (falling back
+    /// under the ceiling cleared `over_ceiling_since` outright). `owe` below
+    /// crosses what used to be the ceiling, and a verdict then drops the
+    /// count back to zero; `tracking_since` must not move either time.
     #[test]
-    fn over_ceiling_since_is_cleared_the_first_time_a_stop_sees_the_count_drop_back_under() {
+    fn a_low_or_falling_debt_never_clears_tracking_since() {
         let dir = tempfile::tempdir().unwrap();
         let db = dir.path().join("t.db");
         let mut store = EventStore::new(&db).unwrap();
-        owe(&mut store, EVAL_DEBT_CEILING, None);
-        let over = update_eval_debt_state(&store, &db, None, 1_000);
-        assert!(over.over_ceiling_since.is_some(), "fixture sanity: over the ceiling");
+        let first = update_eval_debt_state(&store, &db, None, 1_000);
+        assert_eq!(first.tracking_since, Some(1_000), "fixture sanity: tracking started");
+        owe(&mut store, 20, None);
+        let with_backlog = update_eval_debt_state(&store, &db, None, 2_000);
+        assert_eq!(with_backlog.tracking_since, Some(1_000), "a real backlog appearing must not move the clock either");
         crate::mark::record_useful(&mut store, "s", "s", "t", "2026-09-08T00:00:00Z", "owed-global-0").unwrap();
-        let dropped = update_eval_debt_state(&store, &db, None, 2_000);
-        assert_eq!(dropped.over_ceiling_since, None, "a verdict that drops the count under the ceiling resets the clock");
+        let dropped = update_eval_debt_state(&store, &db, None, 3_000);
+        assert_eq!(dropped.tracking_since, Some(1_000), "a verdict that drops the backlog back down must not clear the clock");
+    }
+
+    /// Case named in the build brief: an old sidecar carries over as the
+    /// clock. A sidecar written before 2026-09-16, carrying the field under
+    /// its old name, must still supply the same instant as `tracking_since`
+    /// - the whole point of the `serde(alias)` on that field: the clock the
+    /// owner's machine already started keeps running under the new name
+    /// instead of silently resetting to `None` on the first read after the
+    /// upgrade.
+    #[test]
+    fn an_old_sidecar_field_name_carries_over_as_tracking_since() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("t.db");
+        let text = r#"{"thor":{"over_ceiling_since":1234,"known_report_ids":[],"last_evaluation_seen":null,"last_evaluation_report_id":null}}"#;
+        std::fs::write(eval_debt_state_path(&db), text).unwrap();
+        let state = project_eval_state(&db, Some("thor"));
+        assert_eq!(state.tracking_since, Some(1234), "the old field name must still populate tracking_since");
     }
 
     // --------------------------------------------------- evaluation reports

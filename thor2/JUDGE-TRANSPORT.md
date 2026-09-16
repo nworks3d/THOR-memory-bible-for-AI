@@ -160,14 +160,17 @@ independently, at its own call site in `hook_once`'s `Stop` arm. `setup_debt`
 never walks a subagent
 through AGENTS.md's setup questions, because there is no owner in the room
 for that conversation either. The evaluation debt (added 2026-09-12, trigger
-rewritten 2026-09-16 to a per-project sidecar rather than a single verdict
-clock - `serve/src/bin/serve.rs`'s `evaluation_debt`, `serve::usefulness`'s
-own "evaluation debt" section - holds once a project's own backlog has sat
-at or over its ceiling for a day with no evaluation report filed for it in
-that time) is silent for a subagent for the identical reason: a subagent
-cannot itself type `/thor-eval`, so holding its turn over a routine only the
-owner can run would spend a whole agent run asking for something it has no
-way to do. The three memory-upkeep debts are
+rewritten twice on 2026-09-16: first to a per-project sidecar rather than a
+single verdict clock, then to drop the item-count ceiling entirely in favour
+of a daily, per-project ask once a session has worked there long enough -
+`serve/src/bin/serve.rs`'s `evaluation_debt`, `serve::usefulness`'s own
+"evaluation debt" section - holds once a full day has passed since the later
+of this project's own tracking clock and its last evaluation report, AND
+this session has worked in the project for at least an hour) is silent for a
+subagent for the identical reason: a subagent cannot itself type
+`/thor-eval`, so holding its turn over a routine only the owner can run
+would spend a whole agent run asking for something it has no way to do. The
+three memory-upkeep debts are
 silenced for a sharper reason: paying one of them - `mark` for the
 judgement debt, `revise`/`retract` for the crowding debt and the
 stale-rule debt - is a write through the tool server, and every write the

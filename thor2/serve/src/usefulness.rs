@@ -540,6 +540,25 @@ pub fn noise_since_last_useful(store: &EventStore) -> HashMap<String, usize> {
 // must not be told to stop and evaluate before it has done anything here
 // worth evaluating. The item count is still shown in the Stop hook's own
 // message, for context - never as a condition any more.
+//
+// A THIRD REWRITE, THE SAME DAY (`no evaluation is asked outside a
+// project, where no report can be filed`): never for a checkout that
+// resolves to NO project at all, regardless of how stale or well-worked it
+// looks. Filing the one thing that silences this debt - a Report tagged
+// `evaluation-report` - is a write `model::gate::declare` judges like any
+// other, and ground 21 (`NO_SCOPE_PROBLEM`) refuses to declare a Report, or
+// any other archive-kind item, with no project at all. A checkout with no
+// project could never file the report that would silence this ask, so
+// asking it at all would hold a turn once a day, forever, with no honest
+// way out. `bin/serve.rs`'s `evaluation_debt` and its own call site both
+// gate on this independently (see that function's own doc comment);
+// `update_eval_debt_state` below is skipped at the same call site too, so a
+// no-project checkout's sidecar entry (keyed `""`, see `project_key`)
+// never grows a `tracking_since` clock nothing could ever act on. A `""`
+// entry already sitting in a sidecar written before this existed - the
+// owner's own live sidecar held exactly one, started 2026-09-16 21:56,
+// from before this gate existed - is left exactly as it is: inert, never
+// read for a no-project checkout any more, never deleted either.
 
 /// How many minutes THIS session must have worked in a project - measured
 /// from the earliest `item_served` event it recorded for an item that
@@ -769,13 +788,18 @@ pub fn newest_evaluation_report(store: &EventStore, project: Option<&str>) -> Op
 /// Refresh this project's own two facts from `store` as it stands right
 /// now, and write the sidecar back if anything actually changed. Called
 /// ONCE PER MAIN-SESSION STOP in a project (`bin/serve.rs`'s `hook_once`,
-/// unconditionally within its own `!is_subagent` guard) - deliberately
-/// unconditioned by the once-per-session/enough-time-worked-here gates that
-/// decide whether the obligation is actually SHOWN (`eval_debt_not_yet_
-/// asked_this_session`, the minutes-worked half of `eval_debt_owed`): those
-/// are about whether to SPEAK, this is about whether the RECORD stays true,
-/// and a session that is never asked must still leave the tracking clock
-/// and the report sighting exactly as accurate as one that was.
+/// unconditionally within its own `!is_subagent && stop_project.is_some()`
+/// guard) - deliberately unconditioned by the once-per-session/enough-
+/// time-worked-here gates that decide whether the obligation is actually
+/// SHOWN (`eval_debt_not_yet_asked_this_session`, the minutes-worked half
+/// of `eval_debt_owed`): those are about whether to SPEAK, this is about
+/// whether the RECORD stays true, and a session that is never asked must
+/// still leave the tracking clock and the report sighting exactly as
+/// accurate as one that was. NEVER called at all for a checkout with no
+/// project (`stop_project.is_some()`, added 2026-09-16) - see this file's
+/// own "evaluation debt" section doc comment, third rewrite, for why: no
+/// project means no Report can ever be filed to silence this, so there is
+/// nothing honest for a `""`-keyed entry to track.
 ///
 /// NEVER CALLED BY `doctor` (`ops::health::judgement_debt_line`), which
 /// reads this same state through [`project_eval_state`] but must stay

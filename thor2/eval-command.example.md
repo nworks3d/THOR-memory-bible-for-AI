@@ -30,7 +30,9 @@ evaluation report and this session has worked in it for at least an hour,
 the Stop hook also asks for this evaluation itself, by name, instead of one
 more item. It asks every day, in every project a session actually works in,
 regardless of how many notes currently owe a verdict - filing the report
-below is what silences it for a day.
+below is what silences it for a day. It only ever asks inside a project:
+a checkout that resolves to no project is never asked, since there would
+be no way to file the report that silences it.
 
 ---
 

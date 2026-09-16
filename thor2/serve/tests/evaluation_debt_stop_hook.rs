@@ -30,6 +30,21 @@
 //! clock by controlling a real `item_served` event's own `served_at`, since
 //! neither clock can be made to pass by waiting in a test.
 //!
+//! A THIRD REWRITE, THE SAME DAY (`no evaluation is asked outside a
+//! project, where no report can be filed`): a checkout that resolves to NO
+//! project at all can never file the Report that silences this debt -
+//! `model::gate`'s ground 21 (`NO_SCOPE_PROBLEM`) refuses to declare a
+//! Report, or any other archive-kind item, with no project. Before this
+//! fix, every "fires" test in this file below used `Sandbox::global_cwd`
+//! (no project) to drive the debt, which is exactly the shape that could
+//! never be silenced in real use. Every "fires" test now uses `Sandbox::
+//! project_dir` instead, and the "silences" section gained three tests of
+//! its own (`is_silent_for_a_checkout_with_no_project_even_with_a_stale_
+//! legacy_clock_and_enough_time_worked`, `a_no_project_stop_never_creates_
+//! the_sidecar_file_at_all`, `the_identical_setup_with_a_real_project_
+//! still_fires`) proving the new gate directly, side by side with the
+//! identical fixture scoped to a real project.
+//!
 //! EVERY PAYLOAD BELOW NAMES AN EXPLICIT `cwd`, unlike this file's own
 //! earlier shape - the sidecar is keyed by the EXACT project a Stop
 //! resolves to (`project::resolve_project`), not by `project::applies_to`'s
@@ -95,7 +110,10 @@ impl Sandbox {
     /// `None` - the deliberate stand-in for "global", used instead of
     /// simply omitting `cwd` from a payload, which would instead inherit
     /// wherever `cargo test` itself was invoked from (inside this very
-    /// repository, and so a REAL project).
+    /// repository, and so a REAL project). Since the fix this file now
+    /// tests, this is ALSO the fixture for "no project at all", which is a
+    /// checkout the evaluation debt must never speak in - see this file's
+    /// own module doc comment.
     fn global_cwd(&self) -> PathBuf {
         let dir = self.home.path().join("no-project-cwd");
         std::fs::create_dir_all(&dir).unwrap();
@@ -104,10 +122,13 @@ impl Sandbox {
 
     /// A real, empty directory carrying a `.thor-project` marker naming
     /// `project` - so a payload's own `cwd` resolves to a REAL, named
-    /// project (`project::resolve_project`). Needed by the tests that file
-    /// a scoped evaluation Report: `model::gate`'s ground 21 refuses a
-    /// Report with no project at all except one exempt id, so "global" is
-    /// not an option for those.
+    /// project (`project::resolve_project`). Needed by every test that
+    /// expects the evaluation debt to actually fire: `model::gate`'s
+    /// ground 21 refuses a Report with no project at all except one exempt
+    /// id, so "global" is not an option for those, and - since this file's
+    /// own 2026-09-16 fix - the debt itself now never speaks for a
+    /// checkout with no project regardless of whether a report is ever
+    /// filed.
     fn project_dir(&self, project: &str) -> PathBuf {
         let dir = self.home.path().join("checkouts").join(project);
         std::fs::create_dir_all(&dir).unwrap();
@@ -343,6 +364,13 @@ fn declare_teeth_eligible_item(store: &mut EventStore, id: &str) {
 }
 
 // ------------------------------------------------------------- fires
+//
+// Every test below is scoped to a REAL project (`Sandbox::project_dir`),
+// never `Sandbox::global_cwd` any more - see this file's own module doc
+// comment for why: a checkout with no project can never file the report
+// that would silence this debt, so it must never be asked in the first
+// place, and a "fires" test run against `global_cwd` would since 2026-09-16
+// simply fail.
 
 #[test]
 fn fires_for_a_main_session_and_names_the_real_eval_path_when_it_exists() {
@@ -350,15 +378,15 @@ fn fires_for_a_main_session_and_names_the_real_eval_path_when_it_exists() {
     let db = dir.path().join("thor.db");
     let sandbox = Sandbox::new();
     sandbox.seed_eval_command();
-    let cwd = sandbox.global_cwd();
+    let project_dir = sandbox.project_dir("thor-fixture");
 
     let mut store = EventStore::new(&db).unwrap();
-    declare_owed_items(&mut store, OWED_CONTEXT_COUNT, None);
-    serve_marker_in_session(&mut store, "s1", None);
-    seed_tracking_since(&store, &db, None, 25);
+    declare_owed_items(&mut store, OWED_CONTEXT_COUNT, Some("thor-fixture"));
+    serve_marker_in_session(&mut store, "s1", Some("thor-fixture"));
+    seed_tracking_since(&store, &db, Some("thor-fixture"), 25);
     drop(store);
 
-    let out = run_hook(&db, &stop_payload("s1", &cwd), &sandbox);
+    let out = run_hook(&db, &stop_payload("s1", &project_dir), &sandbox);
     let v: serde_json::Value = serde_json::from_str(&out).unwrap_or_else(|e| panic!("expected a decision JSON: {e}: {out}"));
     assert_eq!(v["decision"], "block", "{out}");
     let reason = v["reason"].as_str().unwrap();
@@ -385,15 +413,15 @@ fn falls_back_to_the_generic_note_when_no_eval_file_exists() {
     // Deliberately no `seed_eval_command()` call: the sandbox HOME exists,
     // but nothing lives at `.claude/commands/thor-eval.md` under it.
     let sandbox = Sandbox::new();
-    let cwd = sandbox.global_cwd();
+    let project_dir = sandbox.project_dir("thor-fixture");
 
     let mut store = EventStore::new(&db).unwrap();
-    declare_owed_items(&mut store, OWED_CONTEXT_COUNT, None);
-    serve_marker_in_session(&mut store, "s1", None);
-    seed_tracking_since(&store, &db, None, 25);
+    declare_owed_items(&mut store, OWED_CONTEXT_COUNT, Some("thor-fixture"));
+    serve_marker_in_session(&mut store, "s1", Some("thor-fixture"));
+    seed_tracking_since(&store, &db, Some("thor-fixture"), 25);
     drop(store);
 
-    let out = run_hook(&db, &stop_payload("s1", &cwd), &sandbox);
+    let out = run_hook(&db, &stop_payload("s1", &project_dir), &sandbox);
     let v: serde_json::Value = serde_json::from_str(&out).unwrap_or_else(|e| panic!("expected a decision JSON: {e}: {out}"));
     assert_eq!(v["decision"], "block", "{out}");
     let reason = v["reason"].as_str().unwrap();
@@ -420,17 +448,17 @@ fn both_debts_due_shows_the_evaluation_first() {
     let dir = tempfile::tempdir().unwrap();
     let db = dir.path().join("thor.db");
     let sandbox = Sandbox::new();
-    let cwd = sandbox.global_cwd();
+    let project_dir = sandbox.project_dir("thor-fixture");
 
     let mut store = EventStore::new(&db).unwrap();
-    let ids = declare_owed_items(&mut store, OWED_CONTEXT_COUNT, None);
+    let ids = declare_owed_items(&mut store, OWED_CONTEXT_COUNT, Some("thor-fixture"));
     for id in &ids {
         serve::deliver::record_delivery(&mut store, "s1", "fixture", "t", "2026-09-08T00:00:00Z", &[id.clone()]);
     }
-    seed_tracking_since(&store, &db, None, 25);
+    seed_tracking_since(&store, &db, Some("thor-fixture"), 25);
     drop(store);
 
-    let out = run_hook(&db, &stop_payload("s1", &cwd), &sandbox);
+    let out = run_hook(&db, &stop_payload("s1", &project_dir), &sandbox);
     let v: serde_json::Value = serde_json::from_str(&out).unwrap_or_else(|e| panic!("expected a decision JSON: {e}: {out}"));
     assert_eq!(v["decision"], "block", "{out}");
     let reason = v["reason"].as_str().unwrap();
@@ -445,15 +473,15 @@ fn is_silent_for_a_subagent_payload_on_the_same_store() {
     let dir = tempfile::tempdir().unwrap();
     let db = dir.path().join("thor.db");
     let sandbox = Sandbox::new();
-    let cwd = sandbox.global_cwd();
+    let project_dir = sandbox.project_dir("thor-fixture");
 
     let mut store = EventStore::new(&db).unwrap();
-    declare_owed_items(&mut store, OWED_CONTEXT_COUNT, None);
-    serve_marker_in_session(&mut store, "s1", None);
-    seed_tracking_since(&store, &db, None, 25);
+    declare_owed_items(&mut store, OWED_CONTEXT_COUNT, Some("thor-fixture"));
+    serve_marker_in_session(&mut store, "s1", Some("thor-fixture"));
+    seed_tracking_since(&store, &db, Some("thor-fixture"), 25);
     drop(store);
 
-    let out = run_hook(&db, &subagent_stop_payload("s1", &cwd), &sandbox);
+    let out = run_hook(&db, &subagent_stop_payload("s1", &project_dir), &sandbox);
     assert!(out.trim().is_empty(), "a subagent's Stop must never be held for the evaluation debt: {out}");
 }
 
@@ -462,19 +490,19 @@ fn is_silent_on_the_second_stop_of_the_same_session() {
     let dir = tempfile::tempdir().unwrap();
     let db = dir.path().join("thor.db");
     let sandbox = Sandbox::new();
-    let cwd = sandbox.global_cwd();
+    let project_dir = sandbox.project_dir("thor-fixture");
 
     let mut store = EventStore::new(&db).unwrap();
-    declare_owed_items(&mut store, OWED_CONTEXT_COUNT, None);
-    serve_marker_in_session(&mut store, "s1", None);
-    seed_tracking_since(&store, &db, None, 25);
+    declare_owed_items(&mut store, OWED_CONTEXT_COUNT, Some("thor-fixture"));
+    serve_marker_in_session(&mut store, "s1", Some("thor-fixture"));
+    seed_tracking_since(&store, &db, Some("thor-fixture"), 25);
     drop(store);
 
-    let first = run_hook(&db, &stop_payload("s1", &cwd), &sandbox);
+    let first = run_hook(&db, &stop_payload("s1", &project_dir), &sandbox);
     let v: serde_json::Value = serde_json::from_str(&first).expect("the first Stop must fire");
     assert_eq!(v["decision"], "block", "fixture sanity: {first}");
 
-    let second = run_hook(&db, &stop_payload("s1", &cwd), &sandbox);
+    let second = run_hook(&db, &stop_payload("s1", &project_dir), &sandbox);
     assert!(second.trim().is_empty(), "the same session must not be asked twice: {second}");
 }
 
@@ -487,14 +515,14 @@ fn fires_with_zero_items_owed_once_stale_and_worked_long_enough() {
     let dir = tempfile::tempdir().unwrap();
     let db = dir.path().join("thor.db");
     let sandbox = Sandbox::new();
-    let cwd = sandbox.global_cwd();
+    let project_dir = sandbox.project_dir("thor-fixture");
 
     let mut store = EventStore::new(&db).unwrap();
-    serve_marker_in_session(&mut store, "s1", None);
-    seed_tracking_since(&store, &db, None, 25);
+    serve_marker_in_session(&mut store, "s1", Some("thor-fixture"));
+    seed_tracking_since(&store, &db, Some("thor-fixture"), 25);
     drop(store);
 
-    let out = run_hook(&db, &stop_payload("s1", &cwd), &sandbox);
+    let out = run_hook(&db, &stop_payload("s1", &project_dir), &sandbox);
     let v: serde_json::Value = serde_json::from_str(&out).unwrap_or_else(|e| panic!("expected a decision JSON: {e}: {out}"));
     assert_eq!(v["decision"], "block", "a zero-item backlog must still owe an evaluation: {out}");
     let reason = v["reason"].as_str().unwrap();
@@ -503,48 +531,53 @@ fn fires_with_zero_items_owed_once_stale_and_worked_long_enough() {
 
 /// Case named in the build brief: the session's first serving here was less
 /// than an hour ago -> silent, however stale the project's own tracking
-/// clock is.
+/// clock is. Scoped to a real project (unlike before this file's own
+/// 2026-09-16 fix) so this proves the MINUTES-WORKED gate specifically,
+/// never conflated with the separate no-project gate proven below.
 #[test]
 fn is_silent_when_the_session_has_worked_here_less_than_an_hour() {
     let dir = tempfile::tempdir().unwrap();
     let db = dir.path().join("thor.db");
     let sandbox = Sandbox::new();
-    let cwd = sandbox.global_cwd();
+    let project_dir = sandbox.project_dir("thor-fixture");
 
     let mut store = EventStore::new(&db).unwrap();
-    declare_owed_items(&mut store, OWED_CONTEXT_COUNT, None);
-    serve_marker_in_session_minutes_ago(&mut store, "s1", None, 30);
-    seed_tracking_since(&store, &db, None, 100);
+    declare_owed_items(&mut store, OWED_CONTEXT_COUNT, Some("thor-fixture"));
+    serve_marker_in_session_minutes_ago(&mut store, "s1", Some("thor-fixture"), 30);
+    seed_tracking_since(&store, &db, Some("thor-fixture"), 100);
     drop(store);
 
-    let out = run_hook(&db, &stop_payload("s1", &cwd), &sandbox);
+    let out = run_hook(&db, &stop_payload("s1", &project_dir), &sandbox);
     assert!(out.trim().is_empty(), "less than an hour worked here must never speak, however stale: {out}");
 }
 
 /// Case named in the build brief: a session that served nothing in the
 /// project is silent - the 2026-09-16 gate against hijacking a session that
-/// did no THOR-relevant work here at all.
+/// did no THOR-relevant work here at all. Scoped to a real project so this
+/// proves that gate specifically, never conflated with the no-project gate
+/// proven below.
 #[test]
 fn is_silent_for_a_session_that_served_nothing_in_this_project() {
     let dir = tempfile::tempdir().unwrap();
     let db = dir.path().join("thor.db");
     let sandbox = Sandbox::new();
-    let cwd = sandbox.global_cwd();
+    let project_dir = sandbox.project_dir("thor-fixture");
 
     let mut store = EventStore::new(&db).unwrap();
-    declare_owed_items(&mut store, OWED_CONTEXT_COUNT, None);
+    declare_owed_items(&mut store, OWED_CONTEXT_COUNT, Some("thor-fixture"));
     // Deliberately no `serve_marker_in_session` call: "s1" never had
     // anything served to it at all in this store.
-    seed_tracking_since(&store, &db, None, 25);
+    seed_tracking_since(&store, &db, Some("thor-fixture"), 25);
     drop(store);
 
-    let out = run_hook(&db, &stop_payload("s1", &cwd), &sandbox);
+    let out = run_hook(&db, &stop_payload("s1", &project_dir), &sandbox);
     assert!(out.trim().is_empty(), "a session that served nothing here must not be hijacked into the evaluation: {out}");
 }
 
 /// Case named in the build brief: a new evaluation-report Report for the
 /// project silences it - the whole point of the 2026-09-16 rewrite: filing
-/// the report is what tells THOR the evaluation happened.
+/// the report is what tells THOR the evaluation happened. Already scoped
+/// to a real project before this file's own no-project fix, unchanged here.
 #[test]
 fn a_new_evaluation_report_for_the_project_silences_it() {
     let dir = tempfile::tempdir().unwrap();
@@ -587,18 +620,21 @@ fn a_new_evaluation_report_for_the_project_silences_it() {
 /// insert`) - so marking a handful of totally unrelated global facts, right
 /// up to the edge of the window, must not stop the obligation from firing
 /// once this project's own tracking clock has genuinely stayed stale for a
-/// day and this session has worked here long enough.
+/// day and this session has worked here long enough. Scoped to a real
+/// project (`thor-fixture`), since this file's own no-project fix: the
+/// unrelated facts stay global (`project: None`) on purpose, so this also
+/// proves a global item's own verdict never masquerades as this project's.
 #[test]
 fn regression_verdicts_on_unrelated_global_items_never_reset_the_clock() {
     let dir = tempfile::tempdir().unwrap();
     let db = dir.path().join("thor.db");
     let sandbox = Sandbox::new();
-    let cwd = sandbox.global_cwd();
+    let project_dir = sandbox.project_dir("thor-fixture");
 
     let mut store = EventStore::new(&db).unwrap();
-    declare_owed_items(&mut store, OWED_CONTEXT_COUNT, None);
-    serve_marker_in_session(&mut store, "s1", None);
-    seed_tracking_since(&store, &db, None, 25);
+    declare_owed_items(&mut store, OWED_CONTEXT_COUNT, Some("thor-fixture"));
+    serve_marker_in_session(&mut store, "s1", Some("thor-fixture"));
+    seed_tracking_since(&store, &db, Some("thor-fixture"), 25);
 
     // Verdicts on OTHER global items, every few hours over the last day -
     // exactly the pattern that silenced the old clock forever. None of
@@ -626,9 +662,120 @@ fn regression_verdicts_on_unrelated_global_items_never_reset_the_clock() {
     }
     drop(store);
 
-    let out = run_hook(&db, &stop_payload("s1", &cwd), &sandbox);
+    let out = run_hook(&db, &stop_payload("s1", &project_dir), &sandbox);
     let v: serde_json::Value = serde_json::from_str(&out)
         .unwrap_or_else(|e| panic!("recent verdicts on unrelated global items must never silence this: {e}: {out}"));
+    assert_eq!(v["decision"], "block", "{out}");
+    let reason = v["reason"].as_str().unwrap();
+    assert!(reason.contains("Run the THOR evaluation"), "{reason}");
+}
+
+// --------------------------------------------- silences: no project at all
+//
+// THE FIX THIS FILE WAS REWRITTEN FOR (`no evaluation is asked outside a
+// project, where no report can be filed`). Every test above already proves
+// the debt fires correctly INSIDE a project; the three tests below prove
+// the new half: it must never fire OUTSIDE one, regardless of how stale or
+// well-worked the checkout looks, and it must never touch the sidecar
+// either.
+
+/// Case named in the build brief: a main-session Stop with no project, a
+/// clock seeded 25 hours back under the empty project key (`usefulness::
+/// project_key(None)` is `""`), and 61 minutes of serving in that session -
+/// the identical shape that fires for a real project just below
+/// (`the_identical_setup_with_a_real_project_still_fires`) - stays silent,
+/// and leaves the sidecar file byte-for-byte exactly as `seed_tracking_
+/// since` left it: not reset, not bumped, not touched at all. This is also
+/// the shape the live sidecar on the owner's own machine was found in
+/// (`eval-debt-state.json` already held a `""` entry from before this fix,
+/// started 2026-09-16 21:56) - proving that legacy entry is now inert,
+/// never deleted, never acted on again.
+#[test]
+fn is_silent_for_a_checkout_with_no_project_even_with_a_stale_legacy_clock_and_enough_time_worked() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("thor.db");
+    let sandbox = Sandbox::new();
+    let cwd = sandbox.global_cwd();
+
+    let mut store = EventStore::new(&db).unwrap();
+    declare_owed_items(&mut store, OWED_CONTEXT_COUNT, None);
+    serve_marker_in_session_minutes_ago(&mut store, "s1", None, 61);
+    seed_tracking_since(&store, &db, None, 25);
+    drop(store);
+
+    let sidecar = serve::usefulness::eval_debt_state_path(&db);
+    let before = std::fs::read_to_string(&sidecar).expect("fixture sanity: seed_tracking_since must have written the sidecar");
+
+    let out = run_hook(&db, &stop_payload("s1", &cwd), &sandbox);
+    assert!(out.trim().is_empty(), "a checkout with no project must never be asked for the evaluation, however stale: {out}");
+
+    let after = std::fs::read_to_string(&sidecar).unwrap();
+    assert_eq!(before, after, "a no-project Stop must never touch the sidecar, not even the stale \"\" entry already there");
+}
+
+/// A companion to the test above, proving the gate structurally rather than
+/// only by outcome. The test above seeds `tracking_since` before the Stop
+/// runs, so - even if the `stop_project.is_some()` half of the gate were
+/// missing entirely - `usefulness::update_eval_debt_state` would still be a
+/// no-op the second time (its own `get_or_insert` never overwrites an
+/// existing value, and no new report exists to stamp), so a byte-for-byte
+/// comparison alone cannot tell "the write was skipped" apart from "the
+/// write ran and happened to change nothing". This test closes that gap:
+/// with NO sidecar seeded at all - the very first Stop this checkout would
+/// ever see - a version of the code missing the gate would create the file
+/// right here (see `usefulness::eval_debt_state_tests`'s own `the_first_
+/// call_for_a_project_always_writes_the_sidecar`, which proves that is
+/// exactly what happens for a project). This is the one assertion in this
+/// file that actually goes red if the gate in `bin/serve.rs`'s `hook_once`
+/// (`if !is_subagent && stop_project.is_some()`) is weakened back to
+/// `if !is_subagent`.
+#[test]
+fn a_no_project_stop_never_creates_the_sidecar_file_at_all() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("thor.db");
+    let sandbox = Sandbox::new();
+    let cwd = sandbox.global_cwd();
+
+    let mut store = EventStore::new(&db).unwrap();
+    declare_owed_items(&mut store, OWED_CONTEXT_COUNT, None);
+    serve_marker_in_session_minutes_ago(&mut store, "s1", None, 61);
+    // Deliberately no `seed_tracking_since` call: nothing has written the
+    // sidecar yet, the same as the very first Stop this checkout would ever
+    // see.
+    drop(store);
+
+    let sidecar = serve::usefulness::eval_debt_state_path(&db);
+    assert!(!sidecar.exists(), "fixture sanity: nothing has written the sidecar yet");
+
+    let out = run_hook(&db, &stop_payload("s1", &cwd), &sandbox);
+    assert!(out.trim().is_empty(), "a checkout with no project must never be asked for the evaluation: {out}");
+    assert!(
+        !sidecar.exists(),
+        "a no-project Stop must never create the sidecar file at all - the write is skipped entirely, not merely a no-op"
+    );
+}
+
+/// THE CONTRAST both tests above need: the identical fixture (same backlog
+/// size, same clock seeded 25 hours back, the same 61 minutes served),
+/// except `cwd` resolves to a real project this time - and this one must
+/// still fire, proving the silence above is really about the missing
+/// project and nothing else accidentally different between the fixtures.
+#[test]
+fn the_identical_setup_with_a_real_project_still_fires() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("thor.db");
+    let sandbox = Sandbox::new();
+    let project_dir = sandbox.project_dir("thor-fixture");
+
+    let mut store = EventStore::new(&db).unwrap();
+    declare_owed_items(&mut store, OWED_CONTEXT_COUNT, Some("thor-fixture"));
+    serve_marker_in_session_minutes_ago(&mut store, "s1", Some("thor-fixture"), 61);
+    seed_tracking_since(&store, &db, Some("thor-fixture"), 25);
+    drop(store);
+
+    let out = run_hook(&db, &stop_payload("s1", &project_dir), &sandbox);
+    let v: serde_json::Value = serde_json::from_str(&out)
+        .unwrap_or_else(|e| panic!("the identical setup, scoped to a real project, must still fire: {e}: {out}"));
     assert_eq!(v["decision"], "block", "{out}");
     let reason = v["reason"].as_str().unwrap();
     assert!(reason.contains("Run the THOR evaluation"), "{reason}");
@@ -642,22 +789,25 @@ fn regression_verdicts_on_unrelated_global_items_never_reset_the_clock() {
 /// a sixth gate between `judgement_debt` and the backlog burn must not
 /// swallow an EARLIER debt - `setup_debt` runs first and must still win
 /// outright, even on a store that ALSO satisfies the evaluation debt's own
-/// condition.
+/// condition. Scoped to a real project (unlike before this file's own
+/// no-project fix) so the backlog really is eval-eligible on its own merits
+/// - the claim this test makes only means something if the debt it says
+/// `setup_debt` masks would otherwise actually fire.
 #[test]
 fn setup_debt_still_fires_with_an_eval_eligible_backlog_also_present() {
     let dir = tempfile::tempdir().unwrap();
     let db = dir.path().join("thor.db");
     let sandbox = Sandbox::new();
-    let cwd = sandbox.global_cwd();
+    let project_dir = sandbox.project_dir("thor-fixture");
 
     let mut store = EventStore::new(&db).unwrap();
     declare_setup_note(&mut store);
-    declare_owed_items(&mut store, OWED_CONTEXT_COUNT, None);
-    serve_marker_in_session(&mut store, "s1", None);
-    seed_tracking_since(&store, &db, None, 25);
+    declare_owed_items(&mut store, OWED_CONTEXT_COUNT, Some("thor-fixture"));
+    serve_marker_in_session(&mut store, "s1", Some("thor-fixture"));
+    seed_tracking_since(&store, &db, Some("thor-fixture"), 25);
     drop(store);
 
-    let out = run_hook(&db, &stop_payload("s1", &cwd), &sandbox);
+    let out = run_hook(&db, &stop_payload("s1", &project_dir), &sandbox);
     let v: serde_json::Value = serde_json::from_str(&out).unwrap_or_else(|e| panic!("expected a decision JSON: {e}: {out}"));
     assert_eq!(v["decision"], "block", "{out}");
     let reason = v["reason"].as_str().unwrap();
@@ -669,6 +819,10 @@ fn setup_debt_still_fires_with_an_eval_eligible_backlog_also_present() {
 /// `teeth_debt`) must still fire on its own store, unaffected, when the
 /// evaluation debt itself has nothing to say (no sidecar was ever seeded
 /// here, and the session served nothing applying to this project either).
+/// Left on `global_cwd` deliberately: this test was never about the
+/// evaluation debt firing or staying silent in the first place (nothing
+/// here would make it fire either way), only about the debt after it still
+/// running.
 #[test]
 fn teeth_debt_still_fires_after_the_evaluation_debt_check() {
     let dir = tempfile::tempdir().unwrap();

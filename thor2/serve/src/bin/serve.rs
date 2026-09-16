@@ -942,12 +942,15 @@ fn hook_once(db_path: &Path) -> Option<HookOutput> {
         // about to settle the whole backlog.
         //
         // THE SIDECAR UPDATE (`usefulness::update_eval_debt_state`) RUNS
-        // UNCONDITIONALLY HERE, before either gate below: it is how this
-        // project's own two facts (how long ago THOR started tracking it at
-        // all, and whether an evaluation report has been seen for it) stay
-        // true on EVERY main-session Stop, regardless of whether this
+        // UNCONDITIONALLY HERE, before either gate below, FOR EVERY CHECKOUT
+        // THAT RESOLVES TO A PROJECT: it is how this project's own two facts
+        // (how long ago THOR started tracking it at all, and whether an
+        // evaluation report has been seen for it) stay true on every
+        // main-session Stop inside that project, regardless of whether this
         // particular session ends up asked - a session that is never asked
         // must still leave the record exactly as accurate as one that was.
+        // NEVER RUN AT ALL WHEN `stop_project` IS `None` - see the new
+        // paragraph below this one, past the `is_subagent` one, for why.
         //
         // ONE GATE DECIDES WHETHER THE OBLIGATION IS SHOWN, once the sidecar
         // is current: ONCE PER SESSION, THEN SILENT REGARDLESS OF WHETHER
@@ -974,7 +977,27 @@ fn hook_once(db_path: &Path) -> Option<HookOutput> {
         // asking for something it cannot do. The sidecar update above is
         // skipped for a subagent too - see `update_eval_debt_state`'s own
         // doc comment on why "every main-session Stop" excludes it.
-        if !is_subagent {
+        //
+        // ALSO GATED ON `stop_project.is_some()`, at this same call site,
+        // since 2026-09-16: silencing this debt for good needs a live Report
+        // tagged `evaluation-report`, and `model::gate`'s ground 21
+        // (`NO_SCOPE_PROBLEM`) refuses to declare a Report - or any other
+        // archive-kind item - with no project at all (see that constant's
+        // own doc comment for the refusal text). A checkout that resolves to
+        // no project could otherwise be asked once a day, forever, with no
+        // honest way to ever silence it - exactly the trap this half of the
+        // gate exists to close. The sidecar update is skipped for the
+        // identical reason, not only the ask itself: writing `tracking_
+        // since` under the empty-project sidecar key (`usefulness::
+        // project_key`) for a checkout that can never file the report that
+        // would read it back would only grow a clock nothing can ever act
+        // on. A "" entry already sitting in a sidecar written before this
+        // gate existed is left exactly as it is - inert from here on, never
+        // read for a no-project checkout any more, and never deleted either.
+        // `evaluation_debt` below carries the identical guard a second time,
+        // on purpose (see its own doc comment), so the rule still holds even
+        // if a future caller reaches it some other way.
+        if !is_subagent && stop_project.is_some() {
             if let Ok(store) = EventStore::open_existing(db_path) {
                 usefulness::update_eval_debt_state(&store, db_path, stop_project.as_deref(), time::now_unix());
                 if eval_debt_not_yet_asked_this_session(db_path, &session_id) {
@@ -2222,7 +2245,17 @@ fn session_first_served_in_project(store: &EventStore, session_id: &str, current
 /// update_eval_debt_state`'s own doc comment for why that write happens
 /// once, unconditionally, at the call site, before the gate that decides
 /// whether this function is even reached.
+///
+/// NEVER SPEAKS FOR `current_project: None`, EVEN THOUGH THE CALL SITE
+/// ALREADY GUARDS THIS TOO (`hook_once`'s `Stop` arm, `stop_project.is_
+/// some()`) - a second, independent guard on purpose, not a redundant one:
+/// a checkout with no project can never file the Report that would silence
+/// this (`model::gate`'s ground 21, `NO_SCOPE_PROBLEM`), so asking would
+/// have no honest way out regardless of which caller reaches this function.
+/// Repeating the check here means that stays true even if some future
+/// caller forgets, or bypasses, the call site's own gate.
 fn evaluation_debt(store: &EventStore, db_path: &Path, session_id: &str, current_project: Option<&str>) -> Option<String> {
+    current_project?;
     let first_served = session_first_served_in_project(store, session_id, current_project)?;
     let now = time::now_unix();
     let minutes_worked = usefulness::minutes_ago(now, first_served);
@@ -4343,14 +4376,28 @@ mod evaluation_debt_tests {
     }
 
     // --------------------------------------------------------- evaluation_debt
+    //
+    // EVERY "FIRES" CASE BELOW IS SCOPED TO A REAL PROJECT (`Some("thor")`),
+    // never `None` any more. Before the 2026-09-16 fix (`no evaluation is
+    // asked outside a project, where no report can be filed`), the two
+    // tests right below this comment drove `evaluation_debt` with `None`
+    // and asserted it fired - which was itself the defect: a checkout with
+    // no project can never file the Report that silences this debt
+    // (`model::gate`'s ground 21, `NO_SCOPE_PROBLEM`), so that firing had no
+    // honest way to ever go quiet. See `is_silent_for_a_checkout_with_no_
+    // project_however_stale_or_long_worked` and `the_identical_case_with_a_
+    // project_still_fires` further below for the corrected pair: the exact
+    // same fixture, once proving `None` is now always silent, once proving
+    // `Some("thor")` still fires.
 
     #[test]
     fn fires_once_tracking_has_gone_stale_for_a_day_and_the_session_has_worked_here_long_enough() {
         let (_dir, db, mut store) = new_store();
-        owe(&mut store, 12);
-        serve_marker_minutes_ago(&mut store, "s1", None, 90);
-        seed_tracking_since(&db, None, &store, 25);
-        let asked = evaluation_debt(&store, &db, "s1", None).expect("stale tracking plus enough time worked must speak");
+        owe_project(&mut store, 12, Some("thor"));
+        serve_marker_minutes_ago(&mut store, "s1", Some("thor"), 90);
+        seed_tracking_since(&db, Some("thor"), &store, 25);
+        let asked =
+            evaluation_debt(&store, &db, "s1", Some("thor")).expect("stale tracking plus enough time worked must speak");
         assert!(asked.starts_with("[THOR]"), "{asked}");
         assert!(asked.contains("never had an evaluation since THOR started tracking it"), "{asked}");
         assert!(asked.contains("This session has worked here for"), "{asked}");
@@ -4363,14 +4410,53 @@ mod evaluation_debt_tests {
     /// Case named in the build brief: zero items owed must still fire once
     /// the day has passed and enough time has been worked - the item count
     /// is context in the message now, never a condition. Deliberately no
-    /// `owe` call at all.
+    /// `owe_project` call at all.
     #[test]
     fn fires_with_zero_items_owed_once_stale_and_worked_long_enough() {
         let (_dir, db, mut store) = new_store();
+        serve_marker_minutes_ago(&mut store, "s1", Some("thor"), 90);
+        seed_tracking_since(&db, Some("thor"), &store, 25);
+        let asked =
+            evaluation_debt(&store, &db, "s1", Some("thor")).expect("a zero-item backlog must still owe an evaluation");
+        assert!(asked.contains("0 item(s) currently owe a verdict here"), "{asked}");
+    }
+
+    /// THE FIX ITSELF (`no evaluation is asked outside a project, where no
+    /// report can be filed`), proven at the pure-function level: the
+    /// IDENTICAL fixture as `fires_once_tracking_has_gone_stale_for_a_day_
+    /// and_the_session_has_worked_here_long_enough` above - a real backlog,
+    /// a clock seeded 25 hours stale, 90 minutes worked this session - stays
+    /// silent for `None`. A checkout with no project can never file the
+    /// Report that would silence this (ground 21, `NO_SCOPE_PROBLEM`, in
+    /// `model::gate`), so it must never be asked regardless of how stale or
+    /// how well-worked it looks.
+    #[test]
+    fn is_silent_for_a_checkout_with_no_project_however_stale_or_long_worked() {
+        let (_dir, db, mut store) = new_store();
+        owe(&mut store, 12);
         serve_marker_minutes_ago(&mut store, "s1", None, 90);
         seed_tracking_since(&db, None, &store, 25);
-        let asked = evaluation_debt(&store, &db, "s1", None).expect("a zero-item backlog must still owe an evaluation");
-        assert!(asked.contains("0 item(s) currently owe a verdict here"), "{asked}");
+        assert_eq!(
+            evaluation_debt(&store, &db, "s1", None),
+            None,
+            "a checkout with no project must never be asked for the evaluation"
+        );
+    }
+
+    /// THE CONTRAST: the identical fixture as the test just above, except
+    /// scoped to a real project - and this one must still fire, proving the
+    /// silence above is about the missing project specifically, not some
+    /// other accidental difference between the two fixtures.
+    #[test]
+    fn the_identical_case_with_a_project_still_fires() {
+        let (_dir, db, mut store) = new_store();
+        owe_project(&mut store, 12, Some("thor"));
+        serve_marker_minutes_ago(&mut store, "s1", Some("thor"), 90);
+        seed_tracking_since(&db, Some("thor"), &store, 25);
+        assert!(
+            evaluation_debt(&store, &db, "s1", Some("thor")).is_some(),
+            "the identical case, scoped to a real project, must still fire"
+        );
     }
 
     /// Case named in the build brief: the session's first serving here was

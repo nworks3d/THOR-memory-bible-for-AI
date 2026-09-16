@@ -285,7 +285,9 @@ review in one pass rather than judging notes one at a time - regardless of
 how many notes currently owe a verdict. That only happens once per
 conversation, even if the project is still without an evaluation afterward -
 and filing the report at the end of that review is what silences the ask
-for a day.
+for a day. It only ever happens inside a project, and never in a checkout
+that resolves to no project at all - there, no report could ever be filed
+to silence it, so it is never asked in the first place.
 
 The first of those only ever names a note THIS session actually saw fire -
 never one that only ever showed up during other, unrelated work. Answer for

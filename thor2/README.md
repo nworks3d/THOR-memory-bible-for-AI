@@ -155,6 +155,9 @@ where this checkout's own tracking clock and last evaluation report are
 named. It asks every day, in every project you actually work in, regardless
 of how many notes currently owe a verdict. Filing the evaluation report -
 the last step of the routine above - is what silences the ask for a day.
+This only ever happens inside a project: a checkout that resolves to no
+project is never asked, since there would be no collection to file that
+report under and so no way to ever silence the ask again.
 
 `--project <key>` additionally writes a `.thor-project` marker in the current
 directory to override the project name. By default, a checkout is scoped to the

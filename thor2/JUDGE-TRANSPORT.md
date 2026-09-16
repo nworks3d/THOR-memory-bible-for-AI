@@ -166,7 +166,10 @@ of a daily, per-project ask once a session has worked there long enough -
 `serve/src/bin/serve.rs`'s `evaluation_debt`, `serve::usefulness`'s own
 "evaluation debt" section - holds once a full day has passed since the later
 of this project's own tracking clock and its last evaluation report, AND
-this session has worked in the project for at least an hour) is silent for a
+this session has worked in the project for at least an hour, AND the
+checkout resolves to a real project at all - never for one that resolves to
+no project, since 2026-09-16, since no project means no Report can ever be
+filed to silence it) is silent for a
 subagent for the identical reason: a subagent cannot itself type
 `/thor-eval`, so holding its turn over a routine only the owner can run
 would spend a whole agent run asking for something it has no way to do. The

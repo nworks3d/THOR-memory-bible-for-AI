@@ -847,6 +847,18 @@ fn bindings_short(bindings: &[model::item::Binding]) -> String {
 /// silently disagree with what it reports on - the same reasoning this
 /// whole line already exists for (see this doc comment's own history
 /// above).
+///
+/// NEVER NAMES A CLOCK FOR A CHECKOUT WITH NO PROJECT (`checkout_project:
+/// None`), since 2026-09-16 (`no evaluation is asked outside a project,
+/// where no report can be filed`): the Stop hook itself never asks for the
+/// evaluation there any more - see `serve::usefulness`'s own "evaluation
+/// debt" section, third rewrite, for why - so a tracking clock or a named
+/// report here would describe an obligation that can no longer fire. This
+/// line says so in one clause instead, and never reads `project_eval_
+/// state`/`newest_evaluation_report` at all for `None`: correct either way,
+/// since a no-project checkout's own sidecar entry is inert leftover state
+/// at best (see `update_eval_debt_state`'s own doc comment), but reading it
+/// anyway would invite exactly the drift this whole line exists to avoid.
 pub fn judgement_debt_line(db: &Path, checkout_project: Option<&str>, full: bool) -> Option<String> {
     let store = EventStore::open_existing(db).ok()?;
     let (total, in_project) = serve::usefulness::judgement_debt_counts(&store, checkout_project);
@@ -868,30 +880,48 @@ pub fn judgement_debt_line(db: &Path, checkout_project: Option<&str>, full: bool
              among them would ever be asked about here; `mark` each once it is next served to settle it"
         ),
     }];
-    let state = serve::usefulness::project_eval_state(db, checkout_project);
-    let now = serve::time::now_unix();
-    let tracking_clause = match state.tracking_since {
-        Some(t) => format!("tracking this project's evaluation clock for {} day(s)", serve::usefulness::days_ago(now, t)),
-        None => "the tracking clock starts at the first Stop in this project".to_string(),
-    };
-    // The NEWEST report in the STORE, not merely the sidecar's own last-seen
-    // id - see `newest_evaluation_report`'s own doc comment for why: a
-    // report filed since the last Stop in this project is real right now,
-    // even though no Stop has looked at it yet.
-    let report_clause = match serve::usefulness::newest_evaluation_report(&store, checkout_project) {
-        None => "the store holds no evaluation report for this project".to_string(),
-        Some((id, _seq)) if state.last_evaluation_report_id.as_deref() == Some(id.as_str()) => {
-            let seen = state.last_evaluation_seen.unwrap_or(now);
-            format!("newest evaluation report '{id}', first seen by a Stop {} day(s) ago", serve::usefulness::days_ago(now, seen))
+    match checkout_project {
+        Some(_) => {
+            let state = serve::usefulness::project_eval_state(db, checkout_project);
+            let now = serve::time::now_unix();
+            let tracking_clause = match state.tracking_since {
+                Some(t) => {
+                    format!("tracking this project's evaluation clock for {} day(s)", serve::usefulness::days_ago(now, t))
+                }
+                None => "the tracking clock starts at the first Stop in this project".to_string(),
+            };
+            // The NEWEST report in the STORE, not merely the sidecar's own
+            // last-seen id - see `newest_evaluation_report`'s own doc
+            // comment for why: a report filed since the last Stop in this
+            // project is real right now, even though no Stop has looked at
+            // it yet.
+            let report_clause = match serve::usefulness::newest_evaluation_report(&store, checkout_project) {
+                None => "the store holds no evaluation report for this project".to_string(),
+                Some((id, _seq)) if state.last_evaluation_report_id.as_deref() == Some(id.as_str()) => {
+                    let seen = state.last_evaluation_seen.unwrap_or(now);
+                    format!(
+                        "newest evaluation report '{id}', first seen by a Stop {} day(s) ago",
+                        serve::usefulness::days_ago(now, seen)
+                    )
+                }
+                Some((id, _seq)) if state.known_report_ids.contains(&id) => {
+                    format!("newest evaluation report '{id}', already seen by an earlier Stop")
+                }
+                Some((id, _seq)) => format!("newest evaluation report '{id}' in the store, not yet seen by a Stop"),
+            };
+            out[0].push_str(&format!(" - {tracking_clause}; {report_clause}"));
+            if serve::usefulness::eval_debt_stale(state.tracking_since, state.last_evaluation_seen, now) {
+                out[0]
+                    .push_str("; the Stop hook asks for the evaluation once per session after an hour of work when a day has passed");
+            }
         }
-        Some((id, _seq)) if state.known_report_ids.contains(&id) => {
-            format!("newest evaluation report '{id}', already seen by an earlier Stop")
+        // No clock, no report clause, no staleness note: a checkout with no
+        // project is never asked for the evaluation at all (see this
+        // function's own doc comment), so naming any of the three would
+        // describe an obligation that can never fire here.
+        None => {
+            out[0].push_str("; the evaluation is only ever asked inside a project, so this checkout is never asked for one");
         }
-        Some((id, _seq)) => format!("newest evaluation report '{id}' in the store, not yet seen by a Stop"),
-    };
-    out[0].push_str(&format!(" - {tracking_clause}; {report_clause}"));
-    if serve::usefulness::eval_debt_stale(state.tracking_since, state.last_evaluation_seen, now) {
-        out[0].push_str("; the Stop hook asks for the evaluation once per session after an hour of work when a day has passed");
     }
     let named = serve::usefulness::judgement_debt_named(&store, checkout_project);
     let cap = name_cap(full);
@@ -2163,6 +2193,49 @@ mod tests {
         assert!(
             line.contains("the Stop hook asks for the evaluation once per session after an hour of work when a day has passed"),
             "{line}"
+        );
+    }
+
+    /// THE FIX ITSELF (`no evaluation is asked outside a project, where no
+    /// report can be filed`), proven for `doctor`: a checkout with no
+    /// project still names its own judgement debt (a global item, exactly
+    /// like `judgement_debt_line_still_speaks_for_a_checkout_with_no_
+    /// project` above), but the evaluation tail names no clock at all - not
+    /// "tracking this project's evaluation clock", not "the store holds no
+    /// evaluation report", not the Stop-hook note - and says plainly that
+    /// the evaluation is only ever asked inside a project. Proven even with
+    /// a STALE `""`-keyed sidecar entry seeded 25 hours back - the exact
+    /// shape a sidecar written before this fix could still carry (see
+    /// `usefulness::update_eval_debt_state`'s own doc comment) - to show
+    /// that legacy entry is read for nothing here, not merely unmentioned
+    /// by coincidence.
+    #[test]
+    fn judgement_debt_line_names_no_clock_at_all_for_a_checkout_with_no_project() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("t.db");
+        {
+            let mut store = EventStore::new(&db).unwrap();
+            let mut item = rule("owed-global-no-project-tail");
+            item.bindings = vec![Binding::Moment(intent::Action::Commit)];
+            store::declare(&mut store, "s", "l", "a", &item).unwrap();
+            for _ in 0..serve::usefulness::JUDGEMENT_DEBT_AFTER {
+                serve::deliver::record_delivery(&mut store, "s", "l", "t", "2026-09-08T00:00:00Z", &["owed-global-no-project-tail".to_string()]);
+            }
+        }
+        let stale = serve::time::now_unix() - 25 * 3600;
+        seed_eval_debt_state(&db, "", serve::usefulness::ProjectEvalState { tracking_since: Some(stale), ..Default::default() });
+
+        let line = judgement_debt_line(&db, None, false).expect("a global item is owed, the line must speak");
+        assert!(line.contains("resolves to no project"), "{line}");
+        assert!(
+            line.contains("the evaluation is only ever asked inside a project"),
+            "must say plainly why there is no clock here: {line}"
+        );
+        assert!(!line.contains("tracking this project's evaluation clock"), "must never name a clock for no project: {line}");
+        assert!(!line.contains("the store holds no evaluation report"), "must never name a report clause for no project: {line}");
+        assert!(
+            !line.contains("the Stop hook asks for the evaluation once per session"),
+            "must never claim the Stop hook will ask, since it never does for no project: {line}"
         );
     }
 

@@ -233,6 +233,15 @@ pub struct JudgementDebtItem {
     pub count: usize,
     pub kind: model::item::Kind,
     pub bindings: Vec<model::item::Binding>,
+    /// WHICH of the bindings above actually fired last - see `model::
+    /// served::ItemServed::trigger`'s own doc comment for the three shapes
+    /// and the defect this closes (an evaluation could name a binding but
+    /// never the place among what it reaches an item had really been
+    /// firing). `None` when the item has never fired, when its newest
+    /// serving predates this field, or when that serving carried no trigger
+    /// of its own (a prompt-triggered serve) - `model::served::last_trigger`
+    /// makes no distinction between those three, and neither does this.
+    pub last_trigger: Option<String>,
 }
 
 /// THE GAP THIS CLOSES. `judgement_debt_counts` above tells `doctor` how big
@@ -258,7 +267,10 @@ pub fn judgement_debt_named(store: &EventStore, checkout_project: Option<&str>) 
     let mut named: Vec<JudgementDebtItem> = owed_items(store)
         .into_iter()
         .filter(|o| crate::project::applies_to(o.project.as_deref(), checkout_project))
-        .map(|o| JudgementDebtItem { id: o.id, count: o.count, kind: o.kind, bindings: o.bindings })
+        .map(|o| {
+            let last_trigger = model::served::last_trigger(store, &o.id);
+            JudgementDebtItem { id: o.id, count: o.count, kind: o.kind, bindings: o.bindings, last_trigger }
+        })
         .collect();
     named.sort_by(|a, b| b.count.cmp(&a.count).then_with(|| a.id.cmp(&b.id)));
     named
@@ -617,6 +629,35 @@ pub fn noise_since_last_useful(store: &EventStore) -> HashMap<String, usize> {
 // -> `EVAL_REPEAT_WORK_MINUTES`, measured from whenever that report reset
 // the accrual, so a long day keeps asking every three hours instead of
 // going quiet until the next UTC midnight.
+//
+// A SEVENTH REWRITE (2026-09-17) drops the UTC CALENDAR DAY itself, the one
+// piece every rewrite above kept: "today" becomes a rolling
+// `EVAL_REPORT_COVERS_HOURS` (16) hours from `last_evaluation_seen`
+// (`eval_report_covers`, replacing `eval_done_today`/`crate::time::
+// same_utc_day`), and `session_work_reset_needed` drops its own UTC-day
+// clause to match - the accrual now restarts only when there is no anchor
+// yet or a newer report has been seen, never on a midnight crossing.
+//
+// THE DAY THIS WAS MEASURED (acme-shop eval 2, 2026-09-17). The report
+// was filed about 01:30 local time (23:30 UTC); the Stop hook demanded a new
+// evaluation at 02:09 local (00:09 UTC), 39 minutes later; `doctor` said
+// "today's evaluation is not done" while naming that very report as the
+// newest thing in the store. Local midnight for the owner is 02:00 UTC, so
+// the UTC calendar day split one working night into two "days" 39 minutes
+// apart - the exact shape every earlier rewrite's own UTC-day choice was
+// building toward without ever being asked to answer.
+//
+// WHY A ROLLING WINDOW, AND WHY 16 HOURS. A night worker's day ends when
+// they sleep, not at an arbitrary meridian their assistant's clock happens
+// to cross - so "today" was never the right question; "recently enough"
+// is. Sixteen hours covers a normal night session (report filed in the
+// small hours) clean through to the next afternoon without a spurious
+// repeat ask, while still making yesterday afternoon's report due again
+// this morning rather than buying silence for a second working day. No
+// grace period, no `tracking_since` revival: still exactly `EVAL_FIRST_
+// WORK_MINUTES`/`EVAL_REPEAT_WORK_MINUTES` of accrued work either way,
+// measured from whichever reset last applied - only what "still covers"
+// means has changed.
 
 /// How many minutes of ACCRUED WORK (see `SessionWorkState`/`accrue_
 /// session_work` below - gap-filtered hook events of this session, so an
@@ -662,49 +703,64 @@ pub const EVAL_PAUSE_MINUTES: i64 = 30;
 /// is never subject to this throttle at all.
 const EVAL_WORK_WRITE_THROTTLE_SECS: i64 = 60;
 
+/// How many hours a filed evaluation report covers before this project is
+/// owed a fresh one - see `eval_report_covers` below and this section's own
+/// "SEVENTH REWRITE" paragraph for the measured case that replaced a UTC
+/// calendar day with this rolling window. Not a config knob (CONTRACT R9):
+/// chosen once, long enough to carry a normal night session through to the
+/// next afternoon, short enough that a quiet project is still asked about
+/// well within two working days.
+pub const EVAL_REPORT_COVERS_HOURS: i64 = 16;
+
 /// THE TIME HALF OF THE PURE PREDICATE, factored out of `eval_debt_owed`
 /// below so `doctor` (`ops::health::judgement_debt_line`), which runs cold
 /// outside any session and so can never evaluate the minutes-worked half,
 /// can still report accurately on the half it CAN evaluate - without
-/// duplicating the "is this the current UTC day" rule a second time and
-/// risking it drift from the one `eval_debt_owed` actually acts on. Replaces
-/// `eval_debt_stale` and the retired `EVAL_DEBT_STALE_HOURS` (2026-09-16,
-/// fourth rewrite, this section's own doc comment): a rolling 24 hours
-/// measured against the LATER of `tracking_since`/`last_evaluation_seen`
-/// gave way to a UTC calendar day measured against `last_evaluation_seen`
-/// alone.
+/// duplicating this rule a second time and risking it drift from the one
+/// `eval_debt_owed` actually acts on. Replaces `eval_done_today`/`crate::
+/// time::same_utc_day` (2026-09-17, seventh rewrite, this section's own doc
+/// comment): a UTC calendar day measured against `last_evaluation_seen`
+/// alone gave way to a rolling `EVAL_REPORT_COVERS_HOURS`-hour window
+/// measured against the identical field.
 ///
-/// Holds (today's evaluation IS done) when `last_evaluation_seen` is
-/// `Some`, AND it falls on the same UTC calendar day as `now_unix`
-/// (`crate::time::same_utc_day`). `None` - no evaluation report has ever
-/// been seen for this project - reads as "not done today", never as "done
+/// Holds (the last evaluation STILL COVERS this project) when
+/// `last_evaluation_seen` is `Some`, AND `now_unix` is within
+/// `EVAL_REPORT_COVERS_HOURS` hours AFTER it - never before: a `seen` in the
+/// future (clock skew, a hand-edited sidecar) must not silence anything
+/// early, so `now_unix - seen` has to land in `0..EVAL_REPORT_COVERS_HOURS`
+/// hours, not merely under it. `None` - no evaluation report has ever been
+/// seen for this project - reads as "does not cover", never as "covers
 /// forever": there is no instant for a report that was never seen, so there
-/// is nothing for `same_utc_day` to agree with.
-pub fn eval_done_today(last_evaluation_seen: Option<i64>, now_unix: i64) -> bool {
-    last_evaluation_seen.is_some_and(|seen| crate::time::same_utc_day(seen, now_unix))
+/// is nothing for the window to measure from.
+pub fn eval_report_covers(last_evaluation_seen: Option<i64>, now_unix: i64) -> bool {
+    let Some(seen) = last_evaluation_seen else { return false };
+    (0..EVAL_REPORT_COVERS_HOURS * 3600).contains(&(now_unix - seen))
 }
 
 /// THE WHOLE PURE PREDICATE. Rewritten 2026-09-16 to drop `tracking_since`
 /// and the 24-hour rolling window entirely in favour of a UTC calendar day
 /// (see this section's own doc comment, fourth rewrite, for why); rewritten
-/// again 2026-09-17 (fifth rewrite) to ask a DIFFERENT threshold once today's
-/// report already exists, rather than staying silent for the rest of the
-/// day regardless of how much more work follows it. Every input is already
-/// resolved elsewhere (`accrued_minutes` from `SessionWorkState::
-/// accrued_secs` via `record_hook_event`, `last_evaluation_seen` from this
-/// project's own `ProjectEvalState`, `now_unix` from `crate::time::
-/// now_unix`), so this stays nothing but the conditions themselves,
-/// unit-testable with plain integers and no store, no clock, no filesystem.
+/// again 2026-09-17 (fifth rewrite) to ask a DIFFERENT threshold once
+/// today's report already exists, rather than staying silent for the rest
+/// of the day regardless of how much more work follows it; rewritten again
+/// 2026-09-17 (seventh rewrite) to replace "today's report" with "a report
+/// that still covers" (`eval_report_covers` above), dropping the calendar
+/// day entirely. Every input is already resolved elsewhere (`accrued_
+/// minutes` from `SessionWorkState::accrued_secs` via `record_hook_event`,
+/// `last_evaluation_seen` from this project's own `ProjectEvalState`,
+/// `now_unix` from `crate::time::now_unix`), so this stays nothing but the
+/// conditions themselves, unit-testable with plain integers and no store, no
+/// clock, no filesystem.
 ///
 /// Holds when `accrued_minutes` has reached the threshold FOR WHICHEVER
-/// CASE APPLIES: `EVAL_REPEAT_WORK_MINUTES` when `eval_done_today` above
-/// already holds (a report exists for today, so this would be a repeat
-/// ask), or `EVAL_FIRST_WORK_MINUTES` when it does not (no report yet
-/// today, so this would be the first ask). `accrued_minutes` itself is
-/// already measured from whichever reset last applied - a new UTC day or a
-/// newly seen report, both handled by `session_work_reset_needed` before
-/// this predicate ever runs - so neither branch here needs to look at a
-/// reset instant a second time.
+/// CASE APPLIES: `EVAL_REPEAT_WORK_MINUTES` when `eval_report_covers` above
+/// already holds (a report still covers, so this would be a repeat ask), or
+/// `EVAL_FIRST_WORK_MINUTES` when it does not (nothing covers, so this
+/// would be the first ask). `accrued_minutes` itself is already measured
+/// from whichever reset last applied - no anchor yet or a newly seen
+/// report, both handled by `session_work_reset_needed` before this
+/// predicate ever runs - so neither branch here needs to look at a reset
+/// instant a second time.
 ///
 /// THE REPEAT BRANCH ALSO NEEDS A RISK, since the sixth rewrite (2026-09-17,
 /// owner's decision - see this file's own "the repeat's own risk" doc
@@ -713,7 +769,7 @@ pub fn eval_done_today(last_evaluation_seen: Option<i64>, now_unix: i64) -> bool
 /// other. THE FIRST-OF-DAY BRANCH IS UNCHANGED: no risk condition at all,
 /// only the accrued-time floor, exactly as it was before this rewrite.
 pub fn eval_debt_owed(accrued_minutes: i64, last_evaluation_seen: Option<i64>, now_unix: i64, edits_since_test: u32, compacted_since_anchor: bool) -> bool {
-    if eval_done_today(last_evaluation_seen, now_unix) {
+    if eval_report_covers(last_evaluation_seen, now_unix) {
         accrued_minutes >= EVAL_REPEAT_WORK_MINUTES && (edits_since_test >= EVAL_REPEAT_MIN_UNTESTED_EDITS || compacted_since_anchor)
     } else {
         accrued_minutes >= EVAL_FIRST_WORK_MINUTES
@@ -997,23 +1053,35 @@ pub struct SessionWorkState {
     pub compacted_since_anchor: bool,
 }
 
-/// Whether `session`'s own accrual must restart at `now_unix` rather than
-/// fold one more gap onto what it already carries - see this section's own
-/// doc comment, fifth rewrite. Three cases, all "start over": no event has
-/// ever been seen for this (project, session) pair (`anchor_unix` is
-/// `None`); `now_unix` falls on a different UTC calendar day than the
-/// anchor (`crate::time::same_utc_day` - the identical rule `eval_done_
-/// today` already applies to `last_evaluation_seen`, so a session that
-/// works past midnight UTC resets here at exactly the instant a fresh
-/// `EVAL_FIRST_WORK_MINUTES` ask becomes possible again); or a newer
+/// Whether `session`'s own accrual must restart rather than fold one more
+/// gap onto what it already carries - see this section's own doc comment,
+/// fifth rewrite. Two cases, both "start over": no event has ever been seen
+/// for this (project, session) pair (`anchor_unix` is `None`); or a newer
 /// evaluation report has been seen for the project than this accrual period
 /// ever accounted for (`last_evaluation_seen` strictly later than
 /// `anchor_unix` - a report seen BEFORE this period began was already the
 /// reason for the reset that started it, most recently).
-fn session_work_reset_needed(session: &SessionWorkState, now_unix: i64, last_evaluation_seen: Option<i64>) -> bool {
+///
+/// NO LONGER TAKES `now_unix`, AND NO LONGER RESETS ON A CALENDAR-DAY
+/// CROSSING - dropped 2026-09-17 (seventh rewrite, this section's own doc
+/// comment) alongside `eval_done_today`/`crate::time::same_utc_day`, which
+/// this used to call for exactly that clause. `eval_report_covers`'s own
+/// rolling window has no midnight to cross in the first place, so there is
+/// no longer an instant "a fresh `EVAL_FIRST_WORK_MINUTES` ask becomes
+/// possible again" tied to the calendar for this to chase - only the two
+/// cases above ever restart the accrual now. This also retired the elaborate
+/// "pin the fixture at noon UTC" workaround `serve/tests/evaluation_debt_
+/// stop_hook.rs`'s own `seed_session_work_with_risk` needed for the old
+/// clause: measured there, a fixture built from literal "now" could land on
+/// a different UTC day than the real hook subprocess's own clock read
+/// moments later when a test happened to run within the fixture's own
+/// minutes of real UTC midnight, so `seed_session_work_with_risk` had to
+/// dodge the boundary instead of just using "now" - a race that no longer
+/// exists once nothing here reads a calendar day at all.
+fn session_work_reset_needed(session: &SessionWorkState, last_evaluation_seen: Option<i64>) -> bool {
     match session.anchor_unix {
         None => true,
-        Some(anchor) => !crate::time::same_utc_day(anchor, now_unix) || last_evaluation_seen.is_some_and(|seen| seen > anchor),
+        Some(anchor) => last_evaluation_seen.is_some_and(|seen| seen > anchor),
     }
 }
 
@@ -1045,7 +1113,7 @@ fn session_work_reset_needed(session: &SessionWorkState, now_unix: i64, last_eva
 /// `compacted_since_anchor` (sticky - never cleared by anything but a reset),
 /// and `Other` touches neither.
 pub fn accrue_session_work(session: &SessionWorkState, now_unix: i64, last_evaluation_seen: Option<i64>, event: HookEventKind) -> SessionWorkState {
-    if session_work_reset_needed(session, now_unix, last_evaluation_seen) {
+    if session_work_reset_needed(session, last_evaluation_seen) {
         return SessionWorkState {
             anchor_unix: Some(now_unix),
             accrued_secs: 0,
@@ -1453,61 +1521,91 @@ pub fn default_eval_command_path() -> Option<PathBuf> {
 mod eval_debt_predicate_tests {
     use super::*;
 
-    // A fixed reference instant, deliberately at NOON UTC (43_200 seconds
-    // past midnight) so "still today" and "a full day earlier" are both
-    // obviously correct by eye: anything within 12 hours either side of NOW
-    // stays on the same UTC calendar day, and anything a full DAY or more
-    // away always crosses into a different one, regardless of what time of
-    // day NOW itself happens to be.
+    // A fixed reference instant. Unlike the retired UTC-calendar-day rule,
+    // `eval_report_covers`'s rolling window does not care what time of day
+    // NOW is - there is no midnight to sit near or cross - so this no longer
+    // has to be pinned at noon for the tests below to be obviously correct
+    // by eye; any fixed instant does.
     const NOW: i64 = 1_800_014_400;
     const HOUR: i64 = 3600;
     const DAY: i64 = 86400;
 
-    // ------------------------------------------------------- eval_done_today
+    // ---------------------------------------------------- eval_report_covers
+    //
+    // Replaces `eval_done_today`/`same_utc_day` (2026-09-17, seventh rewrite
+    // - see this file's own "evaluation debt" section). THE MEASURED CASE:
+    // acme-shop eval 2 was filed about 01:30 local time (23:30 UTC), the
+    // Stop hook demanded a new evaluation at 02:09 local (00:09 UTC), and
+    // `doctor` said "today's evaluation is not done" while naming that very
+    // report as the newest - local midnight for the owner is 02:00 UTC, so
+    // the UTC calendar day split his working night in two, 39 minutes apart.
 
     #[test]
-    fn no_report_ever_seen_is_never_done_today() {
-        assert!(!eval_done_today(None, NOW));
+    fn no_report_ever_seen_never_covers() {
+        assert!(!eval_report_covers(None, NOW));
     }
 
     #[test]
-    fn a_report_seen_earlier_today_is_done_today() {
-        assert!(eval_done_today(Some(NOW - HOUR), NOW), "an hour ago, same UTC day");
-        assert!(eval_done_today(Some(NOW), NOW), "this very instant");
+    fn a_report_seen_recently_covers() {
+        assert!(eval_report_covers(Some(NOW - HOUR), NOW), "an hour ago, well inside the window");
+        assert!(eval_report_covers(Some(NOW), NOW), "this very instant");
     }
 
-    /// Case named in the build brief: a report first seen today silences it
-    /// for the rest of the day.
+    /// Case named in the build brief: 15 hours old still covers.
     #[test]
-    fn a_report_seen_yesterday_is_not_done_today() {
-        assert!(!eval_done_today(Some(NOW - DAY), NOW), "exactly one day earlier is always a different UTC day");
+    fn a_report_seen_15_hours_ago_still_covers() {
+        assert!(eval_report_covers(Some(NOW - 15 * HOUR), NOW));
     }
 
-    /// NOW is noon; 23 hours earlier is 13:00 the day before - still
-    /// "yesterday" even though less than a full 24 hours have passed. This
-    /// is exactly the behaviour the retired rolling-24-hour window did NOT
-    /// have (see this file's "evaluation debt" section, fourth rewrite).
+    /// Case named in the build brief: 17 hours old does not cover - past
+    /// `EVAL_REPORT_COVERS_HOURS` (16), regardless of where any calendar
+    /// day boundary would have fallen.
     #[test]
-    fn a_report_seen_23_hours_ago_that_crossed_midnight_is_not_done_today() {
-        assert!(!eval_done_today(Some(NOW - 23 * HOUR), NOW));
+    fn a_report_seen_17_hours_ago_does_not_cover() {
+        assert!(!eval_report_covers(Some(NOW - 17 * HOUR), NOW));
+    }
+
+    /// The exact boundary: precisely `EVAL_REPORT_COVERS_HOURS` old is
+    /// already too old - the window is "under 16 hours", not "16 or fewer".
+    #[test]
+    fn exactly_the_limit_does_not_cover() {
+        assert!(!eval_report_covers(Some(NOW - EVAL_REPORT_COVERS_HOURS * HOUR), NOW));
+    }
+
+    /// One second under the boundary still covers.
+    #[test]
+    fn one_second_under_the_limit_covers() {
+        assert!(eval_report_covers(Some(NOW - EVAL_REPORT_COVERS_HOURS * HOUR + 1), NOW));
+    }
+
+    /// A report seen a full day back - the case that used to be exactly
+    /// "yesterday" under the retired UTC-day rule - still reads as simply
+    /// "too old" under the window, the same conclusion for an unrelated
+    /// reason.
+    #[test]
+    fn a_report_seen_a_full_day_ago_does_not_cover() {
+        assert!(!eval_report_covers(Some(NOW - DAY), NOW));
     }
 
     #[test]
-    fn a_report_seen_at_a_future_instant_on_a_different_day_is_not_done_today() {
-        // Clock skew or a hand-edited sidecar: a future timestamp on a
-        // DIFFERENT day must not spuriously agree with "today" either.
-        assert!(!eval_done_today(Some(NOW + DAY), NOW));
+    fn a_report_seen_at_a_future_instant_does_not_cover() {
+        // Clock skew or a hand-edited sidecar: a future timestamp must not
+        // spuriously read as "covers" either - `now - seen` goes negative,
+        // which is outside `0..EVAL_REPORT_COVERS_HOURS` hours same as any
+        // other out-of-window value.
+        assert!(!eval_report_covers(Some(NOW + HOUR), NOW));
+        assert!(!eval_report_covers(Some(NOW + DAY), NOW));
     }
 
     // --------------------------------------------------------- eval_debt_owed
     //
     // `edits_since_test`/`compacted_since_anchor` are irrelevant to every
     // test in this block: none of them ever reach the REPEAT branch with
-    // enough accrued time for a risk to matter (`eval_done_today` is either
-    // `None`/yesterday, or the accrued minutes stay under `EVAL_REPEAT_
-    // WORK_MINUTES`), so every call below passes `0, false` - see "eval_
-    // debt_owed: the repeat risk" further down for the tests that actually
-    // exercise the risk gate.
+    // enough accrued time for a risk to matter (`eval_report_covers` is
+    // either `false`/out of the window, or the accrued minutes stay under
+    // `EVAL_REPEAT_WORK_MINUTES`), so every call below passes `0, false` -
+    // see "eval_debt_owed: the repeat risk" further down for the tests that
+    // actually exercise the risk gate.
 
     /// Case named in the build brief: 59 minutes accrued this session ->
     /// silent, 61 -> fires - no report has ever been seen in either case,
@@ -1601,8 +1699,8 @@ mod eval_debt_predicate_tests {
 
     #[test]
     fn with_no_report_today_the_repeat_threshold_never_applies() {
-        // Without `eval_done_today`, `EVAL_REPEAT_WORK_MINUTES` (180) worth
-        // of accrued work is still just "well past the first threshold",
+        // Without `eval_report_covers` holding, `EVAL_REPEAT_WORK_MINUTES`
+        // (180) worth of accrued work is still just "well past the first threshold",
         // and must fire exactly as any other first-of-day case would - no
         // risk needed, since this never reaches the repeat branch at all.
         assert!(eval_debt_owed(EVAL_REPEAT_WORK_MINUTES, None, NOW, 0, false));
@@ -1742,23 +1840,31 @@ mod session_work_tests {
         assert_eq!(after, SessionWorkState { anchor_unix: Some(NOW), accrued_secs: 0, last_event_unix: Some(NOW), ..Default::default() });
     }
 
-    /// Case named in the build brief: a new UTC day resets it.
+    /// INVERTED 2026-09-17 (seventh rewrite, this file's own "evaluation
+    /// debt" section) from `a_new_utc_day_resets_the_anchor_and_the_work`,
+    /// which used to assert the opposite of what this now proves:
+    /// `session_work_reset_needed` dropped its own UTC-day clause the same
+    /// day `eval_report_covers` replaced the calendar day with a rolling
+    /// window, so a session working right through midnight now keeps its
+    /// accrued total exactly as it would at any other minute - only "no
+    /// anchor yet" or "a newer report was seen" reset it any more.
     #[test]
-    fn a_new_utc_day_resets_the_anchor_and_the_work() {
-        // One second before today's midnight - "yesterday" no matter the
-        // wall-clock hour NOW itself happens to represent.
-        let yesterday = NOW - NOW.rem_euclid(86400) - 1;
-        let session = SessionWorkState { anchor_unix: Some(yesterday), accrued_secs: 9_000, last_event_unix: Some(yesterday), ..Default::default() };
-        let after = accrue_session_work(&session, NOW, None, HookEventKind::Other);
-        assert_eq!(after.accrued_secs, 0, "crossing into a new UTC day must drop whatever was accrued");
-        assert_eq!(after.anchor_unix, Some(NOW), "and restart the anchor at the event that crossed the boundary");
+    fn crossing_a_utc_midnight_no_longer_resets_the_accrual_on_its_own() {
+        // One second before today's midnight and one second after it - a
+        // real UTC-day crossing, the exact shape the retired clause used to
+        // reset on.
+        let midnight = NOW - NOW.rem_euclid(86400);
+        let session = SessionWorkState { anchor_unix: Some(midnight - 1), accrued_secs: 9_000, last_event_unix: Some(midnight - 1), ..Default::default() };
+        let after = accrue_session_work(&session, midnight + 1, None, HookEventKind::Other);
+        assert_eq!(after.accrued_secs, 9_000 + 2, "crossing midnight must not drop what was already accrued");
+        assert_eq!(after.anchor_unix, session.anchor_unix, "and must not restart the anchor either");
     }
 
     #[test]
-    fn staying_within_the_same_utc_day_never_resets_on_its_own() {
+    fn an_ordinary_short_gap_never_resets_the_accrual() {
         let session = SessionWorkState { anchor_unix: Some(NOW - 5 * MIN), accrued_secs: 100, last_event_unix: Some(NOW - MIN), ..Default::default() };
         let after = accrue_session_work(&session, NOW, None, HookEventKind::Other);
-        assert_eq!(after.anchor_unix, session.anchor_unix, "the same calendar day must never reset on its own");
+        assert_eq!(after.anchor_unix, session.anchor_unix, "a short gap with no newer report must never reset on its own");
     }
 
     /// Case named in the build brief: a new report resets the anchor and the
@@ -1833,22 +1939,26 @@ mod session_work_tests {
         assert!(later.compacted_since_anchor, "a compaction earlier in the same anchor period is still a real risk");
     }
 
-    /// Case named in the build brief: a new UTC day resets both (the edit
-    /// count and the summary flag), the same as it already resets
-    /// `accrued_secs`.
+    /// INVERTED 2026-09-17 (seventh rewrite, this file's own "evaluation
+    /// debt" section) from `a_new_utc_day_resets_the_edit_count_and_the_
+    /// summary_flag_too` - see `crossing_a_utc_midnight_no_longer_resets_
+    /// the_accrual_on_its_own`'s own doc comment for why crossing midnight
+    /// is no longer a reset trigger at all: neither is the edit count or the
+    /// summary flag, which reset only alongside `accrued_secs`, by the same
+    /// `session_work_reset_needed` call.
     #[test]
-    fn a_new_utc_day_resets_the_edit_count_and_the_summary_flag_too() {
-        let yesterday = NOW - NOW.rem_euclid(86400) - 1;
+    fn crossing_a_utc_midnight_no_longer_resets_the_edit_count_or_the_summary_flag() {
+        let midnight = NOW - NOW.rem_euclid(86400);
         let session = SessionWorkState {
-            anchor_unix: Some(yesterday),
-            last_event_unix: Some(yesterday),
+            anchor_unix: Some(midnight - 1),
+            last_event_unix: Some(midnight - 1),
             edits_since_test: 5,
             compacted_since_anchor: true,
             ..Default::default()
         };
-        let after = accrue_session_work(&session, NOW, None, HookEventKind::Other);
-        assert_eq!(after.edits_since_test, 0, "a new UTC day must drop the untested-edit count too");
-        assert!(!after.compacted_since_anchor, "and the summary flag too");
+        let after = accrue_session_work(&session, midnight + 1, None, HookEventKind::Other);
+        assert_eq!(after.edits_since_test, 5, "crossing midnight must not drop the untested-edit count");
+        assert!(after.compacted_since_anchor, "or the summary flag");
     }
 
     /// Case named in the build brief: a new report resets both.
@@ -1869,11 +1979,15 @@ mod session_work_tests {
     /// A reset that coincides with the very event that would otherwise have
     /// counted still seeds the fresh period with it - the new period's own
     /// first edit still counts as one, it is only what came BEFORE the reset
-    /// that is discarded.
+    /// that is discarded. Triggered here by `anchor_unix: None` (no event
+    /// ever seen for this pair, `session_work_reset_needed`'s own first
+    /// case) rather than a UTC-day crossing - see `crossing_a_utc_midnight_
+    /// no_longer_resets_the_accrual_on_its_own`'s own doc comment for why
+    /// that is no longer a reset trigger at all (seventh rewrite,
+    /// 2026-09-17).
     #[test]
     fn a_reset_still_counts_its_own_triggering_event() {
-        let yesterday = NOW - NOW.rem_euclid(86400) - 1;
-        let session = SessionWorkState { anchor_unix: Some(yesterday), last_event_unix: Some(yesterday), edits_since_test: 5, ..Default::default() };
+        let session = SessionWorkState { anchor_unix: None, edits_since_test: 5, ..Default::default() };
         let after = accrue_session_work(&session, NOW, None, HookEventKind::UntestedEdit);
         assert_eq!(after.edits_since_test, 1, "the old count is discarded, but this event's own edit still seeds the new period");
     }

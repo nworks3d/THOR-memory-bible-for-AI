@@ -147,22 +147,21 @@ there the day writes are turned on. An existing copy - the owner's own
 edited version, or one an earlier install already wrote - is left exactly
 as it is.
 
-Once a project has gone without an evaluation report TODAY (the current UTC
-calendar day - not your own local day, since this workspace has no way to
-resolve a local time zone), and the session has accrued at least an hour of
-work in that project, the `Stop` hook asks for this whole routine by name
-instead of one more item at a time - see the `judgement debt` line under
-"Check it" below for where this checkout's own newest evaluation report is
-named. It is not once per session: it blocks the first `Stop` of EVERY turn,
-regardless of how many notes currently owe a verdict, naming how many times
-it has already asked and since when, until the report is filed. Filing the
-evaluation report - the last step of the routine above - is what lets a
-turn end and stays quiet until tomorrow. This only ever happens inside a
-project: a checkout that resolves to no project is never asked, since there
-would be no collection to file that report under and so no way to ever
-silence the ask at all.
+Once a project has gone 16 hours without an evaluation report, and the
+session has accrued at least an hour of work in that project, the `Stop`
+hook asks for this whole routine by name instead of one more item at a time
+- see the `judgement debt` line under "Check it" below for where this
+checkout's own newest evaluation report is named. It is not once per
+session: it blocks the first `Stop` of EVERY turn, regardless of how many
+notes currently owe a verdict, naming how many times it has already asked
+and since when, until the report is filed. Filing the evaluation report -
+the last step of the routine above - is what lets a turn end and stays
+quiet for the next 16 hours. This only ever happens inside a project: a
+checkout that resolves to no project is never asked, since there would be
+no collection to file that report under and so no way to ever silence the
+ask at all.
 
-Filing that report does not buy silence for the rest of the day, either -
+Filing that report does not buy silence for the full 16 hours, either -
 but only when something risky happened since: once three more hours of
 accrued work go by since it, AND at least three code changes have gone by
 with no test or build run since, or the context was summarized, a repeat
@@ -274,13 +273,13 @@ count. A rule the owner has pinned to fire at every session start never
 appears on that list: pinning it already answered whether it belongs there,
 and a verdict on it would change nothing else in the memory. The same line
 also names the newest evaluation report this store holds for the project
-and the day it was first seen, or that none exists yet; says whether TODAY's
-evaluation is already done (and, once it is, that a repeat is due after
-three more hours of accrued work since it AND a risk shows up too - time
-alone never triggers a repeat); and, when it is not, how many times the
-`Stop` hook has already asked and since when, plus a note that it blocks
-every turn once a session has accrued an hour of work here, until the
-report is filed. It also names the most recently active session's own
+and the day it was first seen, or that none exists yet; says whether it
+still covers this project (within the last 16 hours - and, once it does,
+that a repeat is due after three more hours of accrued work since it AND a
+risk shows up too - time alone never triggers a repeat); and, when it does
+not, how many times the `Stop` hook has already asked and since when, plus
+a note that it blocks every turn once a session has accrued an hour of work
+here, until the report is filed. It also names the most recently active session's own
 accrued work for this project, its own untested-edit count and whether a
 context summary has happened since its own last reset, and when its next
 evaluation is due, where that is known.

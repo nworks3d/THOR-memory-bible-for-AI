@@ -241,7 +241,11 @@ fn with_warnings(
             Some(existing) => model::store::capacity_for_revise(store, existing, item, &serve::time::now_iso8601()),
             None => model::store::capacity(store, item),
         };
-        if let Ok(model::store::Capacity::Crowded(note)) = cap {
+        // `Broad` shown the same way as `Crowded`: both are notes about the
+        // same write, never a refusal - see `model::store::Capacity::Broad`'s
+        // own doc comment for why the all-directory case is its own variant
+        // now (2026-09-17) rather than sharing `Crowded`'s shape.
+        if let Ok(model::store::Capacity::Crowded(note) | model::store::Capacity::Broad(note)) = cap {
             notes.push(note);
         }
     }
@@ -2145,7 +2149,7 @@ impl ThorMcpServer {
         }
     }
 
-    #[tool(description = "Code lane: judges an item you were served or looked up. Default records that it HELPED, which clears noise recorded before it (a later noise mark still counts - the newest verdict wins). Pass noise:true for the opposite; two noise marks since the last useful one retire the item from the injection surfaces, though it stays fully findable via lookup. A second call THIS SESSION for the same id with the same verdict writes nothing and says so; a different verdict is written and the earlier one is named in the reply. On a replica this queues instead of writing ('queued for the main machine' is not an error). Refused when the item is not live (retracted or archived) - there is nothing to judge. Also refused, with nothing written, when the item is pinned (Always-bound): the owner already answered by pinning it, so a verdict changes nothing - unpin it first if it should be judged instead. Replies with the verdict recorded, or the refusal text.", annotations(title = "Record a verdict", read_only_hint = false, destructive_hint = false, idempotent_hint = false, open_world_hint = false))]
+    #[tool(description = "Code lane: judges an item you were served or looked up. Default records that it HELPED, which clears noise recorded before it (a later noise mark still counts - the newest verdict wins). Pass noise:true for the opposite; two noise marks since the last useful one retire the item from the injection surfaces, though it stays fully findable via lookup. A second call THIS SESSION for the same id with the same verdict writes nothing and says so, unless the item fired 40 more times since, in which case it is owed again and written; a different verdict is written and the earlier one is named in the reply. On a replica this queues instead of writing ('queued for the main machine' is not an error). Refused when the item is not live (retracted or archived) - there is nothing to judge. Also refused, with nothing written, when the item is pinned (Always-bound): the owner already answered by pinning it, so a verdict changes nothing - unpin it first if it should be judged instead. Replies with the verdict recorded, or the refusal text.", annotations(title = "Record a verdict", read_only_hint = false, destructive_hint = false, idempotent_hint = false, open_world_hint = false))]
     async fn mark(&self, Parameters(args): Parameters<MarkArgs>) -> String {
         // A repeat of the SAME verdict on the SAME id, from THIS process, is
         // caught before anything else runs - before even a replica's own
@@ -2153,9 +2157,23 @@ impl ThorMcpServer {
         // boundary is the only session boundary this server can observe.
         // Nothing is written and nothing is queued: the store (or the drain,
         // for a replica) never sees a second identical judgement to count.
+        //
+        // EXCEPT WHEN THE ITEM WAS OWED AGAIN, since 2026-09-17. Measured
+        // (Printer-stuff eval 1): six items judged earlier in a long session
+        // fired 40+ more times since, doctor listed them as owed again, and
+        // this refusal had no way to pay that debt down in the same session
+        // - the project's own debt count stayed put no matter how many more
+        // times the item fired. So this refusal is no longer unconditional:
+        // it holds here, immediately, ONLY for a replica repeat (`prev.seq:
+        // None` - `capture` below never hands this process a real event seq
+        // to count firings against, so there is nothing here that could ever
+        // decide "owed again" for one). An AUTHORITY repeat (`prev.seq:
+        // Some`) is deferred into `self.blocking` below instead, where the
+        // real store can count `item_served` events since that seq - see the
+        // matching check inside the closure for the rest of this reasoning.
         let previous = self.mark_history.lock().unwrap_or_else(|p| p.into_inner()).get(&args.id).copied();
         if let Some(prev) = previous {
-            if prev.noise == args.noise {
+            if prev.noise == args.noise && prev.seq.is_none() {
                 return format!(
                     "already judged {} this session{}; not counted again",
                     prev.verdict_word(),
@@ -2188,6 +2206,47 @@ impl ThorMcpServer {
         let id_for_history = args.id.clone();
         let noise = args.noise;
         self.blocking(move |s| {
+            // THE AUTHORITY HALF OF THE "OWED AGAIN" CHECK (see the doc
+            // comment above this function's own early, replica-only refusal
+            // for the reasoning). `previous.seq` is `Some` here, never
+            // `None`: a `None` (replica) repeat already returned before this
+            // closure was ever built. Counted with `get_events_by_entity`
+            // rather than `serve::usefulness::served_since_last_verdict`
+            // (which folds the WHOLE log and resets on ANY verdict, not this
+            // session's own earlier one specifically) because the question
+            // here is narrower and exact: how many `item_served` events does
+            // THIS id carry with a seq past THIS session's own earlier
+            // verdict, regardless of what any other session judged before or
+            // after it.
+            let mut owed_again_note = String::new();
+            if let Some(prev) = previous {
+                if prev.noise == noise {
+                    let prev_seq = prev.seq.unwrap_or_else(|| {
+                        unreachable!("a seq:None repeat already returned before self.blocking")
+                    });
+                    let fired_since = s
+                        .get_events_by_entity(&args.id)
+                        .map(|events| {
+                            events
+                                .iter()
+                                .filter(|e| e.kind == thor_core::event_store::EventKind::ItemServed && e.seq > prev_seq)
+                                .count()
+                        })
+                        .unwrap_or(0);
+                    if fired_since < serve::usefulness::JUDGEMENT_DEBT_AFTER {
+                        return Err(format!(
+                            "already judged {} this session{}; not counted again",
+                            prev.verdict_word(),
+                            prev.seq_suffix()
+                        ));
+                    }
+                    owed_again_note = format!(
+                        "judged {} again: it fired {fired_since} more times since this session's earlier verdict \
+                         (event seq {prev_seq}), so it was owed a fresh one; ",
+                        prev.verdict_word()
+                    );
+                }
+            }
             // A VERDICT ON SOMETHING THAT IS GONE IS NOT A VERDICT. Measured
             // 2026-08-19: doctor named four items owed a judgement, all four
             // retracted, and marking one moved the counter to three. So the
@@ -2248,15 +2307,27 @@ impl ThorMcpServer {
                             args.id
                         )
                     };
+                    // The "stands in history" clause is about a DIFFERENT
+                    // earlier verdict this session gave way to - never about
+                    // the SAME verdict written again because it was owed
+                    // again (`owed_again_note`, prepended below, already
+                    // says everything that case needs said). Before the
+                    // "owed again" repeat existed, reaching this line with
+                    // `previous.is_some()` always meant a different verdict
+                    // - the same-verdict case returned earlier, before any
+                    // write - so this guard was implicit; now it has to be
+                    // explicit.
                     if let Some(prev) = previous {
-                        reply.push_str(&format!(
-                            " - this session's earlier {}{} stands in history; the later verdict is the one \
-                             that counts",
-                            prev.verdict_word(),
-                            prev.seq_suffix()
-                        ));
+                        if prev.noise != noise {
+                            reply.push_str(&format!(
+                                " - this session's earlier {}{} stands in history; the later verdict is the one \
+                                 that counts",
+                                prev.verdict_word(),
+                                prev.seq_suffix()
+                            ));
+                        }
                     }
-                    Ok(reply)
+                    Ok(format!("{owed_again_note}{reply}"))
                 }
                 Err(e) => Err(format!("could not record the mark: {e}")),
             }
@@ -6310,6 +6381,83 @@ mod tests {
         let noise_events =
             events.iter().filter(|e| e.kind == thor_core::event_store::EventKind::ItemMarkedNoise).count();
         assert_eq!(noise_events, 1, "the repeat must not have written a second noise event");
+    }
+
+    /// THE DEFECT THIS PREVENTS (measured 2026-09-17, Printer-stuff eval 1):
+    /// six items judged earlier in a long session fired 40+ more times,
+    /// doctor listed them as owed again, the second `mark` was refused, and
+    /// the project's debt stayed at 10 with no way to pay it down in that
+    /// same session. `serve::usefulness::JUDGEMENT_DEBT_AFTER` (40)
+    /// `item_served` events since the earlier verdict's own event seq is
+    /// enough to write the verdict again, with a reply that says why.
+    #[tokio::test]
+    async fn a_repeated_identical_verdict_is_written_again_once_it_fired_enough_more_times() {
+        let srv = server();
+        let mut args = base_remember("owed-again");
+        args.always = false;
+        args.targets = vec![TargetArg { kind: "command".to_string(), value: "owed-again-command".to_string() }];
+        srv.remember(Parameters(args)).await;
+
+        let first = srv.mark(Parameters(MarkArgs { id: "owed-again".to_string(), noise: true })).await;
+        assert!(first.contains("marked noise"), "{first}");
+
+        {
+            let mut store = srv.store.lock().unwrap();
+            for _ in 0..serve::usefulness::JUDGEMENT_DEBT_AFTER {
+                serve::deliver::record_delivery(&mut store, "s", "l", "hook", "2026-09-17T00:00:00Z", &["owed-again".to_string()]);
+            }
+        }
+
+        let second = srv.mark(Parameters(MarkArgs { id: "owed-again".to_string(), noise: true })).await;
+        assert!(
+            second.starts_with("judged noise again: it fired"),
+            "must open with the owed-again note, before the normal reply text: {second}"
+        );
+        assert!(
+            second.contains(&format!("it fired {} more times since this session's earlier verdict", serve::usefulness::JUDGEMENT_DEBT_AFTER)),
+            "{second}"
+        );
+        assert!(second.contains("event seq"), "must name the earlier verdict's own seq: {second}");
+        assert!(second.contains("marked noise"), "the normal reply text must still follow: {second}");
+
+        let store = srv.store.lock().unwrap();
+        let events = store.get_events_by_entity("owed-again").unwrap();
+        let noise_events =
+            events.iter().filter(|e| e.kind == thor_core::event_store::EventKind::ItemMarkedNoise).count();
+        assert_eq!(noise_events, 2, "owed again means written again: a second noise event must land");
+    }
+
+    /// THE BOUNDARY: one firing short of `JUDGEMENT_DEBT_AFTER` still refuses
+    /// exactly as before - "40 more times" has to mean AT LEAST 40, not
+    /// merely more than zero.
+    #[tokio::test]
+    async fn a_repeated_identical_verdict_one_short_of_the_threshold_still_refuses() {
+        let srv = server();
+        let mut args = base_remember("not-owed-again");
+        args.always = false;
+        args.targets = vec![TargetArg { kind: "command".to_string(), value: "not-owed-again-command".to_string() }];
+        srv.remember(Parameters(args)).await;
+
+        let first = srv.mark(Parameters(MarkArgs { id: "not-owed-again".to_string(), noise: true })).await;
+        assert!(first.contains("marked noise"), "{first}");
+
+        {
+            let mut store = srv.store.lock().unwrap();
+            for _ in 0..(serve::usefulness::JUDGEMENT_DEBT_AFTER - 1) {
+                serve::deliver::record_delivery(&mut store, "s", "l", "hook", "2026-09-17T00:00:00Z", &["not-owed-again".to_string()]);
+            }
+        }
+
+        let second = srv.mark(Parameters(MarkArgs { id: "not-owed-again".to_string(), noise: true })).await;
+        assert!(second.contains("already judged noise this session"), "{second}");
+        assert!(second.contains("not counted again"), "{second}");
+        assert!(!second.starts_with("judged noise again"), "one short of the threshold is not owed again: {second}");
+
+        let store = srv.store.lock().unwrap();
+        let events = store.get_events_by_entity("not-owed-again").unwrap();
+        let noise_events =
+            events.iter().filter(|e| e.kind == thor_core::event_store::EventKind::ItemMarkedNoise).count();
+        assert_eq!(noise_events, 1, "one short of the threshold must not write a second noise event");
     }
 
     /// The other half: a DIFFERENT verdict this session is written exactly as

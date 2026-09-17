@@ -34,6 +34,24 @@ pub const ITEM_SERVED_KIND: &str = "item_served";
 pub struct ItemServed {
     /// ISO-8601 timestamp of the moment this item was handed to a gate.
     pub served_at: String,
+    /// WHERE it fired: the command line as typed (truncated - see
+    /// `serve::deliver::TRIGGER_LIMIT`) for a command-triggered serve, the
+    /// file path for a file-triggered serve, the literal `"session start"`
+    /// for the Always block at `SessionStart`, or `None` for every other
+    /// surface (a prompt-triggered serve, or a body this crate did not write
+    /// itself). Added 2026-09-17 - `#[serde(default)]` so an event written
+    /// before this field existed still deserializes, as `None` rather than a
+    /// parse failure (see `served_round_trips_without_a_trigger` below).
+    ///
+    /// THE DEFECT THIS CLOSES. `serve::usefulness::judgement_debt_named`
+    /// named an item's binding, but never WHERE among the places that
+    /// binding reaches it had actually been firing - and an evaluation's own
+    /// question is "did it belong where it fired". Measured 2026-09-17:
+    /// acme-shop eval 1 skipped two owed items outright because it could
+    /// not see where they fired; eval 2 skipped three more from the same
+    /// gap in a different session of the same project.
+    #[serde(default)]
+    pub trigger: Option<String>,
 }
 
 /// How many days back `served_count` looks by default - see its own doc
@@ -64,6 +82,32 @@ pub fn served_count(store: &EventStore, item_id: &str, now: &str, window_days: i
         .filter_map(|body| unix_from_iso8601(&body.served_at))
         .filter(|&secs| secs >= threshold)
         .count()
+}
+
+/// The `trigger` of the newest `item_served` event on record for `item_id` -
+/// the place an evaluation must judge "did it belong there" against (see
+/// `ItemServed::trigger`'s own doc comment for the defect this closes).
+/// `None` when the item has never fired, when its newest serving predates
+/// this field (an old body still parses, per `#[serde(default)]`, just with
+/// `trigger: None`), or when that serving simply carried no trigger of its
+/// own (a prompt-triggered serve).
+///
+/// `get_events_by_entity` returns events oldest first (`seq` ascending - see
+/// its own doc comment in `thor_core`), so the newest is the last one that
+/// parses as an `ItemServed`, found by walking from the end rather than
+/// sorting a whole copy of the list.
+///
+/// Fails open to `None` on a broken log, the same reasoning `served_count`
+/// above already gives: the only thing this ever feeds is the wording of an
+/// advisory line, never a refusal.
+pub fn last_trigger(store: &EventStore, item_id: &str) -> Option<String> {
+    let events = store.get_events_by_entity(item_id).ok()?;
+    events
+        .iter()
+        .rev()
+        .filter(|e| e.kind == EventKind::ItemServed)
+        .find_map(|e| serde_json::from_str::<ItemServed>(&e.body).ok())
+        .and_then(|body| body.trigger)
 }
 
 /// Days since the Unix epoch -> (year, month, day), proleptic Gregorian,
@@ -124,10 +168,23 @@ mod tests {
 
     #[test]
     fn item_served_round_trips() {
-        let body = ItemServed { served_at: "2026-08-02T12:00:00Z".to_string() };
+        let body = ItemServed { served_at: "2026-08-02T12:00:00Z".to_string(), trigger: Some("git push".to_string()) };
         let json = serde_json::to_string(&body).unwrap();
         let back: ItemServed = serde_json::from_str(&json).unwrap();
         assert_eq!(body, back);
+    }
+
+    /// THE DEFECT THIS PREVENTS: a body written before `trigger` existed - no
+    /// such key in its JSON at all, not merely a `null` - must still
+    /// deserialize, as `None`, rather than fail to parse. Every reader on
+    /// this boundary (`served_count`, `last_trigger`) fails open to a
+    /// default on a body that does not parse, so a body that FAILS to parse
+    /// here would silently read as "never served" instead of "served, no
+    /// trigger recorded" - two different facts.
+    #[test]
+    fn served_round_trips_without_a_trigger() {
+        let back: ItemServed = serde_json::from_str(r#"{"served_at":"2026-08-02T12:00:00Z"}"#).unwrap();
+        assert_eq!(back, ItemServed { served_at: "2026-08-02T12:00:00Z".to_string(), trigger: None });
     }
 
     /// Known values, cross-checked against `serve::time::iso8601_from_unix`'s
@@ -152,7 +209,15 @@ mod tests {
     }
 
     fn record_served(store: &mut EventStore, id: &str, served_at: &str) {
-        let body = serde_json::to_string(&ItemServed { served_at: served_at.to_string() }).unwrap();
+        record_served_with_trigger(store, id, served_at, None);
+    }
+
+    fn record_served_with_trigger(store: &mut EventStore, id: &str, served_at: &str, trigger: Option<&str>) {
+        let body = serde_json::to_string(&ItemServed {
+            served_at: served_at.to_string(),
+            trigger: trigger.map(str::to_string),
+        })
+        .unwrap();
         store.append_event("s", "l", "t", EventKind::ItemServed, id, None, &body).unwrap();
     }
 
@@ -177,5 +242,52 @@ mod tests {
         record_served(&mut store, "i1", "2026-08-20T00:00:00Z"); // 23 days back: inside
         record_served(&mut store, "i1", "2026-09-10T00:00:00Z"); // 2 days back: inside
         assert_eq!(served_count(&store, "i1", now, SERVED_WINDOW_DAYS), 2);
+    }
+
+    #[test]
+    fn last_trigger_is_none_for_an_item_never_served() {
+        let store = EventStore::in_memory().unwrap();
+        assert_eq!(last_trigger(&store, "never-served"), None);
+    }
+
+    #[test]
+    fn last_trigger_reads_the_newest_serving_not_the_first() {
+        let mut store = EventStore::in_memory().unwrap();
+        record_served_with_trigger(&mut store, "i1", "2026-09-10T00:00:00Z", Some("git push"));
+        record_served_with_trigger(&mut store, "i1", "2026-09-11T00:00:00Z", Some("src/main.rs"));
+        assert_eq!(last_trigger(&store, "i1").as_deref(), Some("src/main.rs"));
+    }
+
+    /// A serving with no trigger of its own (a prompt-triggered serve) is
+    /// still the NEWEST one, and must read as `None` rather than falling
+    /// back to an older serving's trigger - "no trigger on the newest
+    /// firing" and "no newest firing at all" both answer `None`, on purpose,
+    /// since the caller (`ops::health::judgement_debt_line`) only ever
+    /// prints something when this is `Some`.
+    #[test]
+    fn last_trigger_is_none_when_the_newest_serving_carried_none() {
+        let mut store = EventStore::in_memory().unwrap();
+        record_served_with_trigger(&mut store, "i1", "2026-09-10T00:00:00Z", Some("git push"));
+        record_served(&mut store, "i1", "2026-09-11T00:00:00Z");
+        assert_eq!(last_trigger(&store, "i1"), None);
+    }
+
+    /// A body written before `trigger` existed still deserializes (as
+    /// `trigger: None`, per `#[serde(default)]`) rather than failing to
+    /// parse, so it reads as a real, triggerless serving - not as "skip this
+    /// one, it does not exist". A GENUINELY unreadable newest body (missing
+    /// even `served_at`, which has no default) is the one shape `last_
+    /// trigger` actually walks past, falling through to an older serving
+    /// that does parse.
+    #[test]
+    fn last_trigger_walks_past_a_newest_body_that_fails_to_parse_at_all() {
+        let mut store = EventStore::in_memory().unwrap();
+        record_served_with_trigger(&mut store, "i1", "2026-09-09T00:00:00Z", Some("git push"));
+        store.append_event("s", "l", "t", EventKind::ItemServed, "i1", None, "{}").unwrap();
+        assert_eq!(
+            last_trigger(&store, "i1").as_deref(),
+            Some("git push"),
+            "a newest body with no served_at at all fails to parse and must not hide an older, readable trigger"
+        );
     }
 }

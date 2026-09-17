@@ -828,26 +828,29 @@ fn bindings_short(bindings: &[model::item::Binding]) -> String {
 /// from the store itself, not only from the sidecar, so a report no Stop
 /// has looked at yet is still named (see `serve::usefulness::newest_
 /// evaluation_report`'s own doc comment for why the sidecar alone cannot
-/// answer this) - and the day it was first seen; whether TODAY's evaluation
-/// (the current UTC calendar day, `serve::usefulness::eval_done_today`) is
-/// already done; and, only when it is NOT, how many times this project has
-/// been asked since its last report, since when, and that the Stop hook
-/// blocks every turn once a session has accrued an hour of work here. That
-/// last note is necessarily approximate about the accrued-work half:
-/// `doctor` runs cold, outside any session, so it can name whether today's
-/// report exists but never with full certainty how long any PARTICULAR
-/// session has worked here right now (`serve::usefulness::
-/// EVAL_FIRST_WORK_MINUTES`/`EVAL_REPEAT_WORK_MINUTES`) - only a real Stop,
-/// inside a real session, can ever know that for certain. Since 2026-09-17
-/// (fifth rewrite, `serve::usefulness`'s own "evaluation debt" section) this
-/// line also names the MOST RECENTLY ACTIVE session's own accrued total from
-/// the sidecar (`serve::usefulness::most_recently_active_session`) and when
-/// it is next due - the closest a cold read gets to an honest answer, and
-/// explicitly named as coming from the sidecar rather than a live
-/// measurement. Also names, once today's report already exists, that a
-/// REPEAT evaluation follows after `EVAL_REPEAT_WORK_MINUTES` more of
-/// accrued work since it, rather than staying silent until the next UTC
-/// day. READ-ONLY: this reads the
+/// answer this) - and the day it was first seen; whether the last one still
+/// COVERS this project (a rolling `serve::usefulness::
+/// EVAL_REPORT_COVERS_HOURS`-hour window, `serve::usefulness::
+/// eval_report_covers` - replaced the UTC calendar day 2026-09-17, seventh
+/// rewrite, `serve::usefulness`'s own "evaluation debt" section, for the
+/// measured case a calendar day got wrong); and, only when it does NOT, how
+/// many times this project has been asked since its last report, since
+/// when, and that the Stop hook blocks every turn once a session has
+/// accrued an hour of work here. That last note is necessarily approximate
+/// about the accrued-work half: `doctor` runs cold, outside any session, so
+/// it can name whether a covering report exists but never with full
+/// certainty how long any PARTICULAR session has worked here right now
+/// (`serve::usefulness::EVAL_FIRST_WORK_MINUTES`/`EVAL_REPEAT_WORK_
+/// MINUTES`) - only a real Stop, inside a real session, can ever know that
+/// for certain. Since 2026-09-17 (fifth rewrite, `serve::usefulness`'s own
+/// "evaluation debt" section) this line also names the MOST RECENTLY ACTIVE
+/// session's own accrued total from the sidecar (`serve::usefulness::
+/// most_recently_active_session`) and when it is next due - the closest a
+/// cold read gets to an honest answer, and explicitly named as coming from
+/// the sidecar rather than a live measurement. Also names, once a covering
+/// report already exists, that a REPEAT evaluation follows after
+/// `EVAL_REPEAT_WORK_MINUTES` more of accrued work since it, rather than
+/// staying silent for the rest of the window. READ-ONLY: this reads the
 /// evaluation debt's own sidecar (`serve::usefulness::project_eval_state`)
 /// but, unlike the Stop hook's own `update_eval_debt_state`/`record_eval_
 /// debt_asked`, never writes it - a diagnostic that mutated state on every
@@ -914,10 +917,10 @@ pub fn judgement_debt_line(db: &Path, checkout_project: Option<&str>, full: bool
                 Some((id, _seq)) => format!("newest evaluation report '{id}' in the store, not yet seen by a Stop"),
             };
             out[0].push_str(&format!(" - {report_clause}"));
-            let done_today = serve::usefulness::eval_done_today(state.last_evaluation_seen, now);
-            if done_today {
+            let covered = serve::usefulness::eval_report_covers(state.last_evaluation_seen, now);
+            if covered {
                 out[0].push_str(
-                    "; today's evaluation is done, and a repeat is due once three more hours of accrued work go by since it \
+                    "; the last evaluation still covers this project, and a repeat is due once three more hours of accrued work go by since it \
                      AND a risk shows up too (three or more untested edits since the last test or build run, or a context \
                      summary) - time alone never triggers a repeat",
                 );
@@ -929,8 +932,9 @@ pub fn judgement_debt_line(db: &Path, checkout_project: Option<&str>, full: bool
                     None => "not asked yet".to_string(),
                 };
                 out[0].push_str(&format!(
-                    "; today's evaluation is not done - {ask_clause}; the Stop hook blocks every turn once a session \
-                     has accrued an hour of work here, until the report is filed"
+                    "; no evaluation in the last {} hours - {ask_clause}; the Stop hook blocks every turn once a session \
+                     has accrued an hour of work here, until the report is filed",
+                    serve::usefulness::EVAL_REPORT_COVERS_HOURS
                 ));
             }
             // THE MOST RECENTLY ACTIVE SESSION'S OWN ACCRUAL, since the fifth
@@ -948,7 +952,7 @@ pub fn judgement_debt_line(db: &Path, checkout_project: Option<&str>, full: bool
             if let Some((session_id, work)) = serve::usefulness::most_recently_active_session(&state) {
                 let accrued_minutes = work.accrued_secs / 60;
                 let threshold =
-                    if done_today { serve::usefulness::EVAL_REPEAT_WORK_MINUTES } else { serve::usefulness::EVAL_FIRST_WORK_MINUTES };
+                    if covered { serve::usefulness::EVAL_REPEAT_WORK_MINUTES } else { serve::usefulness::EVAL_FIRST_WORK_MINUTES };
                 let due_clause = match (threshold - accrued_minutes).max(0) {
                     0 => "already due".to_string(),
                     remaining => format!("due after {remaining} more minute(s) of accrued work"),
@@ -981,8 +985,19 @@ pub fn judgement_debt_line(db: &Path, checkout_project: Option<&str>, full: bool
     let named = serve::usefulness::judgement_debt_named(&store, checkout_project);
     let cap = name_cap(full);
     for item in named.iter().take(cap) {
+        // ", last fired at '<trigger>'" only when the newest serving on
+        // record actually carried one - see `JudgementDebtItem::last_
+        // trigger`'s own doc comment for the three cases that answer `None`.
+        // Without this an evaluation could see WHERE an item was BOUND but
+        // not where among that binding's own reach it had actually been
+        // firing - measured 2026-09-17 (acme-shop eval 1 and 2): five
+        // owed items were skipped outright for exactly that gap.
+        let last_fired = match &item.last_trigger {
+            Some(trigger) => format!(", last fired at '{trigger}'"),
+            None => String::new(),
+        };
         out.push(format!(
-            "  judgement debt: {} ({}x, {:?}) at {}",
+            "  judgement debt: {} ({}x, {:?}) at {}{last_fired}",
             item.id,
             item.count,
             item.kind,
@@ -1521,22 +1536,41 @@ pub fn crowding_line(db: &Path, checkouts: Option<&Path>, full: bool) -> String 
 
     // Every distinct anchor that resolves, and the pool it stands for.
     let mut anchors: std::collections::BTreeSet<(String, String)> = Default::default();
+    // Every distinct COMMAND binding value of a live item whose project
+    // resolves to one of the checkouts above - probed the same way a Path
+    // anchor is, just below, but with nothing on disk to check for existence
+    // against: a command is text a Rule/Orientation names, never a file this
+    // function could look up. Added 2026-09-17 (measured, Printer-stuff eval
+    // 2): `serve why --command "node tools/push.mjs"` showed 7 items
+    // applying and 4 shown, while this line, probing files only, reported
+    // nothing for that project - the crowd was real and this line could not
+    // see it.
+    let mut command_anchors: std::collections::BTreeSet<(String, String)> = Default::default();
     for li in serve::live::live_items(&store).iter().filter(|li| li.item.kind.can_fire()) {
         let Some(project) = li.item.project.clone() else { continue };
         let Some(base) = roots.get(&project) else { continue };
         for binding in &li.item.bindings {
-            let model::item::Binding::Target { kind: model::item::TargetKind::Path, value } = binding else {
-                continue;
-            };
-            if value.contains(':') || value.starts_with('/') || value.starts_with("\\\\") {
-                continue;
-            }
-            if base.join(value.replace('\\', "/")).exists() {
-                anchors.insert((project.clone(), value.clone()));
+            match binding {
+                model::item::Binding::Target { kind: model::item::TargetKind::Path, value } => {
+                    if value.contains(':') || value.starts_with('/') || value.starts_with("\\\\") {
+                        continue;
+                    }
+                    if base.join(value.replace('\\', "/")).exists() {
+                        anchors.insert((project.clone(), value.clone()));
+                    }
+                }
+                model::item::Binding::Target { kind: model::item::TargetKind::Command, value } => {
+                    command_anchors.insert((project.clone(), value.clone()));
+                }
+                _ => {}
             }
         }
     }
-    if anchors.is_empty() {
+    // Loaded ONCE for every probe below - see `serve::serve_with_decay`'s own
+    // doc comment for the day this loop's own command anchors doubled this
+    // line's runtime by re-folding an unchanging log per probe.
+    let decay = serve::decay::DecayContext::load(&store);
+    if anchors.is_empty() && command_anchors.is_empty() {
         return "crowding: no resolvable anchor to probe, nothing to say".to_string();
     }
 
@@ -1556,7 +1590,7 @@ pub fn crowding_line(db: &Path, checkouts: Option<&Path>, full: bool) -> String 
         // The project is what `rank::select` filters on. Leaving it out serves
         // only global items and makes every pool look empty.
         input.project = Some(project.clone());
-        let served = serve::serve(&store, &input);
+        let served = serve::serve_with_decay(&store, &input, &decay);
         let shown: std::collections::HashSet<&str> =
             served.selection.shown.iter().map(|r| r.id.as_str()).collect();
         for r in &served.all {
@@ -1569,6 +1603,31 @@ pub fn crowding_line(db: &Path, checkouts: Option<&Path>, full: bool) -> String 
         }
         if worst.as_ref().map(|(n, _, _)| served.all.len() > *n).unwrap_or(true) {
             worst = Some((served.all.len(), project.clone(), path.clone()));
+        }
+    }
+    // The identical probe, for a command anchor instead of a file - see
+    // `command_anchors`'s own doc comment above for why this exists. Named
+    // "<command> (command)" everywhere a path would otherwise print bare, so
+    // a reader can tell the two apart in `lost_at` and in the worst-pool
+    // line below without opening the store.
+    for (project, command) in &command_anchors {
+        let mut input = serve::input::ServeInput::default();
+        input.add_command(command);
+        input.project = Some(project.clone());
+        let served = serve::serve_with_decay(&store, &input, &decay);
+        let shown: std::collections::HashSet<&str> =
+            served.selection.shown.iter().map(|r| r.id.as_str()).collect();
+        let where_lost = format!("{command} (command)");
+        for r in &served.all {
+            eligible.insert(r.id.clone());
+            if shown.contains(r.id.as_str()) {
+                reachable.insert(r.id.clone());
+            } else {
+                lost_at.entry(r.id.clone()).or_insert_with(|| format!("{where_lost} in {project}"));
+            }
+        }
+        if worst.as_ref().map(|(n, _, _)| served.all.len() > *n).unwrap_or(true) {
+            worst = Some((served.all.len(), project.clone(), where_lost));
         }
     }
 
@@ -2039,6 +2098,63 @@ mod tests {
         );
     }
 
+    /// THE DEFECT THIS PREVENTS (measured 2026-09-17): acme-shop eval 1
+    /// skipped two owed items because it could not see where they fired;
+    /// eval 2 skipped three more from the same gap in another session of the
+    /// same project. The named list now prints the newest serving's own
+    /// trigger after the binding, so "did it belong where it fired" has an
+    /// answer to judge.
+    #[test]
+    fn judgement_debt_line_names_the_last_trigger_when_one_was_recorded() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("t.db");
+        {
+            let mut store = EventStore::new(&db).unwrap();
+            let mut item = rule("owed-with-trigger");
+            item.bindings = vec![Binding::Target { kind: TargetKind::Command, value: "npm run deploy".to_string() }];
+            item.project = Some("thor".to_string());
+            store::declare(&mut store, "s", "l", "a", &item).unwrap();
+            for _ in 0..(serve::usefulness::JUDGEMENT_DEBT_AFTER - 1) {
+                serve::deliver::record_delivery(&mut store, "s", "l", "t", "2026-09-08T00:00:00Z", &["owed-with-trigger".to_string()]);
+            }
+            serve::deliver::record_delivery_with_trigger(
+                &mut store,
+                "s",
+                "l",
+                "hook",
+                "2026-09-17T00:00:00Z",
+                &["owed-with-trigger".to_string()],
+                Some("npm run deploy"),
+            );
+        }
+        let line = judgement_debt_line(&db, Some("thor"), false).expect("something is owed, the line must speak");
+        assert!(
+            line.contains("  judgement debt: owed-with-trigger (") && line.contains(", last fired at 'npm run deploy'"),
+            "must name where the newest serving actually fired: {line}"
+        );
+    }
+
+    /// The contrast: no trigger ever recorded (every delivery in this
+    /// fixture is a plain `record_delivery`) must print no suffix at all,
+    /// never "last fired at 'None'" or an empty pair of quotes.
+    #[test]
+    fn judgement_debt_line_names_no_trigger_clause_when_none_was_ever_recorded() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("t.db");
+        {
+            let mut store = EventStore::new(&db).unwrap();
+            let mut item = rule("owed-without-trigger");
+            item.bindings = vec![Binding::Target { kind: TargetKind::Command, value: "npm run build".to_string() }];
+            item.project = Some("thor".to_string());
+            store::declare(&mut store, "s", "l", "a", &item).unwrap();
+            for _ in 0..serve::usefulness::JUDGEMENT_DEBT_AFTER {
+                serve::deliver::record_delivery(&mut store, "s", "l", "t", "2026-09-08T00:00:00Z", &["owed-without-trigger".to_string()]);
+            }
+        }
+        let line = judgement_debt_line(&db, Some("thor"), false).expect("something is owed, the line must speak");
+        assert!(!line.contains("last fired at"), "no trigger was ever recorded, so nothing must be named: {line}");
+    }
+
     /// A checkout that resolves to no project at all still gets an honest
     /// answer - the global share of the backlog, said plainly rather than
     /// silently dropped - and still gets the item itself named.
@@ -2205,27 +2321,28 @@ mod tests {
         std::fs::write(serve::usefulness::eval_debt_state_path(db), serde_json::to_string(&all).unwrap()).unwrap();
     }
 
-    /// The Unix instant of the most recent UTC midnight before the real
-    /// "now" - lets a test build a fixture timestamp `serve::usefulness::
-    /// eval_done_today` will always agree is "today", regardless of what
-    /// wall-clock hour the test suite happens to run at. Mirrors `bin/
-    /// serve.rs`'s own test-only `start_of_today_utc` helper.
-    fn start_of_today_utc() -> i64 {
-        let now = serve::time::now_unix();
-        now - now.rem_euclid(86400)
+    /// An instant `serve::usefulness::eval_report_covers` will always agree
+    /// still covers, relative to the real "now" - regardless of what
+    /// wall-clock hour the test suite happens to run at. Replaces the
+    /// retired `start_of_today_utc` (seventh rewrite, 2026-09-17: the UTC
+    /// calendar day it measured against is gone). Mirrors `bin/serve.rs`'s
+    /// own test-only `recently_covered` helper.
+    fn recently_covered() -> i64 {
+        serve::time::now_unix() - 3600
     }
 
     /// THE EVALUATION DEBT'S OWN TAIL, since 2026-09-12 (trigger rewritten
-    /// four times, three of them on 2026-09-16, most recently to a UTC
-    /// calendar day with no `tracking_since` grace period at all - see
-    /// `serve::usefulness`'s own "evaluation debt" section for why): with no
-    /// sidecar at all yet, a real backlog still gets its tail, and - UNLIKE
-    /// THE RETIRED `tracking_since` GRACE PERIOD - the "not done" note
-    /// appears immediately: no report has ever been seen, so today's
-    /// evaluation cannot possibly be done, from the very first Stop this
-    /// project is ever seen at.
+    /// several times, most recently (2026-09-17, seventh rewrite) from a UTC
+    /// calendar day to a rolling `serve::usefulness::EVAL_REPORT_COVERS_
+    /// HOURS`-hour window, with no `tracking_since` grace period at all -
+    /// see `serve::usefulness`'s own "evaluation debt" section for why: with
+    /// no sidecar at all yet, a real backlog still gets its tail, and -
+    /// UNLIKE THE RETIRED `tracking_since` GRACE PERIOD - the "not covered"
+    /// note appears immediately: no report has ever been seen, so nothing
+    /// can possibly cover, from the very first Stop this project is ever
+    /// seen at.
     #[test]
-    fn judgement_debt_line_shows_todays_evaluation_not_done_with_no_sidecar_at_all() {
+    fn judgement_debt_line_shows_no_evaluation_in_the_window_with_no_sidecar_at_all() {
         let dir = tempfile::tempdir().unwrap();
         let db = dir.path().join("t.db");
         {
@@ -2234,7 +2351,7 @@ mod tests {
         }
         let line = judgement_debt_line(&db, Some("thor"), false).expect("a real backlog, the line must speak");
         assert!(line.contains("the store holds no evaluation report for this project"), "{line}");
-        assert!(line.contains("today's evaluation is not done"), "{line}");
+        assert!(line.contains("no evaluation in the last 16 hours"), "{line}");
         assert!(line.contains("not asked yet"), "{line}");
         assert!(
             line.contains("the Stop hook blocks every turn once a session has accrued an hour of work here"),
@@ -2243,9 +2360,10 @@ mod tests {
     }
 
     /// Once the sidecar carries a non-zero ask count and a first-asked
-    /// instant, the tail names both, alongside the "not done" note.
+    /// instant, the tail names both, alongside the "no evaluation in the
+    /// window" note.
     #[test]
-    fn judgement_debt_line_names_the_ask_count_and_first_asked_day_when_not_done_today() {
+    fn judgement_debt_line_names_the_ask_count_and_first_asked_day_when_nothing_covers() {
         let dir = tempfile::tempdir().unwrap();
         let db = dir.path().join("t.db");
         {
@@ -2260,7 +2378,7 @@ mod tests {
         );
         let line = judgement_debt_line(&db, Some("thor"), false).expect("a real backlog, the line must speak");
         assert!(line.contains("the store holds no evaluation report for this project"), "{line}");
-        assert!(line.contains("today's evaluation is not done"), "{line}");
+        assert!(line.contains("no evaluation in the last 16 hours"), "{line}");
         assert!(line.contains("asked 4 time(s), the first 2 day(s) ago"), "{line}");
         assert!(
             line.contains("the Stop hook blocks every turn once a session has accrued an hour of work here"),
@@ -2273,7 +2391,7 @@ mod tests {
     /// project still names its own judgement debt (a global item, exactly
     /// like `judgement_debt_line_still_speaks_for_a_checkout_with_no_
     /// project` above), but the evaluation tail names nothing at all - not
-    /// a report clause, not a "today's evaluation" status, not an ask count
+    /// a report clause, not a coverage status, not an ask count
     /// - and says plainly that the evaluation is only ever asked inside a
     /// project. Proven even with a sidecar entry already carrying an ask
     /// count and a first-asked clock - the exact shape a sidecar written
@@ -2307,7 +2425,10 @@ mod tests {
             "must say plainly why there is nothing else here: {line}"
         );
         assert!(!line.contains("the store holds no evaluation report"), "must never name a report clause for no project: {line}");
-        assert!(!line.contains("today's evaluation"), "must never claim any evaluation status for no project: {line}");
+        assert!(
+            !line.contains("still covers this project") && !line.contains("no evaluation in the last"),
+            "must never claim any evaluation status for no project: {line}"
+        );
         assert!(!line.contains("asked 9 time(s)"), "must never name an ask count for no project: {line}");
         assert!(
             !line.contains("the Stop hook blocks every turn"),
@@ -2315,16 +2436,16 @@ mod tests {
         );
     }
 
-    /// A report seen TODAY still names itself and its age, and says
-    /// plainly that today's evaluation is done - and the "not done"/ask
-    /// clauses and the Stop-hook note are all absent. The report must be a
-    /// REAL live Report in the store, not merely a sidecar entry - see
-    /// `declare_report`'s own doc comment.
+    /// A recently seen report still names itself and its age, and says
+    /// plainly that the last evaluation still covers this project - and the
+    /// "no evaluation in the window"/ask clauses and the Stop-hook note are
+    /// all absent. The report must be a REAL live Report in the store, not
+    /// merely a sidecar entry - see `declare_report`'s own doc comment.
     #[test]
-    fn judgement_debt_line_names_a_report_seen_today_and_says_todays_evaluation_is_done() {
+    fn judgement_debt_line_names_a_recently_seen_report_and_says_it_still_covers() {
         let dir = tempfile::tempdir().unwrap();
         let db = dir.path().join("t.db");
-        let today = start_of_today_utc();
+        let today = recently_covered();
         {
             let mut store = EventStore::new(&db).unwrap();
             declare_owed_for_eval_debt(&mut store, 12, "thor");
@@ -2345,15 +2466,15 @@ mod tests {
             line.contains("newest evaluation report 'eval-thor-2026-09-14', first seen by a Stop 0 day(s) ago"),
             "{line}"
         );
-        assert!(line.contains("today's evaluation is done"), "{line}");
-        assert!(!line.contains("today's evaluation is not done"), "{line}");
-        assert!(!line.contains("the Stop hook blocks every turn"), "a report seen today must leave out the blocking note: {line}");
+        assert!(line.contains("the last evaluation still covers this project"), "{line}");
+        assert!(!line.contains("no evaluation in the last"), "{line}");
+        assert!(!line.contains("the Stop hook blocks every turn"), "a report that still covers must leave out the blocking note: {line}");
     }
 
     /// UNLIKE THE OLD CEILING GATE: the evaluation tail no longer depends on
     /// how many items are owed at all - even a single owed item (nowhere
-    /// near what used to be the ceiling of ten) still shows the "not done"
-    /// note.
+    /// near what used to be the ceiling of ten) still shows the "no
+    /// evaluation in the window" note.
     #[test]
     fn the_evaluation_tail_speaks_regardless_of_how_few_items_are_owed() {
         let dir = tempfile::tempdir().unwrap();
@@ -2365,7 +2486,7 @@ mod tests {
             declare_owed_for_eval_debt(&mut store, 1, "thor");
         }
         let line = judgement_debt_line(&db, Some("thor"), false).expect("one item is still owed, the line must speak");
-        assert!(line.contains("today's evaluation is not done"), "{line}");
+        assert!(line.contains("no evaluation in the last 16 hours"), "{line}");
         assert!(
             line.contains("the Stop hook blocks every turn once a session has accrued an hour of work here"),
             "{line}"
@@ -2502,14 +2623,14 @@ mod tests {
         assert!(line.contains("already due"), "{line}");
     }
 
-    /// A report already seen today shifts BOTH the top-level wording (a
+    /// A report that still covers shifts BOTH the top-level wording (a
     /// repeat evaluation, not a first one) and the per-session threshold to
     /// `EVAL_REPEAT_WORK_MINUTES` rather than `EVAL_FIRST_WORK_MINUTES`.
     #[test]
-    fn judgement_debt_line_uses_the_repeat_threshold_once_todays_report_already_exists() {
+    fn judgement_debt_line_uses_the_repeat_threshold_once_a_covering_report_already_exists() {
         let dir = tempfile::tempdir().unwrap();
         let db = dir.path().join("t.db");
-        let today = start_of_today_utc();
+        let today = recently_covered();
         {
             let mut store = EventStore::new(&db).unwrap();
             declare_owed_for_eval_debt(&mut store, 12, "thor");
@@ -2532,7 +2653,7 @@ mod tests {
         );
         let line = judgement_debt_line(&db, Some("thor"), false).expect("a real backlog, the line must speak");
         assert!(
-            line.contains("today's evaluation is done, and a repeat is due once three more hours of accrued work go by since it"),
+            line.contains("the last evaluation still covers this project, and a repeat is due once three more hours of accrued work go by since it"),
             "{line}"
         );
         assert!(line.contains("time alone never triggers a repeat"), "the risk gate must be named plainly: {line}");
@@ -3287,6 +3408,40 @@ mod tests {
         let line = crowding_line(&db, Some(&checkouts), false);
         assert!(line.starts_with("crowding:"), "{line}");
         assert!(!line.contains("--checkouts"), "a checkout WAS given: {line}");
+    }
+
+    /// THE DEFECT THIS PREVENTS (measured 2026-09-17, Printer-stuff eval 2):
+    /// `serve why --command "node tools/push.mjs"` showed 7 items applying
+    /// and 4 shown, while this line - probing `TargetKind::Path` bindings
+    /// only - reported nothing for that project at all. More than
+    /// `serve::render::MAX_ITEMS` live items bound to the same COMMAND must
+    /// be counted and named too, the invisible ones tagged "(command)" so a
+    /// reader can tell them apart from a file anchor in the same list.
+    #[test]
+    fn crowding_line_also_probes_a_command_anchor_and_names_it_as_such() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("t.db");
+        let checkouts = dir.path().join("dev");
+        let repo = checkouts.join("Cmd-Project");
+        std::fs::create_dir_all(repo.join(".git")).unwrap();
+        {
+            let mut store = EventStore::new(&db).unwrap();
+            for i in 0..(serve::render::MAX_ITEMS + 1) {
+                let mut item = rule(&format!("cmd-crowd-{i}"));
+                item.text = format!("fixture command crowd case {i}");
+                item.project = Some("Cmd-Project".to_string());
+                item.bindings =
+                    vec![Binding::Target { kind: TargetKind::Command, value: "npm run deploy".to_string() }];
+                legacy_declare(&mut store, &item);
+            }
+            let line = crowding_line(&db, Some(&checkouts), false);
+            assert!(line.starts_with("crowding:"), "{line}");
+            assert!(!line.contains("none -"), "a real command crowd must not read as healthy: {line}");
+            assert!(
+                line.contains("npm run deploy (command) in Cmd-Project"),
+                "the command anchor must be named, tagged, and scoped to its project: {line}"
+            );
+        }
     }
 
     // ------------------------------------------------------- semantic_line

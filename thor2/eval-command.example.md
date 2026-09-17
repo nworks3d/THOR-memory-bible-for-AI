@@ -25,22 +25,21 @@ item, once per turn. That is the same debt this routine pays; here you
 settle it deliberately, over the whole session, instead of one item at a
 time.
 
-Every day, in every project a session actually works in, once that session
-has put in at least an hour there, the Stop hook requires this evaluation
-before a turn can end - not once per session: it blocks the FIRST Stop of
-EVERY turn, regardless of how many notes currently owe a verdict, for as
-long as no evaluation report has yet been filed for this project TODAY (the
-current UTC calendar day - not the owner's own local day, since this
-workspace has no way to resolve his local time zone). It names how many
-times it has already asked, and since when. Filing the report below is what
-goes quiet - but not necessarily until the next UTC day: once three more
-hours of accrued work go by since that report, AND a real risk has shown up
-since then too - three or more code changes with no test or build run in
-between, or a context summary - the obligation returns the same day, as a
-repeat covering only what happened since that report (see the SCOPE note
-under step 2). Three quiet hours with neither risk stays silent. It only
-ever asks inside a project: a checkout that resolves to no project is never
-asked, since there would be no way to file the report that silences it.
+In every project a session actually works in, once that session has put in
+at least an hour there, the Stop hook requires this evaluation before a turn
+can end - not once per session: it blocks the FIRST Stop of EVERY turn,
+regardless of how many notes currently owe a verdict, for as long as no
+evaluation report filed for this project still covers it (within the last
+16 hours). It names how many times it has already asked, and since when.
+Filing the report below is what goes quiet - but not necessarily for the
+full 16 hours: once three more hours of accrued work go by since that
+report, AND a real risk has shown up since then too - three or more code
+changes with no test or build run in between, or a context summary - the
+obligation returns while the report still covers, as a repeat covering only
+what happened since that report (see the SCOPE note under step 2). Three
+quiet hours with neither risk stays silent. It only ever asks inside a
+project: a checkout that resolves to no project is never asked, since there
+would be no way to file the report that silences it.
 
 ---
 
@@ -85,11 +84,11 @@ still to be probed. For each: settle it now, or carry it into this report's
 own open points with the reason it is still open. No previous report? Say so
 and move on.
 
-SCOPE: if an evaluation report for this project was already filed earlier
-TODAY, this evaluation covers only what happened SINCE that report - not the
-whole session, and not the whole day. Judge only what fired since then;
-everything the previous report already covers is not this evaluation's
-business again.
+SCOPE: if an evaluation report for this project was already filed within the
+last 16 hours, this evaluation covers only what happened SINCE that report -
+not the whole session, and not the whole 16 hours. Judge only what fired
+since then; everything the previous report already covers is not this
+evaluation's business again.
 
 The test is not "was it useful" but **did it belong where it fired**.
 - `mcp__thor__mark(id: "<id>")` - it belonged there.
@@ -378,8 +377,8 @@ and text the full report exactly as you gave it to the owner. This is a
 dated record, not a rule - the health-check numbers may appear in it, and it
 never fires on its own. It is also what tells THOR the evaluation happened:
 the Stop hook reads it back, and filing it is what lets a blocked turn end
-and stays quiet until tomorrow (the next UTC day) - a report filed today
-never buys tomorrow's silence in advance.
+and stays quiet for the next 16 hours - a report filed now never buys more
+than that in advance.
 
 Do not store or change anything else unless the owner asks for it. The
 exceptions are the work the steps themselves call for: the verdicts, the

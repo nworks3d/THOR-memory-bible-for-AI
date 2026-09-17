@@ -83,30 +83,6 @@ pub fn unix_from_iso8601(s: &str) -> Option<i64> {
     Some(days_from_civil(y, mo, da) * 86400 + h * 3600 + mi * 60 + se)
 }
 
-/// Whether `a_unix` and `b_unix` fall on the same UTC calendar day. A UTC
-/// day is exactly 86400 seconds, with no leap-second adjustment in this
-/// scheme (the same reading `unix_from_iso8601` already gives every stored
-/// timestamp), so floor division by 86400 is the whole rule - no civil (y,
-/// m, d) conversion needed at all, unlike `iso8601_from_unix`'s own use of
-/// `civil_from_days` above.
-///
-/// UTC, DELIBERATELY NOT THE MACHINE'S OWN LOCAL DAY (`serve::usefulness`'s
-/// evaluation-debt predicate, `eval_done_today`, is this function's only
-/// caller, added 2026-09-16 for "a project worked in for an hour cannot end
-/// a turn without its daily evaluation report"): this workspace carries no
-/// dependency able to resolve a local UTC offset - no `chrono` (see
-/// `core/Cargo.toml`'s own doc comment on why that was dropped), no `time`
-/// crate, nothing reaching libc's own `localtime_r` either - so "the
-/// current day" can only ever mean the UTC day this process' own clock
-/// (`now_unix`) reads. A report filed late at night or very early in the
-/// morning, the owner's own local time, can therefore land on what this
-/// function still calls "yesterday" or "tomorrow". Flagged here rather than
-/// silently assumed; revisit if a local-offset-capable dependency is ever
-/// added for some other reason.
-pub fn same_utc_day(a_unix: i64, b_unix: i64) -> bool {
-    a_unix.div_euclid(86400) == b_unix.div_euclid(86400)
-}
-
 /// The current instant as Unix seconds - the one impure clock read this
 /// module makes, and the shared root both `now_iso8601` below and the
 /// evaluation debt's own "how long since" comparison
@@ -165,18 +141,6 @@ mod tests {
             let stamp = iso8601_from_unix(secs);
             assert_eq!(unix_from_iso8601(&stamp), Some(secs), "round trip through {stamp}");
         }
-    }
-
-    #[test]
-    fn same_utc_day_holds_within_the_same_calendar_day() {
-        assert!(same_utc_day(0, 86399), "23:59:59 into day 0 is still day 0");
-        assert!(same_utc_day(43200, 1), "noon and one second past midnight are still the same day");
-        assert!(same_utc_day(1_700_000_000, 1_700_000_000), "a timestamp always agrees with itself");
-    }
-
-    #[test]
-    fn same_utc_day_is_false_across_a_midnight_boundary() {
-        assert!(!same_utc_day(86399, 86400), "one second apart, but on opposite sides of midnight");
     }
 
     #[test]

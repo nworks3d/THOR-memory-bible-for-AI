@@ -160,7 +160,7 @@ independently, at its own call site in `hook_once`'s `Stop` arm. `setup_debt`
 never walks a subagent
 through AGENTS.md's setup questions, because there is no owner in the room
 for that conversation either. The evaluation debt (added 2026-09-12, trigger
-rewritten six times, three of them on 2026-09-16, two on 2026-09-17: first
+rewritten seven times, three of them on 2026-09-16, three on 2026-09-17: first
 to a per-project sidecar rather than a single verdict clock, then to drop
 the item-count
 ceiling entirely in favour of a daily, per-project ask once a session has
@@ -173,16 +173,20 @@ timestamp, and a REPEAT ask once a report already exists for today, then -
 the owner's decision, also 2026-09-17, after measuring an unconditional
 repeat land on a calm moment six times out of ten - to gate that REPEAT ask
 on a real risk (untested edits or a context summary) rather than on accrued
-time alone: `serve/src/bin/serve.rs`'s `evaluation_debt`, `serve::
+time alone, and finally - after a report filed at 01:30 local was followed
+39 minutes later by a fresh demand, because 02:00 local IS midnight UTC
+here - to a ROLLING 16-HOUR WINDOW measured from the report itself instead
+of a calendar day: `serve/src/bin/serve.rs`'s `evaluation_debt`, `serve::
 usefulness`'s own "evaluation debt" section - holds when no evaluation
-report for this project has been first seen on the current UTC calendar day
-(`serve::usefulness::eval_done_today`, `crate::time::same_utc_day` - UTC,
-never the owner's own local day, since this workspace has no dependency
-capable of resolving a local UTC offset) AND this session has accrued at
+report for this project, first seen by a Stop, still covers it
+(`serve::usefulness::eval_report_covers`, `EVAL_REPORT_COVERS_HOURS` - a
+window measured from the report itself, so no local UTC offset is needed to
+keep one working night on one side of it, which is what the calendar day
+this replaced could not do) AND this session has accrued at
 least an hour of work in the project (`serve::usefulness::
 EVAL_FIRST_WORK_MINUTES`, `SessionWorkState`/`record_hook_event` - every
 hook event of a session, gap-filtered so a pause of `EVAL_PAUSE_MINUTES` or
-more contributes nothing), OR a report already exists for today AND three
+more contributes nothing), OR a covering report already exists AND three
 more hours of accrued work have gone by since it
 (`EVAL_REPEAT_WORK_MINUTES`, measured from whenever that report reset the
 accrual) AND AT LEAST ONE RISK HOLDS SINCE THAT SAME RESET (sixth rewrite,

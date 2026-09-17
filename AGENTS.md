@@ -280,18 +280,19 @@ honest way out, and the message says which. Saying it in your reply settles
 nothing - the fix has to be a real change to the note, or the tag that records
 the decision.
 
-Once in a while it asks for something bigger instead of one more note: every
-day, in every project a session actually works in, once that session has
-accrued at least an hour of work there and no evaluation report has yet been
-filed for that project TODAY (the current UTC calendar day), it asks you to
-run the full end-of-session review in one pass rather than judging notes one
-at a time - regardless of how many notes currently owe a verdict. THIS ONE
-DOES NOT GO QUIET AFTER ONE ASK: it holds the end of every turn, naming how
-many times it has already asked and since when, until a report is actually
-filed - and filing it at the end of that review is the only thing that lets
-a turn end and stays quiet until tomorrow. Filing it does not buy silence
-for the rest of the day either - but only when something risky happened
-since: once three more hours of accrued work go by since that report, AND
+Once in a while it asks for something bigger instead of one more note: in
+every project a session actually works in, once that session has accrued at
+least an hour of work there and no evaluation report filed for that project
+still covers it (one covers the next 16 hours - a rolling window rather than
+a calendar day, so a report filed late at night is not undone by midnight),
+it asks you to run the full end-of-session review in one pass rather than
+judging notes one at a time - regardless of how many notes currently owe a
+verdict. THIS ONE DOES NOT GO QUIET AFTER ONE ASK: it holds the end of every
+turn, naming how many times it has already asked and since when, until a
+report is actually filed - and filing it at the end of that review is the
+only thing that lets a turn end and stays quiet for the next 16 hours.
+Filing it does not buy silence for that whole window either - but only when
+something risky happened since: once three more hours of accrued work go by since that report, AND
 three or more code changes have gone by with no test or build run since, or
 the context was summarized, it asks again the same way, covering only what
 happened since then plus the state of the work, until a newer report is

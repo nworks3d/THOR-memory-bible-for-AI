@@ -133,9 +133,30 @@ pub struct Served {
 /// merely withheld by the cap, it never applies here at all (see `decay`'s
 /// own doc comment).
 pub fn serve(store: &EventStore, input: &input::ServeInput) -> Served {
+    serve_with_decay(store, input, &decay::DecayContext::load(store))
+}
+
+/// `serve` above, for a caller that is about to serve MANY inputs against
+/// one unchanging store and can therefore load the decay context once
+/// instead of once per input.
+///
+/// WHY THIS EXISTS, MEASURED 2026-09-17. `DecayContext::load` folds the
+/// whole event log twice (`ever_marked_useful`, `noise_since_last_useful`),
+/// which is the right trade for a single hook call and the wrong one for a
+/// probe loop: `ops::health::crowding_line` serves every resolvable anchor
+/// in every checkout, and when it gained command anchors that same day the
+/// health check went from 1m20s to 2m38s on a 163k-event store - the added
+/// time was almost entirely re-folding a log that had not changed between
+/// probes. The answer is identical either way: `serve` itself is now this
+/// function with a freshly loaded context, so there is no second copy of
+/// the serving path to drift.
+pub fn serve_with_decay(
+    store: &EventStore,
+    input: &input::ServeInput,
+    decay: &decay::DecayContext,
+) -> Served {
     let candidates = live::candidates_for(store, input);
-    let decay = decay::DecayContext::load(store);
-    let all = decay::retain_live(rank::select(&candidates, input), &decay);
+    let all = decay::retain_live(rank::select(&candidates, input), decay);
     let selection = render::cap(all.clone());
     Served { all, selection }
 }
@@ -198,5 +219,50 @@ mod tests {
         assert_eq!(served.selection.shown.len(), 4);
         assert_eq!(served.selection.withheld, 2);
         assert_eq!(served.all.len() - served.selection.shown.len(), served.selection.withheld);
+    }
+
+    /// THE SHORTCUT MUST NOT DRIFT. `serve_with_decay` exists so a probe
+    /// loop can load the decay context once instead of once per input (see
+    /// its own doc comment for the measured runtime that bought it); if it
+    /// ever answered differently from `serve`, `ops::health::crowding_line`
+    /// would quietly report a crowd nobody actually has. Proven against a
+    /// store where decay REALLY bites - one item carries two noise marks and
+    /// no mark of usefulness, so it is retired from this surface - because
+    /// two serving paths that both ignore decay would agree for the wrong
+    /// reason.
+    #[test]
+    fn serving_with_a_shared_decay_context_answers_exactly_as_serve_does() {
+        let mut db = EventStore::in_memory().unwrap();
+        for i in 0..3 {
+            let item = Item {
+                id: format!("d{i}"),
+                kind: Kind::Rule,
+                text: format!("rule number {i}"),
+                bindings: vec![Binding::Moment(Action::Configure)],
+                severity: None,
+                project: None,
+                tags: vec![],
+                expires: None,
+                key: None,
+                falsifier: Some(format!("rule number {i} turns out to be wrong")),
+                check: None,
+            };
+            store::declare(&mut db, "s", "l", "a", &item).unwrap();
+        }
+        let now = time::now_iso8601();
+        for _ in 0..decay::NOISE_MARKS_BEFORE_STALE {
+            mark::record_noise(&mut db, "s", "l", "a", &now, "d1").unwrap();
+        }
+
+        let mut input = input::ServeInput::default();
+        input.add_moment(Action::Configure);
+        let fresh = serve(&db, &input);
+        let shared = serve_with_decay(&db, &input, &decay::DecayContext::load(&db));
+
+        let ids = |s: &Served| s.selection.shown.iter().map(|r| r.id.clone()).collect::<Vec<_>>();
+        assert_eq!(ids(&fresh), ids(&shared));
+        assert_eq!(fresh.all.len(), shared.all.len());
+        assert!(!ids(&shared).contains(&"d1".to_string()), "decay must still retire the noisy item: {:?}", ids(&shared));
+        assert_eq!(shared.all.len(), 2, "the other two still apply");
     }
 }

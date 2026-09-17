@@ -45,13 +45,25 @@
 //! mechanism. Every ask is now counted on the PROJECT's own sidecar entry
 //! (`asked_count`/`first_asked_since_report`) instead of a session's, reset
 //! the moment a new report is seen (`the_ask_counter_increments_per_turn_
-//! and_resets_once_a_report_is_seen`). `seed_eval_state`/`start_of_today_
-//! utc` below drive `last_evaluation_seen` directly, at an exact,
-//! day-boundary-safe instant relative to the real wall clock this binary
-//! reads; `seed_tracking_since` (still calling the real, unchanged
-//! `update_eval_debt_state` write) remains only for the no-project tests,
-//! which care about whether the sidecar is touched AT ALL, never about
-//! which particular field it carries.
+//! and_resets_once_a_report_is_seen`). `seed_eval_state`/`recently_covered`/
+//! `no_longer_covered` below drive `last_evaluation_seen` directly, at an
+//! exact instant relative to the real wall clock this binary reads;
+//! `seed_tracking_since` (still calling the real, unchanged `update_eval_
+//! debt_state` write) remains only for the no-project tests, which care
+//! about whether the sidecar is touched AT ALL, never about which
+//! particular field it carries.
+//!
+//! A SEVENTH REWRITE (2026-09-17, `serve::usefulness`'s own "evaluation
+//! debt" section) drops the UTC CALENDAR DAY the fourth rewrite chose, in
+//! favour of a rolling `usefulness::EVAL_REPORT_COVERS_HOURS`-hour window
+//! from `last_evaluation_seen` (`usefulness::eval_report_covers`, replacing
+//! `eval_done_today`/`crate::time::same_utc_day`) - measured (acme-shop
+//! eval 2): a report filed about 01:30 local time (23:30 UTC) left `doctor`
+//! saying "today's evaluation is not done" 39 minutes later, at 00:09 UTC,
+//! naming that very report as the newest thing in the store. `recently_
+//! covered`/`no_longer_covered` replace the retired `start_of_today_utc`;
+//! `seed_session_work_with_risk`'s own doc comment covers the accrual-side
+//! half of this same rewrite.
 //!
 //! EVERY PAYLOAD BELOW NAMES AN EXPLICIT `cwd`, unlike this file's own
 //! earlier shape - the sidecar is keyed by the EXACT project a Stop
@@ -282,27 +294,27 @@ fn declare_owed_items(store: &mut EventStore, n: usize, project: Option<&str>) -
 /// "how long has this session worked here" comes from hook-event accrual
 /// (`serve::usefulness::SessionWorkState`/`record_hook_event`) instead.
 ///
-/// THE ANCHOR IS PINNED AT NOON UTC ON TODAY'S OWN CALENDAR DAY
-/// (`start_of_today_utc() + 12h`, by the wall clock THIS PROCESS reads right
-/// now), never at the literal "now" - the identical day-boundary-safety
-/// `seed_eval_state`'s own report timestamps already rely on
-/// (`start_of_today_utc`'s own doc comment), needed here for a reason that
-/// fixture never had to deal with: `accrue_session_work` (unlike a plain
-/// `last_evaluation_seen` comparison) re-derives its own answer from a FRESH
-/// wall-clock read inside the real hook subprocess, so a seed built from
-/// literal "now" minus `minutes` can land on a DIFFERENT UTC calendar day
-/// than the subprocess's own "now" whenever a test happens to run within
+/// THE ANCHOR IS BUILT FROM THE LITERAL "now" this process reads right now,
+/// `minutes` in the past - safe since 2026-09-17 (seventh rewrite,
+/// `serve::usefulness`'s own "evaluation debt" section) in a way it was not
+/// before: `accrue_session_work` (unlike a plain `last_evaluation_seen`
+/// comparison) re-derives its own answer from a FRESH wall-clock read
+/// inside the real hook subprocess, so a seed built from literal "now"
+/// minus `minutes` used to be able to land on a DIFFERENT UTC calendar day
+/// than the subprocess's own "now" whenever a test happened to run within
 /// `minutes` of real UTC midnight - measured directly: this test suite
 /// failed exactly this way when run at 00:25 UTC, seeding "90 minutes ago"
 /// one calendar day before the subprocess's own clock read moments later,
-/// which `session_work_reset_needed` (correctly, by its own design) then
-/// read as a new-day reset, silently zeroing the very accrual the test
-/// meant to prove. Noon is always safely inside "today" however many hours
-/// into the real day the test happens to run, so both instants land on the
-/// identical UTC day regardless.
+/// which `session_work_reset_needed` used to read as a new-day reset,
+/// silently zeroing the very accrual the test meant to prove. That rule is
+/// gone: `session_work_reset_needed` no longer reads a calendar day at all,
+/// only whether there is an anchor yet and whether a newer report was seen,
+/// so there is no boundary left here to dodge and the elaborate "pin at
+/// noon UTC" workaround this comment used to describe is retired along with
+/// it.
 ///
-/// A seed `last_event_unix` that lands in the FUTURE relative to the real
-/// subprocess's own clock (whenever the test runs before noon UTC) is
+/// A seed `last_event_unix` that lands slightly in the FUTURE relative to
+/// the real subprocess's own clock (a few milliseconds of test overhead) is
 /// harmless: `accrue_session_work` only ever ADDS a gap when it is positive
 /// and under `EVAL_PAUSE_MINUTES`, so a negative gap just leaves the seeded
 /// total untouched, which is exactly what a fixture asking for an EXACT
@@ -325,13 +337,13 @@ fn seed_session_work_with_risk(db: &Path, project: Option<&str>, session_id: &st
     let mut all = serve::usefulness::read_eval_debt_state(db);
     let key = project.unwrap_or("").to_string();
     let mut entry = all.get(&key).cloned().unwrap_or_default();
-    let noon_today = start_of_today_utc() + 12 * 3600;
+    let now = serve::time::now_unix();
     entry.sessions.insert(
         session_id.to_string(),
         serve::usefulness::SessionWorkState {
-            anchor_unix: Some(noon_today - minutes * 60),
+            anchor_unix: Some(now - minutes * 60),
             accrued_secs: minutes * 60,
-            last_event_unix: Some(noon_today),
+            last_event_unix: Some(now),
             edits_since_test,
             compacted_since_anchor,
         },
@@ -365,13 +377,34 @@ fn seed_eval_state(db: &Path, project: Option<&str>, state: serve::usefulness::P
     std::fs::write(serve::usefulness::eval_debt_state_path(db), serde_json::to_string(&all).unwrap()).unwrap();
 }
 
-/// The Unix instant of the most recent UTC midnight before the real "now" -
-/// lets a test build a fixture timestamp `usefulness::eval_done_today` will
-/// always agree is "today", or - one second earlier - "yesterday",
-/// regardless of what wall-clock hour the test suite happens to run at.
-fn start_of_today_utc() -> i64 {
-    let now = serve::time::now_unix();
-    now - now.rem_euclid(86400)
+/// An instant `usefulness::eval_report_covers` will always agree still
+/// covers, relative to the real "now" - regardless of what wall-clock hour
+/// the test suite happens to run at. Replaces the retired
+/// `start_of_today_utc` (seventh rewrite, 2026-09-17: the UTC calendar day
+/// it measured against is gone).
+///
+/// FOUR HOURS, NOT ONE - MEASURED WHY. Several tests in this file seed this
+/// alongside `seed_session_work_with_risk(..., serve::usefulness::
+/// EVAL_REPEAT_WORK_MINUTES + 1, ...)`, whose own anchor lands
+/// `EVAL_REPEAT_WORK_MINUTES + 1` (181) minutes - about three hours - before
+/// "now". `session_work_reset_needed` resets the accrual the instant a
+/// report is seen AFTER that anchor (`last_evaluation_seen` strictly later
+/// than `anchor_unix`), so an offset shorter than the accrual it is paired
+/// with silently zeroes the very accrual the test means to prove: measured
+/// directly, one hour here against a three-hour accrual reset it to zero
+/// and turned a "fires" test into a false silence with no visible error
+/// beyond the eventual assertion failure. Four hours clears the longest
+/// accrual this file seeds with room to spare, while staying comfortably
+/// inside the 16-hour window.
+fn recently_covered() -> i64 {
+    serve::time::now_unix() - 4 * 3600
+}
+
+/// The mirror of `recently_covered` above: an instant safely OUTSIDE
+/// `usefulness::EVAL_REPORT_COVERS_HOURS`, so a fixture can prove the "does
+/// not cover any more" branch regardless of wall-clock time.
+fn no_longer_covered() -> i64 {
+    serve::time::now_unix() - (serve::usefulness::EVAL_REPORT_COVERS_HOURS + 1) * 3600
 }
 
 /// A live evaluation-report Report, correctly tagged and scoped - the exact
@@ -463,7 +496,7 @@ fn fires_for_a_main_session_and_names_the_real_eval_path_when_it_exists() {
     assert_eq!(v["decision"], "block", "{out}");
     let reason = v["reason"].as_str().unwrap();
     assert!(reason.contains("[THOR]"), "{reason}");
-    assert!(reason.contains("This project has not had its evaluation today"), "{reason}");
+    assert!(reason.contains("This project has had no evaluation in the last 16 hours"), "{reason}");
     assert!(reason.contains("This session has worked here for"), "{reason}");
     assert!(reason.contains(&format!("{OWED_CONTEXT_COUNT} item(s) currently owe a verdict here")), "{reason}");
     assert!(reason.contains("It has been asked 1 time(s)"), "{reason}");
@@ -471,7 +504,7 @@ fn fires_for_a_main_session_and_names_the_real_eval_path_when_it_exists() {
     assert!(reason.contains(&expected_path.display().to_string()), "must name the real eval file path: {reason}");
     assert!(reason.contains("/thor-eval"), "must tell the owner how to run it: {reason}");
     assert!(reason.contains("A turn cannot end until the evaluation report for this project is filed"), "{reason}");
-    assert!(reason.contains("After that it is quiet until tomorrow"), "{reason}");
+    assert!(reason.contains("After that it is quiet for 16 hours"), "{reason}");
 }
 
 #[test]
@@ -758,11 +791,11 @@ fn is_silent_for_a_session_with_no_accrued_work_yet() {
     assert!(out.trim().is_empty(), "a session with no accrued work yet must not be hijacked into the evaluation: {out}");
 }
 
-/// Case named in the build brief: a report first seen today silences it for
-/// the rest of the day - proven across TWO separate fresh turns, not just
-/// the one Stop that immediately follows the report.
+/// Case named in the build brief: a report that still covers silences it
+/// for as long as it covers - proven across TWO separate fresh turns, not
+/// just the one Stop that immediately follows the report.
 #[test]
-fn a_report_first_seen_today_silences_it_for_the_rest_of_the_day() {
+fn a_recently_seen_report_silences_it_for_as_long_as_it_covers() {
     let dir = tempfile::tempdir().unwrap();
     let db = dir.path().join("thor.db");
     let sandbox = Sandbox::new();
@@ -778,20 +811,20 @@ fn a_report_first_seen_today_silences_it_for_the_rest_of_the_day() {
     seed_eval_state(
         &db,
         Some("thor-fixture"),
-        serve::usefulness::ProjectEvalState { last_evaluation_seen: Some(start_of_today_utc()), ..Default::default() },
+        serve::usefulness::ProjectEvalState { last_evaluation_seen: Some(recently_covered()), ..Default::default() },
     );
     seed_session_work(&db, Some("thor-fixture"), "s1", 90);
 
     let first = run_hook(&db, &stop_payload("s1", &project_dir), &sandbox);
-    assert!(first.trim().is_empty(), "a report seen today must silence the first turn: {first}");
+    assert!(first.trim().is_empty(), "a report that still covers must silence the first turn: {first}");
     let second = run_hook(&db, &stop_payload("s1", &project_dir), &sandbox);
-    assert!(second.trim().is_empty(), "and every turn after it, for the rest of the day: {second}");
+    assert!(second.trim().is_empty(), "and every turn after it, for as long as it keeps covering: {second}");
 }
 
-/// Case named in the build brief: a report first seen yesterday does not
-/// silence today's obligation.
+/// Case named in the build brief: a report seen outside the coverage window
+/// does not silence the obligation.
 #[test]
-fn a_report_first_seen_yesterday_does_not_silence_today() {
+fn a_report_outside_the_coverage_window_does_not_silence_it() {
     let dir = tempfile::tempdir().unwrap();
     let db = dir.path().join("thor.db");
     let sandbox = Sandbox::new();
@@ -806,13 +839,13 @@ fn a_report_first_seen_yesterday_does_not_silence_today() {
     seed_eval_state(
         &db,
         Some("thor-fixture"),
-        serve::usefulness::ProjectEvalState { last_evaluation_seen: Some(start_of_today_utc() - 1), ..Default::default() },
+        serve::usefulness::ProjectEvalState { last_evaluation_seen: Some(no_longer_covered()), ..Default::default() },
     );
     seed_session_work(&db, Some("thor-fixture"), "s1", 90);
 
     let out = run_hook(&db, &stop_payload("s1", &project_dir), &sandbox);
     let v: serde_json::Value =
-        serde_json::from_str(&out).unwrap_or_else(|e| panic!("yesterday's report must not buy today's silence: {e}: {out}"));
+        serde_json::from_str(&out).unwrap_or_else(|e| panic!("a report outside the coverage window must not buy silence: {e}: {out}"));
     assert_eq!(v["decision"], "block", "{out}");
 }
 
@@ -836,7 +869,7 @@ fn the_day_after_a_report_59_minutes_worked_is_silent_61_fires() {
     seed_eval_state(
         &db,
         Some("thor-fixture"),
-        serve::usefulness::ProjectEvalState { last_evaluation_seen: Some(start_of_today_utc() - 1), ..Default::default() },
+        serve::usefulness::ProjectEvalState { last_evaluation_seen: Some(no_longer_covered()), ..Default::default() },
     );
     seed_session_work(&db, Some("thor-fixture"), "s1", 59);
     let silent = run_hook(&db, &stop_payload("s1", &project_dir), &sandbox);
@@ -850,7 +883,7 @@ fn the_day_after_a_report_59_minutes_worked_is_silent_61_fires() {
     seed_eval_state(
         &db2,
         Some("thor-fixture"),
-        serve::usefulness::ProjectEvalState { last_evaluation_seen: Some(start_of_today_utc() - 1), ..Default::default() },
+        serve::usefulness::ProjectEvalState { last_evaluation_seen: Some(no_longer_covered()), ..Default::default() },
     );
     seed_session_work(&db2, Some("thor-fixture"), "s2", 61);
     let out = run_hook(&db2, &stop_payload("s2", &project_dir), &sandbox);
@@ -882,7 +915,7 @@ fn a_report_seen_today_with_90_minutes_accrued_since_stays_silent() {
     seed_eval_state(
         &db,
         Some("thor-fixture"),
-        serve::usefulness::ProjectEvalState { last_evaluation_seen: Some(start_of_today_utc()), ..Default::default() },
+        serve::usefulness::ProjectEvalState { last_evaluation_seen: Some(recently_covered()), ..Default::default() },
     );
     seed_session_work(&db, Some("thor-fixture"), "s1", 90);
 
@@ -908,7 +941,7 @@ fn a_report_seen_today_with_three_hours_accrued_since_fires_the_repeat_message()
         &db,
         Some("thor-fixture"),
         serve::usefulness::ProjectEvalState {
-            last_evaluation_seen: Some(start_of_today_utc()),
+            last_evaluation_seen: Some(recently_covered()),
             last_evaluation_report_id: Some("eval-thor-fixture-2026-09-17".to_string()),
             ..Default::default()
         },
@@ -960,7 +993,7 @@ fn three_hours_accrued_with_no_risk_at_all_stays_silent_end_to_end() {
         &db,
         Some("thor-fixture"),
         serve::usefulness::ProjectEvalState {
-            last_evaluation_seen: Some(start_of_today_utc()),
+            last_evaluation_seen: Some(recently_covered()),
             last_evaluation_report_id: Some("eval-thor-fixture-2026-09-17".to_string()),
             ..Default::default()
         },
@@ -992,7 +1025,7 @@ fn subagent_untested_edits_count_toward_the_risk_counter_but_a_subagent_stop_nev
         &db,
         Some("thor-fixture"),
         serve::usefulness::ProjectEvalState {
-            last_evaluation_seen: Some(start_of_today_utc()),
+            last_evaluation_seen: Some(recently_covered()),
             last_evaluation_report_id: Some("eval-thor-fixture-2026-09-17".to_string()),
             ..Default::default()
         },

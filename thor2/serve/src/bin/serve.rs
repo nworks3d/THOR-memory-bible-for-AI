@@ -919,16 +919,17 @@ fn hook_once(db_path: &Path) -> Option<HookOutput> {
         }
 
         // THE EVALUATION DEBT (2026-09-12, moved ahead of the judgement debt
-        // below; its own trigger rewritten FIVE TIMES, three of them on
-        // 2026-09-16, one on 2026-09-17 alone - see `usefulness`'s own
+        // below; its own trigger rewritten SEVEN TIMES, three of them on
+        // 2026-09-16, three on 2026-09-17 - see `usefulness`'s own
         // "evaluation debt" section for the full story). Everything below
         // this asks about ONE item at a time - the busiest owed one,
         // batched, still one item's own verdict per `mark` call. This asks a
-        // different question: has this project's evaluation report NOT been
-        // seen yet TODAY (the current UTC calendar day -
-        // `usefulness::eval_done_today`), and has THIS session already
+        // different question: does NO evaluation report for this project
+        // still COVER it (a report covers the next `usefulness::
+        // EVAL_REPORT_COVERS_HOURS` hours from the Stop that first saw it -
+        // `usefulness::eval_report_covers`), and has THIS session already
         // accrued enough work here (`usefulness::EVAL_FIRST_WORK_MINUTES`,
-        // or `usefulness::EVAL_REPEAT_WORK_MINUTES` once today's report
+        // or `usefulness::EVAL_REPEAT_WORK_MINUTES` once a covering report
         // already exists - `usefulness::eval_debt_owed`) for the honest
         // answer to be the WHOLE end-of-session routine (`ops::install::
         // seed_eval_command`'s file, `/thor-eval`) rather than one more
@@ -1234,7 +1235,19 @@ fn hook_once(db_path: &Path) -> Option<HookOutput> {
             };
 
             let ids: Vec<String> = items.iter().map(|r| r.id.clone()).collect();
-            deliver::record_delivery(&mut store, &session_id, &session_id, "hook", &time::now_iso8601(), &ids);
+            // "session start" - the one trigger this surface can ever have:
+            // every item here is the pinned `Always` block, never a reaction
+            // to a particular file or command. See `ItemServed::trigger`'s
+            // own doc comment for the other two shapes.
+            deliver::record_delivery_with_trigger(
+                &mut store,
+                &session_id,
+                &session_id,
+                "hook",
+                &time::now_iso8601(),
+                &ids,
+                Some("session start"),
+            );
             match decay_notice(&store, db_path, session_cwd.as_deref()) {
                 Some(notice) => Some(HookOutput::ContextWithNotice { event_name, block, notice }),
                 None => Some(HookOutput::Context { event_name, block }),
@@ -1272,6 +1285,9 @@ fn hook_once(db_path: &Path) -> Option<HookOutput> {
             let selection = render::cap(all);
             let block = render::render_text(&selection, &input, db_path)?;
             let ids: Vec<String> = selection.shown.iter().map(|r| r.id.clone()).collect();
+            // No trigger: a prompt is neither a command nor a file, the two
+            // shapes `ItemServed::trigger` names - plain `record_delivery`
+            // already writes `None`, exactly what this surface needs.
             deliver::record_delivery(&mut store, &session_id, &session_id, "hook", &time::now_iso8601(), &ids);
             Some(HookOutput::Context { event_name, block })
         }
@@ -1428,7 +1444,24 @@ fn hook_once(db_path: &Path) -> Option<HookOutput> {
             };
             let block = block?;
             let ids: Vec<String> = served.selection.shown.iter().map(|r| r.id.clone()).collect();
-            deliver::record_delivery(&mut store, &session_id, &session_id, "hook", &time::now_iso8601(), &ids);
+            // The command as typed wins over the file, never the tool-name
+            // fallback `input.add_command` used above when there was no real
+            // command (`absent_guard::proposed_command` returns `None` for
+            // that case too - it is not "the command line as typed" the way
+            // `ItemServed::trigger` means it, only a stand-in target). A
+            // Bash-style call never carries both at once in a real payload
+            // (see the comment above `input.add_command`/`add_file` a few
+            // lines up), so the order only matters for a hand-built input.
+            let trigger = absent_guard::proposed_command(tool_input).or(file_path);
+            deliver::record_delivery_with_trigger(
+                &mut store,
+                &session_id,
+                &session_id,
+                "hook",
+                &time::now_iso8601(),
+                &ids,
+                trigger,
+            );
             Some(HookOutput::Context { event_name, block })
         }
     }
@@ -1939,11 +1972,20 @@ fn crowding_debt(
         // an item already stands on - see its own doc comment - and by the
         // time this reads `item` back with `show`, it already IS the live
         // occupant of every binding it carries. So `capacity` here always
-        // falls through to this same `Crowded` note, exactly as before a
+        // falls through to a note rather than a refusal, exactly as before a
         // Path/Dir/Command anchor could ever be refused outright: a fresh
         // declare/revise cannot land a NEW one on a full anchor any more
         // (refused at the door instead), but a legacy or bypassed write that
         // already holds one is read correctly all the same.
+        //
+        // ONLY `Crowded` IS DEBT - `Capacity::Broad` (the all-directory case,
+        // since 2026-09-17) never matches this pattern and falls straight to
+        // `continue` below, exactly like `Capacity::Fine` always did. See
+        // `Capacity::Broad`'s own doc comment for the measured case this
+        // separated: a directory-only item's note is about BREADTH, not
+        // about a rival pool being full, and reading it as "stored onto a
+        // place that is already full" (this function's own message below)
+        // was simply wrong for that shape - the place was never full.
         let Ok(model::store::Capacity::Crowded(note)) = model::store::capacity(store, &item) else {
             continue;
         };
@@ -2209,7 +2251,17 @@ fn judgement_debt(store: &EventStore, db_path: &Path, session_id: &str, current_
     let mut items_block = String::new();
     for (id, count) in owed.iter().take(JUDGEMENT_DEBT_BATCH_MAX) {
         let text = model::store::show(store, id).ok().map(|i| i.text).unwrap_or_default();
-        items_block.push_str(&format!("\n- '{id}' ({count}x since last judged, if ever): {text}"));
+        // ", last fired at '<trigger>'" - the same clause `ops::health::
+        // judgement_debt_line`'s own named list prints, and trivial to add
+        // here once `model::served::last_trigger` existed for that line to
+        // call: an evaluation judging "did it belong where it fired" needs
+        // the place, not only the binding, and this is the live Stop-time
+        // ask, not only the cold `doctor` report.
+        let last_fired = match model::served::last_trigger(store, id) {
+            Some(trigger) => format!(", last fired at '{trigger}'"),
+            None => String::new(),
+        };
+        items_block.push_str(&format!("\n- '{id}' ({count}x since last judged, if ever){last_fired}: {text}"));
     }
     let held_back = total_owed - batch_len;
     let held_back_note = if held_back > 0 {
@@ -2271,20 +2323,23 @@ fn judged_since(store: &EventStore, id: &str, after_seq: i64) -> bool {
 /// `usefulness::project_eval_state` reads this exact project's own sidecar
 /// facts, and `usefulness::eval_debt_owed` is the one shared predicate
 /// `doctor` (`ops::health::judgement_debt_line`, via its time-only half
-/// `eval_done_today`) evaluates against the identical sidecar field, so the
-/// two can never disagree about whether today's evaluation is done.
-/// `usefulness::judgement_debt_counts`'s own second number is read too, but
-/// only for the message's own context - it is no longer part of the
-/// condition.
+/// `eval_report_covers`) evaluates against the identical sidecar field, so
+/// the two can never disagree about whether the last evaluation still
+/// covers this project. `usefulness::judgement_debt_counts`'s own second
+/// number is read too, but only for the message's own context - it is no
+/// longer part of the condition.
 ///
-/// TWO DIFFERENT MESSAGES, depending on `usefulness::eval_done_today`: no
-/// report yet today names how many times this project has been asked and
-/// since when, exactly as before the fifth rewrite; a report already seen
-/// today (so this is necessarily a REPEAT ask - `eval_debt_owed` itself
-/// would have stayed silent otherwise) instead names the hours accrued
-/// since that report and the report's own id, and says the evaluation
-/// covers only what happened since it plus the state of the work
-/// (`eval-command.example.md`'s own new SCOPE clause). Either way
+/// TWO DIFFERENT MESSAGES, depending on `usefulness::eval_report_covers`: no
+/// evaluation covering this project yet names how many times it has been
+/// asked and since when, exactly as before the fifth rewrite (2026-09-17
+/// renamed this branch's own trigger from "today" to "the last
+/// `usefulness::EVAL_REPORT_COVERS_HOURS` hours" - seventh rewrite,
+/// `usefulness`'s own "evaluation debt" section); one that still covers (so
+/// this is necessarily a REPEAT ask - `eval_debt_owed` itself would have
+/// stayed silent otherwise) instead names the hours accrued since that
+/// report and the report's own id, and says the evaluation covers only what
+/// happened since it plus the state of the work (`eval-command.example.md`'s
+/// own new SCOPE clause). Either way
 /// `usefulness::record_eval_debt_asked` still runs at the call site, so the
 /// ask count `doctor` reports stays accurate even for a repeat ask whose
 /// own message does not quote it.
@@ -2333,7 +2388,7 @@ fn evaluation_debt(
             .to_string(),
     };
 
-    if usefulness::eval_done_today(state.last_evaluation_seen, now) {
+    if usefulness::eval_report_covers(state.last_evaluation_seen, now) {
         // THE REPEAT ASK (fifth rewrite, 2026-09-17): names hours, not
         // minutes (the owner's own wording: "after every THREE HOURS OF
         // WORK"), and the report id this accrual reset against, rather than
@@ -2376,12 +2431,13 @@ fn evaluation_debt(
         // exactly the instant the call site is about to stamp.
         let first_asked = state.first_asked_since_report.unwrap_or(now);
         let asked_count = state.asked_count + 1;
+        let covers_hours = usefulness::EVAL_REPORT_COVERS_HOURS;
         Some(format!(
-            "[THOR] This project has not had its evaluation today. This session has worked here for {accrued_minutes} minute(s); \
+            "[THOR] This project has had no evaluation in the last {covers_hours} hours. This session has worked here for {accrued_minutes} minute(s); \
              {owed_in_project} item(s) currently owe a verdict here. It has been asked {asked_count} time(s) - the first \
              {} day(s) ago - with no report filed yet. \
              Run the THOR evaluation before you finish: {ask} \
-             A turn cannot end until the evaluation report for this project is filed. After that it is quiet until tomorrow.",
+             A turn cannot end until the evaluation report for this project is filed. After that it is quiet for {covers_hours} hours.",
             usefulness::days_ago(now, first_asked)
         ))
     }
@@ -3450,33 +3506,32 @@ mod judgement_debt_tests {
         );
     }
 
-    /// The other half, and the one that must not regress: an item that really
-    /// cannot appear still holds the turn. Without it, "ask the real ranker"
-    /// could quietly become "never ask anything".
+    /// RETIRED 2026-09-17, AND HERE IS WHY THAT IS SAFE RATHER THAN A QUIET
+    /// LOSS OF COVERAGE. This test used to stand for "an item that really
+    /// cannot appear still holds the turn", proven with a DIRECTORY binding
+    /// as the one fixture its own author could find for "the estimate calls
+    /// it crowded and the real ranker agrees it is unreachable" - a plain
+    /// crowded PATH pool does not do it (recency lets an equal-weight
+    /// newcomer win, per `a_crowded_estimate_settles_itself_when_the_item_
+    /// really_reaches_the_block` above), and the test's own doc comment said
+    /// so: "a Dir binding reaches no automatic surface at all... so here the
+    /// estimate and the ranker agree, and the debt is owed".
     ///
-    /// A DIRECTORY binding is the honest case, and the reason a plain crowded
-    /// pool is not: measured while writing this, a newcomer of equal weight on
-    /// a full PATH pool is shown anyway - it wins on recency and pushes an
-    /// older holder out - so the write-time note overstated that case too. A
-    /// Dir binding reaches no automatic surface at all (`rank::select` drops it
-    /// before comparing a single path), so here the estimate and the ranker
-    /// agree, and the debt is owed.
-    #[test]
-    fn an_item_that_can_never_appear_still_holds_the_turn() {
-        let dir = tempfile::tempdir().unwrap();
-        let db = dir.path().join("t.db");
-        let mut store = EventStore::new(&db).unwrap();
-        record_session_watermark(&db, "now");
-        let mut mine = path_newcomer("mine", "p", "everything under this folder is generated, never hand-edited");
-        mine.bindings = vec![Binding::Target {
-            kind: model::item::TargetKind::Dir,
-            value: "server/generated".to_string(),
-        }];
-        model::store::declare(&mut store, "mcp", "mcp", "t", &mine).unwrap();
-
-        let asked = crowding_debt(&store, &db, "now", None).expect("an item no surface can reach must still hold the turn");
-        assert!(asked.contains("mine"), "{asked}");
-    }
+    /// That premise is the exact misconception Fix 1 (`Capacity::Broad`,
+    /// 2026-09-17) closes: a directory anchor has reached the files inside
+    /// it since 2026-08-19 (`normalize::target_matches`), so an all-directory
+    /// item is not the unreachable case this test needed - it is BROAD, and
+    /// `crowding_debt` now never asks `reaches_a_block` about one at all (see
+    /// `Capacity::Broad`'s own doc comment for the measured case: `serve why
+    /// --file` on a file under the exact same kind of anchor answered "1
+    /// item(s) apply"). Keeping this test would mean asserting the bug.
+    ///
+    /// `a_directory_only_item_written_this_session_produces_no_crowding_debt`
+    /// above proves the corrected behaviour for the identical fixture shape.
+    /// No other construction for "estimate says Crowded, ranker says never
+    /// reachable" is known to this suite; `reaches_a_block` stays exercised
+    /// by every test around it that proves the estimate and the ranker CAN
+    /// disagree the other way (a crowded estimate that the ranker does show).
 
     /// THE LAZINESS THIS REMOVES. The write response already said "this may
     /// well never be shown there". Across two real sessions that note was
@@ -3893,6 +3948,32 @@ mod judgement_debt_tests {
         );
     }
 
+    /// THE DEFECT THIS PREVENTS (measured 2026-09-17, Printer-stuff session):
+    /// `claude-app-sandbox-echte-schijf-via-wmi` and `nas-naar-prullenbak-
+    /// via-rename-naar-recycle`, both bound to a directory only, were nagged
+    /// at Stop although `serve why --file` on a file under the anchor
+    /// answered "1 item(s) apply; the block would show 1" - the place was
+    /// never full, the advisory was read as a displacement. A directory-only
+    /// item's note is `Capacity::Broad`, not `Capacity::Crowded` (see that
+    /// variant's own doc comment), and this debt only ever reacts to
+    /// `Crowded` - so it must stay silent for one, however many files the
+    /// directory reaches.
+    #[test]
+    fn a_directory_only_item_written_this_session_produces_no_crowding_debt() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("t.db");
+        let mut store = EventStore::new(&db).unwrap();
+        record_session_watermark(&db, "now");
+        let mut mine = crowded_newcomer("dir-only-mine", "p");
+        mine.bindings = vec![Binding::Target { kind: TargetKind::Dir, value: "src/deep".to_string() }];
+        model::store::declare(&mut store, "mcp", "mcp", "t", &mine).unwrap();
+
+        assert!(
+            crowding_debt(&store, &db, "now", None).is_none(),
+            "a directory-only item's note is Broad, never Crowded, and must never be read as debt"
+        );
+    }
+
 
     fn declare(store: &mut EventStore, id: &str, pinned: bool) {
         let item = Item {
@@ -4259,6 +4340,23 @@ mod judgement_debt_tests {
         assert!(asked.contains("second"), "{asked}");
     }
 
+    /// THE DEFECT THIS PREVENTS (measured 2026-09-17): an evaluation judging
+    /// "did it belong where it fired" could see an owed item's own text but
+    /// not where it had actually been firing. This Stop-time ask names it
+    /// too now, the same way `ops::health::judgement_debt_line`'s own named
+    /// list does - trivial to add once `model::served::last_trigger` existed
+    /// for that line to call.
+    #[test]
+    fn the_ask_names_where_the_owed_item_last_fired() {
+        let mut store = EventStore::in_memory().unwrap();
+        declare(&mut store, "triggered", false);
+        serve_it(&mut store, "triggered", JUDGEMENT_DEBT_AFTER - 1);
+        deliver::record_delivery_with_trigger(&mut store, "s", "s", "t", "2026-08-07T00:00:00Z", &["triggered".to_string()], Some("npm run deploy"));
+
+        let asked = judgement_debt(&store, Path::new("no-watermark-for-this-test"), "s", None).expect("fixture sanity: it is owed");
+        assert!(asked.contains("last fired at 'npm run deploy'"), "{asked}");
+    }
+
     /// A verdict on one of several owed items settles only that one - the
     /// others must still be owed and still asked about together, not
     /// silently cleared as a side effect of somebody else's answer.
@@ -4391,14 +4489,23 @@ mod evaluation_debt_tests {
         std::fs::write(usefulness::eval_debt_state_path(db), serde_json::to_string(&all).unwrap()).unwrap();
     }
 
-    /// The Unix instant of the most recent UTC midnight before the real
-    /// "now" - lets a test build a fixture timestamp `usefulness::
-    /// eval_done_today` will always agree is "today" (this instant, or
-    /// anything after it up to "now"), or - one second earlier - "yesterday",
-    /// regardless of what wall-clock hour the test suite happens to run at.
-    fn start_of_today_utc() -> i64 {
-        let now = time::now_unix();
-        now - now.rem_euclid(86400)
+    /// An instant `usefulness::eval_report_covers` will always agree still
+    /// covers, relative to the real "now" - replaces the retired
+    /// `start_of_today_utc` (seventh rewrite, 2026-09-17: the UTC-calendar-
+    /// day rule it measured against is gone, and reusing it under the new
+    /// rolling window would be wrong at least once a day, whenever the test
+    /// suite happened to run within `usefulness::EVAL_REPORT_COVERS_HOURS`
+    /// of real UTC midnight). One hour ago is comfortably inside the window
+    /// regardless of wall-clock time.
+    fn recently_covered() -> i64 {
+        time::now_unix() - 3600
+    }
+
+    /// The mirror of `recently_covered` above: an instant safely OUTSIDE
+    /// `usefulness::EVAL_REPORT_COVERS_HOURS`, so a fixture can prove the
+    /// "does not cover any more" branch regardless of wall-clock time.
+    fn no_longer_covered() -> i64 {
+        time::now_unix() - (usefulness::EVAL_REPORT_COVERS_HOURS + 1) * 3600
     }
 
     /// A `SessionWorkState` fixture carrying `minutes` worth of accrued work
@@ -4431,8 +4538,13 @@ mod evaluation_debt_tests {
     // debt" section) from a rolling 24-hour window measured against
     // `tracking_since`/`last_evaluation_seen` to a UTC calendar day measured
     // against `last_evaluation_seen` alone - `seed_eval_state` writes that
-    // field directly, `start_of_today_utc` builds a day-boundary-safe
-    // fixture instant relative to the REAL wall clock this function reads.
+    // field directly. REWRITTEN AGAIN 2026-09-17 (seventh rewrite): the UTC
+    // calendar day gave way to a rolling `usefulness::EVAL_REPORT_COVERS_
+    // HOURS`-hour window (`usefulness::eval_report_covers`); `recently_
+    // covered`/`no_longer_covered` build a fixture instant safely inside or
+    // outside that window, relative to the REAL wall clock this function
+    // reads - simpler than the retired `start_of_today_utc`, which had to
+    // dodge a real calendar-day boundary this rule no longer has.
     // REWRITTEN AGAIN 2026-09-17 (fifth rewrite): "how long has this session
     // worked here" moved from a store-derived timestamp
     // (`session_first_served_in_project`, retired) to `work_minutes` above,
@@ -4458,13 +4570,13 @@ mod evaluation_debt_tests {
         let asked =
             evaluation_debt(&store, &db, Some("thor"), &work_minutes(90)).expect("no report ever seen, enough time worked");
         assert!(asked.starts_with("[THOR]"), "{asked}");
-        assert!(asked.contains("This project has not had its evaluation today"), "{asked}");
+        assert!(asked.contains("This project has had no evaluation in the last 16 hours"), "{asked}");
         assert!(asked.contains("This session has worked here for"), "{asked}");
         assert!(asked.contains("minute(s)"), "{asked}");
         assert!(asked.contains("12 item(s) currently owe a verdict here"), "{asked}");
         assert!(asked.contains("It has been asked 1 time(s)"), "{asked}");
         assert!(asked.contains("A turn cannot end until the evaluation report for this project is filed"), "{asked}");
-        assert!(asked.contains("After that it is quiet until tomorrow"), "{asked}");
+        assert!(asked.contains("After that it is quiet for 16 hours"), "{asked}");
     }
 
     /// Case named in the build brief: zero items owed must still fire once
@@ -4491,7 +4603,7 @@ mod evaluation_debt_tests {
         let (_dir, db, mut store) = new_store();
         owe(&mut store, 12);
         seed_eval_state(&db, None, usefulness::ProjectEvalState {
-            last_evaluation_seen: Some(start_of_today_utc() - 1),
+            last_evaluation_seen: Some(no_longer_covered()),
             ..Default::default()
         });
         assert_eq!(
@@ -4510,7 +4622,7 @@ mod evaluation_debt_tests {
         let (_dir, db, mut store) = new_store();
         owe_project(&mut store, 12, Some("thor"));
         seed_eval_state(&db, Some("thor"), usefulness::ProjectEvalState {
-            last_evaluation_seen: Some(start_of_today_utc() - 1),
+            last_evaluation_seen: Some(no_longer_covered()),
             ..Default::default()
         });
         assert!(
@@ -4526,38 +4638,39 @@ mod evaluation_debt_tests {
         let (_dir, db, mut store) = new_store();
         owe_project(&mut store, 12, Some("thor"));
         seed_eval_state(&db, Some("thor"), usefulness::ProjectEvalState {
-            last_evaluation_seen: Some(start_of_today_utc() - 1),
+            last_evaluation_seen: Some(no_longer_covered()),
             ..Default::default()
         });
         assert_eq!(evaluation_debt(&store, &db, Some("thor"), &work_minutes(30)), None);
     }
 
-    /// Case named in the build brief: a report first seen today silences the
+    /// Case named in the build brief: a report that still covers silences the
     /// FIRST obligation, however long the session has worked - as long as
     /// accrued work has not yet also crossed the REPEAT threshold (see the
     /// repeat-ask tests further below for that boundary).
     #[test]
-    fn a_report_seen_today_silences_it() {
+    fn a_recently_seen_report_silences_it() {
         let (_dir, db, store) = new_store();
         seed_eval_state(&db, Some("thor"), usefulness::ProjectEvalState {
-            last_evaluation_seen: Some(start_of_today_utc()),
+            last_evaluation_seen: Some(recently_covered()),
             ..Default::default()
         });
         assert_eq!(evaluation_debt(&store, &db, Some("thor"), &work_minutes(90)), None);
     }
 
-    /// Case named in the build brief: a report first seen yesterday does
-    /// not silence today's obligation.
+    /// Case named in the build brief: a report seen more than
+    /// `usefulness::EVAL_REPORT_COVERS_HOURS` ago no longer covers, and does
+    /// not silence the obligation.
     #[test]
-    fn a_report_seen_yesterday_does_not_silence_today() {
+    fn a_report_outside_the_coverage_window_does_not_silence_it() {
         let (_dir, db, store) = new_store();
         seed_eval_state(&db, Some("thor"), usefulness::ProjectEvalState {
-            last_evaluation_seen: Some(start_of_today_utc() - 1),
+            last_evaluation_seen: Some(no_longer_covered()),
             ..Default::default()
         });
         assert!(
             evaluation_debt(&store, &db, Some("thor"), &work_minutes(90)).is_some(),
-            "yesterday's report must not buy today's silence"
+            "a report outside the coverage window must not buy silence"
         );
     }
 
@@ -4617,7 +4730,7 @@ mod evaluation_debt_tests {
             "fixture sanity: acme's own checkout sees it"
         );
         seed_eval_state(&db, Some("thor"), usefulness::ProjectEvalState {
-            last_evaluation_seen: Some(start_of_today_utc()),
+            last_evaluation_seen: Some(recently_covered()),
             ..Default::default()
         });
         assert_eq!(
@@ -4637,7 +4750,7 @@ mod evaluation_debt_tests {
         owe_project(&mut store, 3, Some("thor"));
         seed_eval_state(&db, Some("thor"), usefulness::ProjectEvalState {
             asked_count: 2,
-            first_asked_since_report: Some(start_of_today_utc()),
+            first_asked_since_report: Some(recently_covered()),
             ..Default::default()
         });
         let asked = evaluation_debt(&store, &db, Some("thor"), &work_minutes(90)).expect("still owed, must speak");
@@ -4658,7 +4771,7 @@ mod evaluation_debt_tests {
         // not read the first threshold at all any more.
         let (_dir, db, store) = new_store();
         seed_eval_state(&db, Some("thor"), usefulness::ProjectEvalState {
-            last_evaluation_seen: Some(start_of_today_utc()),
+            last_evaluation_seen: Some(recently_covered()),
             last_evaluation_report_id: Some("eval-thor-2026-09-17".to_string()),
             ..Default::default()
         });
@@ -4670,7 +4783,7 @@ mod evaluation_debt_tests {
         let (_dir, db, mut store) = new_store();
         owe_project(&mut store, 5, Some("thor"));
         seed_eval_state(&db, Some("thor"), usefulness::ProjectEvalState {
-            last_evaluation_seen: Some(start_of_today_utc()),
+            last_evaluation_seen: Some(recently_covered()),
             last_evaluation_report_id: Some("eval-thor-2026-09-17".to_string()),
             ..Default::default()
         });
@@ -4704,7 +4817,7 @@ mod evaluation_debt_tests {
         let (_dir, db, mut store) = new_store();
         owe_project(&mut store, 5, Some("thor"));
         seed_eval_state(&db, Some("thor"), usefulness::ProjectEvalState {
-            last_evaluation_seen: Some(start_of_today_utc()),
+            last_evaluation_seen: Some(recently_covered()),
             last_evaluation_report_id: Some("eval-thor-2026-09-17".to_string()),
             ..Default::default()
         });
@@ -4724,7 +4837,7 @@ mod evaluation_debt_tests {
         let (_dir, db, mut store) = new_store();
         owe_project(&mut store, 5, Some("thor"));
         seed_eval_state(&db, Some("thor"), usefulness::ProjectEvalState {
-            last_evaluation_seen: Some(start_of_today_utc()),
+            last_evaluation_seen: Some(recently_covered()),
             last_evaluation_report_id: Some("eval-thor-2026-09-17".to_string()),
             ..Default::default()
         });
@@ -4744,7 +4857,7 @@ mod evaluation_debt_tests {
         let (_dir, db, mut store) = new_store();
         owe_project(&mut store, 5, Some("thor"));
         seed_eval_state(&db, Some("thor"), usefulness::ProjectEvalState {
-            last_evaluation_seen: Some(start_of_today_utc()),
+            last_evaluation_seen: Some(recently_covered()),
             last_evaluation_report_id: Some("eval-thor-2026-09-17".to_string()),
             ..Default::default()
         });

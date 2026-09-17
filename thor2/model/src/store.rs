@@ -725,6 +725,25 @@ pub enum Capacity {
     /// this item is seen then depends on closeness at some future moment,
     /// which nobody can decide now - so it is said, not enforced.
     Crowded(String),
+    /// Every binding on this item is a DIRECTORY (`is_all_dir_binding_set`) -
+    /// the note is about BREADTH (this reaches every file under a whole
+    /// tree, read after anything anchored at the exact file touched), never
+    /// about a rival pool being full. Split out from `Crowded` 2026-09-17:
+    /// the two used to share one shape, and `crowding_debt` (`bin/serve.rs`)
+    /// read either one as "stored onto a place that is already full" and
+    /// nagged the writer to fold, re-anchor or tag it crowded-on-purpose.
+    /// Measured the same day: `claude-app-sandbox-echte-schijf-via-wmi` and
+    /// `nas-naar-prullenbak-via-rename-naar-recycle`, both bound to
+    /// directories only, were nagged at Stop although `serve why --file` on
+    /// a file under the anchor answered "1 item(s) apply; the block would
+    /// show 1" - the place was never full, so treating the advisory as a
+    /// displacement was simply wrong. `Broad` carries the identical wording
+    /// `Crowded` used to for this case (nothing about the note itself was
+    /// wrong, only what read it), so every surface that already shows a
+    /// `Crowded` note to the writer of a remember/revise shows this one the
+    /// same way; only `crowding_debt`'s own displacement nag is narrowed to
+    /// `Crowded` alone.
+    Broad(String),
 }
 
 /// Which live items would compete with `item` at the moment `binding` stands
@@ -864,7 +883,11 @@ pub fn capacity(store: &EventStore, item: &Item) -> anyhow::Result<Capacity> {
         // breadth, not about silence. It used to say such an item could never
         // be shown at all, which was true of the matcher as it stood and is
         // the defect that fix closes.
-        return Ok(Capacity::Crowded(
+        //
+        // `Broad`, not `Crowded`, since 2026-09-17 - see `Capacity::Broad`'s
+        // own doc comment for why a note about reaching every file under a
+        // tree must never be read as a rival pool being full.
+        return Ok(Capacity::Broad(
             "every binding on this item is a DIRECTORY, so it reaches every file inside that \
              directory. That is broad on purpose and it is read AFTER anything anchored at the \
              exact file being touched. If this fact is really about one file or one command, bind \
@@ -886,9 +909,12 @@ pub fn capacity(store: &EventStore, item: &Item) -> anyhow::Result<Capacity> {
     // The note half (never a refusal) is its own function - see
     // `crowded_binding_note`'s own doc comment for why: `capacity_for_revise`
     // needs to ask this exact question again, against the same candidates, to
-    // know whether a REVISE's own crowding note is this one (measurable) or
-    // the different, unconditional directory note just above (nothing to
-    // measure).
+    // measure a REVISE's own crowding note. Before 2026-09-17 it also had to
+    // ask `is_all_dir_binding_set` a second time here, to tell that note
+    // apart from the different, unconditional directory note just above -
+    // both shared the one `Crowded` shape. Now they do not: the directory
+    // note is `Capacity::Broad`, so `capacity_for_revise` only ever sees a
+    // `Crowded` value here in the first place, nothing left to tell apart.
     let crowded = crowded_binding_note(&candidates, item, &bindings).map(|(note, _, _)| note);
 
     if every_binding_is_hopeless {
@@ -907,9 +933,10 @@ pub fn capacity(store: &EventStore, item: &Item) -> anyhow::Result<Capacity> {
                  reach a block: {worst}"
             ),
             fix: "give it a binding that is actually free - the exact file or command it is about \
-                  rather than a broad moment - or raise its severity if that is honestly what it \
-                  is, or fold the constraint into the item that already holds that ground. Storing \
-                  it as it stands would be cover that looks real and never fires."
+                  rather than a broad moment - or fold the constraint into the item that already \
+                  holds that ground. Do not raise its severity to win the place: that pushes a \
+                  heavier warning out to show a lighter one. Storing it as it stands would be \
+                  cover that looks real and never fires."
                 .to_string(),
         }));
     }
@@ -955,8 +982,9 @@ fn crowded_binding_note<'a>(
                 "{} already holds AT LEAST {at_least_equal} item(s) of the same weight or heavier, \
                  for {} place(s) in a block - this one may well never be shown there. At least, \
                  because this count sees only the rivals sharing this one binding; the real crowd \
-                 also includes everything reaching that place through a moment, which only doctor's \
-                 crowding line can count. Bind it to the exact file or command it is about instead \
+                 also includes everything reaching that place through a moment or a command, which \
+                 only doctor's crowding line can count, per file and per command anchor in a \
+                 checkout. Bind it to the exact file or command it is about instead \
                  of the broad moment, or fold it into whichever item already carries that ground.",
                 describe(binding),
                 crate::item::MAX_ITEMS
@@ -1009,19 +1037,22 @@ pub fn capacity_for_revise(
     if existing.bindings != updated.bindings {
         return Ok(cap);
     }
+    // The one note this function knows how to measure is the per-binding
+    // one `crowded_binding_note` builds (`Capacity::Crowded`). The
+    // all-directory note `capacity` returns unconditionally, before ever
+    // reaching that computation, says something about BREADTH, not about a
+    // rival pool - there is nothing here for a servings count to confirm or
+    // replace. Before 2026-09-17 the two shared one shape, so telling them
+    // apart took a second `is_all_dir_binding_set` call, against the same
+    // candidates `capacity` had already asked it against. Now the directory
+    // note is its own variant (`Capacity::Broad` - see its own doc comment),
+    // so this guard alone already excludes it: a `Broad` value can never
+    // match `Crowded(_)` in the first place.
     if !matches!(cap, Capacity::Crowded(_)) {
         return Ok(cap);
     }
     let bindings: Vec<&Binding> =
         updated.bindings.iter().filter(|b| !matches!(b, Binding::Always)).collect();
-    // The one `Crowded` note this function knows how to measure is the
-    // per-binding one `crowded_binding_note` builds. The all-directory note
-    // `capacity` returns unconditionally, before ever reaching that
-    // computation, says something about BREADTH, not about a rival pool -
-    // there is nothing here for a servings count to confirm or replace.
-    if is_all_dir_binding_set(updated, &bindings) {
-        return Ok(cap);
-    }
     let candidates = if store.heads_projection_current() {
         live_items_from_projection(store)?
     } else {
@@ -2238,6 +2269,19 @@ mod tests {
         let msg = format!("{err}");
         assert!(msg.contains("never reach a block"), "the refusal must say why: {msg}");
         assert!(msg.contains("heavy-"), "and name what holds the places: {msg}");
+        // FIX 2026-09-17: the fix text used to float "or raise its severity
+        // if that is honestly what it is" as one of the ways out - exactly
+        // the compensating knob the evaluation routine forbids (it pushes a
+        // heavier warning out to show a lighter one). That INVITATION must
+        // be gone; the new text still names the same three words, but only
+        // inside a PROHIBITION ("Do not raise its severity"), which is why
+        // this checks the old lead-in specifically rather than banning the
+        // phrase outright.
+        assert!(!msg.contains("or raise its severity"), "must not invite winning the place by raising severity: {msg}");
+        assert!(
+            msg.contains("Do not raise its severity to win the place"),
+            "must say plainly why not, instead: {msg}"
+        );
     }
 
     /// The other half, and the reason the refusal is narrow: a rival of the
@@ -2327,6 +2371,13 @@ mod tests {
     /// write. But its breadth has to be SAID, because a rule about a whole
     /// tree reads like a rule about the file you are touching, and is served
     /// after one.
+    ///
+    /// `Capacity::Broad`, not `Capacity::Crowded`, since 2026-09-17 - see
+    /// `Capacity::Broad`'s own doc comment for the measured case a shared
+    /// shape with `Crowded` caused: `crowding_debt` (`bin/serve.rs`) read
+    /// this exact note as a rival pool being full and nagged the writer to
+    /// fold, re-anchor, or tag the item crowded-on-purpose, for a place that
+    /// was never actually full.
     #[test]
     fn a_directory_only_item_is_told_how_broadly_it_reaches() {
         let mut store = EventStore::in_memory().unwrap();
@@ -2334,12 +2385,12 @@ mod tests {
         item.bindings = vec![Binding::Target { kind: TargetKind::Dir, value: "src/deep".to_string() }];
 
         match capacity(&store, &item).unwrap() {
-            Capacity::Crowded(note) => {
+            Capacity::Broad(note) => {
                 assert!(note.contains("DIRECTORY"), "{note}");
                 assert!(note.contains("every file inside that directory"), "how far it reaches: {note}");
                 assert!(note.contains("read AFTER"), "and where that puts it in the order: {note}");
             }
-            other => panic!("a directory-only item must be warned about, got {other:?}"),
+            other => panic!("a directory-only item must be warned about, with Broad specifically, got {other:?}"),
         }
         declare(&mut store, "s", "l", "t", &item).expect("a note never refuses the write");
 
@@ -2537,7 +2588,8 @@ mod tests {
     /// cannot depend on `serve` to call that function (see `served.rs`'s own
     /// top comment for why the dependency runs the other way).
     fn seed_served(store: &mut EventStore, id: &str, served_at: &str) {
-        let body = serde_json::to_string(&crate::served::ItemServed { served_at: served_at.to_string() }).unwrap();
+        let body = serde_json::to_string(&crate::served::ItemServed { served_at: served_at.to_string(), trigger: None })
+            .unwrap();
         store.append_event("s", "l", "t", EventKind::ItemServed, id, None, &body).unwrap();
     }
 

@@ -1618,7 +1618,16 @@ mod tests {
             bindings: vec![Binding::Target { kind: TargetKind::Path, value: "config/app.toml".to_string() }],
             severity: Some(Severity::Costly),
             project: Some("thor2".to_string()),
-            tags: vec!["config".to_string()],
+            // Costly with no check answers gate ground 11's teeth question
+            // since it was widened to Orientation (2026-09-17) - a plain
+            // fixture describing where a file lives has nothing literal to
+            // catch, so the honest answer is the tag, not a check. Kept
+            // alongside "config" rather than replacing it: nothing below
+            // asserts on that tag, but severity/kind/bindings are load-
+            // bearing for the crowding and near-duplicate tests that reuse
+            // this fixture, so only the field ground 11 actually asks about
+            // changes.
+            tags: vec!["config".to_string(), format!("{}a fixture describing where a file lives with nothing literal to catch", crate::store::NO_LITERAL_REASON_PREFIX)],
             expires: None,
             key: None,
             falsifier: Some("config/app.toml is removed or the app stops reading it".to_string()),
@@ -2783,7 +2792,13 @@ mod tests {
     fn archiving_refuses_an_anchor_that_is_absent_on_purpose() {
         let mut store = EventStore::in_memory().unwrap();
         let mut item = sample_with("guards-secrets", "this file is gitignored and must never be committed");
-        item.tags = vec![DELIBERATE_ANCHOR_TAG.to_string()];
+        // Overwrites sample()'s tags wholesale, so its no-literal answer to
+        // ground 11 has to come back too - this fixture is Costly with no
+        // check, same as sample() itself.
+        item.tags = vec![
+            DELIBERATE_ANCHOR_TAG.to_string(),
+            format!("{}a fixture describing an anchor that is absent on purpose", crate::store::NO_LITERAL_REASON_PREFIX),
+        ];
         declare(&mut store, "s1", "l1", "test", &item).unwrap();
 
         let err = archive(&mut store, "s1", "l1", "test", "guards-secrets", "anchor resolves to nothing", None)

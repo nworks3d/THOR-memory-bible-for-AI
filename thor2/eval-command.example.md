@@ -158,18 +158,29 @@ A fact about something irreversible or costly that carries no check only
 informs: it sits there while the mistake happens and says nothing. Walk the
 facts that fired this session and are heavy (`irreversible` or `costly`),
 and decide for each. `get` shows you `severity`; a fact with no `check`
-field can stop nothing. The health check counts the state under `teeth`.
+field can stop nothing. Note the `teeth` line from the health check before
+you start this step and again once you finish it - the report names both.
 
-Two outcomes, and both belong in the report:
+The burden of proof is reversed: for every heavy fact with no check, TRY to
+give it one before anything else. Work out, in writing, which literal
+fragment marks the mistake, at which file or command it belongs (a fact
+hanging on a broad moment gets re-anchored to the exact command or file
+first), and which check kind fits - `forbidden`, `absent`, `absent_all`,
+`contains`, or `requires`. Then attach it with `revise`. Measured
+2026-08-09: this is how a line about deleting a pushed remote tag went from
+"fires on every `rm`, stops nothing" to "refuses exactly that form" - by
+re-anchoring, not by writing a new rule.
 
-- **There is a literal fragment that makes the mistake.** Attach a check,
-  in the forms step 5 describes. Often the ANCHOR turns out to be the real
-  problem: a line about a dangerous command bound to a broad moment fires
-  everywhere and refuses nowhere. Move it to that command and attach the
-  check there.
-- **There is no literal fragment.** A judgement rule ("check first", "assume
-  nothing") has nothing to catch. That is meant to inform, and that is not
-  a shortcoming. Say so, and move on.
+Only after that attempt may you answer "no literal", and only with one of
+two reasons written into the tag: the fragment also appears in legitimate
+use of that command (name the legitimate form), or the mistake leaves no
+text at all - an omission, a judgement. "It is a judgement rule" without
+having made the attempt is not an answer.
+
+A heavy fact that already carries a no-literal tag is re-checked, not waved
+through: read the reason again against the fact. If the fact names a
+command or a file, the reason is suspect and the attempt above applies
+again. Say per fact whether the reason held.
 
 What you NEVER do here: stretch the literal to catch more. If it catches one
 form and not another, that is the honest answer - write down the gap you
@@ -186,8 +197,9 @@ anchor full after moving it? Correct the check until it holds, or store the
 fact without a check and put the reason nothing can catch it in the tags; a
 full anchor is solved with a route from step 6. That happens in the same
 turn, not as a line in the report. Step 4 is done once every heavy fact that
-fired has a decision (a check, or a recorded reason why not) and nothing is
-left hanging on a refusal.
+fired has a decision - a check that holds, or a tried-and-justified
+no-literal tag - every fact that already carried a no-literal tag has been
+re-checked this session, and nothing is left hanging on a refusal.
 
 ## 5. Capture what was missing
 
@@ -331,8 +343,10 @@ not done.
 2. what you judged as noise and why, and what belonged where it fired;
 3. what you revised, with before and after, and which artifact you checked
    it against;
-4. which heavy facts gained teeth, and which could not because there was
-   nothing literal to catch - with the gap you left open;
+4. the doctor's `teeth` line before and after this step; each fact that
+   gained a check, with its id, the check kind, the literal, and where it
+   is anchored; each fact that got or kept a no-literal reason, with the
+   reason; and the gaps you left open;
 5. what you stored that had been missing;
 6. what the gate did - including every false block and every refusal of
    your own write actions;

@@ -2832,6 +2832,32 @@ mod tests {
         assert!(events.is_empty(), "a refused remember must write nothing at all, found: {events:?}");
     }
 
+    /// THE GAP THIS CLOSES (measured 2026-09-17 on the owner's own live
+    /// store): gate ground 11 has asked this question of a heavy Rule since
+    /// 2026-08-09, but was gated to `Kind::Rule` alone, so a heavy
+    /// Orientation could carry neither a check nor a no-literal reason and
+    /// still be remembered - 7 of them had, all written in the week before
+    /// this test. Proven at the actual MCP surface, not just against
+    /// `model::gate` directly, since that is the door a session really
+    /// writes through.
+    #[tokio::test]
+    async fn a_heavy_orientation_with_no_check_is_refused_at_the_remember_surface() {
+        let srv = server();
+        let mut args = base_remember("heavy-orientation-no-check-1");
+        args.kind = "orientation".to_string();
+        args.tags = vec![]; // no no-literal answer either - the gap this closes
+        let reply = srv.remember(Parameters(args)).await;
+        assert!(reply.contains("REFUSED"), "expected a loud refusal, got: {reply}");
+        assert!(reply.contains("no check"), "expected the teeth question to fire: {reply}");
+        assert!(
+            reply.contains(model::store::NO_LITERAL_REASON_PREFIX),
+            "expected the fix to name the way out: {reply}"
+        );
+
+        let events = srv.store.lock().unwrap().get_all_events().unwrap();
+        assert!(events.is_empty(), "a refused remember must write nothing at all, found: {events:?}");
+    }
+
     #[tokio::test]
     async fn a_refused_revise_that_drops_a_field_is_loud_and_writes_nothing() {
         // `tags` used to be the fixture field for this test, but it now

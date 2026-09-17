@@ -888,52 +888,82 @@ fn shape_problems(
             "add a falsifier: one sentence naming the observation that would make this fact false, or write it as a Report instead if it never goes stale",
         ));
     }
-    // Ground 11: a heavy rule must have been ASKED whether it can refuse.
+    // Ground 11: a heavy Rule or Orientation must have been ASKED whether it
+    // can refuse.
     //
-    // Not "must have teeth" - plenty of real rules have nothing literal to
+    // Not "must have teeth" - plenty of real items have nothing literal to
     // catch, and forcing a check on those would be the compensating knob R9
     // forbids. The refusal is about the QUESTION being answered, and the
     // answer "no" is a one-word tag. See `store::NO_LITERAL_TAG` for the
     // measurement that showed nothing in the system ever asked.
     //
     // This fires on revise as well as declare, and that is the point: it is
-    // the only path by which rules written before the question existed ever
-    // get asked it. A rule nobody touches is never asked, which is the honest
-    // limit - a fact you never revisit is a fact you never learn anything new
-    // about.
+    // the only path by which items written before the question existed ever
+    // get asked it. An item nobody touches is never asked, which is the
+    // honest limit - a fact you never revisit is a fact you never learn
+    // anything new about.
+    //
     // Severity OR a literal in its own text. Severity alone was too narrow,
     // and the owner named the case on 2026-08-09: a new project's deploy rule
     // that nobody thought to mark expensive gets no question at all, and then
     // waits its turn behind every older rule in the backlog burn. A rule that
     // spells out a command, a flag or a path is asked at the door instead,
     // while the session that wrote it still knows what it meant.
+    //
+    // Gated on `Kind::Rule` alone until 2026-09-17, which left Orientation
+    // free of the same question on the SEVERITY half below. Measured that
+    // day on the owner's own store: 271 live heavy (irreversible/costly)
+    // Rule/Orientation items - 254 Rules, all 254 already answered (91 with
+    // a check, 163 with a no-literal tag, 0 with neither), against 17
+    // Orientations of which only 10 were (3 with a check, 7 with a
+    // no-literal tag) - the other 7 carried neither, and every one of those
+    // 7 was written in the week just before this ground widened to reach
+    // them.
+    //
+    // The NAMES-SOMETHING half stays Rule-only, deliberately, not widened
+    // alongside it: it is a text heuristic, measured and false-positive-
+    // tuned against real Rule text only (see the block of
+    // `a_global_rule_naming_a_*` tests below), and three real Orientation
+    // fixtures elsewhere in this file - written for grounds 7/8/16, about
+    // anchor normalisation, not this one - name a concrete path in their own
+    // text with no severity at all. Widening an untuned heuristic to a kind
+    // it was never measured against is the same mistake this file's own
+    // doctrine forbids elsewhere: never stretch a trigger to buy a catch: it
+    // would have refused three legitimate items to close a gap the
+    // measurement above never found (all 7 real misses carried a severity).
     let names_something = candidate_literal(&item.text).is_some();
-    if item.kind == Kind::Rule
-        && (matches!(item.severity, Some(Severity::Irreversible) | Some(Severity::Costly)) || names_something)
+    if ((item.kind.can_fire() && matches!(item.severity, Some(Severity::Irreversible) | Some(Severity::Costly)))
+        || (item.kind == Kind::Rule && names_something))
         && item.check.is_none()
         && !item.tags.iter().any(|t| t.starts_with(crate::store::ANSWER_GUARD_TAG_PREFIX))
     {
         match item.tags.iter().find_map(|t| crate::store::teeth_answer(t)) {
             None => problems.push(Refusal::new(
-                "this rule carries no check, so it can only inform while the mistake happens - and it is \
+                "this item carries no check, so it can only inform while the mistake happens - and it is \
                  either marked expensive or names something concrete in its own text",
                 format!(
-                    "answer one question: is there a text whose presence MEANS the mistake is happening? \
-                     If yes, add a check with that literal - forbidden for a command or for any file, \
-                     absent for one named file. If no (an authorised action looks identical to an \
-                     unauthorised one), put '{}<why not>' in its tags - one plain phrase of 20 to 120 characters, no comma and no line break, because it travels as a tag. The reason is the answer, and a \
-                     bare '{}' no longer counts.",
+                    "first TRY a check: is there a text whose presence MEANS the mistake is happening? \
+                     If yes, add a check with that literal and revise it in - forbidden for a command or \
+                     for any file, absent for one named file, absent_all for a set of literals in one \
+                     file or directory, contains for text that must stay, requires for a trigger that \
+                     must be answered. Only once that fails, say why: put '{}<why not>' in its tags, one \
+                     plain phrase of {} to {} characters, no comma and no line break, because it travels \
+                     as a tag - and the only two honest reasons are that the same fragment also appears \
+                     in legitimate use of that command (name the legitimate form), or that the mistake \
+                     leaves no text at all, an omission or a judgement. A bare '{}' no longer counts.",
                     crate::store::NO_LITERAL_REASON_PREFIX,
+                    crate::store::NO_LITERAL_REASON_MIN,
+                    crate::store::ARCHIVE_REASON_LIMIT,
                     crate::store::NO_LITERAL_TAG
                 ),
             )),
             // Only an item that already carried the bare word keeps it, and
-            // only `revise` ever says so. Re-asking every rule written before
+            // only `revise` ever says so. Re-asking every item written before
             // the reason existed would be the wall the backlog burn was built
             // to avoid; refusing to accept a NEW bare one costs nobody a
             // second turn.
             Some(crate::store::TeethAnswer::Bare) if !bare_answer_allowed => problems.push(Refusal::new(
-                format!("this rule answers the teeth question with a bare '{}' and no reason", crate::store::NO_LITERAL_TAG),
+                format!("this item answers the teeth question with a bare '{}' and no reason", crate::store::NO_LITERAL_TAG),
                 format!(
                     "say why nothing can catch it: tag it '{}<why not>' instead. Nothing here can verify \
                      the reason - the point is that the next reader can disagree with it, which a bare \
@@ -2841,6 +2871,26 @@ mod tests {
         assert!(revise(&never_answered, &updated).is_err(), "the exemption is per item, not global");
     }
 
+    /// The revise path specifically, on the kind this ground was written for
+    /// first: a rule that already had teeth and loses them by having its
+    /// only check cleared, with no reason offered in its place.
+    #[test]
+    fn clearing_a_heavy_rules_last_check_is_refused_without_a_reason() {
+        let mut existing = base(Kind::Rule);
+        existing.bindings = vec![Binding::Always];
+        existing.severity = Some(Severity::Irreversible);
+        existing.check = Some(Check::Forbidden { literals: vec!["--force".to_string()] });
+
+        let mut updated = existing.clone();
+        updated.check = None;
+        let err = revise(&existing, &updated).unwrap_err();
+        assert!(
+            err.problem.contains("no check"),
+            "clearing the only check on a heavy rule must trigger the teeth question: {}",
+            err.problem
+        );
+    }
+
     /// The third honest answer, and the one the owner's own reporting rule
     /// needed: a rule about what gets SAID is enforced by the response guard,
     /// not by a check. Naming the guard entry says more than "nothing to catch
@@ -2940,6 +2990,124 @@ mod tests {
             "the fix message must be one unbroken line (no embedded newlines): {}",
             fix_msg
         );
+    }
+
+    // -------------------------------------------------- ground 11 (orientation)
+    //
+    // The same ground, proven for the other kind it now reaches. Added
+    // 2026-09-17 alongside widening the condition above from `Kind::Rule` to
+    // `can_fire()` - see that ground's own comment for the measurement that
+    // showed Orientation, not Rule, was the actual gap.
+
+    #[test]
+    fn a_heavy_orientation_with_no_check_is_refused_until_the_question_is_answered() {
+        let mut item = base(Kind::Orientation);
+        item.severity = Some(Severity::Irreversible);
+        item.check = None;
+        let err = declare(&item).unwrap_err();
+        assert!(err.problem.contains("no check"), "names what is missing: {}", err.problem);
+        assert!(err.fix.contains(crate::store::NO_LITERAL_TAG), "names the way out: {}", err.fix);
+    }
+
+    #[test]
+    fn answering_no_lets_a_heavy_orientation_in_exactly_as_it_is() {
+        let mut item = base(Kind::Orientation);
+        item.severity = Some(Severity::Irreversible);
+        item.tags = vec![format!(
+            "{}an authorised action looks exactly like an unauthorised one",
+            crate::store::NO_LITERAL_REASON_PREFIX
+        )];
+        assert!(
+            declare(&item).is_ok(),
+            "an orientation with nothing literal to catch is legitimate - the tag records that it was asked"
+        );
+    }
+
+    #[test]
+    fn answering_yes_lets_a_heavy_orientation_in_with_its_teeth() {
+        let mut item = base(Kind::Orientation);
+        item.severity = Some(Severity::Irreversible);
+        item.check = Some(Check::Forbidden { literals: vec!["--force".to_string()] });
+        assert!(declare(&item).is_ok());
+    }
+
+    #[test]
+    fn a_light_or_unrated_orientation_is_never_asked() {
+        let mut light = base(Kind::Orientation);
+        light.severity = Some(Severity::HouseStyle);
+        assert!(declare(&light).is_ok(), "house style is not what this ground is about");
+
+        let mut unrated = base(Kind::Orientation);
+        unrated.severity = None;
+        assert!(declare(&unrated).is_ok(), "an unrated orientation claims nothing about cost");
+    }
+
+    #[test]
+    fn raising_an_existing_light_orientation_to_heavy_asks_the_question_before_it_lands() {
+        let mut light = base(Kind::Orientation);
+        light.severity = Some(Severity::HouseStyle);
+        assert!(declare(&light).is_ok(), "fixture sanity: it goes in as it stands");
+
+        let mut now_heavy = light.clone();
+        now_heavy.severity = Some(Severity::Costly);
+        let err = revise(&light, &now_heavy).unwrap_err();
+        assert!(
+            err.problem.contains("no check"),
+            "calling a fact expensive must trigger the teeth question on an orientation too: {}",
+            err.problem
+        );
+
+        let mut answered = now_heavy.clone();
+        answered.tags = vec![format!(
+            "{}an authorised action looks exactly like an unauthorised one",
+            crate::store::NO_LITERAL_REASON_PREFIX
+        )];
+        assert!(revise(&light, &answered).is_ok(), "and answering it lets the re-rating through");
+    }
+
+    /// The revise path specifically: an orientation that already had teeth
+    /// and loses them. THE DEFECT THIS CLOSES (measured 2026-09-17): before
+    /// Orientation was gated here, clearing a heavy orientation's only check
+    /// went straight through with nothing to say about it.
+    #[test]
+    fn clearing_a_heavy_orientations_last_check_is_refused_without_a_reason() {
+        let mut existing = base(Kind::Orientation);
+        existing.severity = Some(Severity::Irreversible);
+        existing.check = Some(Check::Forbidden { literals: vec!["--force".to_string()] });
+
+        let mut updated = existing.clone();
+        updated.check = None;
+        let err = revise(&existing, &updated).unwrap_err();
+        assert!(
+            err.problem.contains("no check"),
+            "clearing the only check on a heavy orientation must trigger the teeth question: {}",
+            err.problem
+        );
+    }
+
+    #[test]
+    fn a_bare_no_literal_answer_with_no_reason_is_refused_on_a_new_orientation() {
+        let mut item = base(Kind::Orientation);
+        item.severity = Some(Severity::Irreversible);
+        item.tags = vec![crate::store::NO_LITERAL_TAG.to_string()];
+        let err = declare(&item).unwrap_err();
+        assert!(err.problem.contains("no reason"), "names what is missing: {}", err.problem);
+        assert!(
+            err.fix.contains(crate::store::NO_LITERAL_REASON_PREFIX),
+            "names the way out: {}",
+            err.fix
+        );
+    }
+
+    /// The refusal must offer both honest exits, not just the one the
+    /// original Rule-only message happened to illustrate.
+    #[test]
+    fn the_no_check_refusal_names_both_honest_no_literal_reasons() {
+        let mut item = base(Kind::Orientation);
+        item.severity = Some(Severity::Costly);
+        let err = declare(&item).unwrap_err();
+        assert!(err.fix.contains("legitimate use"), "names the first honest reason: {}", err.fix);
+        assert!(err.fix.contains("leaves no text"), "names the second honest reason: {}", err.fix);
     }
 
     #[test]

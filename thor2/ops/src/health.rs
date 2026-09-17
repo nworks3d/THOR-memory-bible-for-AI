@@ -832,12 +832,22 @@ fn bindings_short(bindings: &[model::item::Binding]) -> String {
 /// (the current UTC calendar day, `serve::usefulness::eval_done_today`) is
 /// already done; and, only when it is NOT, how many times this project has
 /// been asked since its last report, since when, and that the Stop hook
-/// blocks every turn once a session has worked here for an hour. That last
-/// note is necessarily approximate about the minutes-worked half: `doctor`
-/// runs cold, outside any session, so it can name whether today's report
-/// exists but never how long any particular session has worked here
-/// (`serve::usefulness::EVAL_MIN_SESSION_MINUTES`) - only a real Stop,
-/// inside a real session, can ever know that. READ-ONLY: this reads the
+/// blocks every turn once a session has accrued an hour of work here. That
+/// last note is necessarily approximate about the accrued-work half:
+/// `doctor` runs cold, outside any session, so it can name whether today's
+/// report exists but never with full certainty how long any PARTICULAR
+/// session has worked here right now (`serve::usefulness::
+/// EVAL_FIRST_WORK_MINUTES`/`EVAL_REPEAT_WORK_MINUTES`) - only a real Stop,
+/// inside a real session, can ever know that for certain. Since 2026-09-17
+/// (fifth rewrite, `serve::usefulness`'s own "evaluation debt" section) this
+/// line also names the MOST RECENTLY ACTIVE session's own accrued total from
+/// the sidecar (`serve::usefulness::most_recently_active_session`) and when
+/// it is next due - the closest a cold read gets to an honest answer, and
+/// explicitly named as coming from the sidecar rather than a live
+/// measurement. Also names, once today's report already exists, that a
+/// REPEAT evaluation follows after `EVAL_REPEAT_WORK_MINUTES` more of
+/// accrued work since it, rather than staying silent until the next UTC
+/// day. READ-ONLY: this reads the
 /// evaluation debt's own sidecar (`serve::usefulness::project_eval_state`)
 /// but, unlike the Stop hook's own `update_eval_debt_state`/`record_eval_
 /// debt_asked`, never writes it - a diagnostic that mutated state on every
@@ -904,8 +914,11 @@ pub fn judgement_debt_line(db: &Path, checkout_project: Option<&str>, full: bool
                 Some((id, _seq)) => format!("newest evaluation report '{id}' in the store, not yet seen by a Stop"),
             };
             out[0].push_str(&format!(" - {report_clause}"));
-            if serve::usefulness::eval_done_today(state.last_evaluation_seen, now) {
-                out[0].push_str("; today's evaluation is done");
+            let done_today = serve::usefulness::eval_done_today(state.last_evaluation_seen, now);
+            if done_today {
+                out[0].push_str(
+                    "; today's evaluation is done, and asks again once three more hours of accrued work go by since it",
+                );
             } else {
                 let ask_clause = match state.first_asked_since_report {
                     Some(first) => {
@@ -915,7 +928,32 @@ pub fn judgement_debt_line(db: &Path, checkout_project: Option<&str>, full: bool
                 };
                 out[0].push_str(&format!(
                     "; today's evaluation is not done - {ask_clause}; the Stop hook blocks every turn once a session \
-                     has worked here for an hour, until the report is filed"
+                     has accrued an hour of work here, until the report is filed"
+                ));
+            }
+            // THE MOST RECENTLY ACTIVE SESSION'S OWN ACCRUAL, since the fifth
+            // rewrite (2026-09-17, `serve::usefulness`'s own "evaluation
+            // debt" section): `doctor` has no session of its own to measure
+            // "how long has THIS session worked here" the way a real Stop
+            // can, but the sidecar now carries every session's own accrued
+            // total (`ProjectEvalState::sessions`), so the most recently
+            // active one - by `last_event_unix` - is the closest cold read
+            // gets to an honest answer, named explicitly as an
+            // approximation rather than silently guessed at. Silent when the
+            // sidecar holds no session yet for this project (a fresh
+            // sidecar, or one written before this field existed) - there is
+            // nothing to name, not an error.
+            if let Some((session_id, work)) = serve::usefulness::most_recently_active_session(&state) {
+                let accrued_minutes = work.accrued_secs / 60;
+                let threshold =
+                    if done_today { serve::usefulness::EVAL_REPEAT_WORK_MINUTES } else { serve::usefulness::EVAL_FIRST_WORK_MINUTES };
+                let due_clause = match (threshold - accrued_minutes).max(0) {
+                    0 => "already due".to_string(),
+                    remaining => format!("due after {remaining} more minute(s) of accrued work"),
+                };
+                out[0].push_str(&format!(
+                    "; its most recently active session ('{session_id}') has accrued {accrued_minutes} minute(s) of work \
+                     here since its last reset, {due_clause}"
                 ));
             }
         }
@@ -2186,7 +2224,7 @@ mod tests {
         assert!(line.contains("today's evaluation is not done"), "{line}");
         assert!(line.contains("not asked yet"), "{line}");
         assert!(
-            line.contains("the Stop hook blocks every turn once a session has worked here for an hour"),
+            line.contains("the Stop hook blocks every turn once a session has accrued an hour of work here"),
             "{line}"
         );
     }
@@ -2212,7 +2250,7 @@ mod tests {
         assert!(line.contains("today's evaluation is not done"), "{line}");
         assert!(line.contains("asked 4 time(s), the first 2 day(s) ago"), "{line}");
         assert!(
-            line.contains("the Stop hook blocks every turn once a session has worked here for an hour"),
+            line.contains("the Stop hook blocks every turn once a session has accrued an hour of work here"),
             "{line}"
         );
     }
@@ -2316,8 +2354,112 @@ mod tests {
         let line = judgement_debt_line(&db, Some("thor"), false).expect("one item is still owed, the line must speak");
         assert!(line.contains("today's evaluation is not done"), "{line}");
         assert!(
-            line.contains("the Stop hook blocks every turn once a session has worked here for an hour"),
+            line.contains("the Stop hook blocks every turn once a session has accrued an hour of work here"),
             "{line}"
+        );
+    }
+
+    // -------------------------------------- the most recently active session
+    //
+    // Added 2026-09-17 (fifth rewrite, `serve::usefulness`'s own "evaluation
+    // debt" section): the sidecar now carries every session's own accrued
+    // work (`ProjectEvalState::sessions`), so `doctor` names the most
+    // recently active one and how much more accrued work it needs before
+    // the next evaluation is due - the closest a cold read gets to the
+    // per-session detail only a real Stop can know for certain.
+
+    /// Case named in the build brief (doctor tail): the most recently active
+    /// session's own accrued work is named, and how much more is needed
+    /// before the FIRST threshold (no report yet today).
+    #[test]
+    fn judgement_debt_line_names_the_most_recently_active_sessions_accrued_work() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("t.db");
+        {
+            let mut store = EventStore::new(&db).unwrap();
+            declare_owed_for_eval_debt(&mut store, 12, "thor");
+        }
+        let now = serve::time::now_unix();
+        seed_eval_debt_state(
+            &db,
+            "thor",
+            serve::usefulness::ProjectEvalState {
+                sessions: std::collections::BTreeMap::from([(
+                    "s1".to_string(),
+                    serve::usefulness::SessionWorkState { anchor_unix: Some(now - 40 * 60), accrued_secs: 40 * 60, last_event_unix: Some(now) },
+                )]),
+                ..Default::default()
+            },
+        );
+        let line = judgement_debt_line(&db, Some("thor"), false).expect("a real backlog, the line must speak");
+        assert!(
+            line.contains("its most recently active session ('s1') has accrued 40 minute(s) of work here since its last reset"),
+            "{line}"
+        );
+        assert!(line.contains("due after 20 more minute(s) of accrued work"), "{line}");
+    }
+
+    #[test]
+    fn judgement_debt_line_says_a_session_already_over_the_threshold_is_already_due() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("t.db");
+        {
+            let mut store = EventStore::new(&db).unwrap();
+            declare_owed_for_eval_debt(&mut store, 12, "thor");
+        }
+        let now = serve::time::now_unix();
+        seed_eval_debt_state(
+            &db,
+            "thor",
+            serve::usefulness::ProjectEvalState {
+                sessions: std::collections::BTreeMap::from([(
+                    "s1".to_string(),
+                    serve::usefulness::SessionWorkState { anchor_unix: Some(now - 90 * 60), accrued_secs: 90 * 60, last_event_unix: Some(now) },
+                )]),
+                ..Default::default()
+            },
+        );
+        let line = judgement_debt_line(&db, Some("thor"), false).expect("a real backlog, the line must speak");
+        assert!(line.contains("already due"), "{line}");
+    }
+
+    /// A report already seen today shifts BOTH the top-level wording (a
+    /// repeat evaluation, not a first one) and the per-session threshold to
+    /// `EVAL_REPEAT_WORK_MINUTES` rather than `EVAL_FIRST_WORK_MINUTES`.
+    #[test]
+    fn judgement_debt_line_uses_the_repeat_threshold_once_todays_report_already_exists() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("t.db");
+        let today = start_of_today_utc();
+        {
+            let mut store = EventStore::new(&db).unwrap();
+            declare_owed_for_eval_debt(&mut store, 12, "thor");
+            declare_report(&mut store, "eval-thor-2026-09-17", "thor");
+        }
+        let now = serve::time::now_unix();
+        seed_eval_debt_state(
+            &db,
+            "thor",
+            serve::usefulness::ProjectEvalState {
+                last_evaluation_seen: Some(today),
+                last_evaluation_report_id: Some("eval-thor-2026-09-17".to_string()),
+                known_report_ids: std::collections::BTreeSet::from(["eval-thor-2026-09-17".to_string()]),
+                sessions: std::collections::BTreeMap::from([(
+                    "s1".to_string(),
+                    serve::usefulness::SessionWorkState { anchor_unix: Some(today), accrued_secs: 100 * 60, last_event_unix: Some(now) },
+                )]),
+                ..Default::default()
+            },
+        );
+        let line = judgement_debt_line(&db, Some("thor"), false).expect("a real backlog, the line must speak");
+        assert!(
+            line.contains("today's evaluation is done, and asks again once three more hours of accrued work go by since it"),
+            "{line}"
+        );
+        let remaining = serve::usefulness::EVAL_REPEAT_WORK_MINUTES - 100;
+        assert!(
+            line.contains(&format!("due after {remaining} more minute(s) of accrued work")),
+            "must measure against the REPEAT threshold, not the first-of-day one: {line}"
         );
     }
 

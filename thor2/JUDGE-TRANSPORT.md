@@ -160,33 +160,45 @@ independently, at its own call site in `hook_once`'s `Stop` arm. `setup_debt`
 never walks a subagent
 through AGENTS.md's setup questions, because there is no owner in the room
 for that conversation either. The evaluation debt (added 2026-09-12, trigger
-rewritten four times, three of them on 2026-09-16: first to a per-project
-sidecar rather than a single verdict clock, then to drop the item-count
-ceiling entirely in favour of a daily, per-project ask once a session has
-worked there long enough, then to never ask outside a project at all, then
-- the owner's decision that day, "he does not want to ever have to run an
-evaluation himself" - to a UTC CALENDAR DAY with no once-per-session limit:
-`serve/src/bin/serve.rs`'s `evaluation_debt`, `serve::usefulness`'s own
-"evaluation debt" section - holds when no evaluation report for this
-project has been first seen on the current UTC calendar day
+rewritten five times, three of them on 2026-09-16, one on 2026-09-17: first
+to a per-project sidecar rather than a single verdict clock, then to drop
+the item-count ceiling entirely in favour of a daily, per-project ask once a
+session has worked there long enough, then to never ask outside a project
+at all, then - the owner's decision that day, "he does not want to ever have
+to run an evaluation himself" - to a UTC CALENDAR DAY with no
+once-per-session limit, then - the owner's decision on 2026-09-17, "after
+three hours of work a new evaluation is due" - to ACCRUED WORK rather than a
+single wall-clock timestamp, and a REPEAT ask once a report already exists
+for today: `serve/src/bin/serve.rs`'s `evaluation_debt`, `serve::
+usefulness`'s own "evaluation debt" section - holds when no evaluation
+report for this project has been first seen on the current UTC calendar day
 (`serve::usefulness::eval_done_today`, `crate::time::same_utc_day` - UTC,
 never the owner's own local day, since this workspace has no dependency
-capable of resolving a local UTC offset), AND this session has worked in
-the project for at least an hour, AND the checkout resolves to a real
-project at all - never for one that resolves to no project, since no
-project means no Report can ever be filed to silence it. It now BLOCKS THE
-FIRST STOP OF EVERY TURN for as long as it holds, not merely once per
-session - relying entirely on Claude Code's own `stop_hook_active` (the
-`already_fired` branch at the very top of `hook_once`'s `Stop` arm, shared
-by every debt in this function) for the "at most once per turn" safety,
-adding no second copy of that mechanism - and counts every ask on the
-project's own sidecar entry (`ProjectEvalState`'s `asked_count`/`first_
-asked_since_report`, reset the moment a new report is seen), replacing the
-retired session-keyed `eval-debt-asked.json`. It is silent for a
-subagent for the identical reason: a subagent cannot itself type
-`/thor-eval`, so holding its turn over a routine only the owner can run
-would spend a whole agent run asking for something it has no way to do. The
-three memory-upkeep debts are
+capable of resolving a local UTC offset) AND this session has accrued at
+least an hour of work in the project (`serve::usefulness::
+EVAL_FIRST_WORK_MINUTES`, `SessionWorkState`/`record_hook_event` - every
+hook event of a session, gap-filtered so a pause of `EVAL_PAUSE_MINUTES` or
+more contributes nothing), OR a report already exists for today AND three
+more hours of accrued work have gone by since it
+(`EVAL_REPEAT_WORK_MINUTES`, measured from whenever that report reset the
+accrual) - AND the checkout resolves to a real project at all - never for
+one that resolves to no project, since no project means no Report can ever
+be filed to silence it. It now BLOCKS THE FIRST STOP OF EVERY TURN for as
+long as it holds, not merely once per session - relying entirely on Claude
+Code's own `stop_hook_active` (the `already_fired` branch at the very top of
+`hook_once`'s `Stop` arm, shared by every debt in this function) for the "at
+most once per turn" safety, adding no second copy of that mechanism - and
+counts every ask on the project's own sidecar entry (`ProjectEvalState`'s
+`asked_count`/`first_asked_since_report`, reset the moment a new report is
+seen), replacing the retired session-keyed `eval-debt-asked.json`. The
+accrual itself (`record_hook_event`) runs on EVERY hook event of a session
+inside a project - `SessionStart`, `UserPromptSubmit`, `PreToolUse` and
+`Stop` alike, a subagent's own included, since a subagent's work still
+counts as work of its own session - but the debt's own BLOCKING check is
+silent for a subagent's `Stop` for the identical reason every other debt
+here is: a subagent cannot itself type `/thor-eval`, so holding its turn
+over a routine only the owner can run would spend a whole agent run asking
+for something it has no way to do. The three memory-upkeep debts are
 silenced for a sharper reason: paying one of them - `mark` for the
 judgement debt, `revise`/`retract` for the crowding debt and the
 stale-rule debt - is a write through the tool server, and every write the

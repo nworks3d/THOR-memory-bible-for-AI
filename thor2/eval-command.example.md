@@ -1,9 +1,9 @@
 ---
 description: THOR session evaluation - judge what fired, repair what has rotted, give teeth to what nothing could stop, capture what was missing, report what the gate did and where it chafed, and close with a plain-language summary
-allowed-tools: mcp__thor__mark, mcp__thor__get, mcp__thor__lookup, mcp__thor__remember, mcp__thor__revise, mcp__thor__retract, mcp__thor__status, mcp__thor__history
+allowed-tools: mcp__thor__mark, mcp__thor__get, mcp__thor__lookup, mcp__thor__remember, mcp__thor__revise, mcp__thor__retract, mcp__thor__status, mcp__thor__history, Bash
 ---
 
-THOR session evaluation. Work through steps 1 to 7, then the report. You need
+THOR session evaluation. Work through steps 1 to 8, then the report. You need
 no prior knowledge for this: everything is below. Do not skip a step because
 it seems like there is "nothing to report" - write "nothing" for that step
 explicitly instead. An empty step is a finding; a skipped step is a gap.
@@ -39,7 +39,38 @@ asked, since there would be no way to file the report that silences it.
 
 ---
 
-## 1. Judge what fired
+## 1. State of the work
+
+Before anything else: what does this project's own working copy actually
+look like right now, and can you back every claim below with something you
+just ran, not with something you remember saying earlier in this
+conversation?
+
+- **Uncommitted changes.** Run `git status` and `git diff --stat`. Name
+  every changed file, and, where you can tell, which agent or session made
+  it - a background agent, a delegated task, or the session running this
+  evaluation itself. No changes at all is a finding too: say so explicitly.
+- **The project's own tests or build, run now.** Do not quote a result from
+  earlier in the session - a build can go stale the moment one more file
+  changes after it. Run it again, right now, and quote the actual result
+  line (a pass/fail count, or the compiler's own summary), never a
+  paraphrase of one.
+- **Agents or background jobs.** Anything still running, or that stopped
+  partway through its own work, gets named: what it was doing, and whether
+  it finished, failed, or is still going right now.
+- **Promises made without proof.** A claim that something is "done",
+  "deployed", "fixed", or "working" with nothing run this session to back it
+  up - a machine still busy elsewhere, a deploy nobody has verified, a fix
+  nobody has re-tested. Name each one plainly; repeating the claim is not
+  the same as checking it.
+
+Every item above gets a decision: settle it now if you can (run the missing
+test, check the machine, ask what a background job actually did), or carry
+it into this report's own open points with the reason you could not settle
+it here. Step 1 is done once every item above has one of those two outcomes
+- never left as a bare observation with nothing decided about it.
+
+## 2. Judge what fired
 
 Before any of that: look up the previous evaluation report for this project
 (`mcp__thor__lookup` for the tag `evaluation-report` and this project; take
@@ -48,6 +79,12 @@ reason, the gaps it left open, and everything it listed as not verified or
 still to be probed. For each: settle it now, or carry it into this report's
 own open points with the reason it is still open. No previous report? Say so
 and move on.
+
+SCOPE: if an evaluation report for this project was already filed earlier
+TODAY, this evaluation covers only what happened SINCE that report - not the
+whole session, and not the whole day. Judge only what fired since then;
+everything the previous report already covers is not this evaluation's
+business again.
 
 The test is not "was it useful" but **did it belong where it fired**.
 - `mcp__thor__mark(id: "<id>")` - it belonged there.
@@ -80,10 +117,10 @@ if it belonged where it fired,
 noise if it did not. On top of that: every fact you recognised as noise
 this session, and every useful fact the Stop hook itself never asked about.
 Do not re-mark something that already carries a verdict - that would count
-twice. Step 1 is done once this project's debt is at zero, or every item
+twice. Step 2 is done once this project's debt is at zero, or every item
 still left is named in the report with the reason you could not judge it.
 
-## 2. Repair what has rotted (this is not noise)
+## 3. Repair what has rotted (this is not noise)
 
 Did a fact come up that was still RELEVANT but no longer matches the
 artifact - the code, the file, the current state? That is not noise, and
@@ -102,14 +139,14 @@ build.
 
 Does the gate refuse your revision - the text too long, the anchor full?
 That is not a finding but work for the same turn: keep the text short and
-put the reasoning in a separate Report as step 4 describes, or move it to
-the right anchor with a route from step 5. Step 2 is done once every fact
+put the reasoning in a separate Report as step 5 describes, or move it to
+the right anchor with a route from step 6. Step 3 is done once every fact
 you recognised as rotten has actually been revised - no revision is left
 hanging on a refusal.
 
-## 3. Give teeth to what nothing could stop
+## 4. Give teeth to what nothing could stop
 
-Step 2 asks whether a fact is still TRUE. This step asks whether it can DO
+Step 3 asks whether a fact is still TRUE. This step asks whether it can DO
 anything.
 
 A fact about something irreversible or costly that carries no check only
@@ -121,7 +158,7 @@ field can stop nothing. The health check counts the state under `teeth`.
 Two outcomes, and both belong in the report:
 
 - **There is a literal fragment that makes the mistake.** Attach a check,
-  in the forms step 4 describes. Often the ANCHOR turns out to be the real
+  in the forms step 5 describes. Often the ANCHOR turns out to be the real
   problem: a line about a dangerous command bound to a broad moment fires
   everywhere and refuses nowhere. Move it to that command and attach the
   check there.
@@ -132,22 +169,22 @@ Two outcomes, and both belong in the report:
 What you NEVER do here: stretch the literal to catch more. If it catches one
 form and not another, that is the honest answer - write down the gap you
 left open. A broader rule that blocks legitimate work is the most expensive
-outcome this system knows (see step 5), and the doctrine forbids widening a
+outcome this system knows (see step 6), and the doctrine forbids widening a
 trigger to buy a catch.
 
 This evaluation cannot probe anything itself; that needs a real command. So
-every check you add here goes on step 7's list as "still to be probed". A
+every check you add here goes on step 8's list as "still to be probed". A
 check that has never been probed is an assumption.
 
 Does the gate refuse the check you are adding - does it not hold, or is the
 anchor full after moving it? Correct the check until it holds, or store the
 fact without a check and put the reason nothing can catch it in the tags; a
-full anchor is solved with a route from step 5. That happens in the same
-turn, not as a line in the report. Step 3 is done once every heavy fact that
+full anchor is solved with a route from step 6. That happens in the same
+turn, not as a line in the report. Step 4 is done once every heavy fact that
 fired has a decision (a check, or a recorded reason why not) and nothing is
 left hanging on a refusal.
 
-## 4. Capture what was missing
+## 5. Capture what was missing
 
 Did you find a gotcha, a contract, or a behaviour detail that should have
 been in THOR and that you can state concretely? Store it NOW with
@@ -161,7 +198,7 @@ Where the gate will refuse you, so you get it right immediately:
 - anchor it to the file or command it is REALLY about, never to a path that
   merely happens to appear in the sentence;
 - every binding already full of heavier rivals: solve it with a route from
-  step 5 (fold it into an existing fact, anchor it narrower, or deliberately
+  step 6 (fold it into an existing fact, anchor it narrower, or deliberately
   leave it with the label `crowded-on-purpose`) and name the occupants in
   your report - dropping it is not a route;
 - a NEW place - a project, scope or purpose that does not exist yet: choose
@@ -177,10 +214,10 @@ Want a fact to be able to REFUSE a wrong action instead of only informing:
 
 All other forms only inform, and that is usually the right choice.
 
-Step 4 is done once every fact you tried to capture is actually stored - no
+Step 5 is done once every fact you tried to capture is actually stored - no
 attempt is left hanging on a refusal from the gate.
 
-## 5. What the gate did
+## 6. What the gate did
 
 This is the signal that counts here, not a mark.
 
@@ -218,11 +255,11 @@ This is the signal that counts here, not a mark.
   heavier warning out of the way to show a lighter one, which is exactly
   the compensating trick this design forbids.
 
-Step 5 is done once every refusal is named, every false block is in the
+Step 6 is done once every refusal is named, every false block is in the
 report, and every displacement notice is either resolved or deliberately
 tagged - reporting alone is never enough here.
 
-## 6. Friction - where it chafed
+## 7. Friction - where it chafed
 
 This is a full outcome, not an afterthought. Name everything that cost you
 time or confidence, even what you fixed yourself:
@@ -242,12 +279,12 @@ time or confidence, even what you fixed yourself:
 
 For each point of friction: is this a one-off, or will it happen again next
 session? If it will recur, THOR should hold a fact about it - capture that
-under step 4 instead of only reporting it.
+under step 5 instead of only reporting it.
 
-Step 6 is done once you have decided that for every point of friction - not
+Step 7 is done once you have decided that for every point of friction - not
 every point needs to become a fact, but every point needs a decision.
 
-## 7. What you did NOT verify
+## 8. What you did NOT verify
 
 Name explicitly what you are assuming but have not checked. If you added a
 fact bound to a target, this evaluation only ever sees what FIRED - a
@@ -257,7 +294,7 @@ putting the forbidden fragment literally into a command and seeing whether
 the gate responds. Never test with a file check or with free prose - that
 proves nothing.
 
-Step 7 is done once every untested addition from this session is on that
+Step 8 is done once every untested addition from this session is on that
 list, named with what should make it refuse.
 
 ---
@@ -283,16 +320,19 @@ resolve it before you report: "I could not save this" does not belong in
 this report - if it is still there when you write the report, the work is
 not done.
 
-1. what you judged as noise and why, and what belonged where it fired;
-2. what you revised, with before and after, and which artifact you checked
+1. the state of the work: uncommitted changes and who made them, the actual
+   test/build result you ran, background jobs and their state, and any
+   promise you found made without proof;
+2. what you judged as noise and why, and what belonged where it fired;
+3. what you revised, with before and after, and which artifact you checked
    it against;
-3. which heavy facts gained teeth, and which could not because there was
+4. which heavy facts gained teeth, and which could not because there was
    nothing literal to catch - with the gap you left open;
-4. what you stored that had been missing;
-5. what the gate did - including every false block and every refusal of
+5. what you stored that had been missing;
+6. what the gate did - including every false block and every refusal of
    your own write actions;
-6. the friction, and which of it will happen again next session;
-7. what you did not verify.
+7. the friction, and which of it will happen again next session;
+8. what you did not verify.
 
 Get the numbers about the state of the store from the health check, never
 from memory and never from a fact. That is a SEPARATE program, not a

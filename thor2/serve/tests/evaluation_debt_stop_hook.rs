@@ -206,6 +206,23 @@ fn subagent_stop_payload(session_id: &str, cwd: &Path) -> String {
     .to_string()
 }
 
+/// A `PreToolUse` payload from inside a subagent - the identical `agent_id`
+/// signal as `subagent_stop_payload` above, on the event type the fifth
+/// rewrite's own accrual (`usefulness::record_hook_event`) runs on
+/// unconditionally, subagent or not (see that function's own doc comment).
+fn subagent_pretooluse_payload(session_id: &str, cwd: &Path) -> String {
+    serde_json::json!({
+        "hook_event_name": "PreToolUse",
+        "session_id": session_id,
+        "cwd": cwd.to_string_lossy(),
+        "agent_id": "a1dca2c0feb7f44fb",
+        "agent_type": "general-purpose",
+        "tool_name": "Read",
+        "tool_input": { "file_path": "fixture.txt" },
+    })
+    .to_string()
+}
+
 /// Declares `n` never-judged rules, scoped to `project` (`None` for
 /// global), and serves each one `AFTER` times under a throwaway fixture
 /// session id, so all `n` sit in this checkout's own judgement debt - feeds
@@ -224,11 +241,11 @@ fn subagent_stop_payload(session_id: &str, cwd: &Path) -> String {
 /// NEVER SERVED UNDER A REAL SESSION ID HERE - only under the throwaway
 /// "fixture" one, which feeds the OWED COUNT (`judgement_debt_counts`,
 /// unscoped by session) but is never anyone's `served_ids_in_session`. A
-/// test that also needs THIS session to have served something in the
-/// project uses `serve_marker_in_session` below instead of serving one of
-/// these owed items directly - serving an OWED item under the real session
-/// would also satisfy `judgement_debt`'s own per-item "seen" filter and
-/// make it a second, unwanted contender for most of the tests below.
+/// test that also needs THIS session to have accrued work in the project
+/// uses `seed_session_work` below instead of serving one of these owed
+/// items directly - serving an OWED item under the real session would also
+/// satisfy `judgement_debt`'s own per-item "seen" filter and make it a
+/// second, unwanted contender for most of the tests below.
 fn declare_owed_items(store: &mut EventStore, n: usize, project: Option<&str>) -> Vec<String> {
     let label = project.unwrap_or("global");
     let mut ids = Vec::with_capacity(n);
@@ -256,61 +273,59 @@ fn declare_owed_items(store: &mut EventStore, n: usize, project: Option<&str>) -
     ids
 }
 
-/// Declare a fresh, harmless item scoped to `project` and serve it EXACTLY
-/// ONCE, under the real `session_id`, timestamped 2026-09-08 - long enough
-/// before any real run of this test suite that it also satisfies the
-/// evaluation debt's own minutes-worked floor
-/// (`serve::usefulness::EVAL_MIN_SESSION_MINUTES`) for free, on top of its
-/// original job: giving `session_first_served_in_project` (`bin/serve.rs`)
-/// something to find, without ever approaching `JUDGEMENT_DEBT_AFTER`, so it
-/// never becomes owed itself and never gives `judgement_debt` anything to
-/// ask about. The id embeds `session_id` so two calls in the same test (a
-/// first session, then a second) never collide or trip the write gate's
-/// near-duplicate check.
-fn serve_marker_in_session(store: &mut EventStore, session_id: &str, project: Option<&str>) -> String {
-    let id = format!("marker-{session_id}");
-    let item = Item {
-        id: id.clone(),
-        kind: Kind::Rule,
-        text: format!("fixture marker item for session {session_id}"),
-        bindings: vec![Binding::Always],
-        severity: None,
-        project: project.map(str::to_string),
-        tags: vec![],
-        expires: None,
-        key: None,
-        falsifier: Some("this marker fixture turns out to be wrong".to_string()),
-        check: None,
-    };
-    model::store::declare(store, "fixture", "fixture", "fixture", &item).unwrap();
-    serve::deliver::record_delivery(store, session_id, "fixture", "t", "2026-09-08T00:00:00Z", &[id.clone()]);
-    id
-}
-
-/// The same fixture as `serve_marker_in_session` above, but with a
-/// controllable, recent `served_at` - `minutes_ago` minutes before the real
-/// "now" - so a test can drive `session_first_served_in_project`'s own
-/// clock to land on EITHER side of `EVAL_MIN_SESSION_MINUTES`, which
-/// `serve_marker_in_session`'s fixed 2026-09-08 timestamp cannot do (it is
-/// always well past the floor).
-fn serve_marker_in_session_minutes_ago(store: &mut EventStore, session_id: &str, project: Option<&str>, minutes_ago: i64) {
-    let id = format!("marker-{session_id}-{minutes_ago}");
-    let item = Item {
-        id: id.clone(),
-        kind: Kind::Rule,
-        text: format!("fixture marker item for session {session_id}, {minutes_ago} minute(s) ago"),
-        bindings: vec![Binding::Always],
-        severity: None,
-        project: project.map(str::to_string),
-        tags: vec![],
-        expires: None,
-        key: None,
-        falsifier: Some("this marker fixture turns out to be wrong".to_string()),
-        check: None,
-    };
-    model::store::declare(store, "fixture", "fixture", "fixture", &item).unwrap();
-    let served_at = serve::time::iso8601_from_unix(serve::time::now_unix() - minutes_ago * 60);
-    serve::deliver::record_delivery(store, session_id, "fixture", "t", &served_at, &[id]);
+/// Seed this (project, session) pair's own accrued-work sidecar entry
+/// directly, with `minutes` worth of work already accrued - the fifth
+/// rewrite's own fixture lever (2026-09-17, `serve::usefulness`'s own
+/// "evaluation debt" section), replacing the retired `serve_marker_in_
+/// session`/`serve_marker_in_session_minutes_ago` (which drove the OLD
+/// mechanism, a wall-clock timestamp on an `item_served` event) now that
+/// "how long has this session worked here" comes from hook-event accrual
+/// (`serve::usefulness::SessionWorkState`/`record_hook_event`) instead.
+///
+/// THE ANCHOR IS PINNED AT NOON UTC ON TODAY'S OWN CALENDAR DAY
+/// (`start_of_today_utc() + 12h`, by the wall clock THIS PROCESS reads right
+/// now), never at the literal "now" - the identical day-boundary-safety
+/// `seed_eval_state`'s own report timestamps already rely on
+/// (`start_of_today_utc`'s own doc comment), needed here for a reason that
+/// fixture never had to deal with: `accrue_session_work` (unlike a plain
+/// `last_evaluation_seen` comparison) re-derives its own answer from a FRESH
+/// wall-clock read inside the real hook subprocess, so a seed built from
+/// literal "now" minus `minutes` can land on a DIFFERENT UTC calendar day
+/// than the subprocess's own "now" whenever a test happens to run within
+/// `minutes` of real UTC midnight - measured directly: this test suite
+/// failed exactly this way when run at 00:25 UTC, seeding "90 minutes ago"
+/// one calendar day before the subprocess's own clock read moments later,
+/// which `session_work_reset_needed` (correctly, by its own design) then
+/// read as a new-day reset, silently zeroing the very accrual the test
+/// meant to prove. Noon is always safely inside "today" however many hours
+/// into the real day the test happens to run, so both instants land on the
+/// identical UTC day regardless.
+///
+/// A seed `last_event_unix` that lands in the FUTURE relative to the real
+/// subprocess's own clock (whenever the test runs before noon UTC) is
+/// harmless: `accrue_session_work` only ever ADDS a gap when it is positive
+/// and under `EVAL_PAUSE_MINUTES`, so a negative gap just leaves the seeded
+/// total untouched, which is exactly what a fixture asking for an EXACT
+/// accrued total needs anyway.
+///
+/// Reads the sidecar first and merges in, rather than overwriting the whole
+/// file, so a fixture that already seeded a report (`seed_eval_state`) or
+/// another session's own accrual for the same project is never clobbered.
+fn seed_session_work(db: &Path, project: Option<&str>, session_id: &str, minutes: i64) {
+    let mut all = serve::usefulness::read_eval_debt_state(db);
+    let key = project.unwrap_or("").to_string();
+    let mut entry = all.get(&key).cloned().unwrap_or_default();
+    let noon_today = start_of_today_utc() + 12 * 3600;
+    entry.sessions.insert(
+        session_id.to_string(),
+        serve::usefulness::SessionWorkState {
+            anchor_unix: Some(noon_today - minutes * 60),
+            accrued_secs: minutes * 60,
+            last_event_unix: Some(noon_today),
+        },
+    );
+    all.insert(key, entry);
+    std::fs::write(serve::usefulness::eval_debt_state_path(db), serde_json::to_string(&all).unwrap()).unwrap();
 }
 
 /// Seed the sidecar as though THOR started tracking this project
@@ -428,7 +443,7 @@ fn fires_for_a_main_session_and_names_the_real_eval_path_when_it_exists() {
 
     let mut store = EventStore::new(&db).unwrap();
     declare_owed_items(&mut store, OWED_CONTEXT_COUNT, Some("thor-fixture"));
-    serve_marker_in_session(&mut store, "s1", Some("thor-fixture"));
+    seed_session_work(&db, Some("thor-fixture"), "s1", 90);
     drop(store);
 
     let out = run_hook(&db, &stop_payload("s1", &project_dir), &sandbox);
@@ -458,7 +473,7 @@ fn falls_back_to_the_generic_note_when_no_eval_file_exists() {
 
     let mut store = EventStore::new(&db).unwrap();
     declare_owed_items(&mut store, OWED_CONTEXT_COUNT, Some("thor-fixture"));
-    serve_marker_in_session(&mut store, "s1", Some("thor-fixture"));
+    seed_session_work(&db, Some("thor-fixture"), "s1", 90);
     drop(store);
 
     let out = run_hook(&db, &stop_payload("s1", &project_dir), &sandbox);
@@ -494,6 +509,7 @@ fn both_debts_due_shows_the_evaluation_first() {
         serve::deliver::record_delivery(&mut store, "s1", "fixture", "t", "2026-09-08T00:00:00Z", &[id.clone()]);
     }
     drop(store);
+    seed_session_work(&db, Some("thor-fixture"), "s1", 90);
 
     let out = run_hook(&db, &stop_payload("s1", &project_dir), &sandbox);
     let v: serde_json::Value = serde_json::from_str(&out).unwrap_or_else(|e| panic!("expected a decision JSON: {e}: {out}"));
@@ -517,7 +533,7 @@ fn blocks_on_the_stop_of_a_new_turn_again_and_again_while_no_report_exists() {
 
     let mut store = EventStore::new(&db).unwrap();
     declare_owed_items(&mut store, OWED_CONTEXT_COUNT, Some("thor-fixture"));
-    serve_marker_in_session(&mut store, "s1", Some("thor-fixture"));
+    seed_session_work(&db, Some("thor-fixture"), "s1", 90);
     drop(store);
 
     for turn in 1..=3 {
@@ -545,7 +561,7 @@ fn does_not_block_twice_in_the_same_turn() {
 
     let mut store = EventStore::new(&db).unwrap();
     declare_owed_items(&mut store, OWED_CONTEXT_COUNT, Some("thor-fixture"));
-    serve_marker_in_session(&mut store, "s1", Some("thor-fixture"));
+    seed_session_work(&db, Some("thor-fixture"), "s1", 90);
     drop(store);
 
     let first = run_hook(&db, &stop_payload("s1", &project_dir), &sandbox);
@@ -571,7 +587,7 @@ fn the_ask_counter_increments_per_turn_and_resets_once_a_report_is_seen() {
 
     let mut store = EventStore::new(&db).unwrap();
     declare_owed_items(&mut store, OWED_CONTEXT_COUNT, Some("thor-fixture"));
-    serve_marker_in_session(&mut store, "s1", Some("thor-fixture"));
+    seed_session_work(&db, Some("thor-fixture"), "s1", 90);
     drop(store);
 
     for turn in 1..=3 {
@@ -583,7 +599,7 @@ fn the_ask_counter_increments_per_turn_and_resets_once_a_report_is_seen() {
 
     let mut store = EventStore::open_existing(&db).unwrap();
     declare_report(&mut store, "eval-thor-fixture-2026-09-17", "thor-fixture");
-    serve_marker_in_session(&mut store, "s2", Some("thor-fixture"));
+    seed_session_work(&db, Some("thor-fixture"), "s2", 90);
     drop(store);
     let after_report = run_hook(&db, &stop_payload("s2", &project_dir), &sandbox);
     assert!(after_report.trim().is_empty(), "a freshly filed report must silence this turn: {after_report}");
@@ -604,11 +620,48 @@ fn is_silent_for_a_subagent_payload_on_the_same_store() {
 
     let mut store = EventStore::new(&db).unwrap();
     declare_owed_items(&mut store, OWED_CONTEXT_COUNT, Some("thor-fixture"));
-    serve_marker_in_session(&mut store, "s1", Some("thor-fixture"));
+    seed_session_work(&db, Some("thor-fixture"), "s1", 90);
     drop(store);
 
     let out = run_hook(&db, &subagent_stop_payload("s1", &project_dir), &sandbox);
     assert!(out.trim().is_empty(), "a subagent's Stop must never be held for the evaluation debt: {out}");
+}
+
+/// Case named in the build brief: subagent `PreToolUse` events accrue work
+/// for their own session (`usefulness::record_hook_event` runs
+/// unconditionally, subagent or not - see that function's own doc comment),
+/// but a subagent `Stop` still never blocks, however much that accrual has
+/// grown - proven by reading the sidecar directly after the `PreToolUse`
+/// call, then sending a `Stop` for the SAME session and confirming silence.
+#[test]
+fn subagent_pretooluse_events_accrue_work_but_a_subagent_stop_never_blocks() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("thor.db");
+    let sandbox = Sandbox::new();
+    let project_dir = sandbox.project_dir("thor-fixture");
+
+    let mut store = EventStore::new(&db).unwrap();
+    declare_owed_items(&mut store, OWED_CONTEXT_COUNT, Some("thor-fixture"));
+    drop(store);
+    seed_session_work(&db, Some("thor-fixture"), "sub1", 90);
+
+    let out = run_hook(&db, &subagent_pretooluse_payload("sub1", &project_dir), &sandbox);
+    assert!(out.trim().is_empty(), "PreToolUse never blocks for this debt, subagent or not: {out}");
+    let accrued_after_pretooluse = serve::usefulness::project_eval_state(&db, Some("thor-fixture"))
+        .sessions
+        .get("sub1")
+        .expect("a subagent's own PreToolUse must still record its own session's accrual")
+        .accrued_secs;
+    assert!(
+        accrued_after_pretooluse >= 90 * 60,
+        "the seeded 90 minutes must still be there, not reset by being a subagent event: {accrued_after_pretooluse}"
+    );
+
+    let out = run_hook(&db, &subagent_stop_payload("sub1", &project_dir), &sandbox);
+    assert!(
+        out.trim().is_empty(),
+        "a subagent's Stop must never be held for the evaluation debt, however much it has accrued: {out}"
+    );
 }
 
 /// Case named in the build brief: zero items owed still fires once enough
@@ -621,8 +674,8 @@ fn fires_with_zero_items_owed_once_worked_long_enough() {
     let sandbox = Sandbox::new();
     let project_dir = sandbox.project_dir("thor-fixture");
 
-    let mut store = EventStore::new(&db).unwrap();
-    serve_marker_in_session(&mut store, "s1", Some("thor-fixture"));
+    let store = EventStore::new(&db).unwrap();
+    seed_session_work(&db, Some("thor-fixture"), "s1", 90);
     drop(store);
 
     let out = run_hook(&db, &stop_payload("s1", &project_dir), &sandbox);
@@ -644,7 +697,7 @@ fn is_silent_when_the_session_has_worked_here_less_than_an_hour() {
 
     let mut store = EventStore::new(&db).unwrap();
     declare_owed_items(&mut store, OWED_CONTEXT_COUNT, Some("thor-fixture"));
-    serve_marker_in_session_minutes_ago(&mut store, "s1", Some("thor-fixture"), 30);
+    seed_session_work(&db, Some("thor-fixture"), "s1", 30);
     drop(store);
 
     let out = run_hook(&db, &stop_payload("s1", &project_dir), &sandbox);
@@ -662,18 +715,22 @@ fn is_silent_at_fifty_nine_minutes_worked() {
 
     let mut store = EventStore::new(&db).unwrap();
     declare_owed_items(&mut store, OWED_CONTEXT_COUNT, Some("thor-fixture"));
-    serve_marker_in_session_minutes_ago(&mut store, "s1", Some("thor-fixture"), 59);
+    seed_session_work(&db, Some("thor-fixture"), "s1", 59);
     drop(store);
 
     let out = run_hook(&db, &stop_payload("s1", &project_dir), &sandbox);
     assert!(out.trim().is_empty(), "59 minutes must not yet be enough: {out}");
 }
 
-/// Case named in the build brief: a session that served nothing in the
-/// project is silent - the gate against hijacking a session that did no
-/// THOR-relevant work here at all.
+/// Case named in the build brief: a session with no accrued work yet is
+/// silent - the gate against hijacking a session that has done nothing here
+/// at all. Since the fifth rewrite (2026-09-17), this is also exactly what a
+/// session's very FIRST hook event in a project looks like: `record_hook_
+/// event` resets a never-before-seen (project, session) pair's accrual to
+/// zero rather than crashing or guessing (`usefulness::accrue_session_
+/// work`'s own "the very first event is a reset to zero" behaviour).
 #[test]
-fn is_silent_for_a_session_that_served_nothing_in_this_project() {
+fn is_silent_for_a_session_with_no_accrued_work_yet() {
     let dir = tempfile::tempdir().unwrap();
     let db = dir.path().join("thor.db");
     let sandbox = Sandbox::new();
@@ -681,12 +738,12 @@ fn is_silent_for_a_session_that_served_nothing_in_this_project() {
 
     let mut store = EventStore::new(&db).unwrap();
     declare_owed_items(&mut store, OWED_CONTEXT_COUNT, Some("thor-fixture"));
-    // Deliberately no `serve_marker_in_session` call: "s1" never had
-    // anything served to it at all in this store.
+    // Deliberately no `seed_session_work` call: this is "s1"'s very first
+    // hook event ever seen in this project.
     drop(store);
 
     let out = run_hook(&db, &stop_payload("s1", &project_dir), &sandbox);
-    assert!(out.trim().is_empty(), "a session that served nothing here must not be hijacked into the evaluation: {out}");
+    assert!(out.trim().is_empty(), "a session with no accrued work yet must not be hijacked into the evaluation: {out}");
 }
 
 /// Case named in the build brief: a report first seen today silences it for
@@ -701,13 +758,17 @@ fn a_report_first_seen_today_silences_it_for_the_rest_of_the_day() {
 
     let mut store = EventStore::new(&db).unwrap();
     declare_owed_items(&mut store, OWED_CONTEXT_COUNT, Some("thor-fixture"));
-    serve_marker_in_session(&mut store, "s1", Some("thor-fixture"));
     drop(store);
+    // `seed_eval_state` overwrites the WHOLE sidecar file (it has no
+    // existing state to merge with here), so it must run BEFORE
+    // `seed_session_work`, which reads-and-merges - the other order would
+    // silently wipe the session accrual `seed_session_work` just wrote.
     seed_eval_state(
         &db,
         Some("thor-fixture"),
         serve::usefulness::ProjectEvalState { last_evaluation_seen: Some(start_of_today_utc()), ..Default::default() },
     );
+    seed_session_work(&db, Some("thor-fixture"), "s1", 90);
 
     let first = run_hook(&db, &stop_payload("s1", &project_dir), &sandbox);
     assert!(first.trim().is_empty(), "a report seen today must silence the first turn: {first}");
@@ -726,13 +787,16 @@ fn a_report_first_seen_yesterday_does_not_silence_today() {
 
     let mut store = EventStore::new(&db).unwrap();
     declare_owed_items(&mut store, OWED_CONTEXT_COUNT, Some("thor-fixture"));
-    serve_marker_in_session(&mut store, "s1", Some("thor-fixture"));
     drop(store);
+    // `seed_eval_state` overwrites the WHOLE sidecar file, so it must run
+    // BEFORE `seed_session_work` (which reads-and-merges) - see the
+    // identical note on the test above.
     seed_eval_state(
         &db,
         Some("thor-fixture"),
         serve::usefulness::ProjectEvalState { last_evaluation_seen: Some(start_of_today_utc() - 1), ..Default::default() },
     );
+    seed_session_work(&db, Some("thor-fixture"), "s1", 90);
 
     let out = run_hook(&db, &stop_payload("s1", &project_dir), &sandbox);
     let v: serde_json::Value =
@@ -753,13 +817,16 @@ fn the_day_after_a_report_59_minutes_worked_is_silent_61_fires() {
 
     let mut store = EventStore::new(&db).unwrap();
     declare_owed_items(&mut store, OWED_CONTEXT_COUNT, Some("thor-fixture"));
-    serve_marker_in_session_minutes_ago(&mut store, "s1", Some("thor-fixture"), 59);
     drop(store);
+    // `seed_eval_state` overwrites the WHOLE sidecar file, so it must run
+    // BEFORE `seed_session_work` (which reads-and-merges) - see the
+    // identical note on the earlier tests in this file.
     seed_eval_state(
         &db,
         Some("thor-fixture"),
         serve::usefulness::ProjectEvalState { last_evaluation_seen: Some(start_of_today_utc() - 1), ..Default::default() },
     );
+    seed_session_work(&db, Some("thor-fixture"), "s1", 59);
     let silent = run_hook(&db, &stop_payload("s1", &project_dir), &sandbox);
     assert!(silent.trim().is_empty(), "59 minutes, the day after a report, must still be silent: {silent}");
 
@@ -767,16 +834,90 @@ fn the_day_after_a_report_59_minutes_worked_is_silent_61_fires() {
     let db2 = dir2.path().join("thor.db");
     let mut store2 = EventStore::new(&db2).unwrap();
     declare_owed_items(&mut store2, OWED_CONTEXT_COUNT, Some("thor-fixture"));
-    serve_marker_in_session_minutes_ago(&mut store2, "s2", Some("thor-fixture"), 61);
     drop(store2);
     seed_eval_state(
         &db2,
         Some("thor-fixture"),
         serve::usefulness::ProjectEvalState { last_evaluation_seen: Some(start_of_today_utc() - 1), ..Default::default() },
     );
+    seed_session_work(&db2, Some("thor-fixture"), "s2", 61);
     let out = run_hook(&db2, &stop_payload("s2", &project_dir), &sandbox);
     let v: serde_json::Value = serde_json::from_str(&out).unwrap_or_else(|e| panic!("61 minutes must fire: {e}: {out}"));
     assert_eq!(v["decision"], "block", "{out}");
+}
+
+// ------------------------------------------------------------ repeat: fires
+//
+// Added 2026-09-17 (fifth rewrite, `serve::usefulness`'s own "evaluation
+// debt" section): once a report already exists for today, `EVAL_FIRST_WORK_
+// MINUTES` no longer applies at all - only `EVAL_REPEAT_WORK_MINUTES`,
+// measured from whenever that report reset the accrual, does.
+
+/// A report seen today, with accrued work since it well past `EVAL_FIRST_
+/// WORK_MINUTES` but nowhere near `EVAL_REPEAT_WORK_MINUTES`, must stay
+/// silent - the first threshold simply does not apply any more once today's
+/// report already exists.
+#[test]
+fn a_report_seen_today_with_90_minutes_accrued_since_stays_silent() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("thor.db");
+    let sandbox = Sandbox::new();
+    let project_dir = sandbox.project_dir("thor-fixture");
+
+    let mut store = EventStore::new(&db).unwrap();
+    declare_owed_items(&mut store, OWED_CONTEXT_COUNT, Some("thor-fixture"));
+    drop(store);
+    seed_eval_state(
+        &db,
+        Some("thor-fixture"),
+        serve::usefulness::ProjectEvalState { last_evaluation_seen: Some(start_of_today_utc()), ..Default::default() },
+    );
+    seed_session_work(&db, Some("thor-fixture"), "s1", 90);
+
+    let out = run_hook(&db, &stop_payload("s1", &project_dir), &sandbox);
+    assert!(out.trim().is_empty(), "well past the first threshold but nowhere near the repeat one must stay silent: {out}");
+}
+
+/// Case named in the build brief: a session with 181 minutes of accrued
+/// work after a report seen today is blocked with the repeat message - the
+/// end-to-end proof of the owner's own decision ("after every THREE HOURS OF
+/// WORK... a NEW evaluation is due").
+#[test]
+fn a_report_seen_today_with_three_hours_accrued_since_fires_the_repeat_message() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("thor.db");
+    let sandbox = Sandbox::new();
+    let project_dir = sandbox.project_dir("thor-fixture");
+
+    let mut store = EventStore::new(&db).unwrap();
+    declare_owed_items(&mut store, OWED_CONTEXT_COUNT, Some("thor-fixture"));
+    drop(store);
+    seed_eval_state(
+        &db,
+        Some("thor-fixture"),
+        serve::usefulness::ProjectEvalState {
+            last_evaluation_seen: Some(start_of_today_utc()),
+            last_evaluation_report_id: Some("eval-thor-fixture-2026-09-17".to_string()),
+            ..Default::default()
+        },
+    );
+    seed_session_work(&db, Some("thor-fixture"), "s1", serve::usefulness::EVAL_REPEAT_WORK_MINUTES + 1);
+
+    let out = run_hook(&db, &stop_payload("s1", &project_dir), &sandbox);
+    let v: serde_json::Value =
+        serde_json::from_str(&out).unwrap_or_else(|e| panic!("three hours since the last report must fire a repeat ask: {e}: {out}"));
+    assert_eq!(v["decision"], "block", "{out}");
+    let reason = v["reason"].as_str().unwrap();
+    assert!(reason.starts_with("[THOR]"), "{reason}");
+    assert!(reason.contains("This session has worked here for 3.0 hour(s) since the last evaluation report"), "{reason}");
+    assert!(reason.contains("eval-thor-fixture-2026-09-17"), "must name the report this accrual is measured since: {reason}");
+    assert!(
+        reason.contains("A new evaluation is due, covering only what happened since then plus the state of the work"),
+        "{reason}"
+    );
+    assert!(reason.contains(&format!("{OWED_CONTEXT_COUNT} item(s) currently owe a verdict here")), "{reason}");
+    assert!(reason.contains("A turn cannot end until the evaluation report for this project is filed"), "{reason}");
+    assert!(!reason.contains("It has been asked"), "the repeat message names hours and a report id, never an ask count: {reason}");
 }
 
 /// Case named in the build brief: a new evaluation-report Report for the
@@ -793,7 +934,7 @@ fn a_new_evaluation_report_for_the_project_silences_it() {
 
     let mut store = EventStore::new(&db).unwrap();
     declare_owed_items(&mut store, OWED_CONTEXT_COUNT, Some("thor-fixture"));
-    serve_marker_in_session(&mut store, "s1", Some("thor-fixture"));
+    seed_session_work(&db, Some("thor-fixture"), "s1", 90);
     drop(store);
 
     let first = run_hook(&db, &stop_payload("s1", &project_dir), &sandbox);
@@ -808,7 +949,7 @@ fn a_new_evaluation_report_for_the_project_silences_it() {
     // A fresh session, so a stale minutes-worked timestamp is not what is
     // silencing the second call - it must clear the "served this project"
     // gate on its own too.
-    serve_marker_in_session(&mut store, "s2", Some("thor-fixture"));
+    seed_session_work(&db, Some("thor-fixture"), "s2", 90);
     drop(store);
 
     let second = run_hook(&db, &stop_payload("s2", &project_dir), &sandbox);
@@ -831,7 +972,7 @@ fn regression_verdicts_on_unrelated_global_items_never_silence_this() {
 
     let mut store = EventStore::new(&db).unwrap();
     declare_owed_items(&mut store, OWED_CONTEXT_COUNT, Some("thor-fixture"));
-    serve_marker_in_session(&mut store, "s1", Some("thor-fixture"));
+    seed_session_work(&db, Some("thor-fixture"), "s1", 90);
 
     // Verdicts on OTHER global items - none of these apply to the backlog
     // under test, and none carry the `evaluation-report` tag; they exist
@@ -889,7 +1030,11 @@ fn is_silent_for_a_checkout_with_no_project_even_with_a_pre_existing_sidecar_ent
 
     let mut store = EventStore::new(&db).unwrap();
     declare_owed_items(&mut store, OWED_CONTEXT_COUNT, None);
-    serve_marker_in_session_minutes_ago(&mut store, "s1", None, 61);
+    // Deliberately no `seed_session_work` call: a no-project checkout can
+    // never accrue work that matters here either - `record_hook_event`
+    // itself refuses to touch the sidecar at all for `project: None` (see
+    // its own doc comment), so there is nothing honest a "session has
+    // worked here" fixture could even represent for this case.
     seed_tracking_since(&store, &db, None, 25);
     drop(store);
 
@@ -925,10 +1070,11 @@ fn a_no_project_stop_never_creates_the_sidecar_file_at_all() {
 
     let mut store = EventStore::new(&db).unwrap();
     declare_owed_items(&mut store, OWED_CONTEXT_COUNT, None);
-    serve_marker_in_session_minutes_ago(&mut store, "s1", None, 61);
-    // Deliberately no `seed_tracking_since` call: nothing has written the
-    // sidecar yet, the same as the very first Stop this checkout would ever
-    // see.
+    // Deliberately no `seed_tracking_since` or `seed_session_work` call:
+    // nothing has written the sidecar yet, the same as the very first Stop
+    // this checkout would ever see - and a no-project checkout could never
+    // honestly seed accrued work anyway (`record_hook_event` itself refuses
+    // to touch the sidecar at all for `project: None`).
     drop(store);
 
     let sidecar = serve::usefulness::eval_debt_state_path(&db);
@@ -955,7 +1101,7 @@ fn the_identical_setup_with_a_real_project_still_fires() {
 
     let mut store = EventStore::new(&db).unwrap();
     declare_owed_items(&mut store, OWED_CONTEXT_COUNT, Some("thor-fixture"));
-    serve_marker_in_session_minutes_ago(&mut store, "s1", Some("thor-fixture"), 61);
+    seed_session_work(&db, Some("thor-fixture"), "s1", 61);
     drop(store);
 
     let out = run_hook(&db, &stop_payload("s1", &project_dir), &sandbox);
@@ -985,7 +1131,7 @@ fn setup_debt_still_fires_with_an_eval_eligible_backlog_also_present() {
     let mut store = EventStore::new(&db).unwrap();
     declare_setup_note(&mut store);
     declare_owed_items(&mut store, OWED_CONTEXT_COUNT, Some("thor-fixture"));
-    serve_marker_in_session(&mut store, "s1", Some("thor-fixture"));
+    seed_session_work(&db, Some("thor-fixture"), "s1", 90);
     drop(store);
 
     let out = run_hook(&db, &stop_payload("s1", &project_dir), &sandbox);

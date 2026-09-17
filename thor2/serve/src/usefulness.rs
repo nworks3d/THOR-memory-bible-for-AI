@@ -591,15 +591,76 @@ pub fn noise_since_last_useful(store: &EventStore) -> HashMap<String, usize> {
 // times, and since when, this project has gone unanswered; both reset to
 // zero/`None` the moment `update_eval_debt_state` below next sees a new
 // report, the same Stop that already stamps `last_evaluation_seen`.
+//
+// A FIFTH REWRITE (2026-09-17: "after three hours of work a new evaluation
+// is due, covering what happened since the last one and the state of the
+// work"). The UTC-calendar-day rule above still decides the FIRST ask of
+// the day, but is no longer the only one: the owner found that a report
+// filed first thing in the morning bought silence for the rest of a long
+// working day, however far the project drifted after it. Two changes.
+// First, "how long has this session worked here" stops being a single
+// wall-clock measurement from one `item_served` timestamp
+// (`session_first_served_in_project`, retired by this rewrite - it lived in
+// `bin/serve.rs`) and becomes ACCRUED WORK: every hook event of a session
+// (`SessionStart`, `UserPromptSubmit`, `PreToolUse`, `Stop` - a subagent's
+// own included, see `record_hook_event`'s own doc comment) adds the gap
+// since that exact (project, session) pair's own previous event, but only
+// when the gap is under `EVAL_PAUSE_MINUTES` - an idle session accrues
+// nothing while it waits. `SessionWorkState` carries this running total per
+// session, inside the same per-project sidecar entry this section's other
+// fields already live in, and resets to zero exactly when `tracking_since`
+// never did: a new UTC day, or a new evaluation report seen for the project
+// (`session_work_reset_needed`). Second, `eval_debt_owed` now asks a
+// different question depending on whether today's report already exists:
+// none yet -> the first threshold, `EVAL_FIRST_WORK_MINUTES`, unchanged in
+// value from the retired `EVAL_MIN_SESSION_MINUTES`; one already seen today
+// -> `EVAL_REPEAT_WORK_MINUTES`, measured from whenever that report reset
+// the accrual, so a long day keeps asking every three hours instead of
+// going quiet until the next UTC midnight.
 
-/// How many minutes THIS session must have worked in a project - measured
-/// from the earliest `item_served` event it recorded for an item that
-/// applies to that project, to now - before the evaluation debt is willing
-/// to speak at all, regardless of how long the project has gone without an
-/// evaluation. An hour, not the half hour first tried: the owner rejected
-/// half an hour as too little, on 2026-09-16, because it hijacked the very
-/// first question of a session before there was anything to evaluate yet.
-pub const EVAL_MIN_SESSION_MINUTES: i64 = 60;
+/// How many minutes of ACCRUED WORK (see `SessionWorkState`/`accrue_
+/// session_work` below - gap-filtered hook events of this session, so an
+/// idle pause contributes nothing) this project must see, since the last
+/// reset, before the evaluation debt is willing to speak AT ALL FOR THE
+/// FIRST TIME TODAY. An hour, not the half hour first tried: the owner
+/// rejected half an hour as too little, on 2026-09-16, because it hijacked
+/// the very first question of a session before there was anything to
+/// evaluate yet.
+///
+/// RENAMED FROM `EVAL_MIN_SESSION_MINUTES` (2026-09-17, the fifth rewrite -
+/// see this section's own doc comment): the value is unchanged, only the
+/// name and what it is measured against - a single wall-clock minutes-since
+/// measurement gave way to gap-filtered accrued work - so the name now says
+/// which of the two thresholds below this one is (the FIRST ask of the day;
+/// `EVAL_REPEAT_WORK_MINUTES` is the other).
+pub const EVAL_FIRST_WORK_MINUTES: i64 = 60;
+
+/// How many minutes of accrued work, since a report was LAST seen for this
+/// project, before a REPEAT evaluation is due the same day - the owner's
+/// decision, 2026-09-17: even a project that filed its evaluation this
+/// morning can drift for the rest of a long day, so a report already seen
+/// today no longer buys silence until midnight, only until this much more
+/// work has gone by since it was filed. Three hours: long enough that a
+/// normal session's first-of-day report is never immediately followed by a
+/// second ask, short enough that a full working day still sees more than
+/// one.
+pub const EVAL_REPEAT_WORK_MINUTES: i64 = 180;
+
+/// A gap this long or longer between two consecutive hook events of the same
+/// (project, session) pair is a pause, not work, and contributes nothing to
+/// either threshold above - see `accrue_session_work`. Half an hour: long
+/// enough that a normal think-then-type rhythm, or one slow tool call, never
+/// reads as a pause, short enough that a lunch break or an overnight gap
+/// reliably does.
+pub const EVAL_PAUSE_MINUTES: i64 = 30;
+
+/// How far the accrued-work sidecar is allowed to drift from what
+/// `record_hook_event` last actually wrote to disk before it bothers
+/// writing again - see that function's own doc comment for why a small,
+/// sub-threshold gap can safely stay unwritten (the next write telescopes
+/// it in exactly) and why a `Stop` event, or a reset that just happened,
+/// is never subject to this throttle at all.
+const EVAL_WORK_WRITE_THROTTLE_SECS: i64 = 60;
 
 /// THE TIME HALF OF THE PURE PREDICATE, factored out of `eval_debt_owed`
 /// below so `doctor` (`ops::health::judgement_debt_line`), which runs cold
@@ -623,23 +684,33 @@ pub fn eval_done_today(last_evaluation_seen: Option<i64>, now_unix: i64) -> bool
     last_evaluation_seen.is_some_and(|seen| crate::time::same_utc_day(seen, now_unix))
 }
 
-/// THE WHOLE PURE PREDICATE, rewritten 2026-09-16 to drop `tracking_since`
+/// THE WHOLE PURE PREDICATE. Rewritten 2026-09-16 to drop `tracking_since`
 /// and the 24-hour rolling window entirely in favour of a UTC calendar day
-/// (see this section's own doc comment, fourth rewrite, for why). Both
-/// inputs are already resolved elsewhere (`minutes_worked_this_session`
-/// from `minutes_ago` applied to `bin/serve.rs`'s own session-scoped read,
-/// `last_evaluation_seen` from this project's own `ProjectEvalState` below,
-/// `now_unix` from `crate::time::now_unix`), so this stays nothing but the
-/// conditions themselves, unit-testable with plain integers and no store,
-/// no clock, no filesystem.
+/// (see this section's own doc comment, fourth rewrite, for why); rewritten
+/// again 2026-09-17 (fifth rewrite) to ask a DIFFERENT threshold once today's
+/// report already exists, rather than staying silent for the rest of the
+/// day regardless of how much more work follows it. Every input is already
+/// resolved elsewhere (`accrued_minutes` from `SessionWorkState::
+/// accrued_secs` via `record_hook_event`, `last_evaluation_seen` from this
+/// project's own `ProjectEvalState`, `now_unix` from `crate::time::
+/// now_unix`), so this stays nothing but the conditions themselves,
+/// unit-testable with plain integers and no store, no clock, no filesystem.
 ///
-/// Holds when THIS session has worked in the project for at least
-/// `EVAL_MIN_SESSION_MINUTES`, AND `eval_done_today` above does NOT hold.
-/// The minutes check is first and cheapest, and short-circuits the common
-/// case (a session that only just started here) without even looking at
-/// the sidecar's own timestamp.
-pub fn eval_debt_owed(minutes_worked_this_session: i64, last_evaluation_seen: Option<i64>, now_unix: i64) -> bool {
-    minutes_worked_this_session >= EVAL_MIN_SESSION_MINUTES && !eval_done_today(last_evaluation_seen, now_unix)
+/// Holds when `accrued_minutes` has reached the threshold FOR WHICHEVER
+/// CASE APPLIES: `EVAL_REPEAT_WORK_MINUTES` when `eval_done_today` above
+/// already holds (a report exists for today, so this would be a repeat
+/// ask), or `EVAL_FIRST_WORK_MINUTES` when it does not (no report yet
+/// today, so this would be the first ask). `accrued_minutes` itself is
+/// already measured from whichever reset last applied - a new UTC day or a
+/// newly seen report, both handled by `session_work_reset_needed` before
+/// this predicate ever runs - so neither branch here needs to look at a
+/// reset instant a second time.
+pub fn eval_debt_owed(accrued_minutes: i64, last_evaluation_seen: Option<i64>, now_unix: i64) -> bool {
+    if eval_done_today(last_evaluation_seen, now_unix) {
+        accrued_minutes >= EVAL_REPEAT_WORK_MINUTES
+    } else {
+        accrued_minutes >= EVAL_FIRST_WORK_MINUTES
+    }
 }
 
 /// Whole days between `then_unix` and `now_unix`, floored, never negative -
@@ -651,9 +722,12 @@ pub fn days_ago(now_unix: i64, then_unix: i64) -> i64 {
 }
 
 /// Whole minutes between `then_unix` and `now_unix`, floored, never
-/// negative - `days_ago`'s own rule in a different unit, for the evaluation
-/// debt's own "how long has this session worked here" clock
-/// (`EVAL_MIN_SESSION_MINUTES`).
+/// negative - `days_ago`'s own rule in a different unit. Used to be the
+/// evaluation debt's own "how long has this session worked here" clock;
+/// retired from that role 2026-09-17 (fifth rewrite, this section's own doc
+/// comment) in favour of `SessionWorkState::accrued_secs`, which measures
+/// gap-filtered accrued work rather than plain wall-clock elapsed time.
+/// Kept as a general-purpose sibling of `days_ago` above.
 pub fn minutes_ago(now_unix: i64, then_unix: i64) -> i64 {
     (now_unix - then_unix).max(0) / 60
 }
@@ -665,6 +739,85 @@ pub fn minutes_ago(now_unix: i64, then_unix: i64) -> i64 {
 /// function's own doc comment) - so this can never collide with a real one.
 fn project_key(project: Option<&str>) -> &str {
     project.unwrap_or("")
+}
+
+/// One session's own running account of ACCRUED WORK inside one project -
+/// see this section's own doc comment, fifth rewrite, for the whole story.
+/// Lives inside that project's `ProjectEvalState`, keyed by session id
+/// (`ProjectEvalState::sessions`), since the obligation this backs is
+/// always asked of ONE session at a time, never the project as a whole.
+///
+/// `#[serde(default)]` on every field, the same stance `ProjectEvalState`
+/// itself already takes: a sidecar written before this field existed at all
+/// must still parse, reading a session it has never heard of as the
+/// all-default "no work accrued yet" state rather than a parse failure.
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct SessionWorkState {
+    /// When this accrual period started - `None` before this (project,
+    /// session) pair has ever seen a hook event. Reset to `Some(now)`
+    /// alongside `accrued_secs` by `session_work_reset_needed`/`accrue_
+    /// session_work` below; otherwise left exactly as it was, the same
+    /// "set once, moves only on a reset" shape `tracking_since` above uses.
+    #[serde(default)]
+    pub anchor_unix: Option<i64>,
+    /// Seconds of work accrued since `anchor_unix` - the sum of every gap
+    /// between two consecutive hook events of this exact (project, session)
+    /// pair that was itself under `EVAL_PAUSE_MINUTES`. Never decreases
+    /// except by a full reset back to zero.
+    #[serde(default)]
+    pub accrued_secs: i64,
+    /// The instant of the most recent hook event this (project, session)
+    /// pair was seen at - the basis `accrue_session_work` measures its next
+    /// gap from. Distinct from `anchor_unix`: this one moves on EVERY event,
+    /// reset or not, while `anchor_unix` only ever moves on a reset.
+    #[serde(default)]
+    pub last_event_unix: Option<i64>,
+}
+
+/// Whether `session`'s own accrual must restart at `now_unix` rather than
+/// fold one more gap onto what it already carries - see this section's own
+/// doc comment, fifth rewrite. Three cases, all "start over": no event has
+/// ever been seen for this (project, session) pair (`anchor_unix` is
+/// `None`); `now_unix` falls on a different UTC calendar day than the
+/// anchor (`crate::time::same_utc_day` - the identical rule `eval_done_
+/// today` already applies to `last_evaluation_seen`, so a session that
+/// works past midnight UTC resets here at exactly the instant a fresh
+/// `EVAL_FIRST_WORK_MINUTES` ask becomes possible again); or a newer
+/// evaluation report has been seen for the project than this accrual period
+/// ever accounted for (`last_evaluation_seen` strictly later than
+/// `anchor_unix` - a report seen BEFORE this period began was already the
+/// reason for the reset that started it, most recently).
+fn session_work_reset_needed(session: &SessionWorkState, now_unix: i64, last_evaluation_seen: Option<i64>) -> bool {
+    match session.anchor_unix {
+        None => true,
+        Some(anchor) => !crate::time::same_utc_day(anchor, now_unix) || last_evaluation_seen.is_some_and(|seen| seen > anchor),
+    }
+}
+
+/// One hook event's worth of work, folded onto `session`'s own running
+/// total - the pure heart of the accrual (see this section's own doc
+/// comment, fifth rewrite). A reset (`session_work_reset_needed` above)
+/// discards whatever was accrued before it outright and starts a fresh
+/// anchor at `now_unix`, contributing no gap of its own - there is no
+/// honest "previous event" to measure against once the period it belonged
+/// to is over. Otherwise, the gap since `session.last_event_unix` (`now_
+/// unix` itself when this pair has an anchor but, oddly, no recorded event -
+/// never observed in practice, since a reset always sets both together; the
+/// safe "no gap" fallback rather than a panic) is real work when it is
+/// under `EVAL_PAUSE_MINUTES` and is added in full; at or over it, it is a
+/// pause and adds nothing - though `last_event_unix` still moves forward to
+/// `now_unix` regardless, so a LATER short gap is never measured against a
+/// stale instant from before the pause (the defect a naive "only update on
+/// a write" version would have - see `record_hook_event`'s own doc comment
+/// on the write throttle for why that one is safe and this one would not
+/// be). A negative gap (clock skew) is clamped to zero, never subtracted.
+pub fn accrue_session_work(session: &SessionWorkState, now_unix: i64, last_evaluation_seen: Option<i64>) -> SessionWorkState {
+    if session_work_reset_needed(session, now_unix, last_evaluation_seen) {
+        return SessionWorkState { anchor_unix: Some(now_unix), accrued_secs: 0, last_event_unix: Some(now_unix) };
+    }
+    let gap = now_unix - session.last_event_unix.unwrap_or(now_unix);
+    let add = if (0..EVAL_PAUSE_MINUTES * 60).contains(&gap) { gap } else { 0 };
+    SessionWorkState { anchor_unix: session.anchor_unix, accrued_secs: session.accrued_secs + add, last_event_unix: Some(now_unix) }
 }
 
 /// This project's own two facts for the evaluation debt's trigger (see this
@@ -735,6 +888,14 @@ pub struct ProjectEvalState {
     /// alongside `asked_count` the moment a new report is seen.
     #[serde(default)]
     pub first_asked_since_report: Option<i64>,
+    /// Every session's own accrued-work account inside this project, keyed
+    /// by session id - added 2026-09-17 (fifth rewrite, this section's own
+    /// doc comment) alongside `accrue_session_work`/`record_hook_event`.
+    /// `#[serde(default)]` so a sidecar written before this field existed
+    /// parses with an empty map, exactly the "no work accrued yet" state a
+    /// session this old sidecar never heard of would read as anyway.
+    #[serde(default)]
+    pub sessions: std::collections::BTreeMap<String, SessionWorkState>,
 }
 
 /// The whole sidecar: one [`ProjectEvalState`] per project key (see
@@ -914,6 +1075,86 @@ pub fn record_eval_debt_asked(db: &Path, project: Option<&str>, now_unix: i64) {
     }
 }
 
+/// The impure half of `accrue_session_work`: read this (project, session)
+/// pair's own accrual out of the sidecar, fold in one more hook event at
+/// `now_unix`, and write the result back - UNLESS the change is small enough
+/// to skip, in which case the caller still gets the correct computed value,
+/// only not yet persisted. `None` for `project: None`, touching neither the
+/// sidecar nor the filesystem at all - the identical stance every other
+/// evaluation-debt write already takes (`update_eval_debt_state`'s own call
+/// site in `bin/serve.rs`'s `hook_once`): a checkout with no project can
+/// never file the Report that silences this debt, so there is nothing
+/// honest for a `""`-keyed session entry to track.
+///
+/// CALLED ON EVERY HOOK EVENT of a session inside a project - `SessionStart`,
+/// `UserPromptSubmit`, `PreToolUse` and `Stop` alike, a subagent's own
+/// events included (`bin/serve.rs`'s `hook_once`, unconditioned by
+/// `is_subagent`: a subagent's own work still counts as work of ITS session,
+/// even though its `Stop` can never be the one that blocks - that gate is
+/// applied where `evaluation_debt` decides whether to speak, never here).
+/// Deliberately store-free, unlike `update_eval_debt_state`: this never
+/// opens the `EventStore` at all, only the small JSON sidecar already beside
+/// it, which is what keeps it cheap enough to call from `PreToolUse` on
+/// every single tool call without turning that path into a store scan.
+///
+/// THE WRITE THROTTLE. Persists the whole sidecar back to disk when `is_stop`
+/// is true (a `Stop` is rare enough, and important enough as the one event
+/// that can actually block a turn, that it is never worth deferring), OR
+/// when a reset just happened (`after.anchor_unix != before.anchor_unix` -
+/// worth making durable immediately, though even an unwritten reset
+/// self-heals on the very next event, since `session_work_reset_needed`
+/// re-derives it fresh from the still-stale on-disk anchor rather than from
+/// anything this call would have cached), OR when the WALL-CLOCK gap since
+/// the on-disk `last_event_unix` has already reached `EVAL_WORK_WRITE_
+/// THROTTLE_SECS` (or there is no on-disk value yet at all - the very first
+/// event this pair has ever seen, which must always be durable or nothing
+/// could ever accrue a second time). That last condition is deliberately the
+/// RAW gap, not the accrued delta: a gap classified as a PAUSE adds nothing
+/// to `accrued_secs`, so an accrued-delta throttle would never force a write
+/// for one, leaving `last_event_unix` on disk stuck before the pause - and
+/// the very next short, genuinely-worked gap would then be measured against
+/// that stale pre-pause instant instead of the real previous event, merging
+/// two gaps that should have been judged separately (see `accrue_session_
+/// work`'s own doc comment on why `last_event_unix` always moves forward
+/// even when a pause adds no work). Measuring the raw gap instead closes
+/// that: any gap at least as long as the throttle - work or pause alike -
+/// is always written before it can go stale enough to matter, and only a
+/// run of gaps each smaller than the throttle itself is ever left to
+/// telescope into the next write, which is exact by construction (the sum
+/// of gaps each under a bound, none of which individually reached `EVAL_
+/// PAUSE_MINUTES`, equals one merged gap that has not reached it either).
+pub fn record_hook_event(db: &Path, project: Option<&str>, session_id: &str, is_stop: bool, now_unix: i64) -> Option<SessionWorkState> {
+    project?;
+    let mut all = read_eval_debt_state(db);
+    let key = project_key(project).to_string();
+    let mut entry = all.get(&key).cloned().unwrap_or_default();
+    let before = entry.sessions.get(session_id).cloned().unwrap_or_default();
+    let after = accrue_session_work(&before, now_unix, entry.last_evaluation_seen);
+
+    let reset_happened = after.anchor_unix != before.anchor_unix;
+    let write_gap_elapsed = !before.last_event_unix.is_some_and(|t| now_unix - t < EVAL_WORK_WRITE_THROTTLE_SECS);
+    if !is_stop && !reset_happened && !write_gap_elapsed {
+        return Some(after);
+    }
+    entry.sessions.insert(session_id.to_string(), after.clone());
+    all.insert(key, entry);
+    if let Ok(text) = serde_json::to_string(&all) {
+        let _ = std::fs::write(eval_debt_state_path(db), text);
+    }
+    Some(after)
+}
+
+/// The (session id, its own accrual) this project's sidecar last saw a hook
+/// event from, by `last_event_unix` - `doctor`'s own cold-read stand-in for
+/// "the current session", since it has no session of its own to ask (see
+/// `ops::health::judgement_debt_line`'s own doc comment). `None` when the
+/// sidecar holds no session at all for this project yet. READ-ONLY, like
+/// every other reader of this sidecar `doctor` uses: never called from a
+/// real hook.
+pub fn most_recently_active_session(state: &ProjectEvalState) -> Option<(&str, &SessionWorkState)> {
+    state.sessions.iter().map(|(k, v)| (k.as_str(), v)).max_by_key(|(_, v)| v.last_event_unix.unwrap_or(i64::MIN))
+}
+
 /// The pure resolution rule behind `default_eval_command_path` below:
 /// Claude Code's per-user commands folder is under whichever of these two
 /// candidates is set, USERPROFILE tried first - exactly
@@ -992,9 +1233,9 @@ mod eval_debt_predicate_tests {
 
     // --------------------------------------------------------- eval_debt_owed
 
-    /// Case named in the build brief: 59 minutes worked this session ->
+    /// Case named in the build brief: 59 minutes accrued this session ->
     /// silent, 61 -> fires - no report has ever been seen in either case,
-    /// proving the minutes-worked floor alone decides the difference.
+    /// proving the first-work floor alone decides the difference.
     #[test]
     fn fifty_nine_minutes_worked_is_silent_sixty_one_fires() {
         assert!(!eval_debt_owed(59, None, NOW), "59 minutes must not yet be enough");
@@ -1003,32 +1244,71 @@ mod eval_debt_predicate_tests {
 
     #[test]
     fn exactly_the_minimum_minutes_worked_is_enough() {
-        // The gate is "at least" `EVAL_MIN_SESSION_MINUTES`, not strictly more.
-        assert!(eval_debt_owed(EVAL_MIN_SESSION_MINUTES, None, NOW));
+        // The gate is "at least" `EVAL_FIRST_WORK_MINUTES`, not strictly more.
+        assert!(eval_debt_owed(EVAL_FIRST_WORK_MINUTES, None, NOW));
     }
 
     #[test]
     fn one_minute_under_the_minimum_is_silent_regardless_of_the_report_history() {
-        assert!(!eval_debt_owed(EVAL_MIN_SESSION_MINUTES - 1, Some(NOW - DAY), NOW));
+        assert!(!eval_debt_owed(EVAL_FIRST_WORK_MINUTES - 1, Some(NOW - DAY), NOW));
     }
 
     /// Case named in the build brief: a report first seen today silences
-    /// the obligation, however long the session has worked.
+    /// the FIRST obligation - but not a repeat once enough more work has
+    /// gone by since (see the `repeat_` tests below), so this only holds
+    /// for accrued minutes still under `EVAL_REPEAT_WORK_MINUTES`.
     #[test]
     fn a_report_first_seen_today_silences_it() {
-        assert!(!eval_debt_owed(EVAL_MIN_SESSION_MINUTES, Some(NOW - HOUR), NOW));
+        assert!(!eval_debt_owed(EVAL_FIRST_WORK_MINUTES, Some(NOW - HOUR), NOW));
     }
 
     /// Case named in the build brief: a report first seen yesterday does
     /// not silence today's obligation.
     #[test]
     fn a_report_first_seen_yesterday_does_not_silence_today() {
-        assert!(eval_debt_owed(EVAL_MIN_SESSION_MINUTES, Some(NOW - DAY), NOW));
+        assert!(eval_debt_owed(EVAL_FIRST_WORK_MINUTES, Some(NOW - DAY), NOW));
     }
 
     #[test]
     fn never_evaluated_at_all_fires_once_enough_time_is_worked() {
-        assert!(eval_debt_owed(EVAL_MIN_SESSION_MINUTES, None, NOW));
+        assert!(eval_debt_owed(EVAL_FIRST_WORK_MINUTES, None, NOW));
+    }
+
+    // ------------------------------------------- eval_debt_owed: the repeat
+
+    /// Case named in the build brief ("with a report today 179 minutes
+    /// silent and 181 fires"): once a report already exists for today, the
+    /// FIRST-work threshold no longer applies at all - only the much larger
+    /// repeat threshold does, measured from whatever reset the report
+    /// itself caused.
+    #[test]
+    fn with_a_report_today_179_minutes_is_silent_181_fires() {
+        let seen_today = Some(NOW - HOUR);
+        assert!(!eval_debt_owed(179, seen_today, NOW), "179 minutes must not yet be enough for a repeat");
+        assert!(eval_debt_owed(181, seen_today, NOW), "181 minutes must be enough for a repeat");
+    }
+
+    #[test]
+    fn with_a_report_today_exactly_the_repeat_minimum_is_enough() {
+        assert!(eval_debt_owed(EVAL_REPEAT_WORK_MINUTES, Some(NOW - HOUR), NOW));
+    }
+
+    #[test]
+    fn with_a_report_today_well_past_the_first_threshold_but_under_the_repeat_one_stays_silent() {
+        // Case named in the build brief: a report seen today, 90 minutes
+        // accrued since - well past `EVAL_FIRST_WORK_MINUTES`, but nowhere
+        // near `EVAL_REPEAT_WORK_MINUTES` - must stay silent. The whole
+        // point of the fifth rewrite: a report already seen today no longer
+        // reads the FIRST threshold at all.
+        assert!(!eval_debt_owed(90, Some(NOW - HOUR), NOW));
+    }
+
+    #[test]
+    fn with_no_report_today_the_repeat_threshold_never_applies() {
+        // Without `eval_done_today`, `EVAL_REPEAT_WORK_MINUTES` (180) worth
+        // of accrued work is still just "well past the first threshold",
+        // and must fire exactly as any other first-of-day case would.
+        assert!(eval_debt_owed(EVAL_REPEAT_WORK_MINUTES, None, NOW));
     }
 
     #[test]
@@ -1043,6 +1323,246 @@ mod eval_debt_predicate_tests {
         assert_eq!(minutes_ago(NOW, NOW - 3 * 60), 3);
         assert_eq!(minutes_ago(NOW, NOW - 3 * 60 - 1), 3, "not yet a fourth full minute");
         assert_eq!(minutes_ago(NOW, NOW + 60), 0, "a future timestamp reads as 0, never negative");
+    }
+}
+
+/// `accrue_session_work`/`session_work_reset_needed` (the pure gap/pause/
+/// reset rule) and `record_hook_event`/`most_recently_active_session` (its
+/// I/O wrapper and doctor's own cold read) - see `usefulness`'s own
+/// "evaluation debt" section, fifth rewrite, for the whole story.
+#[cfg(test)]
+mod session_work_tests {
+    use super::*;
+
+    // The identical fixed noon-UTC instant `eval_debt_predicate_tests` uses,
+    // for the identical reason: anything within 12 hours either side stays
+    // on the same UTC calendar day by eye.
+    const NOW: i64 = 1_800_014_400;
+    const MIN: i64 = 60;
+
+    // --------------------------------------------- accrue_session_work: gaps
+
+    /// Case named in the build brief: gaps under 30 minutes accrue.
+    #[test]
+    fn a_gap_under_the_pause_threshold_accrues_in_full() {
+        let session = SessionWorkState { anchor_unix: Some(NOW - 10 * MIN), accrued_secs: 5 * MIN, last_event_unix: Some(NOW - 10 * MIN) };
+        let after = accrue_session_work(&session, NOW, None);
+        assert_eq!(after.accrued_secs, 5 * MIN + 10 * MIN, "the whole 10-minute gap must be added");
+        assert_eq!(after.anchor_unix, session.anchor_unix, "no reset: the anchor must not move");
+        assert_eq!(after.last_event_unix, Some(NOW));
+    }
+
+    /// Case named in the build brief: a 30-minute gap adds nothing.
+    #[test]
+    fn a_gap_at_the_pause_threshold_adds_nothing() {
+        let session =
+            SessionWorkState { anchor_unix: Some(NOW - 40 * MIN), accrued_secs: 5 * MIN, last_event_unix: Some(NOW - EVAL_PAUSE_MINUTES * MIN) };
+        let after = accrue_session_work(&session, NOW, None);
+        assert_eq!(after.accrued_secs, 5 * MIN, "exactly 30 minutes is already a pause, not work");
+        assert_eq!(after.last_event_unix, Some(NOW), "the clock still moves forward, even though nothing accrued");
+    }
+
+    #[test]
+    fn a_gap_just_under_the_pause_threshold_still_accrues_in_full() {
+        let session =
+            SessionWorkState { anchor_unix: Some(NOW - 40 * MIN), accrued_secs: 0, last_event_unix: Some(NOW - (EVAL_PAUSE_MINUTES * 60 - 1)) };
+        let after = accrue_session_work(&session, NOW, None);
+        assert_eq!(after.accrued_secs, EVAL_PAUSE_MINUTES * 60 - 1, "one second under the threshold must still count in full");
+    }
+
+    #[test]
+    fn a_negative_gap_from_clock_skew_never_subtracts() {
+        let session = SessionWorkState { anchor_unix: Some(NOW), accrued_secs: 100, last_event_unix: Some(NOW + MIN) };
+        let after = accrue_session_work(&session, NOW, None);
+        assert_eq!(after.accrued_secs, 100, "a clock that appears to have gone backwards must add zero, never go negative");
+    }
+
+    // ---------------------------------------- session_work_reset_needed / resets
+
+    #[test]
+    fn the_very_first_event_ever_is_a_reset_to_zero() {
+        let after = accrue_session_work(&SessionWorkState::default(), NOW, None);
+        assert_eq!(after, SessionWorkState { anchor_unix: Some(NOW), accrued_secs: 0, last_event_unix: Some(NOW) });
+    }
+
+    /// Case named in the build brief: a new UTC day resets it.
+    #[test]
+    fn a_new_utc_day_resets_the_anchor_and_the_work() {
+        // One second before today's midnight - "yesterday" no matter the
+        // wall-clock hour NOW itself happens to represent.
+        let yesterday = NOW - NOW.rem_euclid(86400) - 1;
+        let session = SessionWorkState { anchor_unix: Some(yesterday), accrued_secs: 9_000, last_event_unix: Some(yesterday) };
+        let after = accrue_session_work(&session, NOW, None);
+        assert_eq!(after.accrued_secs, 0, "crossing into a new UTC day must drop whatever was accrued");
+        assert_eq!(after.anchor_unix, Some(NOW), "and restart the anchor at the event that crossed the boundary");
+    }
+
+    #[test]
+    fn staying_within_the_same_utc_day_never_resets_on_its_own() {
+        let session = SessionWorkState { anchor_unix: Some(NOW - 5 * MIN), accrued_secs: 100, last_event_unix: Some(NOW - MIN) };
+        let after = accrue_session_work(&session, NOW, None);
+        assert_eq!(after.anchor_unix, session.anchor_unix, "the same calendar day must never reset on its own");
+    }
+
+    /// Case named in the build brief: a new report resets the anchor and the
+    /// work.
+    #[test]
+    fn a_report_seen_after_the_anchor_resets_the_anchor_and_the_work() {
+        let session = SessionWorkState { anchor_unix: Some(NOW - 60 * MIN), accrued_secs: 3_000, last_event_unix: Some(NOW - MIN) };
+        let after = accrue_session_work(&session, NOW, Some(NOW - 30 * MIN));
+        assert_eq!(after.accrued_secs, 0, "a report seen since this accrual period began must drop the total");
+        assert_eq!(after.anchor_unix, Some(NOW));
+    }
+
+    #[test]
+    fn a_report_seen_before_the_anchor_never_resets_it_again() {
+        // Already accounted for by an earlier reset - a report seen BEFORE
+        // this accrual period began must not keep re-triggering one forever.
+        let session = SessionWorkState { anchor_unix: Some(NOW - 60 * MIN), accrued_secs: 100, last_event_unix: Some(NOW - MIN) };
+        let after = accrue_session_work(&session, NOW, Some(NOW - 90 * MIN));
+        assert_eq!(after.anchor_unix, session.anchor_unix, "a report older than the anchor is old news, not a new reset");
+        assert_eq!(after.accrued_secs, 100 + MIN, "the ordinary one-minute gap must still accrue normally");
+    }
+
+    #[test]
+    fn a_report_seen_at_exactly_the_anchor_instant_never_resets_it_again() {
+        // Strictly later, per `session_work_reset_needed`'s own doc comment:
+        // a report seen at the exact instant the anchor was set is the
+        // report that CAUSED this reset, not a new one on top of it.
+        let session = SessionWorkState { anchor_unix: Some(NOW - 60 * MIN), accrued_secs: 0, last_event_unix: Some(NOW - 60 * MIN) };
+        let after = accrue_session_work(&session, NOW, Some(NOW - 60 * MIN));
+        assert_eq!(after.anchor_unix, session.anchor_unix);
+    }
+
+    // ----------------------------------------------------- record_hook_event
+
+    fn read_sidecar_session(db: &Path, project: Option<&str>, session_id: &str) -> SessionWorkState {
+        project_eval_state(db, project).sessions.get(session_id).cloned().unwrap_or_default()
+    }
+
+    #[test]
+    fn a_no_project_checkout_is_never_recorded_at_all() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("t.db");
+        assert_eq!(record_hook_event(&db, None, "s1", false, NOW), None);
+        assert!(!eval_debt_state_path(&db).exists(), "a no-project event must never even create the sidecar");
+    }
+
+    #[test]
+    fn the_very_first_event_is_always_written_even_though_it_adds_no_accrued_time() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("t.db");
+        let result = record_hook_event(&db, Some("thor"), "s1", false, NOW).expect("a real project must record");
+        assert_eq!(result, SessionWorkState { anchor_unix: Some(NOW), accrued_secs: 0, last_event_unix: Some(NOW) });
+        assert_eq!(read_sidecar_session(&db, Some("thor"), "s1"), result, "must be durable on disk immediately");
+    }
+
+    /// Case named in the build brief: the write throttle holds (no write on
+    /// a PreToolUse that adds under 60 seconds).
+    #[test]
+    fn a_small_gap_on_a_non_stop_event_is_computed_but_not_written() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("t.db");
+        record_hook_event(&db, Some("thor"), "s1", false, NOW).unwrap();
+        let sidecar = eval_debt_state_path(&db);
+        let before = std::fs::read_to_string(&sidecar).unwrap();
+
+        let result = record_hook_event(&db, Some("thor"), "s1", false, NOW + 5).expect("still a real project");
+        assert_eq!(result.accrued_secs, 5, "the small gap must still be reflected in the value handed back");
+
+        let after = std::fs::read_to_string(&sidecar).unwrap();
+        assert_eq!(before, after, "a 5-second gap on a non-Stop event must never be written to disk");
+    }
+
+    #[test]
+    fn a_gap_reaching_the_write_throttle_is_written() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("t.db");
+        record_hook_event(&db, Some("thor"), "s1", false, NOW).unwrap();
+        record_hook_event(&db, Some("thor"), "s1", false, NOW + EVAL_WORK_WRITE_THROTTLE_SECS).unwrap();
+        assert_eq!(read_sidecar_session(&db, Some("thor"), "s1").accrued_secs, EVAL_WORK_WRITE_THROTTLE_SECS);
+    }
+
+    #[test]
+    fn a_stop_event_always_writes_even_for_a_tiny_gap() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("t.db");
+        record_hook_event(&db, Some("thor"), "s1", false, NOW).unwrap();
+        let result = record_hook_event(&db, Some("thor"), "s1", true, NOW + 2).unwrap();
+        assert_eq!(read_sidecar_session(&db, Some("thor"), "s1"), result, "a Stop must always be durable immediately");
+    }
+
+    /// Proves the correctness argument in `record_hook_event`'s own doc
+    /// comment on the write throttle: a pause must be written immediately
+    /// even though it adds no accrued work, or the NEXT short gap would be
+    /// measured against a stale pre-pause instant and wrongly read as
+    /// another pause.
+    #[test]
+    fn a_pause_boundary_is_always_written_so_the_next_short_gap_is_not_merged_with_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("t.db");
+        record_hook_event(&db, Some("thor"), "s1", false, NOW).unwrap();
+        let after_pause = NOW + (EVAL_PAUSE_MINUTES + 5) * 60;
+        let result = record_hook_event(&db, Some("thor"), "s1", false, after_pause).unwrap();
+        assert_eq!(result.accrued_secs, 0, "fixture sanity: the pause itself must add nothing");
+        assert_eq!(
+            read_sidecar_session(&db, Some("thor"), "s1").last_event_unix,
+            Some(after_pause),
+            "the pause boundary must be written so a later short gap is measured from here, not from before the pause"
+        );
+
+        let resumed = after_pause + 30;
+        let result = record_hook_event(&db, Some("thor"), "s1", true, resumed).unwrap();
+        assert_eq!(result.accrued_secs, 30, "must be measured from the pause boundary, not telescoped with the pause itself");
+    }
+
+    #[test]
+    fn two_sessions_in_the_same_project_accrue_independently() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("t.db");
+        record_hook_event(&db, Some("thor"), "s1", false, NOW).unwrap();
+        record_hook_event(&db, Some("thor"), "s2", false, NOW).unwrap();
+        record_hook_event(&db, Some("thor"), "s1", true, NOW + 10 * MIN).unwrap();
+        assert_eq!(read_sidecar_session(&db, Some("thor"), "s1").accrued_secs, 10 * MIN);
+        assert_eq!(
+            read_sidecar_session(&db, Some("thor"), "s2").accrued_secs,
+            0,
+            "a different session in the same project must never see the other one's accrual"
+        );
+    }
+
+    /// Case named in the build brief: old sidecars parse.
+    #[test]
+    fn a_sidecar_written_before_sessions_existed_still_parses_and_is_still_usable() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("t.db");
+        let text = r#"{"thor":{"tracking_since":1234,"known_report_ids":[],"last_evaluation_seen":null,"last_evaluation_report_id":null,"asked_count":0,"first_asked_since_report":null}}"#;
+        std::fs::write(eval_debt_state_path(&db), text).unwrap();
+        let state = project_eval_state(&db, Some("thor"));
+        assert_eq!(state.tracking_since, Some(1234), "fixture sanity: the rest of the entry still reads back");
+        assert!(state.sessions.is_empty(), "a sessions field that never existed must default to an empty map");
+
+        assert!(record_hook_event(&db, Some("thor"), "s1", false, NOW).is_some(), "must still be usable, not choke on the old shape");
+    }
+
+    // ------------------------------------------- most_recently_active_session
+
+    #[test]
+    fn most_recently_active_session_is_none_for_an_empty_project() {
+        assert_eq!(most_recently_active_session(&ProjectEvalState::default()), None);
+    }
+
+    #[test]
+    fn most_recently_active_session_picks_the_latest_last_event() {
+        let mut state = ProjectEvalState::default();
+        state.sessions.insert("older".to_string(), SessionWorkState { anchor_unix: Some(NOW), accrued_secs: 500, last_event_unix: Some(NOW) });
+        state.sessions.insert(
+            "newer".to_string(),
+            SessionWorkState { anchor_unix: Some(NOW), accrued_secs: 10, last_event_unix: Some(NOW + MIN) },
+        );
+        let (id, work) = most_recently_active_session(&state).expect("must find one");
+        assert_eq!(id, "newer");
+        assert_eq!(work.accrued_secs, 10);
     }
 }
 

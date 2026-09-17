@@ -2,7 +2,7 @@
 
 What changed in each release, newest first. The release workflow copies the section for the tag being released to the top of the release notes and refuses to publish without one.
 
-## Unreleased
+## 2.4.1 (2026-09-17)
 
 - **A session that starts right after a compaction is told so.** A `SessionStart` payload whose own `source` field reads `"compact"` gets one added line: the summary just given is not proof, so anything it calls done, tested, flashed, deployed or live should be checked again first. It never fires for any other source, and never for a subagent.
 - **The evaluation starts with the previous report's open points.** Before judging what fired, it looks up the newest evaluation report filed for this project and either settles what that report left open - unjudged items, gaps, anything still to be probed - now, or carries it into this report's own open points with the reason it is still open.
@@ -14,6 +14,9 @@ What changed in each release, newest first. The release workflow copies the sect
 - **A backup push that failed is retried.** A commit that landed locally but could not reach the remote is pushed again on the very next run, before that run's own once-a-day schedule is even checked.
 - **The evaluation's teeth step tries a check before it accepts that none is possible.** Step 4 no longer lets "it's a judgement rule" end the question on its own: for a heavy fact with no check it now names, in the report, the literal fragment, the file or command it belongs at, and the check kind - and only after that attempt may it answer "no literal", with one of two named reasons. A fact that already carries that reason gets it read again whenever the fact names a command or file. The report states the health check's teeth count before and after the step.
 - **A new heavy Rule or Orientation must say how it can refuse, or why it cannot.** Gate ground 11 has asked this of a Rule since 2.4.0; it now asks the same of an Orientation. Remembering one, or revising one so its severity becomes `costly`/`irreversible` or its last check is cleared, is refused when it carries neither a check nor a `no-literal:<why>` tag - the refusal names both honest reasons a "no-literal" answer may give.
+- **A version bump without a changelog section fails before a tag ever exists.** CI checks that `thor2/Cargo.toml`'s version has a matching `CHANGELOG.md` section on every push, not just at release; the release workflow then copies that section into the published notes and refuses to publish without one.
+
+**Upgrading from 2.4.0**: unpack over the old programs and run `install` once from inside your repository, so it refreshes `/thor-eval` and the project record. Restart your assistant afterwards.
 
 ## 2.4.0 (2026-09-12)
 

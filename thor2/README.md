@@ -255,7 +255,7 @@ rule is one entry with:
 target/release/doctor.exe --db "<store>"
 ```
 
-Its first line always names the build it was run from (`doctor 2.4.0`), so a
+Its first line always names the build it was run from (`doctor 2.4.1`), so a
 report you paste somewhere says which version made it - every program in this
 directory answers the same way to `--version` or `-V`, on its own, with no
 store needed.

@@ -1,6 +1,6 @@
 ---
 description: THOR session evaluation - judge what fired, repair what has rotted, give teeth to what nothing could stop, capture what was missing, report what the gate did and where it chafed, and close with a plain-language summary
-allowed-tools: mcp__thor__mark, mcp__thor__get, mcp__thor__lookup, mcp__thor__remember, mcp__thor__revise, mcp__thor__retract, mcp__thor__status, mcp__thor__history, Bash
+allowed-tools: mcp__thor__mark, mcp__thor__get, mcp__thor__lookup, mcp__thor__remember, mcp__thor__revise, mcp__thor__retract, mcp__thor__status, mcp__thor__history, Bash(git status:*), Bash(git diff:*), Bash(git log:*), Bash(cargo test:*), Bash(cargo build:*), Bash(npm test:*), Bash(npm run verify:*), Bash(node --test:*), Bash(pio run:*), Bash(pio test:*), {{THOR_DOCTOR_ALLOW}}
 ---
 
 THOR session evaluation. Work through steps 1 to 8, then the report. You need
@@ -33,7 +33,12 @@ long as no evaluation report has yet been filed for this project TODAY (the
 current UTC calendar day - not the owner's own local day, since this
 workspace has no way to resolve his local time zone). It names how many
 times it has already asked, and since when. Filing the report below is what
-goes quiet - until the next UTC day, when the obligation returns. It only
+goes quiet - but not necessarily until the next UTC day: once three more
+hours of accrued work go by since that report, AND a real risk has shown up
+since then too - three or more code changes with no test or build run in
+between, or a context summary - the obligation returns the same day, as a
+repeat covering only what happened since that report (see the SCOPE note
+under step 2). Three quiet hours with neither risk stays silent. It only
 ever asks inside a project: a checkout that resolves to no project is never
 asked, since there would be no way to file the report that silences it.
 

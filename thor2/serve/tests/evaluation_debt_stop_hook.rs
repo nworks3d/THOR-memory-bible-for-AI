@@ -312,6 +312,16 @@ fn declare_owed_items(store: &mut EventStore, n: usize, project: Option<&str>) -
 /// file, so a fixture that already seeded a report (`seed_eval_state`) or
 /// another session's own accrual for the same project is never clobbered.
 fn seed_session_work(db: &Path, project: Option<&str>, session_id: &str, minutes: i64) {
+    seed_session_work_with_risk(db, project, session_id, minutes, 0, false);
+}
+
+/// The identical fixture as `seed_session_work` above, plus the two risk
+/// counters the sixth rewrite (2026-09-17) added to `SessionWorkState` - see
+/// `serve::usefulness`'s own "the repeat's own risk" doc comment. Needed by
+/// every test proving a REPEAT ask actually fires: accrued time alone is no
+/// longer enough, so `seed_session_work`'s own all-default risk (0, false)
+/// would silently stay silent for any of those.
+fn seed_session_work_with_risk(db: &Path, project: Option<&str>, session_id: &str, minutes: i64, edits_since_test: u32, compacted_since_anchor: bool) {
     let mut all = serve::usefulness::read_eval_debt_state(db);
     let key = project.unwrap_or("").to_string();
     let mut entry = all.get(&key).cloned().unwrap_or_default();
@@ -322,6 +332,8 @@ fn seed_session_work(db: &Path, project: Option<&str>, session_id: &str, minutes
             anchor_unix: Some(noon_today - minutes * 60),
             accrued_secs: minutes * 60,
             last_event_unix: Some(noon_today),
+            edits_since_test,
+            compacted_since_anchor,
         },
     );
     all.insert(key, entry);
@@ -901,16 +913,27 @@ fn a_report_seen_today_with_three_hours_accrued_since_fires_the_repeat_message()
             ..Default::default()
         },
     );
-    seed_session_work(&db, Some("thor-fixture"), "s1", serve::usefulness::EVAL_REPEAT_WORK_MINUTES + 1);
+    seed_session_work_with_risk(
+        &db,
+        Some("thor-fixture"),
+        "s1",
+        serve::usefulness::EVAL_REPEAT_WORK_MINUTES + 1,
+        serve::usefulness::EVAL_REPEAT_MIN_UNTESTED_EDITS,
+        false,
+    );
 
     let out = run_hook(&db, &stop_payload("s1", &project_dir), &sandbox);
     let v: serde_json::Value =
-        serde_json::from_str(&out).unwrap_or_else(|e| panic!("three hours since the last report must fire a repeat ask: {e}: {out}"));
+        serde_json::from_str(&out).unwrap_or_else(|e| panic!("three hours plus a risk since the last report must fire a repeat ask: {e}: {out}"));
     assert_eq!(v["decision"], "block", "{out}");
     let reason = v["reason"].as_str().unwrap();
     assert!(reason.starts_with("[THOR]"), "{reason}");
     assert!(reason.contains("This session has worked here for 3.0 hour(s) since the last evaluation report"), "{reason}");
     assert!(reason.contains("eval-thor-fixture-2026-09-17"), "must name the report this accrual is measured since: {reason}");
+    assert!(
+        reason.contains(&format!("{} code change(s) since the last test or build run", serve::usefulness::EVAL_REPEAT_MIN_UNTESTED_EDITS)),
+        "must name the risk that triggered it: {reason}"
+    );
     assert!(
         reason.contains("A new evaluation is due, covering only what happened since then plus the state of the work"),
         "{reason}"
@@ -918,6 +941,94 @@ fn a_report_seen_today_with_three_hours_accrued_since_fires_the_repeat_message()
     assert!(reason.contains(&format!("{OWED_CONTEXT_COUNT} item(s) currently owe a verdict here")), "{reason}");
     assert!(reason.contains("A turn cannot end until the evaluation report for this project is filed"), "{reason}");
     assert!(!reason.contains("It has been asked"), "the repeat message names hours and a report id, never an ask count: {reason}");
+}
+
+/// THE CENTRAL CASE THE SIXTH REWRITE EXISTS FOR (owner's decision,
+/// 2026-09-17): the identical fixture as the test just above, MINUS any
+/// risk, must now stay silent - end to end, through the real hook binary.
+#[test]
+fn three_hours_accrued_with_no_risk_at_all_stays_silent_end_to_end() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("thor.db");
+    let sandbox = Sandbox::new();
+    let project_dir = sandbox.project_dir("thor-fixture");
+
+    let mut store = EventStore::new(&db).unwrap();
+    declare_owed_items(&mut store, OWED_CONTEXT_COUNT, Some("thor-fixture"));
+    drop(store);
+    seed_eval_state(
+        &db,
+        Some("thor-fixture"),
+        serve::usefulness::ProjectEvalState {
+            last_evaluation_seen: Some(start_of_today_utc()),
+            last_evaluation_report_id: Some("eval-thor-fixture-2026-09-17".to_string()),
+            ..Default::default()
+        },
+    );
+    seed_session_work(&db, Some("thor-fixture"), "s1", serve::usefulness::EVAL_REPEAT_WORK_MINUTES + 1);
+
+    let out = run_hook(&db, &stop_payload("s1", &project_dir), &sandbox);
+    assert!(out.trim().is_empty(), "three hours accrued with no code change and no summary must stay silent: {out}");
+}
+
+/// Case named in the build brief: subagent edits count toward the risk
+/// counter, but a subagent Stop never blocks - proven with the SAME
+/// three-hours-plus-a-report fixture the "fires" test above uses, so a
+/// version of the code that forgot the risk gate entirely would be caught
+/// here too. `agent_id` marks every payload below as coming from a
+/// Task-tool subagent, the identical signal `subagent_pretooluse_payload`/
+/// `subagent_stop_payload` already use.
+#[test]
+fn subagent_untested_edits_count_toward_the_risk_counter_but_a_subagent_stop_never_blocks() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("thor.db");
+    let sandbox = Sandbox::new();
+    let project_dir = sandbox.project_dir("thor-fixture");
+
+    let mut store = EventStore::new(&db).unwrap();
+    declare_owed_items(&mut store, OWED_CONTEXT_COUNT, Some("thor-fixture"));
+    drop(store);
+    seed_eval_state(
+        &db,
+        Some("thor-fixture"),
+        serve::usefulness::ProjectEvalState {
+            last_evaluation_seen: Some(start_of_today_utc()),
+            last_evaluation_report_id: Some("eval-thor-fixture-2026-09-17".to_string()),
+            ..Default::default()
+        },
+    );
+    seed_session_work(&db, Some("thor-fixture"), "sub1", serve::usefulness::EVAL_REPEAT_WORK_MINUTES + 1);
+
+    for _ in 0..serve::usefulness::EVAL_REPEAT_MIN_UNTESTED_EDITS {
+        let payload = serde_json::json!({
+            "hook_event_name": "PreToolUse",
+            "session_id": "sub1",
+            "cwd": project_dir.to_string_lossy(),
+            "agent_id": "a1dca2c0feb7f44fb",
+            "agent_type": "general-purpose",
+            "tool_name": "Edit",
+            "tool_input": { "file_path": "fixture.rs" },
+        })
+        .to_string();
+        let out = run_hook(&db, &payload, &sandbox);
+        assert!(out.trim().is_empty(), "PreToolUse never blocks for this debt, subagent or not: {out}");
+    }
+
+    let edits = serve::usefulness::project_eval_state(&db, Some("thor-fixture"))
+        .sessions
+        .get("sub1")
+        .expect("a subagent's own PreToolUse must still record its own session's accrual")
+        .edits_since_test;
+    assert_eq!(
+        edits, serve::usefulness::EVAL_REPEAT_MIN_UNTESTED_EDITS,
+        "a subagent's own untested edits must still count toward the risk counter"
+    );
+
+    let out = run_hook(&db, &subagent_stop_payload("sub1", &project_dir), &sandbox);
+    assert!(
+        out.trim().is_empty(),
+        "a subagent's Stop must never be held for the evaluation debt, however large its risk counter has grown: {out}"
+    );
 }
 
 /// Case named in the build brief: a new evaluation-report Report for the

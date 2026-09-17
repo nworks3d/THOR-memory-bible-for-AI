@@ -1022,7 +1022,17 @@ fn hook_once(db_path: &Path) -> Option<HookOutput> {
             if !is_subagent {
                 if let Ok(store) = EventStore::open_existing(db_path) {
                     usefulness::update_eval_debt_state(&store, db_path, stop_project.as_deref(), now);
-                    if let Some(work) = usefulness::record_hook_event(db_path, stop_project.as_deref(), &session_id, true, now) {
+                    // A `Stop` event carries no tool call, so it is never
+                    // itself an edit, a test/build command, or a compaction -
+                    // `HookEventKind::Other` (see that enum's own doc
+                    // comment). The classification `usefulness::
+                    // classify_hook_event` runs below, for `SessionStart`/
+                    // `UserPromptSubmit`/`PreToolUse`, is what actually feeds
+                    // the two risk counters this Stop reads back through
+                    // `work`.
+                    if let Some(work) =
+                        usefulness::record_hook_event(db_path, stop_project.as_deref(), &session_id, true, now, usefulness::HookEventKind::Other)
+                    {
                         if let Some(reason) = evaluation_debt(&store, db_path, stop_project.as_deref(), &work) {
                             usefulness::record_eval_debt_asked(db_path, stop_project.as_deref(), now);
                             return Some(HookOutput::Decision(
@@ -1035,7 +1045,7 @@ fn hook_once(db_path: &Path) -> Option<HookOutput> {
                 // A subagent's own Stop can never block for this debt, but
                 // its work still counts toward its own session's accrual -
                 // see the doc comment above.
-                usefulness::record_hook_event(db_path, stop_project.as_deref(), &session_id, true, now);
+                usefulness::record_hook_event(db_path, stop_project.as_deref(), &session_id, true, now, usefulness::HookEventKind::Other);
             }
         }
 
@@ -1141,8 +1151,27 @@ fn hook_once(db_path: &Path) -> Option<HookOutput> {
     // it reads and writes only the small sidecar beside `db_path`, never
     // `EventStore::new` below - which is what keeps this affordable on
     // EVERY `PreToolUse` call rather than only at `Stop`.
+    //
+    // THE RISK CLASSIFICATION (sixth rewrite, 2026-09-17 - see `usefulness`'s
+    // own "the repeat's own risk" doc comment) is decided here, straight off
+    // the raw payload, before the match below ever parses `tool_name`/
+    // `file_path` for its own purposes: `usefulness::classify_hook_event`
+    // needs nothing but these borrowed fields, all already sitting in
+    // `payload` regardless of which of the three event shapes this actually
+    // is - a field that means nothing for a given shape (`tool_name` on a
+    // `SessionStart`, `source` on a `PreToolUse`) simply reads back empty/
+    // `None` and classifies as `Other`, exactly as it should. `command` is
+    // read the same generic way the informational surface below already
+    // does (`absent_guard::proposed_command` - "nothing here hard-codes
+    // that name"), so a `Bash` or `PowerShell` call alike is recognised.
     if session_project.is_some() {
-        usefulness::record_hook_event(db_path, session_project.as_deref(), &session_id, false, time::now_unix());
+        let hook_tool_input = payload.get("tool_input");
+        let hook_tool_name = payload.get("tool_name").and_then(|v| v.as_str()).unwrap_or("");
+        let hook_file_path = hook_tool_input.and_then(|t| t.get("file_path")).and_then(|v| v.as_str());
+        let hook_command = absent_guard::proposed_command(hook_tool_input);
+        let hook_source = payload.get("source").and_then(|v| v.as_str());
+        let event_kind = usefulness::classify_hook_event(&event_name, hook_tool_name, hook_file_path, hook_command, hook_source);
+        usefulness::record_hook_event(db_path, session_project.as_deref(), &session_id, false, time::now_unix(), event_kind);
     }
 
     let mut store = EventStore::new(db_path).ok()?;
@@ -2285,7 +2314,7 @@ fn evaluation_debt(
     let now = time::now_unix();
     let accrued_minutes = work.accrued_secs / 60;
     let state = usefulness::project_eval_state(db_path, current_project);
-    if !usefulness::eval_debt_owed(accrued_minutes, state.last_evaluation_seen, now) {
+    if !usefulness::eval_debt_owed(accrued_minutes, state.last_evaluation_seen, now, work.edits_since_test, work.compacted_since_anchor) {
         return None;
     }
     let (_, owed_in_project) = usefulness::judgement_debt_counts(store, current_project);
@@ -2310,10 +2339,26 @@ fn evaluation_debt(
         // WORK"), and the report id this accrual reset against, rather than
         // the ask-count/first-asked clause the first-of-day message below
         // uses.
+        //
+        // NAMES THE RISK TOO (sixth rewrite, 2026-09-17 - see `usefulness`'s
+        // own "the repeat's own risk" doc comment): `eval_debt_owed` above
+        // already guarantees at least one of the two holds by the time this
+        // branch is reached, so `risk_reasons` is never empty here - either
+        // clause on its own is a complete, true sentence, and both together
+        // read naturally joined with "and".
         let hours = accrued_minutes as f64 / 60.0;
         let report_id = state.last_evaluation_report_id.as_deref().unwrap_or("an earlier report");
+        let mut risk_reasons = Vec::new();
+        if work.edits_since_test >= usefulness::EVAL_REPEAT_MIN_UNTESTED_EDITS {
+            risk_reasons.push(format!("{} code change(s) since the last test or build run", work.edits_since_test));
+        }
+        if work.compacted_since_anchor {
+            risk_reasons.push("the context was summarized".to_string());
+        }
+        let risk_text = risk_reasons.join(" and ");
         Some(format!(
-            "[THOR] This session has worked here for {hours:.1} hour(s) since the last evaluation report ('{report_id}'). \
+            "[THOR] This session has worked here for {hours:.1} hour(s) since the last evaluation report ('{report_id}'), \
+             and {risk_text}. \
              A new evaluation is due, covering only what happened since then plus the state of the work; \
              {owed_in_project} item(s) currently owe a verdict here. \
              Run the THOR evaluation before you finish: {ask} \
@@ -4364,7 +4409,20 @@ mod evaluation_debt_tests {
     /// did, so a test only needs to build one of these directly instead of
     /// making real wall-clock time pass.
     fn work_minutes(minutes: i64) -> usefulness::SessionWorkState {
-        usefulness::SessionWorkState { anchor_unix: Some(time::now_unix()), accrued_secs: minutes * 60, last_event_unix: Some(time::now_unix()) }
+        usefulness::SessionWorkState {
+            anchor_unix: Some(time::now_unix()),
+            accrued_secs: minutes * 60,
+            last_event_unix: Some(time::now_unix()),
+            ..Default::default()
+        }
+    }
+
+    /// The identical fixture as `work_minutes` above, plus the two risk
+    /// counters the sixth rewrite (2026-09-17) added - see `usefulness`'s
+    /// own "the repeat's own risk" doc comment. Needed by every "repeat
+    /// fires" test below: accrued time alone is no longer enough.
+    fn work_minutes_with_risk(minutes: i64, edits_since_test: u32, compacted_since_anchor: bool) -> usefulness::SessionWorkState {
+        usefulness::SessionWorkState { edits_since_test, compacted_since_anchor, ..work_minutes(minutes) }
     }
 
     // --------------------------------------------------------- evaluation_debt
@@ -4616,11 +4674,15 @@ mod evaluation_debt_tests {
             last_evaluation_report_id: Some("eval-thor-2026-09-17".to_string()),
             ..Default::default()
         });
-        let asked = evaluation_debt(&store, &db, Some("thor"), &work_minutes(usefulness::EVAL_REPEAT_WORK_MINUTES))
-            .expect("three hours since the last report must fire a repeat ask");
+        let work = work_minutes_with_risk(usefulness::EVAL_REPEAT_WORK_MINUTES, usefulness::EVAL_REPEAT_MIN_UNTESTED_EDITS, false);
+        let asked = evaluation_debt(&store, &db, Some("thor"), &work).expect("three hours plus a risk must fire a repeat ask");
         assert!(asked.starts_with("[THOR]"), "{asked}");
         assert!(asked.contains("This session has worked here for 3.0 hour(s) since the last evaluation report"), "{asked}");
         assert!(asked.contains("eval-thor-2026-09-17"), "must name the report this accrual is measured since: {asked}");
+        assert!(
+            asked.contains(&format!("{} code change(s) since the last test or build run", usefulness::EVAL_REPEAT_MIN_UNTESTED_EDITS)),
+            "must name the risk that triggered it: {asked}"
+        );
         assert!(
             asked.contains("A new evaluation is due, covering only what happened since then plus the state of the work"),
             "{asked}"
@@ -4631,6 +4693,63 @@ mod evaluation_debt_tests {
             !asked.contains("It has been asked"),
             "the repeat message names hours and the report id, never an ask count: {asked}"
         );
+    }
+
+    /// THE CENTRAL CASE THE SIXTH REWRITE EXISTS FOR (2026-09-17, owner's
+    /// decision): the identical fixture as the test just above, MINUS any
+    /// risk - three hours accrued, a report already seen today, a real
+    /// backlog - must now stay silent. Time alone is no longer enough.
+    #[test]
+    fn three_hours_accrued_with_no_risk_at_all_stays_silent() {
+        let (_dir, db, mut store) = new_store();
+        owe_project(&mut store, 5, Some("thor"));
+        seed_eval_state(&db, Some("thor"), usefulness::ProjectEvalState {
+            last_evaluation_seen: Some(start_of_today_utc()),
+            last_evaluation_report_id: Some("eval-thor-2026-09-17".to_string()),
+            ..Default::default()
+        });
+        let work = work_minutes_with_risk(usefulness::EVAL_REPEAT_WORK_MINUTES, 0, false);
+        assert_eq!(
+            evaluation_debt(&store, &db, Some("thor"), &work),
+            None,
+            "three hours of accrued time with no code change and no summary must never fire a repeat"
+        );
+    }
+
+    /// The other risk on its own: a context summary, with zero untested
+    /// edits, must still fire - and the message must name the summary, not
+    /// the edit count, as the reason.
+    #[test]
+    fn a_context_summary_with_zero_edits_fires_the_repeat_message_naming_the_summary() {
+        let (_dir, db, mut store) = new_store();
+        owe_project(&mut store, 5, Some("thor"));
+        seed_eval_state(&db, Some("thor"), usefulness::ProjectEvalState {
+            last_evaluation_seen: Some(start_of_today_utc()),
+            last_evaluation_report_id: Some("eval-thor-2026-09-17".to_string()),
+            ..Default::default()
+        });
+        let work = work_minutes_with_risk(usefulness::EVAL_REPEAT_WORK_MINUTES, 0, true);
+        let asked = evaluation_debt(&store, &db, Some("thor"), &work).expect("a context summary alone must fire a repeat ask");
+        assert!(asked.contains("the context was summarized"), "{asked}");
+        assert!(
+            !asked.contains("code change(s) since the last test or build run"),
+            "with zero edits, the edit-count reason must not appear: {asked}"
+        );
+    }
+
+    /// Two untested edits - one short of the floor - with no summary either,
+    /// must stay silent. Case named in the build brief.
+    #[test]
+    fn two_untested_edits_with_no_summary_stays_silent() {
+        let (_dir, db, mut store) = new_store();
+        owe_project(&mut store, 5, Some("thor"));
+        seed_eval_state(&db, Some("thor"), usefulness::ProjectEvalState {
+            last_evaluation_seen: Some(start_of_today_utc()),
+            last_evaluation_report_id: Some("eval-thor-2026-09-17".to_string()),
+            ..Default::default()
+        });
+        let work = work_minutes_with_risk(usefulness::EVAL_REPEAT_WORK_MINUTES, usefulness::EVAL_REPEAT_MIN_UNTESTED_EDITS - 1, false);
+        assert_eq!(evaluation_debt(&store, &db, Some("thor"), &work), None, "two untested edits is under the risk floor");
     }
 }
 

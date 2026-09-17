@@ -217,11 +217,40 @@ pub fn doctor_invocation(bin_dir: &Path, db: &Path, windows: bool) -> String {
     }
 }
 
-/// Fill in the template's one placeholder, `{{THOR_DOCTOR}}`, with the
-/// doctor invocation this install run has already resolved for the current
-/// platform (see `doctor_invocation`).
+/// The `allowed-tools` entry that pre-approves running `doctor` from the eval
+/// command's own frontmatter (`{{THOR_DOCTOR_ALLOW}}` in `eval-command.
+/// example.md`) - the owner's decision, 2026-09-17: an evaluation command
+/// pre-approves Bash only per command, never a bare `Bash` that would let any
+/// shell command through unasked during an evaluation, including a wrong or
+/// whispered one (see this file's own `EVAL_COMMAND_TEMPLATE` doc comment).
+///
+/// FORWARD SLASHES EVEN ON WINDOWS, unlike `doctor_invocation` above:
+/// Claude Code reads a `Bash(...)` entry as a glob pattern matched against
+/// the command text, not as a path handed to a shell, so a Windows backslash
+/// there is an escape character, not a separator - `bin_dir.display()` on
+/// Windows would otherwise put one directly into the pattern.
+///
+/// `windows` is a parameter for the identical reason `doctor_invocation`
+/// takes one rather than reading `cfg!(windows)` itself - see that
+/// function's own doc comment.
+pub fn doctor_allow_invocation(bin_dir: &Path, windows: bool) -> String {
+    let dir = bin_dir.display().to_string().replace('\\', "/");
+    if windows {
+        format!("Bash({dir}/doctor.exe:*)")
+    } else {
+        format!("Bash({dir}/doctor:*)")
+    }
+}
+
+/// Fill in the template's two placeholders - `{{THOR_DOCTOR}}` (the doctor
+/// invocation the report tells a reader to run) and `{{THOR_DOCTOR_ALLOW}}`
+/// (the matching `allowed-tools` entry that pre-approves it) - with this
+/// install run's own resolution for the current platform (see
+/// `doctor_invocation`/`doctor_allow_invocation`).
 fn render_eval_command(bin_dir: &Path, db: &Path) -> String {
-    EVAL_COMMAND_TEMPLATE.replace("{{THOR_DOCTOR}}", &doctor_invocation(bin_dir, db, cfg!(windows)))
+    EVAL_COMMAND_TEMPLATE
+        .replace("{{THOR_DOCTOR}}", &doctor_invocation(bin_dir, db, cfg!(windows)))
+        .replace("{{THOR_DOCTOR_ALLOW}}", &doctor_allow_invocation(bin_dir, cfg!(windows)))
 }
 
 /// Claude Code's per-user commands folder: `~/.claude/commands`. Same base
@@ -1738,6 +1767,20 @@ mod tests {
         );
     }
 
+    /// `doctor_allow_invocation`'s own Windows form: forward slashes even
+    /// though `bin_dir` itself carries backslashes, plus the `.exe` suffix -
+    /// see that function's own doc comment for why a `Bash(...)` allow-list
+    /// entry can never carry a literal backslash.
+    #[test]
+    fn doctor_allow_invocation_windows_form_uses_forward_slashes_and_exe_suffix() {
+        assert_eq!(doctor_allow_invocation(Path::new("C:\\thor2\\bin"), true), "Bash(C:/thor2/bin/doctor.exe:*)");
+    }
+
+    #[test]
+    fn doctor_allow_invocation_non_windows_form_uses_no_suffix() {
+        assert_eq!(doctor_allow_invocation(Path::new("/home/user/thor2/bin"), false), "Bash(/home/user/thor2/bin/doctor:*)");
+    }
+
     /// Proves the real wiring on THIS host: `render_eval_command` passes the
     /// real `cfg!(windows)` (not a caller-chosen value) into
     /// `doctor_invocation`, so a Windows build's own rendered eval command
@@ -1749,9 +1792,13 @@ mod tests {
     #[test]
     fn on_windows_the_real_doctor_line_leads_with_the_call_operator_and_exe_suffix() {
         let rendered = render_eval_command(Path::new("C:\\thor2\\bin"), Path::new("C:\\thor2\\thor.db"));
+        // `l.contains("doctor")` alone would also match the frontmatter's own
+        // `allowed-tools` line since `{{THOR_DOCTOR_ALLOW}}` was added there
+        // too (section 2 of this task) - `--db` narrows this to the actual
+        // invocation line the report tells a reader to run.
         let line = rendered
             .lines()
-            .find(|l| l.contains("doctor"))
+            .find(|l| l.contains("doctor") && l.contains("--db"))
             .expect("the rendered eval command must carry a line naming doctor");
         let trimmed = line.trim();
         assert!(trimmed.starts_with("& \""), "the windows doctor line must start with the call operator: {trimmed}");
@@ -1759,6 +1806,16 @@ mod tests {
             trimmed.ends_with(".exe\" --db \"C:\\thor2\\thor.db\""),
             "the windows doctor line must end with the exe suffix and --db: {trimmed}"
         );
+    }
+
+    /// The identical real-wiring proof as the test above, for the
+    /// `allowed-tools` entry: `render_eval_command` passes the real
+    /// `cfg!(windows)` into `doctor_allow_invocation` too.
+    #[cfg(windows)]
+    #[test]
+    fn on_windows_the_real_doctor_allow_entry_uses_forward_slashes_and_exe_suffix() {
+        let rendered = render_eval_command(Path::new("C:\\thor2\\bin"), Path::new("C:\\thor2\\thor.db"));
+        assert!(rendered.contains("Bash(C:/thor2/bin/doctor.exe:*)"), "{rendered}");
     }
 
     /// THE GAP THIS GUARDS AGAINST: a template shipped with `{{THOR_DOCTOR}}`
@@ -1781,6 +1838,35 @@ mod tests {
         assert!(written.contains("C:\\fake\\thor2\\bin"), "the programs folder must be substituted in: {written}");
         assert!(written.contains("C:\\fake\\thor2\\thor.db"), "the store path must be substituted in: {written}");
         assert!(!written.contains("{{"), "no placeholder may survive substitution: {written}");
+    }
+
+    /// THE GAP SECTION 2 OF THIS TASK CLOSES (owner's decision, 2026-09-17):
+    /// the shipped evaluation command must pre-approve Bash only per
+    /// command, never a bare `Bash` that would let ANY shell command through
+    /// unasked during an evaluation, including a wrong or whispered one.
+    /// Proven on the rendered file's own `allowed-tools` line, entry by
+    /// entry (never a substring search over the whole file, which a bare
+    /// `Bash` sitting right next to a scoped `Bash(...)` entry could pass by
+    /// accident), so a future edit that reintroduces one anywhere in the
+    /// line is still caught regardless of how the rest of it changes.
+    #[test]
+    fn rendered_eval_command_never_pre_approves_a_bare_bash() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("thor-eval.md");
+        seed_eval_command(&path, Path::new("C:\\fake\\thor2\\bin"), Path::new("C:\\fake\\thor2\\thor.db")).unwrap();
+        let written = fs::read_to_string(&path).unwrap();
+
+        let allowed_tools_line =
+            written.lines().find(|l| l.starts_with("allowed-tools:")).expect("the frontmatter must carry an allowed-tools line");
+        let entries: Vec<&str> = allowed_tools_line.trim_start_matches("allowed-tools:").split(',').map(str::trim).collect();
+
+        assert!(!entries.contains(&"Bash"), "a bare Bash entry pre-approves every shell command unasked: {allowed_tools_line}");
+        assert!(
+            entries.iter().any(|e| e.starts_with("Bash(")),
+            "at least one scoped Bash(...) entry must still be present: {allowed_tools_line}"
+        );
+        assert!(entries.iter().any(|e| e.contains("doctor")), "the doctor entry must be present: {allowed_tools_line}");
+        assert!(!allowed_tools_line.contains("{{"), "no placeholder may survive substitution: {allowed_tools_line}");
     }
 
     /// The defect this guards against: an installer that "refreshes" the

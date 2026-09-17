@@ -917,7 +917,9 @@ pub fn judgement_debt_line(db: &Path, checkout_project: Option<&str>, full: bool
             let done_today = serve::usefulness::eval_done_today(state.last_evaluation_seen, now);
             if done_today {
                 out[0].push_str(
-                    "; today's evaluation is done, and asks again once three more hours of accrued work go by since it",
+                    "; today's evaluation is done, and a repeat is due once three more hours of accrued work go by since it \
+                     AND a risk shows up too (three or more untested edits since the last test or build run, or a context \
+                     summary) - time alone never triggers a repeat",
                 );
             } else {
                 let ask_clause = match state.first_asked_since_report {
@@ -951,9 +953,20 @@ pub fn judgement_debt_line(db: &Path, checkout_project: Option<&str>, full: bool
                     0 => "already due".to_string(),
                     remaining => format!("due after {remaining} more minute(s) of accrued work"),
                 };
+                // THE REPEAT'S OWN RISK (sixth rewrite, 2026-09-17 - see
+                // `serve::usefulness`'s own "the repeat's own risk" doc
+                // comment): named here too, alongside the accrued minutes, so
+                // a cold read of `doctor` sees exactly what a live Stop would
+                // gate a repeat on - the untested-edit count since the last
+                // test or build run, and whether a context summary has
+                // happened since this session's own last reset.
+                let summary_clause =
+                    if work.compacted_since_anchor { "a context summary has happened" } else { "no context summary yet" };
                 out[0].push_str(&format!(
                     "; its most recently active session ('{session_id}') has accrued {accrued_minutes} minute(s) of work \
-                     here since its last reset, {due_clause}"
+                     here since its last reset, {due_clause}, with {} untested edit(s) since the last test or build run and \
+                     {summary_clause} - a repeat only ever fires once accrued work AND one of those two holds",
+                    work.edits_since_test
                 ));
             }
         }
@@ -2386,7 +2399,7 @@ mod tests {
             serve::usefulness::ProjectEvalState {
                 sessions: std::collections::BTreeMap::from([(
                     "s1".to_string(),
-                    serve::usefulness::SessionWorkState { anchor_unix: Some(now - 40 * 60), accrued_secs: 40 * 60, last_event_unix: Some(now) },
+                    serve::usefulness::SessionWorkState { anchor_unix: Some(now - 40 * 60), accrued_secs: 40 * 60, last_event_unix: Some(now), ..Default::default() },
                 )]),
                 ..Default::default()
             },
@@ -2397,6 +2410,72 @@ mod tests {
             "{line}"
         );
         assert!(line.contains("due after 20 more minute(s) of accrued work"), "{line}");
+    }
+
+    /// Case named in the build brief (doctor tail): the untested-edit count
+    /// and whether a summary happened are named for the most recently active
+    /// session, and the line says plainly that a repeat only fires with a
+    /// risk.
+    #[test]
+    fn judgement_debt_line_names_the_untested_edit_count_and_whether_a_summary_happened() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("t.db");
+        {
+            let mut store = EventStore::new(&db).unwrap();
+            declare_owed_for_eval_debt(&mut store, 12, "thor");
+        }
+        let now = serve::time::now_unix();
+        seed_eval_debt_state(
+            &db,
+            "thor",
+            serve::usefulness::ProjectEvalState {
+                sessions: std::collections::BTreeMap::from([(
+                    "s1".to_string(),
+                    serve::usefulness::SessionWorkState {
+                        anchor_unix: Some(now - 40 * 60),
+                        accrued_secs: 40 * 60,
+                        last_event_unix: Some(now),
+                        edits_since_test: 2,
+                        compacted_since_anchor: true,
+                    },
+                )]),
+                ..Default::default()
+            },
+        );
+        let line = judgement_debt_line(&db, Some("thor"), false).expect("a real backlog, the line must speak");
+        assert!(line.contains("2 untested edit(s) since the last test or build run"), "{line}");
+        assert!(line.contains("a context summary has happened"), "{line}");
+        assert!(
+            line.contains("a repeat only ever fires once accrued work AND one of those two holds"),
+            "must say plainly that a repeat needs a risk: {line}"
+        );
+    }
+
+    /// The contrast: zero edits and no summary reads as "no context summary
+    /// yet" rather than silently omitting the clause.
+    #[test]
+    fn judgement_debt_line_says_no_context_summary_yet_when_none_has_happened() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("t.db");
+        {
+            let mut store = EventStore::new(&db).unwrap();
+            declare_owed_for_eval_debt(&mut store, 12, "thor");
+        }
+        let now = serve::time::now_unix();
+        seed_eval_debt_state(
+            &db,
+            "thor",
+            serve::usefulness::ProjectEvalState {
+                sessions: std::collections::BTreeMap::from([(
+                    "s1".to_string(),
+                    serve::usefulness::SessionWorkState { anchor_unix: Some(now - 40 * 60), accrued_secs: 40 * 60, last_event_unix: Some(now), ..Default::default() },
+                )]),
+                ..Default::default()
+            },
+        );
+        let line = judgement_debt_line(&db, Some("thor"), false).expect("a real backlog, the line must speak");
+        assert!(line.contains("0 untested edit(s) since the last test or build run"), "{line}");
+        assert!(line.contains("no context summary yet"), "{line}");
     }
 
     #[test]
@@ -2414,7 +2493,7 @@ mod tests {
             serve::usefulness::ProjectEvalState {
                 sessions: std::collections::BTreeMap::from([(
                     "s1".to_string(),
-                    serve::usefulness::SessionWorkState { anchor_unix: Some(now - 90 * 60), accrued_secs: 90 * 60, last_event_unix: Some(now) },
+                    serve::usefulness::SessionWorkState { anchor_unix: Some(now - 90 * 60), accrued_secs: 90 * 60, last_event_unix: Some(now), ..Default::default() },
                 )]),
                 ..Default::default()
             },
@@ -2446,16 +2525,17 @@ mod tests {
                 known_report_ids: std::collections::BTreeSet::from(["eval-thor-2026-09-17".to_string()]),
                 sessions: std::collections::BTreeMap::from([(
                     "s1".to_string(),
-                    serve::usefulness::SessionWorkState { anchor_unix: Some(today), accrued_secs: 100 * 60, last_event_unix: Some(now) },
+                    serve::usefulness::SessionWorkState { anchor_unix: Some(today), accrued_secs: 100 * 60, last_event_unix: Some(now), ..Default::default() },
                 )]),
                 ..Default::default()
             },
         );
         let line = judgement_debt_line(&db, Some("thor"), false).expect("a real backlog, the line must speak");
         assert!(
-            line.contains("today's evaluation is done, and asks again once three more hours of accrued work go by since it"),
+            line.contains("today's evaluation is done, and a repeat is due once three more hours of accrued work go by since it"),
             "{line}"
         );
+        assert!(line.contains("time alone never triggers a repeat"), "the risk gate must be named plainly: {line}");
         let remaining = serve::usefulness::EVAL_REPEAT_WORK_MINUTES - 100;
         assert!(
             line.contains(&format!("due after {remaining} more minute(s) of accrued work")),

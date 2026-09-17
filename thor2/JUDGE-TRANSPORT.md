@@ -160,16 +160,20 @@ independently, at its own call site in `hook_once`'s `Stop` arm. `setup_debt`
 never walks a subagent
 through AGENTS.md's setup questions, because there is no owner in the room
 for that conversation either. The evaluation debt (added 2026-09-12, trigger
-rewritten five times, three of them on 2026-09-16, one on 2026-09-17: first
+rewritten six times, three of them on 2026-09-16, two on 2026-09-17: first
 to a per-project sidecar rather than a single verdict clock, then to drop
-the item-count ceiling entirely in favour of a daily, per-project ask once a
-session has worked there long enough, then to never ask outside a project
-at all, then - the owner's decision that day, "he does not want to ever have
-to run an evaluation himself" - to a UTC CALENDAR DAY with no
-once-per-session limit, then - the owner's decision on 2026-09-17, "after
-three hours of work a new evaluation is due" - to ACCRUED WORK rather than a
-single wall-clock timestamp, and a REPEAT ask once a report already exists
-for today: `serve/src/bin/serve.rs`'s `evaluation_debt`, `serve::
+the item-count
+ceiling entirely in favour of a daily, per-project ask once a session has
+worked there long enough, then to never ask outside a project at all, then -
+the owner's decision that day, "he does not want to ever have to run an
+evaluation himself" - to a UTC CALENDAR DAY with no once-per-session limit,
+then - the owner's decision on 2026-09-17, "after three hours of work a new
+evaluation is due" - to ACCRUED WORK rather than a single wall-clock
+timestamp, and a REPEAT ask once a report already exists for today, then -
+the owner's decision, also 2026-09-17, after measuring an unconditional
+repeat land on a calm moment six times out of ten - to gate that REPEAT ask
+on a real risk (untested edits or a context summary) rather than on accrued
+time alone: `serve/src/bin/serve.rs`'s `evaluation_debt`, `serve::
 usefulness`'s own "evaluation debt" section - holds when no evaluation
 report for this project has been first seen on the current UTC calendar day
 (`serve::usefulness::eval_done_today`, `crate::time::same_utc_day` - UTC,
@@ -181,9 +185,19 @@ hook event of a session, gap-filtered so a pause of `EVAL_PAUSE_MINUTES` or
 more contributes nothing), OR a report already exists for today AND three
 more hours of accrued work have gone by since it
 (`EVAL_REPEAT_WORK_MINUTES`, measured from whenever that report reset the
-accrual) - AND the checkout resolves to a real project at all - never for
-one that resolves to no project, since no project means no Report can ever
-be filed to silence it. It now BLOCKS THE FIRST STOP OF EVERY TURN for as
+accrual) AND AT LEAST ONE RISK HOLDS SINCE THAT SAME RESET (sixth rewrite,
+2026-09-17, owner's decision: an unconditional repeat measured on two of the
+owner's own real sessions landed on a calm moment six times out of ten) -
+`SessionWorkState::edits_since_test` reaching `EVAL_REPEAT_MIN_UNTESTED_
+EDITS` (three Edit/Write/NotebookEdit calls on a non-doc file since the last
+Bash/PowerShell command matching a test or build runner, `usefulness::
+classify_hook_event`/`EVAL_TEST_RUNNER_COMMANDS`), or `SessionWorkState::
+compacted_since_anchor` (a `SessionStart` with `"source": "compact"` since
+the same reset) - either is enough, the FIRST-of-day branch above carries no
+such condition at all - AND the checkout resolves to a real project at all -
+never for one that resolves to no project, since no project means no Report
+can ever be filed to silence it. It now BLOCKS THE FIRST STOP OF EVERY TURN
+for as
 long as it holds, not merely once per session - relying entirely on Claude
 Code's own `stop_hook_active` (the `already_fired` branch at the very top of
 `hook_once`'s `Stop` arm, shared by every debt in this function) for the "at

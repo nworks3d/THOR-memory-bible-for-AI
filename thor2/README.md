@@ -162,13 +162,16 @@ project: a checkout that resolves to no project is never asked, since there
 would be no collection to file that report under and so no way to ever
 silence the ask at all.
 
-Filing that report does not buy silence for the rest of the day, either:
-once three more hours of accrued work go by since it, a repeat evaluation is
-due the same way, covering only what happened since the last report plus
-the state of the work right now, until a newer report is filed. "Accrued"
-means real activity - `SessionStart`, a prompt, a tool call, or `Stop` -
-with a gap of half an hour or more between two of them counting as a pause,
-never as work.
+Filing that report does not buy silence for the rest of the day, either -
+but only when something risky happened since: once three more hours of
+accrued work go by since it, AND at least three code changes have gone by
+with no test or build run since, or the context was summarized, a repeat
+evaluation is due the same way, covering only what happened since the last
+report plus the state of the work right now, until a newer report is filed.
+Three quiet hours with neither counts for nothing. "Accrued" means real
+activity - `SessionStart`, a prompt, a tool call, or `Stop` - with a gap of
+half an hour or more between two of them counting as a pause, never as
+work.
 
 `--project <key>` additionally writes a `.thor-project` marker in the current
 directory to override the project name. By default, a checkout is scoped to the
@@ -273,12 +276,14 @@ and a verdict on it would change nothing else in the memory. The same line
 also names the newest evaluation report this store holds for the project
 and the day it was first seen, or that none exists yet; says whether TODAY's
 evaluation is already done (and, once it is, that a repeat is due after
-three more hours of accrued work since it); and, when it is not, how many
-times the `Stop` hook has already asked and since when, plus a note that it
-blocks every turn once a session has accrued an hour of work here, until the
+three more hours of accrued work since it AND a risk shows up too - time
+alone never triggers a repeat); and, when it is not, how many times the
+`Stop` hook has already asked and since when, plus a note that it blocks
+every turn once a session has accrued an hour of work here, until the
 report is filed. It also names the most recently active session's own
-accrued work for this project and when its next evaluation is due, where
-that is known.
+accrued work for this project, its own untested-edit count and whether a
+context summary has happened since its own last reset, and when its next
+evaluation is due, where that is known.
 
 Two of those checks - whether an old reference still points at a real file,
 and whether some facts never win a place - need to know where your other

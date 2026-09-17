@@ -705,9 +705,16 @@ pub fn eval_done_today(last_evaluation_seen: Option<i64>, now_unix: i64) -> bool
 /// newly seen report, both handled by `session_work_reset_needed` before
 /// this predicate ever runs - so neither branch here needs to look at a
 /// reset instant a second time.
-pub fn eval_debt_owed(accrued_minutes: i64, last_evaluation_seen: Option<i64>, now_unix: i64) -> bool {
+///
+/// THE REPEAT BRANCH ALSO NEEDS A RISK, since the sixth rewrite (2026-09-17,
+/// owner's decision - see this file's own "the repeat's own risk" doc
+/// comment): `edits_since_test` reaching `EVAL_REPEAT_MIN_UNTESTED_EDITS`, or
+/// `compacted_since_anchor` - either is enough, neither is required of the
+/// other. THE FIRST-OF-DAY BRANCH IS UNCHANGED: no risk condition at all,
+/// only the accrued-time floor, exactly as it was before this rewrite.
+pub fn eval_debt_owed(accrued_minutes: i64, last_evaluation_seen: Option<i64>, now_unix: i64, edits_since_test: u32, compacted_since_anchor: bool) -> bool {
     if eval_done_today(last_evaluation_seen, now_unix) {
-        accrued_minutes >= EVAL_REPEAT_WORK_MINUTES
+        accrued_minutes >= EVAL_REPEAT_WORK_MINUTES && (edits_since_test >= EVAL_REPEAT_MIN_UNTESTED_EDITS || compacted_since_anchor)
     } else {
         accrued_minutes >= EVAL_FIRST_WORK_MINUTES
     }
@@ -741,6 +748,206 @@ fn project_key(project: Option<&str>) -> &str {
     project.unwrap_or("")
 }
 
+// --------------------------------------------------- the repeat's own risk
+//
+// THE SIXTH REWRITE (2026-09-17, owner's decision): a REPEAT ask (a report
+// already exists for today) must no longer fire on accrued time alone.
+// Measured on two of the owner's own real sessions: an unconditional repeat
+// landed on a calm moment - no code touched since the last test or build
+// run, nothing summarized - six times out of ten. The FIRST evaluation of
+// the day (no report yet today) is UNCHANGED: it keeps no risk condition at
+// all, only the accrued-time floor (`eval_debt_owed` below).
+//
+// Two risks, either one enough: `SessionWorkState::edits_since_test`
+// reaching `EVAL_REPEAT_MIN_UNTESTED_EDITS`, or `SessionWorkState::
+// compacted_since_anchor` being true. Both live alongside `accrued_secs` in
+// the exact same per-(project, session) struct, and reset at the exact same
+// moments (a new UTC day, or a new evaluation report seen for the project -
+// `session_work_reset_needed`), since they answer the identical question
+// "since the last reset" that `accrued_secs` already does.
+
+/// How many Edit/Write/NotebookEdit calls on a non-doc file, since the last
+/// test or build command, are enough to count as a risk on their own - see
+/// `HookEventKind::UntestedEdit`/`SessionWorkState::edits_since_test`. Three,
+/// not one: a single edit is routine and would make the repeat fire on
+/// almost any three-hour stretch of real work, which is exactly the
+/// unconditional-repeat defect this rewrite exists to close; three in a row
+/// with no test or build run in between is a real pattern, not noise.
+pub const EVAL_REPEAT_MIN_UNTESTED_EDITS: u32 = 3;
+
+/// Commands that reset `SessionWorkState::edits_since_test` back to zero when
+/// they appear in a Bash/PowerShell call's own command text - matched as a
+/// plain substring (`str::contains`), deliberately: a real invocation carries
+/// flags, a working directory change, output redirection and the rest around
+/// the bare runner name, and a substring match catches all of that without
+/// ever having to parse a shell command line. Read generically off whichever
+/// tool call carries a `command` field at all (`absent_guard::
+/// proposed_command`'s own stance, "nothing here hard-codes that name") - a
+/// `Bash` tool and a `PowerShell` tool alike, on whichever platform the
+/// session happens to run on.
+///
+/// A NAMED CONSTANT LIST, not a config file or a per-project setting: THOR
+/// itself works across many of the owner's own projects, of several
+/// different languages and build tools, so this stays generic rather than
+/// tuned to any one of them - unrelated to, and deliberately not shared
+/// with, `eval-command.example.md`'s own narrower `allowed-tools` list (the
+/// commands THAT file pre-approves for running THIS evaluation routine
+/// itself, a Rust workspace's own subset of this list).
+pub const EVAL_TEST_RUNNER_COMMANDS: &[&str] =
+    &["cargo test", "cargo build", "npm test", "npm run test", "npm run verify", "node --test", "pytest", "python -m pytest", "pio run", "pio test", "make test", "go test", "dotnet test"];
+
+/// File extensions an Edit/Write/NotebookEdit call never counts toward
+/// `edits_since_test` for, even with no test or build run since - prose and
+/// documentation carry no behaviour a test could ever catch failing, so
+/// editing one is not the risk this counter exists to flag.
+const EVAL_UNTESTED_EDIT_EXEMPT_EXTENSIONS: &[&str] = &[".md", ".txt", ".rst"];
+
+/// What one hook event means for the two risk counters above - decided once,
+/// at the call site in `bin/serve.rs` where the raw JSON payload is still in
+/// scope (`classify_hook_event` below), so `accrue_session_work` itself never
+/// needs to know Claude Code's own payload shape, only this closed
+/// vocabulary. `Copy`: cheap enough, and passed by value everywhere it is
+/// used.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HookEventKind {
+    /// An Edit, Write or NotebookEdit call on a file whose extension is not
+    /// in `EVAL_UNTESTED_EDIT_EXEMPT_EXTENSIONS`.
+    UntestedEdit,
+    /// A Bash/PowerShell-style call whose own command text contains one of
+    /// `EVAL_TEST_RUNNER_COMMANDS`.
+    TestRun,
+    /// A `SessionStart` whose own `source` field reads `"compact"`.
+    CompactStart,
+    /// Everything else - contributes to the accrued-work clock only, neither
+    /// risk counter moves.
+    Other,
+}
+
+/// The pure classification `bin/serve.rs` calls once per hook event, straight
+/// off the raw payload fields it already has in scope, before ever touching
+/// `accrue_session_work`/`record_hook_event` below - see `HookEventKind`'s
+/// own doc comment for why this stays a plain function of a few borrowed
+/// strings rather than the whole `serde_json::Value` payload: a pure function
+/// of plain fields is unit-testable with no fixture JSON at all.
+///
+/// ORDER OF CHECKS: a compaction is decided first and returns immediately -
+/// `event_name`/`source` are meaningless for a PreToolUse-shaped payload, so
+/// there is no ambiguity to break here. A command matching a test/build
+/// runner wins over the untested-edit check below it on purpose, though in
+/// practice the two can never both be true of the same real Claude Code
+/// payload anyway (a Bash/PowerShell call carries a `command` and no
+/// `file_path`; an Edit/Write/NotebookEdit call carries a `file_path` and no
+/// `command` - the identical non-overlap `bin/serve.rs`'s own command-guard
+/// doc comment already notes for the same two shapes).
+pub fn classify_hook_event(event_name: &str, tool_name: &str, file_path: Option<&str>, command: Option<&str>, source: Option<&str>) -> HookEventKind {
+    if event_name == "SessionStart" && source == Some("compact") {
+        return HookEventKind::CompactStart;
+    }
+    if let Some(command) = command {
+        if EVAL_TEST_RUNNER_COMMANDS.iter().any(|runner| command.contains(runner)) {
+            return HookEventKind::TestRun;
+        }
+    }
+    if matches!(tool_name, "Edit" | "Write" | "NotebookEdit") {
+        if let Some(file_path) = file_path {
+            if !EVAL_UNTESTED_EDIT_EXEMPT_EXTENSIONS.iter().any(|ext| file_path.ends_with(ext)) {
+                return HookEventKind::UntestedEdit;
+            }
+        }
+    }
+    HookEventKind::Other
+}
+
+#[cfg(test)]
+mod classify_hook_event_tests {
+    use super::*;
+
+    #[test]
+    fn an_edit_on_a_source_file_is_an_untested_edit() {
+        assert_eq!(classify_hook_event("PreToolUse", "Edit", Some("src/main.rs"), None, None), HookEventKind::UntestedEdit);
+    }
+
+    #[test]
+    fn a_write_on_a_source_file_is_an_untested_edit() {
+        assert_eq!(classify_hook_event("PreToolUse", "Write", Some("src/new.rs"), None, None), HookEventKind::UntestedEdit);
+    }
+
+    #[test]
+    fn a_notebook_edit_on_a_notebook_is_an_untested_edit() {
+        assert_eq!(classify_hook_event("PreToolUse", "NotebookEdit", Some("analysis.ipynb"), None, None), HookEventKind::UntestedEdit);
+    }
+
+    /// Case named in the build brief: a .md edit does not count.
+    #[test]
+    fn an_edit_on_a_markdown_file_does_not_count() {
+        assert_eq!(classify_hook_event("PreToolUse", "Edit", Some("README.md"), None, None), HookEventKind::Other);
+    }
+
+    #[test]
+    fn an_edit_on_a_txt_or_rst_file_does_not_count_either() {
+        assert_eq!(classify_hook_event("PreToolUse", "Edit", Some("notes.txt"), None, None), HookEventKind::Other);
+        assert_eq!(classify_hook_event("PreToolUse", "Edit", Some("docs/index.rst"), None, None), HookEventKind::Other);
+    }
+
+    #[test]
+    fn an_edit_with_no_file_path_at_all_does_not_count() {
+        assert_eq!(classify_hook_event("PreToolUse", "Edit", None, None, None), HookEventKind::Other);
+    }
+
+    #[test]
+    fn a_read_or_bash_call_on_a_source_file_path_is_not_an_edit_at_all() {
+        // Only Edit/Write/NotebookEdit ever carry the risk - a tool that
+        // merely NAMES a source file (Read, or a Bash call whose command
+        // happens to mention one) must never count as touching it.
+        assert_eq!(classify_hook_event("PreToolUse", "Read", Some("src/main.rs"), None, None), HookEventKind::Other);
+    }
+
+    #[test]
+    fn a_bash_command_containing_a_runner_substring_is_a_test_run() {
+        assert_eq!(classify_hook_event("PreToolUse", "Bash", None, Some("cargo test --workspace"), None), HookEventKind::TestRun);
+    }
+
+    #[test]
+    fn a_powershell_command_containing_a_runner_substring_is_a_test_run() {
+        assert_eq!(classify_hook_event("PreToolUse", "PowerShell", None, Some("cd thor2; cargo build --release"), None), HookEventKind::TestRun);
+    }
+
+    #[test]
+    fn every_named_runner_substring_is_recognised() {
+        for runner in EVAL_TEST_RUNNER_COMMANDS {
+            let command = format!("cd project && {runner} --flag");
+            assert_eq!(classify_hook_event("PreToolUse", "Bash", None, Some(&command), None), HookEventKind::TestRun, "{runner}");
+        }
+    }
+
+    #[test]
+    fn a_command_matching_no_runner_is_not_a_test_run() {
+        assert_eq!(classify_hook_event("PreToolUse", "Bash", None, Some("git status"), None), HookEventKind::Other);
+    }
+
+    #[test]
+    fn a_session_start_with_compact_source_is_a_compact_start() {
+        assert_eq!(classify_hook_event("SessionStart", "", None, None, Some("compact")), HookEventKind::CompactStart);
+    }
+
+    #[test]
+    fn a_session_start_with_a_different_source_is_not_a_compact_start() {
+        assert_eq!(classify_hook_event("SessionStart", "", None, None, Some("startup")), HookEventKind::Other);
+    }
+
+    #[test]
+    fn a_session_start_with_no_source_at_all_is_not_a_compact_start() {
+        assert_eq!(classify_hook_event("SessionStart", "", None, None, None), HookEventKind::Other);
+    }
+
+    #[test]
+    fn a_compact_source_on_a_different_event_name_is_never_a_compact_start() {
+        // "compact" only means anything as a SessionStart's own source -
+        // guards against a coincidental match on some other event's payload.
+        assert_eq!(classify_hook_event("PreToolUse", "", None, None, Some("compact")), HookEventKind::Other);
+    }
+}
+
 /// One session's own running account of ACCRUED WORK inside one project -
 /// see this section's own doc comment, fifth rewrite, for the whole story.
 /// Lives inside that project's `ProjectEvalState`, keyed by session id
@@ -772,6 +979,22 @@ pub struct SessionWorkState {
     /// reset or not, while `anchor_unix` only ever moves on a reset.
     #[serde(default)]
     pub last_event_unix: Option<i64>,
+    /// How many Edit/Write/NotebookEdit calls on a non-doc file have fired
+    /// since `anchor_unix`, minus whichever of those a test or build command
+    /// has since cancelled out - see `HookEventKind::UntestedEdit`/`TestRun`
+    /// and this section's own "the repeat's own risk" doc comment. Reset to
+    /// zero by the same full reset that zeroes `accrued_secs` (a new UTC day,
+    /// or a new evaluation report), AND independently by a test/build
+    /// command that changes nothing else about this state.
+    #[serde(default)]
+    pub edits_since_test: u32,
+    /// Whether a `SessionStart` with `"source": "compact"` has arrived for
+    /// this session since `anchor_unix` - see `HookEventKind::CompactStart`.
+    /// Sticky once true (a compaction earlier in this same anchor period is
+    /// still a real risk now), reset only by the same full reset that zeroes
+    /// `accrued_secs`.
+    #[serde(default)]
+    pub compacted_since_anchor: bool,
 }
 
 /// Whether `session`'s own accrual must restart at `now_unix` rather than
@@ -811,13 +1034,40 @@ fn session_work_reset_needed(session: &SessionWorkState, now_unix: i64, last_eva
 /// a write" version would have - see `record_hook_event`'s own doc comment
 /// on the write throttle for why that one is safe and this one would not
 /// be). A negative gap (clock skew) is clamped to zero, never subtracted.
-pub fn accrue_session_work(session: &SessionWorkState, now_unix: i64, last_evaluation_seen: Option<i64>) -> SessionWorkState {
+///
+/// `event` (sixth rewrite, 2026-09-17 - see this section's own "the repeat's
+/// own risk" doc comment) folds onto the two risk counters the identical way
+/// a reset already folds onto `accrued_secs`: a reset discards them outright,
+/// then this same event's own kind seeds the fresh period (an `UntestedEdit`
+/// that itself triggered a reset still counts as the period's first edit;
+/// nothing else does). Otherwise: `UntestedEdit` adds one to `edits_since_
+/// test`, `TestRun` drops it straight back to zero, `CompactStart` sets
+/// `compacted_since_anchor` (sticky - never cleared by anything but a reset),
+/// and `Other` touches neither.
+pub fn accrue_session_work(session: &SessionWorkState, now_unix: i64, last_evaluation_seen: Option<i64>, event: HookEventKind) -> SessionWorkState {
     if session_work_reset_needed(session, now_unix, last_evaluation_seen) {
-        return SessionWorkState { anchor_unix: Some(now_unix), accrued_secs: 0, last_event_unix: Some(now_unix) };
+        return SessionWorkState {
+            anchor_unix: Some(now_unix),
+            accrued_secs: 0,
+            last_event_unix: Some(now_unix),
+            edits_since_test: u32::from(event == HookEventKind::UntestedEdit),
+            compacted_since_anchor: event == HookEventKind::CompactStart,
+        };
     }
     let gap = now_unix - session.last_event_unix.unwrap_or(now_unix);
     let add = if (0..EVAL_PAUSE_MINUTES * 60).contains(&gap) { gap } else { 0 };
-    SessionWorkState { anchor_unix: session.anchor_unix, accrued_secs: session.accrued_secs + add, last_event_unix: Some(now_unix) }
+    let edits_since_test = match event {
+        HookEventKind::UntestedEdit => session.edits_since_test + 1,
+        HookEventKind::TestRun => 0,
+        HookEventKind::CompactStart | HookEventKind::Other => session.edits_since_test,
+    };
+    SessionWorkState {
+        anchor_unix: session.anchor_unix,
+        accrued_secs: session.accrued_secs + add,
+        last_event_unix: Some(now_unix),
+        edits_since_test,
+        compacted_since_anchor: session.compacted_since_anchor || event == HookEventKind::CompactStart,
+    }
 }
 
 /// This project's own two facts for the evaluation debt's trigger (see this
@@ -1123,17 +1373,35 @@ pub fn record_eval_debt_asked(db: &Path, project: Option<&str>, now_unix: i64) {
 /// telescope into the next write, which is exact by construction (the sum
 /// of gaps each under a bound, none of which individually reached `EVAL_
 /// PAUSE_MINUTES`, equals one merged gap that has not reached it either).
-pub fn record_hook_event(db: &Path, project: Option<&str>, session_id: &str, is_stop: bool, now_unix: i64) -> Option<SessionWorkState> {
+pub fn record_hook_event(
+    db: &Path,
+    project: Option<&str>,
+    session_id: &str,
+    is_stop: bool,
+    now_unix: i64,
+    event: HookEventKind,
+) -> Option<SessionWorkState> {
     project?;
     let mut all = read_eval_debt_state(db);
     let key = project_key(project).to_string();
     let mut entry = all.get(&key).cloned().unwrap_or_default();
     let before = entry.sessions.get(session_id).cloned().unwrap_or_default();
-    let after = accrue_session_work(&before, now_unix, entry.last_evaluation_seen);
+    let after = accrue_session_work(&before, now_unix, entry.last_evaluation_seen, event);
 
     let reset_happened = after.anchor_unix != before.anchor_unix;
     let write_gap_elapsed = !before.last_event_unix.is_some_and(|t| now_unix - t < EVAL_WORK_WRITE_THROTTLE_SECS);
-    if !is_stop && !reset_happened && !write_gap_elapsed {
+    // A counter change (either risk field, not merely the gap arithmetic) is
+    // written immediately too, alongside `is_stop`/`reset_happened`/`write_
+    // gap_elapsed` above - see this section's own "the repeat's own risk"
+    // doc comment. Edits and test/build commands are far rarer than every
+    // other tool call a session makes, so this never turns every `PreToolUse`
+    // into a write the way dropping the time throttle entirely would; it
+    // only means the ONE class of event this whole rewrite is about is never
+    // the one left sitting unwritten until some later, unrelated event
+    // happens to cross the plain time throttle. Losing an increment here
+    // would silently understate the very risk the repeat is gated on.
+    let counter_changed = after.edits_since_test != before.edits_since_test || after.compacted_since_anchor != before.compacted_since_anchor;
+    if !is_stop && !reset_happened && !write_gap_elapsed && !counter_changed {
         return Some(after);
     }
     entry.sessions.insert(session_id.to_string(), after.clone());
@@ -1232,25 +1500,33 @@ mod eval_debt_predicate_tests {
     }
 
     // --------------------------------------------------------- eval_debt_owed
+    //
+    // `edits_since_test`/`compacted_since_anchor` are irrelevant to every
+    // test in this block: none of them ever reach the REPEAT branch with
+    // enough accrued time for a risk to matter (`eval_done_today` is either
+    // `None`/yesterday, or the accrued minutes stay under `EVAL_REPEAT_
+    // WORK_MINUTES`), so every call below passes `0, false` - see "eval_
+    // debt_owed: the repeat risk" further down for the tests that actually
+    // exercise the risk gate.
 
     /// Case named in the build brief: 59 minutes accrued this session ->
     /// silent, 61 -> fires - no report has ever been seen in either case,
     /// proving the first-work floor alone decides the difference.
     #[test]
     fn fifty_nine_minutes_worked_is_silent_sixty_one_fires() {
-        assert!(!eval_debt_owed(59, None, NOW), "59 minutes must not yet be enough");
-        assert!(eval_debt_owed(61, None, NOW), "61 minutes must be enough");
+        assert!(!eval_debt_owed(59, None, NOW, 0, false), "59 minutes must not yet be enough");
+        assert!(eval_debt_owed(61, None, NOW, 0, false), "61 minutes must be enough");
     }
 
     #[test]
     fn exactly_the_minimum_minutes_worked_is_enough() {
         // The gate is "at least" `EVAL_FIRST_WORK_MINUTES`, not strictly more.
-        assert!(eval_debt_owed(EVAL_FIRST_WORK_MINUTES, None, NOW));
+        assert!(eval_debt_owed(EVAL_FIRST_WORK_MINUTES, None, NOW, 0, false));
     }
 
     #[test]
     fn one_minute_under_the_minimum_is_silent_regardless_of_the_report_history() {
-        assert!(!eval_debt_owed(EVAL_FIRST_WORK_MINUTES - 1, Some(NOW - DAY), NOW));
+        assert!(!eval_debt_owed(EVAL_FIRST_WORK_MINUTES - 1, Some(NOW - DAY), NOW, 0, false));
     }
 
     /// Case named in the build brief: a report first seen today silences
@@ -1259,19 +1535,29 @@ mod eval_debt_predicate_tests {
     /// for accrued minutes still under `EVAL_REPEAT_WORK_MINUTES`.
     #[test]
     fn a_report_first_seen_today_silences_it() {
-        assert!(!eval_debt_owed(EVAL_FIRST_WORK_MINUTES, Some(NOW - HOUR), NOW));
+        assert!(!eval_debt_owed(EVAL_FIRST_WORK_MINUTES, Some(NOW - HOUR), NOW, 0, false));
     }
 
     /// Case named in the build brief: a report first seen yesterday does
     /// not silence today's obligation.
     #[test]
     fn a_report_first_seen_yesterday_does_not_silence_today() {
-        assert!(eval_debt_owed(EVAL_FIRST_WORK_MINUTES, Some(NOW - DAY), NOW));
+        assert!(eval_debt_owed(EVAL_FIRST_WORK_MINUTES, Some(NOW - DAY), NOW, 0, false));
     }
 
     #[test]
     fn never_evaluated_at_all_fires_once_enough_time_is_worked() {
-        assert!(eval_debt_owed(EVAL_FIRST_WORK_MINUTES, None, NOW));
+        assert!(eval_debt_owed(EVAL_FIRST_WORK_MINUTES, None, NOW, 0, false));
+    }
+
+    /// Case named in the build brief: the first evaluation of the day still
+    /// fires without any risk - the FIRST-of-day branch carries no risk
+    /// condition at all, unchanged by the sixth rewrite. Identical to
+    /// `never_evaluated_at_all_fires_once_enough_time_is_worked` above,
+    /// named explicitly for this build brief's own case.
+    #[test]
+    fn the_first_evaluation_of_the_day_still_fires_without_any_risk() {
+        assert!(eval_debt_owed(EVAL_FIRST_WORK_MINUTES, None, NOW, 0, false));
     }
 
     // ------------------------------------------- eval_debt_owed: the repeat
@@ -1280,17 +1566,25 @@ mod eval_debt_predicate_tests {
     /// silent and 181 fires"): once a report already exists for today, the
     /// FIRST-work threshold no longer applies at all - only the much larger
     /// repeat threshold does, measured from whatever reset the report
-    /// itself caused.
+    /// itself caused. A qualifying risk is held constant across both calls,
+    /// so this stays a pure test of the TIME boundary - see "the repeat
+    /// risk" block below for the risk boundary itself.
     #[test]
     fn with_a_report_today_179_minutes_is_silent_181_fires() {
         let seen_today = Some(NOW - HOUR);
-        assert!(!eval_debt_owed(179, seen_today, NOW), "179 minutes must not yet be enough for a repeat");
-        assert!(eval_debt_owed(181, seen_today, NOW), "181 minutes must be enough for a repeat");
+        assert!(
+            !eval_debt_owed(179, seen_today, NOW, EVAL_REPEAT_MIN_UNTESTED_EDITS, false),
+            "179 minutes must not yet be enough for a repeat, even with a risk already present"
+        );
+        assert!(
+            eval_debt_owed(181, seen_today, NOW, EVAL_REPEAT_MIN_UNTESTED_EDITS, false),
+            "181 minutes must be enough for a repeat, with a risk present"
+        );
     }
 
     #[test]
     fn with_a_report_today_exactly_the_repeat_minimum_is_enough() {
-        assert!(eval_debt_owed(EVAL_REPEAT_WORK_MINUTES, Some(NOW - HOUR), NOW));
+        assert!(eval_debt_owed(EVAL_REPEAT_WORK_MINUTES, Some(NOW - HOUR), NOW, 0, true));
     }
 
     #[test]
@@ -1299,16 +1593,71 @@ mod eval_debt_predicate_tests {
         // accrued since - well past `EVAL_FIRST_WORK_MINUTES`, but nowhere
         // near `EVAL_REPEAT_WORK_MINUTES` - must stay silent. The whole
         // point of the fifth rewrite: a report already seen today no longer
-        // reads the FIRST threshold at all.
-        assert!(!eval_debt_owed(90, Some(NOW - HOUR), NOW));
+        // reads the FIRST threshold at all. A risk is present in the fixture
+        // (both forms at once) to prove it is really the TIME gate stopping
+        // this, never the risk gate.
+        assert!(!eval_debt_owed(90, Some(NOW - HOUR), NOW, 10, true));
     }
 
     #[test]
     fn with_no_report_today_the_repeat_threshold_never_applies() {
         // Without `eval_done_today`, `EVAL_REPEAT_WORK_MINUTES` (180) worth
         // of accrued work is still just "well past the first threshold",
-        // and must fire exactly as any other first-of-day case would.
-        assert!(eval_debt_owed(EVAL_REPEAT_WORK_MINUTES, None, NOW));
+        // and must fire exactly as any other first-of-day case would - no
+        // risk needed, since this never reaches the repeat branch at all.
+        assert!(eval_debt_owed(EVAL_REPEAT_WORK_MINUTES, None, NOW, 0, false));
+    }
+
+    // ------------------------------------- eval_debt_owed: the repeat's risk
+    //
+    // THE SIXTH REWRITE ITSELF (2026-09-17, owner's decision - see this
+    // file's own "the repeat's own risk" doc comment): accrued time reaching
+    // `EVAL_REPEAT_WORK_MINUTES` is no longer enough on its own for a repeat
+    // - a real risk has to hold too. Every case here holds `seen_today` and
+    // the accrued minutes fixed at exactly the values that would have fired
+    // unconditionally before this rewrite, varying only the two risk
+    // parameters, so each test isolates the risk gate alone.
+
+    #[test]
+    fn case_181_minutes_with_two_untested_edits_and_no_summary_stays_silent() {
+        // Case named in the build brief.
+        assert!(!eval_debt_owed(181, Some(NOW - HOUR), NOW, 2, false), "two untested edits is under the risk floor");
+    }
+
+    #[test]
+    fn case_181_minutes_with_three_untested_edits_fires() {
+        // Case named in the build brief.
+        assert!(eval_debt_owed(181, Some(NOW - HOUR), NOW, 3, false), "three untested edits reaches the risk floor");
+    }
+
+    #[test]
+    fn case_181_minutes_with_a_summary_and_zero_edits_fires() {
+        // Case named in the build brief.
+        assert!(eval_debt_owed(181, Some(NOW - HOUR), NOW, 0, true), "a context summary is a risk on its own, with no edits at all");
+    }
+
+    #[test]
+    fn case_181_minutes_with_neither_edits_nor_a_summary_stays_silent() {
+        // THE CENTRAL CASE THIS REWRITE EXISTS FOR: accrued time alone, with
+        // no risk of either kind, must never fire a repeat any more.
+        assert!(!eval_debt_owed(181, Some(NOW - HOUR), NOW, 0, false), "time alone must never fire a repeat");
+    }
+
+    #[test]
+    fn exactly_the_minimum_untested_edits_is_enough() {
+        // The risk gate is "at least" `EVAL_REPEAT_MIN_UNTESTED_EDITS`, not
+        // strictly more.
+        assert!(eval_debt_owed(EVAL_REPEAT_WORK_MINUTES, Some(NOW - HOUR), NOW, EVAL_REPEAT_MIN_UNTESTED_EDITS, false));
+    }
+
+    #[test]
+    fn one_untested_edit_under_the_minimum_with_no_summary_is_silent() {
+        assert!(!eval_debt_owed(EVAL_REPEAT_WORK_MINUTES, Some(NOW - HOUR), NOW, EVAL_REPEAT_MIN_UNTESTED_EDITS - 1, false));
+    }
+
+    #[test]
+    fn both_risks_at_once_still_fires() {
+        assert!(eval_debt_owed(EVAL_REPEAT_WORK_MINUTES, Some(NOW - HOUR), NOW, EVAL_REPEAT_MIN_UNTESTED_EDITS, true));
     }
 
     #[test]
@@ -1345,8 +1694,8 @@ mod session_work_tests {
     /// Case named in the build brief: gaps under 30 minutes accrue.
     #[test]
     fn a_gap_under_the_pause_threshold_accrues_in_full() {
-        let session = SessionWorkState { anchor_unix: Some(NOW - 10 * MIN), accrued_secs: 5 * MIN, last_event_unix: Some(NOW - 10 * MIN) };
-        let after = accrue_session_work(&session, NOW, None);
+        let session = SessionWorkState { anchor_unix: Some(NOW - 10 * MIN), accrued_secs: 5 * MIN, last_event_unix: Some(NOW - 10 * MIN), ..Default::default() };
+        let after = accrue_session_work(&session, NOW, None, HookEventKind::Other);
         assert_eq!(after.accrued_secs, 5 * MIN + 10 * MIN, "the whole 10-minute gap must be added");
         assert_eq!(after.anchor_unix, session.anchor_unix, "no reset: the anchor must not move");
         assert_eq!(after.last_event_unix, Some(NOW));
@@ -1355,25 +1704,33 @@ mod session_work_tests {
     /// Case named in the build brief: a 30-minute gap adds nothing.
     #[test]
     fn a_gap_at_the_pause_threshold_adds_nothing() {
-        let session =
-            SessionWorkState { anchor_unix: Some(NOW - 40 * MIN), accrued_secs: 5 * MIN, last_event_unix: Some(NOW - EVAL_PAUSE_MINUTES * MIN) };
-        let after = accrue_session_work(&session, NOW, None);
+        let session = SessionWorkState {
+            anchor_unix: Some(NOW - 40 * MIN),
+            accrued_secs: 5 * MIN,
+            last_event_unix: Some(NOW - EVAL_PAUSE_MINUTES * MIN),
+            ..Default::default()
+        };
+        let after = accrue_session_work(&session, NOW, None, HookEventKind::Other);
         assert_eq!(after.accrued_secs, 5 * MIN, "exactly 30 minutes is already a pause, not work");
         assert_eq!(after.last_event_unix, Some(NOW), "the clock still moves forward, even though nothing accrued");
     }
 
     #[test]
     fn a_gap_just_under_the_pause_threshold_still_accrues_in_full() {
-        let session =
-            SessionWorkState { anchor_unix: Some(NOW - 40 * MIN), accrued_secs: 0, last_event_unix: Some(NOW - (EVAL_PAUSE_MINUTES * 60 - 1)) };
-        let after = accrue_session_work(&session, NOW, None);
+        let session = SessionWorkState {
+            anchor_unix: Some(NOW - 40 * MIN),
+            accrued_secs: 0,
+            last_event_unix: Some(NOW - (EVAL_PAUSE_MINUTES * 60 - 1)),
+            ..Default::default()
+        };
+        let after = accrue_session_work(&session, NOW, None, HookEventKind::Other);
         assert_eq!(after.accrued_secs, EVAL_PAUSE_MINUTES * 60 - 1, "one second under the threshold must still count in full");
     }
 
     #[test]
     fn a_negative_gap_from_clock_skew_never_subtracts() {
-        let session = SessionWorkState { anchor_unix: Some(NOW), accrued_secs: 100, last_event_unix: Some(NOW + MIN) };
-        let after = accrue_session_work(&session, NOW, None);
+        let session = SessionWorkState { anchor_unix: Some(NOW), accrued_secs: 100, last_event_unix: Some(NOW + MIN), ..Default::default() };
+        let after = accrue_session_work(&session, NOW, None, HookEventKind::Other);
         assert_eq!(after.accrued_secs, 100, "a clock that appears to have gone backwards must add zero, never go negative");
     }
 
@@ -1381,8 +1738,8 @@ mod session_work_tests {
 
     #[test]
     fn the_very_first_event_ever_is_a_reset_to_zero() {
-        let after = accrue_session_work(&SessionWorkState::default(), NOW, None);
-        assert_eq!(after, SessionWorkState { anchor_unix: Some(NOW), accrued_secs: 0, last_event_unix: Some(NOW) });
+        let after = accrue_session_work(&SessionWorkState::default(), NOW, None, HookEventKind::Other);
+        assert_eq!(after, SessionWorkState { anchor_unix: Some(NOW), accrued_secs: 0, last_event_unix: Some(NOW), ..Default::default() });
     }
 
     /// Case named in the build brief: a new UTC day resets it.
@@ -1391,16 +1748,16 @@ mod session_work_tests {
         // One second before today's midnight - "yesterday" no matter the
         // wall-clock hour NOW itself happens to represent.
         let yesterday = NOW - NOW.rem_euclid(86400) - 1;
-        let session = SessionWorkState { anchor_unix: Some(yesterday), accrued_secs: 9_000, last_event_unix: Some(yesterday) };
-        let after = accrue_session_work(&session, NOW, None);
+        let session = SessionWorkState { anchor_unix: Some(yesterday), accrued_secs: 9_000, last_event_unix: Some(yesterday), ..Default::default() };
+        let after = accrue_session_work(&session, NOW, None, HookEventKind::Other);
         assert_eq!(after.accrued_secs, 0, "crossing into a new UTC day must drop whatever was accrued");
         assert_eq!(after.anchor_unix, Some(NOW), "and restart the anchor at the event that crossed the boundary");
     }
 
     #[test]
     fn staying_within_the_same_utc_day_never_resets_on_its_own() {
-        let session = SessionWorkState { anchor_unix: Some(NOW - 5 * MIN), accrued_secs: 100, last_event_unix: Some(NOW - MIN) };
-        let after = accrue_session_work(&session, NOW, None);
+        let session = SessionWorkState { anchor_unix: Some(NOW - 5 * MIN), accrued_secs: 100, last_event_unix: Some(NOW - MIN), ..Default::default() };
+        let after = accrue_session_work(&session, NOW, None, HookEventKind::Other);
         assert_eq!(after.anchor_unix, session.anchor_unix, "the same calendar day must never reset on its own");
     }
 
@@ -1408,8 +1765,8 @@ mod session_work_tests {
     /// work.
     #[test]
     fn a_report_seen_after_the_anchor_resets_the_anchor_and_the_work() {
-        let session = SessionWorkState { anchor_unix: Some(NOW - 60 * MIN), accrued_secs: 3_000, last_event_unix: Some(NOW - MIN) };
-        let after = accrue_session_work(&session, NOW, Some(NOW - 30 * MIN));
+        let session = SessionWorkState { anchor_unix: Some(NOW - 60 * MIN), accrued_secs: 3_000, last_event_unix: Some(NOW - MIN), ..Default::default() };
+        let after = accrue_session_work(&session, NOW, Some(NOW - 30 * MIN), HookEventKind::Other);
         assert_eq!(after.accrued_secs, 0, "a report seen since this accrual period began must drop the total");
         assert_eq!(after.anchor_unix, Some(NOW));
     }
@@ -1418,8 +1775,8 @@ mod session_work_tests {
     fn a_report_seen_before_the_anchor_never_resets_it_again() {
         // Already accounted for by an earlier reset - a report seen BEFORE
         // this accrual period began must not keep re-triggering one forever.
-        let session = SessionWorkState { anchor_unix: Some(NOW - 60 * MIN), accrued_secs: 100, last_event_unix: Some(NOW - MIN) };
-        let after = accrue_session_work(&session, NOW, Some(NOW - 90 * MIN));
+        let session = SessionWorkState { anchor_unix: Some(NOW - 60 * MIN), accrued_secs: 100, last_event_unix: Some(NOW - MIN), ..Default::default() };
+        let after = accrue_session_work(&session, NOW, Some(NOW - 90 * MIN), HookEventKind::Other);
         assert_eq!(after.anchor_unix, session.anchor_unix, "a report older than the anchor is old news, not a new reset");
         assert_eq!(after.accrued_secs, 100 + MIN, "the ordinary one-minute gap must still accrue normally");
     }
@@ -1429,9 +1786,96 @@ mod session_work_tests {
         // Strictly later, per `session_work_reset_needed`'s own doc comment:
         // a report seen at the exact instant the anchor was set is the
         // report that CAUSED this reset, not a new one on top of it.
-        let session = SessionWorkState { anchor_unix: Some(NOW - 60 * MIN), accrued_secs: 0, last_event_unix: Some(NOW - 60 * MIN) };
-        let after = accrue_session_work(&session, NOW, Some(NOW - 60 * MIN));
+        let session = SessionWorkState { anchor_unix: Some(NOW - 60 * MIN), accrued_secs: 0, last_event_unix: Some(NOW - 60 * MIN), ..Default::default() };
+        let after = accrue_session_work(&session, NOW, Some(NOW - 60 * MIN), HookEventKind::Other);
         assert_eq!(after.anchor_unix, session.anchor_unix);
+    }
+
+    // ------------------------------------ accrue_session_work: the two risks
+    //
+    // `HookEventKind`'s own effect on `edits_since_test`/`compacted_since_
+    // anchor` - see this file's own "the repeat's own risk" doc comment.
+
+    #[test]
+    fn an_untested_edit_adds_one_to_the_edit_count() {
+        let session = SessionWorkState { anchor_unix: Some(NOW - MIN), last_event_unix: Some(NOW - MIN), edits_since_test: 2, ..Default::default() };
+        let after = accrue_session_work(&session, NOW, None, HookEventKind::UntestedEdit);
+        assert_eq!(after.edits_since_test, 3);
+    }
+
+    /// Case named in the build brief: a test command resets the edit count.
+    #[test]
+    fn a_test_run_resets_the_edit_count_to_zero() {
+        let session = SessionWorkState { anchor_unix: Some(NOW - MIN), last_event_unix: Some(NOW - MIN), edits_since_test: 5, ..Default::default() };
+        let after = accrue_session_work(&session, NOW, None, HookEventKind::TestRun);
+        assert_eq!(after.edits_since_test, 0);
+    }
+
+    /// Case named in the build brief: a .md edit does not count - proven
+    /// here at the accrual level too (`classify_hook_event_tests` already
+    /// proves the classification itself never produces `UntestedEdit` for
+    /// one): an `Other`-classified event must leave the edit count exactly
+    /// as it was.
+    #[test]
+    fn an_other_event_never_moves_the_edit_count() {
+        let session = SessionWorkState { anchor_unix: Some(NOW - MIN), last_event_unix: Some(NOW - MIN), edits_since_test: 2, ..Default::default() };
+        let after = accrue_session_work(&session, NOW, None, HookEventKind::Other);
+        assert_eq!(after.edits_since_test, 2);
+    }
+
+    #[test]
+    fn a_compact_start_sets_the_summary_flag_and_it_stays_sticky() {
+        let session = SessionWorkState { anchor_unix: Some(NOW - MIN), last_event_unix: Some(NOW - MIN), ..Default::default() };
+        let after = accrue_session_work(&session, NOW, None, HookEventKind::CompactStart);
+        assert!(after.compacted_since_anchor);
+        // Sticky: a LATER ordinary event must not clear it again.
+        let later = accrue_session_work(&after, NOW + MIN, None, HookEventKind::Other);
+        assert!(later.compacted_since_anchor, "a compaction earlier in the same anchor period is still a real risk");
+    }
+
+    /// Case named in the build brief: a new UTC day resets both (the edit
+    /// count and the summary flag), the same as it already resets
+    /// `accrued_secs`.
+    #[test]
+    fn a_new_utc_day_resets_the_edit_count_and_the_summary_flag_too() {
+        let yesterday = NOW - NOW.rem_euclid(86400) - 1;
+        let session = SessionWorkState {
+            anchor_unix: Some(yesterday),
+            last_event_unix: Some(yesterday),
+            edits_since_test: 5,
+            compacted_since_anchor: true,
+            ..Default::default()
+        };
+        let after = accrue_session_work(&session, NOW, None, HookEventKind::Other);
+        assert_eq!(after.edits_since_test, 0, "a new UTC day must drop the untested-edit count too");
+        assert!(!after.compacted_since_anchor, "and the summary flag too");
+    }
+
+    /// Case named in the build brief: a new report resets both.
+    #[test]
+    fn a_report_seen_after_the_anchor_resets_the_edit_count_and_the_summary_flag_too() {
+        let session = SessionWorkState {
+            anchor_unix: Some(NOW - 60 * MIN),
+            last_event_unix: Some(NOW - MIN),
+            edits_since_test: 4,
+            compacted_since_anchor: true,
+            ..Default::default()
+        };
+        let after = accrue_session_work(&session, NOW, Some(NOW - 30 * MIN), HookEventKind::Other);
+        assert_eq!(after.edits_since_test, 0);
+        assert!(!after.compacted_since_anchor);
+    }
+
+    /// A reset that coincides with the very event that would otherwise have
+    /// counted still seeds the fresh period with it - the new period's own
+    /// first edit still counts as one, it is only what came BEFORE the reset
+    /// that is discarded.
+    #[test]
+    fn a_reset_still_counts_its_own_triggering_event() {
+        let yesterday = NOW - NOW.rem_euclid(86400) - 1;
+        let session = SessionWorkState { anchor_unix: Some(yesterday), last_event_unix: Some(yesterday), edits_since_test: 5, ..Default::default() };
+        let after = accrue_session_work(&session, NOW, None, HookEventKind::UntestedEdit);
+        assert_eq!(after.edits_since_test, 1, "the old count is discarded, but this event's own edit still seeds the new period");
     }
 
     // ----------------------------------------------------- record_hook_event
@@ -1444,7 +1888,7 @@ mod session_work_tests {
     fn a_no_project_checkout_is_never_recorded_at_all() {
         let dir = tempfile::tempdir().unwrap();
         let db = dir.path().join("t.db");
-        assert_eq!(record_hook_event(&db, None, "s1", false, NOW), None);
+        assert_eq!(record_hook_event(&db, None, "s1", false, NOW, HookEventKind::Other), None);
         assert!(!eval_debt_state_path(&db).exists(), "a no-project event must never even create the sidecar");
     }
 
@@ -1452,8 +1896,8 @@ mod session_work_tests {
     fn the_very_first_event_is_always_written_even_though_it_adds_no_accrued_time() {
         let dir = tempfile::tempdir().unwrap();
         let db = dir.path().join("t.db");
-        let result = record_hook_event(&db, Some("thor"), "s1", false, NOW).expect("a real project must record");
-        assert_eq!(result, SessionWorkState { anchor_unix: Some(NOW), accrued_secs: 0, last_event_unix: Some(NOW) });
+        let result = record_hook_event(&db, Some("thor"), "s1", false, NOW, HookEventKind::Other).expect("a real project must record");
+        assert_eq!(result, SessionWorkState { anchor_unix: Some(NOW), accrued_secs: 0, last_event_unix: Some(NOW), ..Default::default() });
         assert_eq!(read_sidecar_session(&db, Some("thor"), "s1"), result, "must be durable on disk immediately");
     }
 
@@ -1463,11 +1907,11 @@ mod session_work_tests {
     fn a_small_gap_on_a_non_stop_event_is_computed_but_not_written() {
         let dir = tempfile::tempdir().unwrap();
         let db = dir.path().join("t.db");
-        record_hook_event(&db, Some("thor"), "s1", false, NOW).unwrap();
+        record_hook_event(&db, Some("thor"), "s1", false, NOW, HookEventKind::Other).unwrap();
         let sidecar = eval_debt_state_path(&db);
         let before = std::fs::read_to_string(&sidecar).unwrap();
 
-        let result = record_hook_event(&db, Some("thor"), "s1", false, NOW + 5).expect("still a real project");
+        let result = record_hook_event(&db, Some("thor"), "s1", false, NOW + 5, HookEventKind::Other).expect("still a real project");
         assert_eq!(result.accrued_secs, 5, "the small gap must still be reflected in the value handed back");
 
         let after = std::fs::read_to_string(&sidecar).unwrap();
@@ -1478,8 +1922,8 @@ mod session_work_tests {
     fn a_gap_reaching_the_write_throttle_is_written() {
         let dir = tempfile::tempdir().unwrap();
         let db = dir.path().join("t.db");
-        record_hook_event(&db, Some("thor"), "s1", false, NOW).unwrap();
-        record_hook_event(&db, Some("thor"), "s1", false, NOW + EVAL_WORK_WRITE_THROTTLE_SECS).unwrap();
+        record_hook_event(&db, Some("thor"), "s1", false, NOW, HookEventKind::Other).unwrap();
+        record_hook_event(&db, Some("thor"), "s1", false, NOW + EVAL_WORK_WRITE_THROTTLE_SECS, HookEventKind::Other).unwrap();
         assert_eq!(read_sidecar_session(&db, Some("thor"), "s1").accrued_secs, EVAL_WORK_WRITE_THROTTLE_SECS);
     }
 
@@ -1487,8 +1931,8 @@ mod session_work_tests {
     fn a_stop_event_always_writes_even_for_a_tiny_gap() {
         let dir = tempfile::tempdir().unwrap();
         let db = dir.path().join("t.db");
-        record_hook_event(&db, Some("thor"), "s1", false, NOW).unwrap();
-        let result = record_hook_event(&db, Some("thor"), "s1", true, NOW + 2).unwrap();
+        record_hook_event(&db, Some("thor"), "s1", false, NOW, HookEventKind::Other).unwrap();
+        let result = record_hook_event(&db, Some("thor"), "s1", true, NOW + 2, HookEventKind::Other).unwrap();
         assert_eq!(read_sidecar_session(&db, Some("thor"), "s1"), result, "a Stop must always be durable immediately");
     }
 
@@ -1501,9 +1945,9 @@ mod session_work_tests {
     fn a_pause_boundary_is_always_written_so_the_next_short_gap_is_not_merged_with_it() {
         let dir = tempfile::tempdir().unwrap();
         let db = dir.path().join("t.db");
-        record_hook_event(&db, Some("thor"), "s1", false, NOW).unwrap();
+        record_hook_event(&db, Some("thor"), "s1", false, NOW, HookEventKind::Other).unwrap();
         let after_pause = NOW + (EVAL_PAUSE_MINUTES + 5) * 60;
-        let result = record_hook_event(&db, Some("thor"), "s1", false, after_pause).unwrap();
+        let result = record_hook_event(&db, Some("thor"), "s1", false, after_pause, HookEventKind::Other).unwrap();
         assert_eq!(result.accrued_secs, 0, "fixture sanity: the pause itself must add nothing");
         assert_eq!(
             read_sidecar_session(&db, Some("thor"), "s1").last_event_unix,
@@ -1512,7 +1956,7 @@ mod session_work_tests {
         );
 
         let resumed = after_pause + 30;
-        let result = record_hook_event(&db, Some("thor"), "s1", true, resumed).unwrap();
+        let result = record_hook_event(&db, Some("thor"), "s1", true, resumed, HookEventKind::Other).unwrap();
         assert_eq!(result.accrued_secs, 30, "must be measured from the pause boundary, not telescoped with the pause itself");
     }
 
@@ -1520,9 +1964,9 @@ mod session_work_tests {
     fn two_sessions_in_the_same_project_accrue_independently() {
         let dir = tempfile::tempdir().unwrap();
         let db = dir.path().join("t.db");
-        record_hook_event(&db, Some("thor"), "s1", false, NOW).unwrap();
-        record_hook_event(&db, Some("thor"), "s2", false, NOW).unwrap();
-        record_hook_event(&db, Some("thor"), "s1", true, NOW + 10 * MIN).unwrap();
+        record_hook_event(&db, Some("thor"), "s1", false, NOW, HookEventKind::Other).unwrap();
+        record_hook_event(&db, Some("thor"), "s2", false, NOW, HookEventKind::Other).unwrap();
+        record_hook_event(&db, Some("thor"), "s1", true, NOW + 10 * MIN, HookEventKind::Other).unwrap();
         assert_eq!(read_sidecar_session(&db, Some("thor"), "s1").accrued_secs, 10 * MIN);
         assert_eq!(
             read_sidecar_session(&db, Some("thor"), "s2").accrued_secs,
@@ -1542,7 +1986,61 @@ mod session_work_tests {
         assert_eq!(state.tracking_since, Some(1234), "fixture sanity: the rest of the entry still reads back");
         assert!(state.sessions.is_empty(), "a sessions field that never existed must default to an empty map");
 
-        assert!(record_hook_event(&db, Some("thor"), "s1", false, NOW).is_some(), "must still be usable, not choke on the old shape");
+        assert!(
+            record_hook_event(&db, Some("thor"), "s1", false, NOW, HookEventKind::Other).is_some(),
+            "must still be usable, not choke on the old shape"
+        );
+    }
+
+    /// Case named in the build brief: old sidecars parse - the narrower
+    /// claim, for a sidecar written after `sessions` existed but before the
+    /// two risk fields did.
+    #[test]
+    fn a_sidecar_session_written_before_the_risk_fields_existed_still_parses() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("t.db");
+        let text = r#"{"thor":{"tracking_since":1234,"known_report_ids":[],"last_evaluation_seen":null,"last_evaluation_report_id":null,"asked_count":0,"first_asked_since_report":null,"sessions":{"s1":{"anchor_unix":1000,"accrued_secs":60,"last_event_unix":1000}}}}"#;
+        std::fs::write(eval_debt_state_path(&db), text).unwrap();
+        let session = read_sidecar_session(&db, Some("thor"), "s1");
+        assert_eq!(session.accrued_secs, 60, "fixture sanity: the rest of the session entry still reads back");
+        assert_eq!(session.edits_since_test, 0, "a session written before this field existed must default to zero");
+        assert!(!session.compacted_since_anchor, "and the summary flag must default to false");
+    }
+
+    /// Case named in the build brief: a counter change is written
+    /// immediately - unlike a plain time-only gap under the write throttle
+    /// (`a_small_gap_on_a_non_stop_event_is_computed_but_not_written` above),
+    /// an untested edit must never wait for the throttle to catch up.
+    #[test]
+    fn an_untested_edit_is_written_immediately_even_under_the_write_throttle() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("t.db");
+        record_hook_event(&db, Some("thor"), "s1", false, NOW, HookEventKind::Other).unwrap();
+        let sidecar = eval_debt_state_path(&db);
+        let before = std::fs::read_to_string(&sidecar).unwrap();
+
+        record_hook_event(&db, Some("thor"), "s1", false, NOW + 5, HookEventKind::UntestedEdit).unwrap();
+        let after = std::fs::read_to_string(&sidecar).unwrap();
+        assert_ne!(before, after, "an edit that changes the untested-edit counter must be written immediately, even under the time throttle");
+        assert_eq!(read_sidecar_session(&db, Some("thor"), "s1").edits_since_test, 1);
+    }
+
+    /// The identical proof for a test/build run resetting the counter back
+    /// to zero - also a counter change, also written immediately.
+    #[test]
+    fn a_test_run_reset_is_written_immediately_even_under_the_write_throttle() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("t.db");
+        record_hook_event(&db, Some("thor"), "s1", false, NOW, HookEventKind::UntestedEdit).unwrap();
+        record_hook_event(&db, Some("thor"), "s1", false, NOW + 1, HookEventKind::UntestedEdit).unwrap();
+        assert_eq!(read_sidecar_session(&db, Some("thor"), "s1").edits_since_test, 2, "fixture sanity");
+        let sidecar = eval_debt_state_path(&db);
+        let before = std::fs::read_to_string(&sidecar).unwrap();
+
+        record_hook_event(&db, Some("thor"), "s1", false, NOW + 3, HookEventKind::TestRun).unwrap();
+        let after = std::fs::read_to_string(&sidecar).unwrap();
+        assert_ne!(before, after, "a test/build run resetting the counter must be written immediately too");
+        assert_eq!(read_sidecar_session(&db, Some("thor"), "s1").edits_since_test, 0);
     }
 
     // ------------------------------------------- most_recently_active_session
@@ -1555,10 +2053,13 @@ mod session_work_tests {
     #[test]
     fn most_recently_active_session_picks_the_latest_last_event() {
         let mut state = ProjectEvalState::default();
-        state.sessions.insert("older".to_string(), SessionWorkState { anchor_unix: Some(NOW), accrued_secs: 500, last_event_unix: Some(NOW) });
+        state.sessions.insert(
+            "older".to_string(),
+            SessionWorkState { anchor_unix: Some(NOW), accrued_secs: 500, last_event_unix: Some(NOW), ..Default::default() },
+        );
         state.sessions.insert(
             "newer".to_string(),
-            SessionWorkState { anchor_unix: Some(NOW), accrued_secs: 10, last_event_unix: Some(NOW + MIN) },
+            SessionWorkState { anchor_unix: Some(NOW), accrued_secs: 10, last_event_unix: Some(NOW + MIN), ..Default::default() },
         );
         let (id, work) = most_recently_active_session(&state).expect("must find one");
         assert_eq!(id, "newer");

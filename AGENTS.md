@@ -290,13 +290,16 @@ DOES NOT GO QUIET AFTER ONE ASK: it holds the end of every turn, naming how
 many times it has already asked and since when, until a report is actually
 filed - and filing it at the end of that review is the only thing that lets
 a turn end and stays quiet until tomorrow. Filing it does not buy silence
-for the rest of the day either: once three more hours of accrued work go by
-since that report, it asks again the same way, covering only what happened
-since then plus the state of the work, until a newer report is filed.
-"Accrued" is gap-filtered real activity - a pause of half an hour or more
-never counts toward it. It only ever happens inside a project, and never in
-a checkout that resolves to no project at all - there, no report could ever
-be filed to silence it, so it is never asked in the first place.
+for the rest of the day either - but only when something risky happened
+since: once three more hours of accrued work go by since that report, AND
+three or more code changes have gone by with no test or build run since, or
+the context was summarized, it asks again the same way, covering only what
+happened since then plus the state of the work, until a newer report is
+filed. Three quiet hours with neither risk stays silent. "Accrued" is
+gap-filtered real activity - a pause of half an hour or more never counts
+toward it. It only ever happens inside a project, and never in a checkout
+that resolves to no project at all - there, no report could ever be filed
+to silence it, so it is never asked in the first place.
 
 The first of those only ever names a note THIS session actually saw fire -
 never one that only ever showed up during other, unrelated work. Answer for

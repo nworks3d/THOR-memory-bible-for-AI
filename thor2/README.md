@@ -416,6 +416,17 @@ nothing and exits 0, which reads exactly like "no rule applies". Use forward
 slashes in the payload, and when a hook is silent, check the payload before
 you conclude the memory is empty.
 
+A fact that exists to REFUSE arrives in one of two shapes, and a program has to
+read both. When the call carries a command line and a rule's own forbidden
+fragment occurs in it, the answer is a refusal naming the rule and the fragment.
+When the call carries structured arguments instead, and it is the TOOL NAME that
+the rule is bound to, nothing is refused: the ordinary answer comes back with a
+prohibition row in its data, naming the same fragment. The second shape is the
+only one a program whose tools carry no command line will ever see - measured
+against a real tool list in September 2026 - so treating a prohibition as
+"something that would have been refused already" is how a rail quietly stops
+being a rail.
+
 **The search door is for looking something up on purpose**, by a person or an
 assistant that then reads the answer. It is not a way to fetch the one fact
 that answers a question, and it is worth knowing why before you build on it.

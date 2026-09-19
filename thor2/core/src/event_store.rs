@@ -1682,6 +1682,29 @@ impl EventStore {
         rows.collect()
     }
 
+    /// Every event's `(kind, entity_id, actor)`, in log order - the same
+    /// shape as `event_kinds` above, plus the actor column, for a caller
+    /// that needs to tell WHO a delivery was served to apart (see
+    /// `serve::usefulness::ASSISTANT_DELIVERY_ACTOR`'s own doc comment for
+    /// why that distinction exists). A SIBLING function, not a widening of
+    /// `event_kinds` itself: that function's other callers
+    /// (`ever_marked_useful`, `noise_counts`, `noise_since_last_useful`)
+    /// only ever read two columns, and would pay for a third they never
+    /// touch on every row of the whole log. Same `prepare_cached` shape,
+    /// same `ORDER BY seq`, same error handling as `event_kinds` - the two
+    /// must never quietly drift apart on what they agree about.
+    pub fn event_kinds_with_actor(&self) -> SqlResult<Vec<(EventKind, String, String)>> {
+        let mut stmt = self.conn.prepare_cached("SELECT kind, entity_id, actor FROM event ORDER BY seq")?;
+        let rows = stmt.query_map([], |row| {
+            let kind_str: &str = row.get_ref(0)?.as_str()?;
+            let kind = EventKind::from_str(kind_str).ok_or(rusqlite::Error::InvalidQuery)?;
+            let entity_id: String = row.get(1)?;
+            let actor: String = row.get(2)?;
+            Ok((kind, entity_id, actor))
+        })?;
+        rows.collect()
+    }
+
     /// The ids this session was actually served, once each.
     ///
     /// Exists so a caller can ask about something the CURRENT reader has
@@ -3183,5 +3206,30 @@ mod item_binding_tests {
             2,
             "the backfill must reconstruct every existing entity's bindings from the log already on disk"
         );
+    }
+
+    /// `event_kinds_with_actor` must return the actor column too, in the
+    /// same log order as `event_kinds`, and agree with it exactly on kind
+    /// and entity_id for the same store - the two must never quietly drift
+    /// apart, since `serve::usefulness` folds both over the same log for
+    /// related questions (see that crate's own `ASSISTANT_DELIVERY_ACTOR`).
+    #[test]
+    fn event_kinds_with_actor_agrees_with_event_kinds_and_carries_the_actor_in_log_order() {
+        let mut store = EventStore::in_memory().unwrap();
+        store.append_event("s", "l", "hook", EventKind::FactCreated, "e1", None, "v1").unwrap();
+        store.append_event("s", "l", "probe", EventKind::ItemServed, "e1", None, "{}").unwrap();
+        store.append_event("s", "l", "hook", EventKind::ItemMarkedUseful, "e1", None, "{}").unwrap();
+
+        let plain = store.event_kinds().unwrap();
+        let with_actor = store.event_kinds_with_actor().unwrap();
+
+        assert_eq!(with_actor.len(), plain.len());
+        assert_eq!(with_actor.len(), 3, "log order: one row per appended event");
+        for ((kind, id), (kind2, id2, _actor)) in plain.iter().zip(with_actor.iter()) {
+            assert_eq!(kind, kind2);
+            assert_eq!(id, id2);
+        }
+        let actors: Vec<&str> = with_actor.iter().map(|(_, _, a)| a.as_str()).collect();
+        assert_eq!(actors, vec!["hook", "probe", "hook"], "actor column, in log order");
     }
 }

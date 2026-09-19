@@ -779,6 +779,31 @@ fn bindings_short(bindings: &[model::item::Binding]) -> String {
     bindings.iter().map(binding_short).collect::<Vec<_>>().join(" + ")
 }
 
+/// One sentence naming every OTHER actor's own firings (`serve::usefulness::
+/// served_to_other_actors`) - up to three, busiest first, ties broken by
+/// name for a deterministic order across runs (the same rule `judgement_
+/// debt_named`'s own sort already uses), with a trailing "and N more" for
+/// any beyond that - so a program driving this boundary itself (see `serve::
+/// usefulness::ASSISTANT_DELIVERY_ACTOR`'s own doc comment for why only an
+/// assistant's own firings ever become debt) stays VISIBLE in `doctor`
+/// instead of silently vanishing the moment its firings stopped counting
+/// toward the judgement debt. Kept to exactly ONE sentence, however many
+/// actors a store has ever recorded - this must never grow into a second
+/// named list the way the debt items above already have one.
+fn other_actors_sentence(counts: &std::collections::HashMap<String, usize>) -> String {
+    let mut actors: Vec<(&str, usize)> = counts.iter().map(|(a, n)| (a.as_str(), *n)).collect();
+    actors.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(b.0)));
+    const NAMED: usize = 3;
+    let named: Vec<String> = actors.iter().take(NAMED).map(|(actor, n)| format!("'{actor}' ({n}x)")).collect();
+    let more = actors.len().saturating_sub(NAMED);
+    let tail = if more > 0 { format!(", and {more} more actor(s)") } else { String::new() };
+    format!(
+        "{}{} also had items served here - not counted as debt, because no session was ever there to judge those firings",
+        named.join(", "),
+        tail
+    )
+}
+
 /// Component: the judgement debt's own two-number backlog - store-wide, and
 /// how much of it belongs to the checkout this run stands in - built on the
 /// exact same fold the Stop hook's own `judgement_debt` acts on
@@ -872,11 +897,31 @@ fn bindings_short(bindings: &[model::item::Binding]) -> String {
 /// inert leftover state at best (see `update_eval_debt_state`'s own doc
 /// comment), but reading it anyway would invite exactly the drift this
 /// whole line exists to avoid.
+///
+/// COUNTS ONLY WHAT AN ASSISTANT WAS SERVED, since 2026-09-19 - for free,
+/// from `judgement_debt_counts` itself (built on `serve::usefulness::
+/// served_since_last_verdict`, which now filters by `serve::usefulness::
+/// ASSISTANT_DELIVERY_ACTOR`; see that constant's own doc comment for why).
+/// Nothing here duplicates that filter. When `serve::usefulness::served_to_
+/// other_actors` is not empty, ONE extra sentence names each other actor and
+/// its own firing count (`other_actors_sentence` above) and says plainly
+/// that none of it is judgement debt - a program driving this boundary on
+/// its own must stay VISIBLE, never silently vanish, but must also never be
+/// asked to answer for a firing no assistant session was ever there to
+/// judge. This can make the line speak even when `total` is zero (nothing an
+/// assistant owes, but another actor has been busy) - staying silent then
+/// would be exactly the vanishing act this whole mechanism exists to
+/// prevent.
 pub fn judgement_debt_line(db: &Path, checkout_project: Option<&str>, full: bool) -> Option<String> {
     let store = EventStore::open_existing(db).ok()?;
     let (total, in_project) = serve::usefulness::judgement_debt_counts(&store, checkout_project);
+    let other_actors = serve::usefulness::served_to_other_actors(&store);
     if total == 0 {
-        return None;
+        return if other_actors.is_empty() {
+            None
+        } else {
+            Some(format!("judgement debt: {}", other_actors_sentence(&other_actors)))
+        };
     }
     let threshold = serve::usefulness::JUDGEMENT_DEBT_AFTER;
     let mut out = vec![match checkout_project {
@@ -1006,6 +1051,9 @@ pub fn judgement_debt_line(db: &Path, checkout_project: Option<&str>, full: bool
     }
     if named.len() > cap {
         out.push(format!("  judgement debt: and {} more, not named here", named.len() - cap));
+    }
+    if !other_actors.is_empty() {
+        out.push(format!("  judgement debt: {}", other_actors_sentence(&other_actors)));
     }
     Some(out.join("\n"))
 }
@@ -2085,7 +2133,7 @@ mod tests {
             item.project = Some("thor".to_string());
             store::declare(&mut store, "s", "l", "a", &item).unwrap();
             for _ in 0..serve::usefulness::JUDGEMENT_DEBT_AFTER {
-                serve::deliver::record_delivery(&mut store, "s", "l", "t", "2026-09-08T00:00:00Z", &["owed-global".to_string()]);
+                serve::deliver::record_delivery(&mut store, "s", "l", serve::usefulness::ASSISTANT_DELIVERY_ACTOR, "2026-09-08T00:00:00Z", &["owed-global".to_string()]);
             }
         }
         let line = judgement_debt_line(&db, Some("thor"), false).expect("something is owed, the line must speak");
@@ -2115,7 +2163,7 @@ mod tests {
             item.project = Some("thor".to_string());
             store::declare(&mut store, "s", "l", "a", &item).unwrap();
             for _ in 0..(serve::usefulness::JUDGEMENT_DEBT_AFTER - 1) {
-                serve::deliver::record_delivery(&mut store, "s", "l", "t", "2026-09-08T00:00:00Z", &["owed-with-trigger".to_string()]);
+                serve::deliver::record_delivery(&mut store, "s", "l", serve::usefulness::ASSISTANT_DELIVERY_ACTOR, "2026-09-08T00:00:00Z", &["owed-with-trigger".to_string()]);
             }
             serve::deliver::record_delivery_with_trigger(
                 &mut store,
@@ -2148,7 +2196,7 @@ mod tests {
             item.project = Some("thor".to_string());
             store::declare(&mut store, "s", "l", "a", &item).unwrap();
             for _ in 0..serve::usefulness::JUDGEMENT_DEBT_AFTER {
-                serve::deliver::record_delivery(&mut store, "s", "l", "t", "2026-09-08T00:00:00Z", &["owed-without-trigger".to_string()]);
+                serve::deliver::record_delivery(&mut store, "s", "l", serve::usefulness::ASSISTANT_DELIVERY_ACTOR, "2026-09-08T00:00:00Z", &["owed-without-trigger".to_string()]);
             }
         }
         let line = judgement_debt_line(&db, Some("thor"), false).expect("something is owed, the line must speak");
@@ -2173,7 +2221,7 @@ mod tests {
             item.bindings = vec![Binding::Moment(intent::Action::Commit)];
             store::declare(&mut store, "s", "l", "a", &item).unwrap();
             for _ in 0..serve::usefulness::JUDGEMENT_DEBT_AFTER {
-                serve::deliver::record_delivery(&mut store, "s", "l", "t", "2026-09-08T00:00:00Z", &["owed-global-2".to_string()]);
+                serve::deliver::record_delivery(&mut store, "s", "l", serve::usefulness::ASSISTANT_DELIVERY_ACTOR, "2026-09-08T00:00:00Z", &["owed-global-2".to_string()]);
             }
         }
         let line = judgement_debt_line(&db, None, false).expect("a global item is still owed with no project resolved");
@@ -2216,7 +2264,7 @@ mod tests {
                     vec![Binding::Target { kind: TargetKind::Command, value: format!("fixture-debt-command-{n:02}") }];
                 store::declare(&mut store, "s", "l", "a", &item).unwrap();
                 for _ in 0..serve::usefulness::JUDGEMENT_DEBT_AFTER {
-                    serve::deliver::record_delivery(&mut store, "s", "l", "t", "2026-09-08T00:00:00Z", &[id.clone()]);
+                    serve::deliver::record_delivery(&mut store, "s", "l", serve::usefulness::ASSISTANT_DELIVERY_ACTOR, "2026-09-08T00:00:00Z", &[id.clone()]);
                 }
             }
         }
@@ -2258,7 +2306,7 @@ mod tests {
                     vec![Binding::Target { kind: TargetKind::Command, value: format!("fixture-debt-command-{n:02}") }];
                 store::declare(&mut store, "s", "l", "a", &item).unwrap();
                 for _ in 0..serve::usefulness::JUDGEMENT_DEBT_AFTER {
-                    serve::deliver::record_delivery(&mut store, "s", "l", "t", "2026-09-08T00:00:00Z", &[id.clone()]);
+                    serve::deliver::record_delivery(&mut store, "s", "l", serve::usefulness::ASSISTANT_DELIVERY_ACTOR, "2026-09-08T00:00:00Z", &[id.clone()]);
                 }
             }
         }
@@ -2283,7 +2331,7 @@ mod tests {
                 vec![Binding::Target { kind: TargetKind::Command, value: format!("fixture-eval-command-{project}-{i:02}") }];
             store::declare(store, "s", "l", "a", &item).unwrap();
             for _ in 0..serve::usefulness::JUDGEMENT_DEBT_AFTER {
-                serve::deliver::record_delivery(store, "s", "l", "t", "2026-09-08T00:00:00Z", &[id.clone()]);
+                serve::deliver::record_delivery(store, "s", "l", serve::usefulness::ASSISTANT_DELIVERY_ACTOR, "2026-09-08T00:00:00Z", &[id.clone()]);
             }
         }
     }
@@ -2408,7 +2456,7 @@ mod tests {
             item.bindings = vec![Binding::Moment(intent::Action::Commit)];
             store::declare(&mut store, "s", "l", "a", &item).unwrap();
             for _ in 0..serve::usefulness::JUDGEMENT_DEBT_AFTER {
-                serve::deliver::record_delivery(&mut store, "s", "l", "t", "2026-09-08T00:00:00Z", &["owed-global-no-project-tail".to_string()]);
+                serve::deliver::record_delivery(&mut store, "s", "l", serve::usefulness::ASSISTANT_DELIVERY_ACTOR, "2026-09-08T00:00:00Z", &["owed-global-no-project-tail".to_string()]);
             }
         }
         let yesterday = serve::time::now_unix() - 25 * 3600;
@@ -2742,7 +2790,7 @@ mod tests {
             store::declare(&mut store, "s", "l", "a", &trigger).unwrap();
             for id in ["pinned-excluded", "trigger-included"] {
                 for _ in 0..serve::usefulness::JUDGEMENT_DEBT_AFTER {
-                    serve::deliver::record_delivery(&mut store, "s", "l", "t", "2026-09-08T00:00:00Z", &[id.to_string()]);
+                    serve::deliver::record_delivery(&mut store, "s", "l", serve::usefulness::ASSISTANT_DELIVERY_ACTOR, "2026-09-08T00:00:00Z", &[id.to_string()]);
                 }
             }
         }
@@ -2778,7 +2826,7 @@ mod tests {
             store::declare(&mut store, "s", "l", "a", &trigger).unwrap();
             for id in ["pinned-heavy", "trigger-heavy"] {
                 for _ in 0..serve::usefulness::JUDGEMENT_DEBT_AFTER {
-                    serve::deliver::record_delivery(&mut store, "s", "l", "t", "2026-09-08T00:00:00Z", &[id.to_string()]);
+                    serve::deliver::record_delivery(&mut store, "s", "l", serve::usefulness::ASSISTANT_DELIVERY_ACTOR, "2026-09-08T00:00:00Z", &[id.to_string()]);
                 }
             }
         }
@@ -2790,6 +2838,81 @@ mod tests {
         assert!(debt.contains("1 item"), "{debt}");
         assert!(debt.contains("trigger-heavy"), "{debt}");
         assert!(!debt.contains("pinned-heavy"), "both lines must agree: neither ever names the pinned item: {debt}");
+    }
+
+    /// THE DEFECT THIS PREVENTS (2026-09-19): a program that is not an
+    /// assistant can drive this same boundary and rack up firings past the
+    /// judgement-debt threshold on its own - `judgement_debt_counts` (and so
+    /// this line's own "N item(s) owed" count) must never name that item as
+    /// debt, since no assistant session was ever there to judge it. But the
+    /// traffic must not silently vanish either: the line must still say who
+    /// fired and how many times.
+    #[test]
+    fn judgement_debt_line_excludes_another_actors_item_but_names_the_actor_and_its_count() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("t.db");
+        {
+            let mut store = EventStore::new(&db).unwrap();
+            // A real, assistant-owed item, so the line already has
+            // something to speak about regardless of the question under
+            // test here (see `judgement_debt_line_speaks_for_another_
+            // actors_traffic_even_with_no_real_debt` below for the zero-debt
+            // case on its own).
+            let mut owed = rule("owed-by-assistant");
+            owed.text = "fixture rule that is owed by a real assistant firing".to_string();
+            owed.bindings = vec![Binding::Target { kind: TargetKind::Command, value: "fixture-assistant-command".to_string() }];
+            store::declare(&mut store, "s", "l", "a", &owed).unwrap();
+            for _ in 0..serve::usefulness::JUDGEMENT_DEBT_AFTER {
+                serve::deliver::record_delivery(
+                    &mut store, "s", "l", serve::usefulness::ASSISTANT_DELIVERY_ACTOR,
+                    "2026-09-19T00:00:00Z", &["owed-by-assistant".to_string()],
+                );
+            }
+            // An item pushed over the threshold by another actor ALONE.
+            let mut probed = rule("probed-only");
+            probed.text = "fixture rule that is only ever served by another actor".to_string();
+            probed.bindings = vec![Binding::Target { kind: TargetKind::Command, value: "fixture-probe-command".to_string() }];
+            store::declare(&mut store, "s", "l", "a", &probed).unwrap();
+            for _ in 0..serve::usefulness::JUDGEMENT_DEBT_AFTER {
+                serve::deliver::record_delivery(&mut store, "s", "l", "probe", "2026-09-19T00:00:00Z", &["probed-only".to_string()]);
+            }
+        }
+        let line = judgement_debt_line(&db, None, false).expect("something is owed, the line must speak");
+        assert!(line.contains("owed-by-assistant"), "the real debt must still be named: {line}");
+        assert!(
+            !line.contains("probed-only"),
+            "an item pushed over the threshold by another actor alone must never be named as debt: {line}"
+        );
+        assert!(line.contains("'probe' (40x)"), "must name the other actor and its firing count: {line}");
+        assert!(
+            line.contains("not counted as") && line.contains("debt"),
+            "must say plainly that this is not counted as debt: {line}"
+        );
+    }
+
+    /// The zero-debt half of the same defect: a store where NOTHING is
+    /// really owed by an assistant must still speak when another actor has
+    /// been busy here - staying silent would be exactly the vanishing act
+    /// this whole mechanism exists to prevent (see `serve::usefulness::
+    /// ASSISTANT_DELIVERY_ACTOR`'s own doc comment, "must be VISIBLE").
+    #[test]
+    fn judgement_debt_line_speaks_for_another_actors_traffic_even_with_no_real_debt() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("t.db");
+        {
+            let mut store = EventStore::new(&db).unwrap();
+            let mut probed = rule("probed-only");
+            probed.text = "fixture rule that is only ever served by another actor".to_string();
+            probed.bindings = vec![Binding::Target { kind: TargetKind::Command, value: "fixture-probe-command".to_string() }];
+            store::declare(&mut store, "s", "l", "a", &probed).unwrap();
+            for _ in 0..serve::usefulness::JUDGEMENT_DEBT_AFTER {
+                serve::deliver::record_delivery(&mut store, "s", "l", "probe", "2026-09-19T00:00:00Z", &["probed-only".to_string()]);
+            }
+        }
+        let line = judgement_debt_line(&db, None, false)
+            .expect("another actor's own traffic must still speak, even with zero real debt");
+        assert!(!line.contains("probed-only"), "still never named as debt: {line}");
+        assert!(line.contains("'probe' (40x)"), "{line}");
     }
 
     // ----------------------------------------------------- contradiction_line

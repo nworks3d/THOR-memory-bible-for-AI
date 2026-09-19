@@ -126,7 +126,7 @@ fn declare_pinned_items(store: &mut EventStore, n: usize, session_id: &str) {
         };
         model::store::declare(store, "fixture", "fixture", "fixture", &item).unwrap();
         for _ in 0..AFTER {
-            serve::deliver::record_delivery(store, session_id, session_id, "t", "2026-09-08T00:00:00Z", &[id.clone()]);
+            serve::deliver::record_delivery(store, session_id, session_id, serve::usefulness::ASSISTANT_DELIVERY_ACTOR, "2026-09-08T00:00:00Z", &[id.clone()]);
         }
     }
 }
@@ -154,7 +154,7 @@ fn declare_trigger_items(store: &mut EventStore, n: usize, session_id: &str) {
         };
         model::store::declare(store, "fixture", "fixture", "fixture", &item).unwrap();
         for _ in 0..AFTER {
-            serve::deliver::record_delivery(store, session_id, session_id, "t", "2026-09-08T00:00:00Z", &[id.clone()]);
+            serve::deliver::record_delivery(store, session_id, session_id, serve::usefulness::ASSISTANT_DELIVERY_ACTOR, "2026-09-08T00:00:00Z", &[id.clone()]);
         }
     }
 }

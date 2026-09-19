@@ -102,6 +102,27 @@ mod tests {
 /// revisiting. Forty more firings is a long way to earn a second question.
 pub const JUDGEMENT_DEBT_AFTER: usize = 40;
 
+/// The actor the hook stamps on every delivery (`ItemServed`) it records for
+/// a real assistant session - and the ONLY actor whose firings ever become
+/// judgement debt (`served_since_last_verdict` below).
+///
+/// WHY THIS IS THE RULE, NOT A PREFERENCE (2026-09-19). A program that is
+/// not an assistant can now drive this memory's own moment boundary too - it
+/// asks `hook` what applies before a LOCAL model acts - and its firings are
+/// recorded exactly like an assistant's: same event kind, same log. Every
+/// recorded firing feeds the judgement debt, the standing question "did this
+/// item belong where it fired", and the only one who can ever answer that is
+/// an assistant session that was actually there to see it fire. A verdict
+/// guessed from a list, without having been there, is precisely the guessed
+/// verdict this project's own evaluation routine forbids. So a firing counts
+/// toward the debt only when it was served to someone who could ever be
+/// asked to judge it - identified here by actor, since that is the one
+/// column every delivery already carries and the hook already stamps
+/// consistently. Every other actor's own firings stay VISIBLE
+/// (`served_to_other_actors` below) but can never become somebody else's
+/// debt.
+pub const ASSISTANT_DELIVERY_ACTOR: &str = "hook";
+
 /// How many times each item has fired since its own last verdict - a mark of
 /// usefulness OR noise resets its running count back to zero, same as a
 /// verdict resets `judgement_debt`'s own question about that item. Extracted
@@ -111,12 +132,24 @@ pub const JUDGEMENT_DEBT_AFTER: usize = 40;
 /// second copy of this exact fold and risking it drift from the real one.
 /// One fold, two callers now (`judgement_debt` and `judgement_debt_counts`
 /// below).
+///
+/// COUNTS ONLY A SERVING WHOSE ACTOR IS `ASSISTANT_DELIVERY_ACTOR`
+/// (2026-09-19 - see that constant's own doc comment for why). A verdict
+/// still resets the count regardless of who was served in between: a
+/// verdict is about the ITEM, not about the audience, so `ItemMarkedUseful`/
+/// `ItemMarkedNoise` are never filtered by actor here, only `ItemServed` is.
+/// An item served only by another actor therefore never even gets an entry
+/// in the returned map - exactly as if it had never fired at all - which is
+/// what keeps it out of `owed_items` below, and so out of the judgement debt
+/// entirely.
 pub fn served_since_last_verdict(store: &EventStore) -> HashMap<String, usize> {
-    let Ok(events) = store.event_kinds() else { return HashMap::new() };
+    let Ok(events) = store.event_kinds_with_actor() else { return HashMap::new() };
     let mut counts: HashMap<String, usize> = HashMap::new();
-    for (kind, id) in events {
+    for (kind, id, actor) in events {
         match kind {
-            EventKind::ItemServed => *counts.entry(id).or_default() += 1,
+            EventKind::ItemServed if actor == ASSISTANT_DELIVERY_ACTOR => {
+                *counts.entry(id).or_default() += 1
+            }
             EventKind::ItemMarkedUseful | EventKind::ItemMarkedNoise => {
                 counts.insert(id, 0);
             }
@@ -124,6 +157,94 @@ pub fn served_since_last_verdict(store: &EventStore) -> HashMap<String, usize> {
         }
     }
     counts
+}
+
+/// How many firings each NON-assistant actor has ever received, across
+/// every item together - a plain count, never fed into the judgement debt
+/// (see `ASSISTANT_DELIVERY_ACTOR`'s own doc comment for why only an
+/// assistant's own firings ever become debt). Exists so that traffic stays
+/// VISIBLE instead of silently vanishing the moment `served_since_last_
+/// verdict` above stopped counting it - `ops::health::judgement_debt_line`
+/// names this map instead of staying quiet about it. Never includes
+/// `ASSISTANT_DELIVERY_ACTOR` itself: that traffic is exactly what `served_
+/// since_last_verdict` above already counts, and counting it twice, in two
+/// different shapes, would only invite the two to drift apart.
+pub fn served_to_other_actors(store: &EventStore) -> HashMap<String, usize> {
+    let Ok(events) = store.event_kinds_with_actor() else { return HashMap::new() };
+    let mut counts: HashMap<String, usize> = HashMap::new();
+    for (kind, _id, actor) in events {
+        if kind == EventKind::ItemServed && actor != ASSISTANT_DELIVERY_ACTOR {
+            *counts.entry(actor).or_default() += 1;
+        }
+    }
+    counts
+}
+
+#[cfg(test)]
+mod assistant_delivery_actor_tests {
+    use super::*;
+
+    /// THE DEFECT THIS PREVENTS (2026-09-19): a program that is not an
+    /// assistant now drives this memory's moment boundary too, and its own
+    /// firings are recorded under a DIFFERENT actor - they must never count
+    /// toward the judgement debt, since no assistant session was ever there
+    /// to answer "did this belong where it fired" for them. An assistant's
+    /// own firing (the default actor the hook stamps) must still count.
+    #[test]
+    fn a_firing_under_another_actor_never_raises_the_count_while_an_assistant_firing_does() {
+        let mut store = EventStore::in_memory().unwrap();
+        crate::deliver::record_delivery(&mut store, "s", "l", "probe", "2026-09-19T00:00:00Z", &["x1".to_string()]);
+        assert_eq!(
+            served_since_last_verdict(&store).get("x1"),
+            None,
+            "another actor's firing must not even create an entry"
+        );
+
+        crate::deliver::record_delivery(&mut store, "s", "l", ASSISTANT_DELIVERY_ACTOR, "2026-09-19T00:00:01Z", &["x1".to_string()]);
+        assert_eq!(served_since_last_verdict(&store).get("x1"), Some(&1), "an assistant firing must count");
+    }
+
+    /// A verdict is about the ITEM, not the audience: it must reset the
+    /// count to zero even when every firing before it came from another
+    /// actor, and a firing from another actor after the reset must still
+    /// never raise it again.
+    #[test]
+    fn a_verdict_resets_the_count_even_when_the_firings_came_from_another_actor() {
+        let mut store = EventStore::in_memory().unwrap();
+        crate::deliver::record_delivery(&mut store, "s", "l", ASSISTANT_DELIVERY_ACTOR, "2026-09-19T00:00:00Z", &["x1".to_string()]);
+        assert_eq!(served_since_last_verdict(&store).get("x1"), Some(&1), "fixture sanity: one assistant firing counted");
+
+        crate::mark::record_useful(&mut store, "s", "l", "a", "2026-09-19T00:00:01Z", "x1").unwrap();
+        assert_eq!(served_since_last_verdict(&store).get("x1"), Some(&0), "a verdict resets the count");
+
+        crate::deliver::record_delivery(&mut store, "s", "l", "probe", "2026-09-19T00:00:02Z", &["x1".to_string()]);
+        assert_eq!(
+            served_since_last_verdict(&store).get("x1"),
+            Some(&0),
+            "another actor's firing after the reset must still never raise it"
+        );
+    }
+
+    /// Per-actor counts, all items folded together, and the assistant's own
+    /// actor never appears - that traffic belongs to `served_since_last_
+    /// verdict` alone, never counted twice in two different shapes.
+    #[test]
+    fn served_to_other_actors_counts_per_actor_and_excludes_the_assistant() {
+        let mut store = EventStore::in_memory().unwrap();
+        crate::deliver::record_delivery(
+            &mut store, "s", "l", "probe", "2026-09-19T00:00:00Z",
+            &["x1".to_string(), "x2".to_string()],
+        );
+        crate::deliver::record_delivery(&mut store, "s", "l", "probe", "2026-09-19T00:00:01Z", &["x1".to_string()]);
+        crate::deliver::record_delivery(&mut store, "s", "l", "other-actor", "2026-09-19T00:00:02Z", &["x1".to_string()]);
+        crate::deliver::record_delivery(&mut store, "s", "l", ASSISTANT_DELIVERY_ACTOR, "2026-09-19T00:00:03Z", &["x1".to_string()]);
+
+        let counts = served_to_other_actors(&store);
+        assert_eq!(counts.get("probe"), Some(&3), "two ids in one call plus one more call = three firings");
+        assert_eq!(counts.get("other-actor"), Some(&1));
+        assert_eq!(counts.get(ASSISTANT_DELIVERY_ACTOR), None, "the assistant's own actor must never appear here");
+        assert_eq!(counts.len(), 2);
+    }
 }
 
 /// Whether `bindings` carries the `Always` binding - THE one definition of
@@ -298,9 +419,15 @@ mod judgement_debt_counting_tests {
         model::store::declare(store, "t", "t", "t", &item).expect("fixture must store");
     }
 
+    /// Served under `ASSISTANT_DELIVERY_ACTOR` (2026-09-19): `served_since_
+    /// last_verdict` now counts only that actor's own firings toward the
+    /// judgement debt (see that constant's own doc comment), so a fixture
+    /// meant to actually cross the threshold has to serve under it - the
+    /// literal placeholder "t" this helper used before would now be silently
+    /// invisible to every count this whole module asserts on.
     fn serve_n(store: &mut EventStore, id: &str, times: usize) {
         for _ in 0..times {
-            crate::deliver::record_delivery(store, "s", "s", "t", "2026-09-08T00:00:00Z", &[id.to_string()]);
+            crate::deliver::record_delivery(store, "s", "s", ASSISTANT_DELIVERY_ACTOR, "2026-09-08T00:00:00Z", &[id.to_string()]);
         }
     }
 
@@ -2203,9 +2330,13 @@ mod eval_debt_state_tests {
         model::store::declare(store, "t", "t", "t", &item).expect("fixture must store");
     }
 
+    /// Served under `ASSISTANT_DELIVERY_ACTOR` (2026-09-19), same reason as
+    /// `judgement_debt_counting_tests`'s own `serve_n`: `owe` below claims to
+    /// build a real judgement-debt backlog, and only an assistant-attributed
+    /// firing counts as one any more.
     fn serve_n(store: &mut EventStore, id: &str, times: usize) {
         for _ in 0..times {
-            crate::deliver::record_delivery(store, "s", "s", "t", "2026-09-08T00:00:00Z", &[id.to_string()]);
+            crate::deliver::record_delivery(store, "s", "s", ASSISTANT_DELIVERY_ACTOR, "2026-09-08T00:00:00Z", &[id.to_string()]);
         }
     }
 

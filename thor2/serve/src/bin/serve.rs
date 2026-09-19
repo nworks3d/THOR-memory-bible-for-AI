@@ -54,6 +54,27 @@ enum Command {
         /// run are untouched by this flag.
         #[arg(long)]
         diagnose: bool,
+        /// The actor recorded on every delivery (`ItemServed`) this run
+        /// makes, in place of the default `usefulness::ASSISTANT_DELIVERY_
+        /// ACTOR` ("hook") - for a caller that is NOT an assistant harness
+        /// (see that constant's own doc comment for why only ITS firings
+        /// are ever judgement debt: an assistant session can be asked "did
+        /// this belong where it fired"; a program driving this boundary on
+        /// its own was never in the room to answer that). 1 to 32
+        /// characters, lowercase ascii letters/digits/dash/underscore only
+        /// (`valid_actor_label`) - anything else is the caller's own
+        /// mistake, named on stderr in one line, exit 2: not the silent
+        /// fail-open this channel otherwise protects for a real payload.
+        #[arg(long)]
+        actor: Option<String>,
+        /// Produce the exact same stdout as a normal run, but record NO
+        /// delivery at all, on every arm - for a measurement run that has
+        /// to be able to call this boundary hundreds of times with invented
+        /// questions and leave no trace in the log. Combines with
+        /// `--actor`; neither flag changes anything about the default
+        /// behaviour (actor "hook", delivery recorded) when left off.
+        #[arg(long)]
+        no_record: bool,
     },
     /// What would fire for a given command, file, target or moment (surface
     /// 2 preview - does not count as a delivery).
@@ -340,7 +361,7 @@ fn main() {
     }
     let cli = Cli::parse();
     match cli.command {
-        Command::Hook { diagnose } => cmd_hook(&cli.db, diagnose),
+        Command::Hook { diagnose, actor, no_record } => cmd_hook(&cli.db, diagnose, actor, no_record),
         Command::Check(args) => cmd_check(&cli.db, &build_input(&args)),
         Command::Why(args) => cmd_why(&cli.db, &build_input(&args)),
         Command::Audit => cmd_audit(&cli.db),
@@ -528,6 +549,10 @@ fn decay_notice(store: &EventStore, db: &Path, cwd: Option<&Path>) -> Option<Str
     ))
 }
 
+/// `Debug` only - for a test failure message (`{other:?}`); nothing in
+/// production ever formats a `HookOutput`, each variant is rendered by hand
+/// in `cmd_hook`.
+#[derive(Debug)]
 enum HookOutput {
     /// An injection surface's block, wrapped by the caller as
     /// `hookSpecificOutput.additionalContext`.
@@ -790,7 +815,16 @@ mod resolve_session_id_tests {
     }
 }
 
-fn hook_once(db_path: &Path, payload_text: Option<String>) -> Option<HookOutput> {
+/// `actor` is the actor stamped on every delivery (`ItemServed`) this call
+/// makes - `usefulness::ASSISTANT_DELIVERY_ACTOR` ("hook") for an ordinary
+/// run, or whatever `--actor` validated for a caller that is not an
+/// assistant harness (see that constant's own doc comment, and `Command::
+/// Hook`'s own doc comment on `actor`/`no_record`). `no_record` true skips
+/// every one of the three `deliver::record_delivery*` calls below entirely -
+/// for a measurement run - while leaving everything else, stdout included,
+/// completely unaffected: `ids` is computed exactly as before either way,
+/// only the write itself is skipped.
+fn hook_once(db_path: &Path, payload_text: Option<String>, actor: &str, no_record: bool) -> Option<HookOutput> {
     // `payload_text` is `Some` only when the caller already read stdin (see
     // `cmd_hook`'s `--diagnose` path, which has to read it to say anything
     // about it). stdin can only be consumed once, so it is read HERE for a
@@ -1318,15 +1352,17 @@ fn hook_once(db_path: &Path, payload_text: Option<String>) -> Option<HookOutput>
             // every item here is the pinned `Always` block, never a reaction
             // to a particular file or command. See `ItemServed::trigger`'s
             // own doc comment for the other two shapes.
-            deliver::record_delivery_with_trigger(
-                &mut store,
-                &session_id,
-                &session_id,
-                "hook",
-                &time::now_iso8601(),
-                &ids,
-                Some("session start"),
-            );
+            if !no_record {
+                deliver::record_delivery_with_trigger(
+                    &mut store,
+                    &session_id,
+                    &session_id,
+                    actor,
+                    &time::now_iso8601(),
+                    &ids,
+                    Some("session start"),
+                );
+            }
             match decay_notice(&store, db_path, session_cwd.as_deref()) {
                 Some(notice) => Some(HookOutput::ContextWithNotice { event_name, block, notice }),
                 None => Some(HookOutput::Context { event_name, block }),
@@ -1367,7 +1403,9 @@ fn hook_once(db_path: &Path, payload_text: Option<String>) -> Option<HookOutput>
             // No trigger: a prompt is neither a command nor a file, the two
             // shapes `ItemServed::trigger` names - plain `record_delivery`
             // already writes `None`, exactly what this surface needs.
-            deliver::record_delivery(&mut store, &session_id, &session_id, "hook", &time::now_iso8601(), &ids);
+            if !no_record {
+                deliver::record_delivery(&mut store, &session_id, &session_id, actor, &time::now_iso8601(), &ids);
+            }
             Some(HookOutput::Context { event_name, block })
         }
         _ => {
@@ -1532,15 +1570,17 @@ fn hook_once(db_path: &Path, payload_text: Option<String>) -> Option<HookOutput>
             // (see the comment above `input.add_command`/`add_file` a few
             // lines up), so the order only matters for a hand-built input.
             let trigger = absent_guard::proposed_command(tool_input).or(file_path);
-            deliver::record_delivery_with_trigger(
-                &mut store,
-                &session_id,
-                &session_id,
-                "hook",
-                &time::now_iso8601(),
-                &ids,
-                trigger,
-            );
+            if !no_record {
+                deliver::record_delivery_with_trigger(
+                    &mut store,
+                    &session_id,
+                    &session_id,
+                    actor,
+                    &time::now_iso8601(),
+                    &ids,
+                    trigger,
+                );
+            }
             Some(HookOutput::Context { event_name, block })
         }
     }
@@ -4079,9 +4119,13 @@ mod judgement_debt_tests {
         serve_as(store, "s", id, times);
     }
 
+    /// Served under `usefulness::ASSISTANT_DELIVERY_ACTOR` (2026-09-19):
+    /// `judgement_debt` (below, via `usefulness::served_since_last_verdict`)
+    /// now counts only that actor's own firings, so a fixture that claims to
+    /// build real judgement debt has to serve under it.
     fn serve_as(store: &mut EventStore, session: &str, id: &str, times: usize) {
         for _ in 0..times {
-            deliver::record_delivery(store, session, session, "t", "2026-08-07T00:00:00Z", &[id.to_string()]);
+            deliver::record_delivery(store, session, session, usefulness::ASSISTANT_DELIVERY_ACTOR, "2026-08-07T00:00:00Z", &[id.to_string()]);
         }
     }
 
@@ -4430,7 +4474,10 @@ mod judgement_debt_tests {
         let mut store = EventStore::in_memory().unwrap();
         declare(&mut store, "triggered", false);
         serve_it(&mut store, "triggered", JUDGEMENT_DEBT_AFTER - 1);
-        deliver::record_delivery_with_trigger(&mut store, "s", "s", "t", "2026-08-07T00:00:00Z", &["triggered".to_string()], Some("npm run deploy"));
+        deliver::record_delivery_with_trigger(
+            &mut store, "s", "s", usefulness::ASSISTANT_DELIVERY_ACTOR,
+            "2026-08-07T00:00:00Z", &["triggered".to_string()], Some("npm run deploy"),
+        );
 
         let asked = judgement_debt(&store, Path::new("no-watermark-for-this-test"), "s", None).expect("fixture sanity: it is owed");
         assert!(asked.contains("last fired at 'npm run deploy'"), "{asked}");
@@ -4518,9 +4565,13 @@ mod evaluation_debt_tests {
         model::store::declare(store, "t", "t", "t", &item).expect("fixture must store");
     }
 
+    /// Served under `usefulness::ASSISTANT_DELIVERY_ACTOR` (2026-09-19), same
+    /// reason as `judgement_debt_tests`'s own `serve_as`: `owe` below claims
+    /// to build real judgement debt for the context line's own count, and
+    /// only an assistant-attributed firing counts as one any more.
     fn serve_it(store: &mut EventStore, id: &str, times: usize) {
         for _ in 0..times {
-            deliver::record_delivery(store, "s", "s", "t", "2026-08-07T00:00:00Z", &[id.to_string()]);
+            deliver::record_delivery(store, "s", "s", usefulness::ASSISTANT_DELIVERY_ACTOR, "2026-08-07T00:00:00Z", &[id.to_string()]);
         }
     }
 
@@ -5036,7 +5087,177 @@ fn hook_preflight(raw: &str, db_path: &Path) -> Result<(), String> {
  Ok(())
 }
 
-fn cmd_hook(db_path: &Path, diagnose: bool) {
+/// Whether `s` is an acceptable `--actor` label for `Command::Hook`: 1 to 32
+/// characters, every one a lowercase ascii letter, digit, dash or underscore.
+/// A pure function of a borrowed `&str` - no clap, no process exit - so the
+/// exact rule can be unit tested directly (see `valid_actor_label_tests`
+/// below) rather than only indirectly, by spawning the binary and reading
+/// its exit code.
+fn valid_actor_label(s: &str) -> bool {
+    (1..=32).contains(&s.len())
+        && s.bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-' || b == b'_')
+}
+
+#[cfg(test)]
+mod valid_actor_label_tests {
+    use super::*;
+
+    #[test]
+    fn an_empty_label_is_rejected() {
+        assert!(!valid_actor_label(""));
+    }
+
+    #[test]
+    fn a_33_character_label_is_rejected() {
+        assert!(!valid_actor_label(&"a".repeat(33)));
+    }
+
+    #[test]
+    fn a_32_character_label_is_accepted() {
+        assert!(valid_actor_label(&"a".repeat(32)));
+    }
+
+    #[test]
+    fn an_uppercase_letter_is_rejected() {
+        assert!(!valid_actor_label("Hook"));
+    }
+
+    #[test]
+    fn a_space_is_rejected() {
+        assert!(!valid_actor_label("local model"));
+    }
+
+    #[test]
+    fn a_slash_is_rejected() {
+        assert!(!valid_actor_label("local/model"));
+    }
+
+    #[test]
+    fn a_good_label_is_accepted() {
+        assert!(valid_actor_label("local-model_v2"));
+    }
+}
+
+#[cfg(test)]
+mod hook_actor_and_no_record_tests {
+    use super::*;
+    use model::item::{Binding, Item, Kind};
+    use thor_core::event_store::EventKind;
+
+    /// One live, global Always-bound item, so `hook_once`'s `SessionStart`
+    /// arm has something to show regardless of project resolution.
+    fn seed_always_item(db_path: &Path, id: &str) {
+        let mut store = EventStore::new(db_path).unwrap();
+        let item = Item {
+            id: id.to_string(),
+            kind: Kind::Rule,
+            text: "an always-bound rule for the hook actor tests".to_string(),
+            bindings: vec![Binding::Always],
+            severity: None,
+            project: None,
+            tags: vec![],
+            expires: None,
+            key: None,
+            falsifier: Some("it stops being true".to_string()),
+            check: None,
+        };
+        model::store::declare(&mut store, "seed", "seed", "seed", &item).unwrap();
+    }
+
+    /// A `cwd` inside `dir` and no `.git` above it anywhere resolves to no
+    /// project at all (`project::resolve_project`), which keeps `decay_
+    /// notice` a guaranteed no-op (`project::git_root` fails at its very
+    /// first `?`) - so the only thing either run below can ever produce is
+    /// the plain `HookOutput::Context` the Always item's own block renders
+    /// to, never `ContextWithNotice`.
+    fn session_start_payload(cwd: &Path, session_id: &str) -> String {
+        serde_json::json!({
+            "hook_event_name": "SessionStart",
+            "session_id": session_id,
+            "cwd": cwd.display().to_string(),
+        })
+        .to_string()
+    }
+
+    fn context_block(out: Option<HookOutput>) -> (String, String) {
+        match out {
+            Some(HookOutput::Context { event_name, block }) => (event_name, block),
+            other => panic!("expected a plain Context block, got {other:?}"),
+        }
+    }
+
+    /// THE DEFECT THIS PREVENTS: the actor recorded on a delivery was the
+    /// bare literal "hook" at every one of the three `deliver::record_
+    /// delivery*` call sites - `--actor` has to actually reach the one this
+    /// run's SessionStart delivery is stamped with, not just validate a flag
+    /// nobody reads.
+    #[test]
+    fn the_actor_flag_is_stamped_on_the_delivery_instead_of_the_default() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("t.db");
+        seed_always_item(&db, "always-1");
+
+        let out = hook_once(&db, Some(session_start_payload(dir.path(), "s1")), "probe-actor", false);
+        let (event_name, block) = context_block(out);
+        assert_eq!(event_name, "SessionStart");
+        assert!(block.contains("always-1") || !block.is_empty(), "fixture sanity: a block was rendered: {block}");
+
+        let store = EventStore::open_existing(&db).unwrap();
+        let recorded = store.event_kinds_with_actor().unwrap();
+        let served: Vec<&str> = recorded
+            .iter()
+            .filter(|(kind, _, _)| *kind == EventKind::ItemServed)
+            .map(|(_, _, actor)| actor.as_str())
+            .collect();
+        assert_eq!(served, vec!["probe-actor"], "the delivery must be stamped with the given actor, not the default");
+    }
+
+    /// THE DEFECT THIS PREVENTS: a measurement run has to be able to call
+    /// this boundary hundreds of times with invented questions and leave NO
+    /// trace - `--no-record` must write no `item_served` event at all, while
+    /// producing byte-for-byte the same stdout as the identical payload
+    /// without the flag.
+    #[test]
+    fn no_record_writes_no_delivery_but_produces_identical_output() {
+        let dir = tempfile::tempdir().unwrap();
+
+        let recorded_db = dir.path().join("recorded.db");
+        seed_always_item(&recorded_db, "always-1");
+        let recorded_out = hook_once(&recorded_db, Some(session_start_payload(dir.path(), "s1")), "hook", false);
+
+        let unrecorded_db = dir.path().join("unrecorded.db");
+        seed_always_item(&unrecorded_db, "always-1");
+        let unrecorded_out = hook_once(&unrecorded_db, Some(session_start_payload(dir.path(), "s1")), "hook", true);
+
+        assert_eq!(context_block(recorded_out), context_block(unrecorded_out), "output must be identical either way");
+
+        let recorded_store = EventStore::open_existing(&recorded_db).unwrap();
+        let recorded_served = recorded_store.event_kinds().unwrap().into_iter().filter(|(k, _)| *k == EventKind::ItemServed).count();
+        assert_eq!(recorded_served, 1, "fixture sanity: a normal run does record one delivery");
+
+        let unrecorded_store = EventStore::open_existing(&unrecorded_db).unwrap();
+        let unrecorded_served =
+            unrecorded_store.event_kinds().unwrap().into_iter().filter(|(k, _)| *k == EventKind::ItemServed).count();
+        assert_eq!(unrecorded_served, 0, "--no-record must write no item_served event at all");
+    }
+}
+
+fn cmd_hook(db_path: &Path, diagnose: bool, actor: Option<String>, no_record: bool) {
+ // Validated HERE, before the reentry check below: a malformed `--actor`
+ // is the caller's own mistake (a typo in whatever is invoking this),
+ // never the silent fail-open R5 protects for a real hook payload, so it
+ // is named on stderr in exactly one line and exits 2 regardless of
+ // reentry or `--diagnose`. `None` (the flag was left off) is the default,
+ // `usefulness::ASSISTANT_DELIVERY_ACTOR` ("hook"), byte for byte what
+ // every call site below already wrote before this flag existed.
+ let actor = match actor {
+ Some(a) if valid_actor_label(&a) => a,
+ Some(a) => {
+ eprintln!("--actor must be 1 to 32 characters of lowercase ascii letters, digits, dash or underscore, got '{a}'");
+ std::process::exit(2);
+ }
+ None => usefulness::ASSISTANT_DELIVERY_ACTOR.to_string(),
+ };
  if serve::reentry::is_reentrant() {
  if diagnose {
  eprintln!("did not look: this process is a hook inside a hook, which never runs the surfaces again");
@@ -5062,7 +5283,7 @@ fn cmd_hook(db_path: &Path, diagnose: bool) {
  };
  std::panic::set_hook(Box::new(|_| {}));
  let db_path = db_path.to_path_buf();
- let result = std::panic::catch_unwind(move || hook_once(&db_path, payload_text));
+ let result = std::panic::catch_unwind(move || hook_once(&db_path, payload_text, &actor, no_record));
  // Taken before the match below consumes `result`.
  let diagnosis: Option<(&str, i32)> = if diagnose {
  Some(match &result {

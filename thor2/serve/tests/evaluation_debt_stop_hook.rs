@@ -278,7 +278,7 @@ fn declare_owed_items(store: &mut EventStore, n: usize, project: Option<&str>) -
         };
         model::store::declare(store, "fixture", "fixture", "fixture", &item).unwrap();
         for _ in 0..AFTER {
-            serve::deliver::record_delivery(store, "fixture", "fixture", "t", "2026-09-08T00:00:00Z", &[id.clone()]);
+            serve::deliver::record_delivery(store, "fixture", "fixture", serve::usefulness::ASSISTANT_DELIVERY_ACTOR, "2026-09-08T00:00:00Z", &[id.clone()]);
         }
         ids.push(id);
     }
@@ -551,7 +551,7 @@ fn both_debts_due_shows_the_evaluation_first() {
     let mut store = EventStore::new(&db).unwrap();
     let ids = declare_owed_items(&mut store, OWED_CONTEXT_COUNT, Some("thor-fixture"));
     for id in &ids {
-        serve::deliver::record_delivery(&mut store, "s1", "fixture", "t", "2026-09-08T00:00:00Z", &[id.clone()]);
+        serve::deliver::record_delivery(&mut store, "s1", "fixture", serve::usefulness::ASSISTANT_DELIVERY_ACTOR, "2026-09-08T00:00:00Z", &[id.clone()]);
     }
     drop(store);
     seed_session_work(&db, Some("thor-fixture"), "s1", 90);

@@ -1056,11 +1056,20 @@ pub struct LookupArgs {
     #[serde(default)]
     pub scope: Option<String>,
     /// An exact Lookup key. When given, this is the ONLY parameter used -
-    /// `query` and `scope` are ignored - and only a real Lookup item can ever
-    /// answer it.
+    /// `query`, `scope` and `kind` are all ignored - and only a real Lookup
+    /// item can ever answer it.
     #[serde(default)]
     pub key: Option<String>,
+    /// Narrow a search to one kind: rule, orientation, report or chunk -
+    /// case-insensitive, and an obvious plural ("rules") is accepted too.
+    /// Applied AFTER the search has already run and AFTER `scope`, so it
+    /// only ever removes hits, never adds or reorders any. `lookup` (the
+    /// Lookup kind) is refused outright rather than silently answered empty -
+    /// see `key` above for the door that actually answers one.
+    #[serde(default)]
+    pub kind: Option<String>,
 }
+
 
 #[derive(Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
@@ -1917,7 +1926,7 @@ impl ThorMcpServer {
         .await
     }
 
-    #[tool(description = "Code lane: searches THOR's memory - every project, archive kinds (Report, Chunk) included - never scoped to only the current project. Call this before remember, so an existing near-duplicate becomes a revise instead. No arguments returns the catalogue of scopes; scope alone lists everything filed there; scope with query narrows a search to it; query alone searches everywhere; key answers only a Lookup item's own exact key (query and scope are then ignored). Read-only, and never an injection surface - nothing here reaches you unprompted. Replies with up to 25 matching lines (id, kind, text) and how many more exist, the catalogue, or a plain 'no matches'.", annotations(title = "Search the memory", read_only_hint = true, destructive_hint = false, idempotent_hint = true, open_world_hint = false))]
+    #[tool(description = "Code lane: searches THOR's memory - every project, archive kinds (Report, Chunk) included - never scoped to only the current project. Call this before remember, so an existing near-duplicate becomes a revise instead. No arguments returns the catalogue of scopes; scope alone lists everything filed there; scope with query narrows a search to it; query alone searches everywhere; key answers only a Lookup item's own exact key (query, scope and kind are then ignored); kind narrows a search to rule, orientation, report or chunk (case-insensitive, an obvious plural such as 'rules' accepted) - without it, Report hits tend to dominate a plain search since their own text runs long, and asking for kind lookup is refused rather than silently answered empty, since a Lookup register only ever answers to its own key. Read-only, and never an injection surface - nothing here reaches you unprompted. Replies with up to 25 matching lines (id, kind, text) and how many more exist, the catalogue, or a plain 'no matches'.", annotations(title = "Search the memory", read_only_hint = true, destructive_hint = false, idempotent_hint = true, open_world_hint = false))]
     async fn lookup(&self, Parameters(args): Parameters<LookupArgs>) -> String {
         let vectors = self.vectors.clone();
         #[cfg(feature = "semantic")]
@@ -1929,6 +1938,14 @@ impl ThorMcpServer {
                     None => Ok(format!("no lookup found for key '{key}'")),
                 };
             }
+            // Parsed once, up front, so an unknown value or "lookup" itself is
+            // refused before anything is searched - see `serve::lookup::parse_searchable_kind`'s
+            // own doc comment for why `Kind::Lookup` gets a different refusal
+            // than a plain typo.
+            let kind = match args.kind.as_deref().map(str::trim).filter(|k| !k.is_empty()) {
+                None => None,
+                Some(raw) => Some(serve::lookup::parse_searchable_kind(raw)?),
+            };
             // NEITHER given is not a mistake any more: it asks what addresses
             // exist. THE DEFECT THIS CLOSES, measured 2026-08-16: the store
             // held 2 Lookup items out of 3523 and neither had ever been
@@ -1975,17 +1992,46 @@ impl ThorMcpServer {
                 Some(sc) => serve::lookup::only_scope(hits, sc),
                 None => hits,
             };
+            // Captured HERE, after scope but before kind, so a kind-filtered
+            // empty answer can say how many hits of OTHER kinds this exact
+            // (scope-narrowed) ranking found - see `other_kind_hint`'s own
+            // doc comment. When `kind` is never given below, this equals
+            // `hits.len()` at the empty check anyway, so it is harmless to
+            // have computed it regardless.
+            let unfiltered_count = hits.len();
+            // Kind narrows LAST, on top of the scope-narrowed ranking, so the
+            // three arguments compose: a query+scope+kind search returns
+            // exactly what query+scope would have, minus the other kinds.
+            let hits = match kind {
+                Some(k) => serve::lookup::only_kind(hits, k),
+                None => hits,
+            };
             // How many the expiry rule held back, so a thin answer is never
-            // mistaken for an empty memory (see lookup::search_with_expired).
-            let withheld = serve::lookup::search_with_expired(s, query).1;
+            // mistaken for an empty memory (see lookup::search_with_expired),
+            // and whether the LITERAL leg (search's own text match) found
+            // anything at all for this query - the precondition
+            // `meaning_only_note` below needs, independent of scope/kind.
+            let (literal_hits, withheld) = serve::lookup::search_with_expired(s, query);
+            let literal_found_any = !literal_hits.is_empty();
             let mut out = String::new();
             if hits.is_empty() {
+                // A thin answer must name the kind when one was asked for, so
+                // it reads as "nothing of that kind" rather than "nothing at
+                // all" - the same courtesy `scope` already gets below. When a
+                // kind WAS asked for, it also says how many hits of other
+                // kinds this ranking found - a bare "no matches" there would
+                // be a lie by omission (see `other_kind_hint`'s own doc
+                // comment).
+                let kind_note = match kind {
+                    Some(k) => format!(" of kind {k:?}{}", serve::lookup::other_kind_hint(unfiltered_count)),
+                    None => String::new(),
+                };
                 match scope {
                     Some(sc) => out.push_str(&format!(
-                        "no matches for '{query}' in scope '{sc}'. Drop 'scope' to search everywhere, \
-                         or pass scope alone to see everything it holds.\n"
+                        "no matches for '{query}'{kind_note} in scope '{sc}'. Drop 'scope' to search \
+                         everywhere, or pass scope alone to see everything it holds.\n"
                     )),
-                    None => out.push_str(&format!("no matches for '{query}'\n")),
+                    None => out.push_str(&format!("no matches for '{query}'{kind_note}\n")),
                 }
             }
             // A CAP, AND IT SAYS SO. Reported from a real session and
@@ -2002,6 +2048,17 @@ impl ThorMcpServer {
             const MAX_HITS: usize = 25;
             for hit in hits.iter().take(MAX_HITS) {
                 out.push_str(&format!("{} ({:?}): {}\n", hit.id, hit.item.kind, hit.item.text));
+            }
+            // Every hit shown came from the meaning leg alone, nothing
+            // literally matched the query at all - say so, since an answer
+            // built entirely from semantic extras otherwise looks exactly
+            // like an ordinary literal result (see `meaning_only_note`'s own
+            // doc comment).
+            if !hits.is_empty() {
+                if let Some(note) = serve::lookup::meaning_only_note(literal_found_any) {
+                    out.push_str(note);
+                    out.push('\n');
+                }
             }
             if hits.len() > MAX_HITS {
                 out.push_str(&format!(
@@ -5337,7 +5394,9 @@ mod tests {
         assert!(srv.remember(Parameters(a)).await.starts_with("stored"));
         assert!(srv.remember(Parameters(b)).await.starts_with("stored"));
 
-        let reply = srv.lookup(Parameters(LookupArgs { scope: None, query: Some("filament".to_string()), key: None })).await;
+        let reply = srv
+            .lookup(Parameters(LookupArgs { scope: None, query: Some("filament".to_string()), key: None, kind: None }))
+            .await;
         assert!(reply.contains("cross-proj-a"), "{reply}");
         assert!(reply.contains("cross-proj-b"), "expected an item from a different project too: {reply}");
     }
@@ -5352,10 +5411,14 @@ mod tests {
         lookup_item.expires = None;
         assert!(srv.remember(Parameters(lookup_item)).await.starts_with("stored"));
 
-        let hit = srv.lookup(Parameters(LookupArgs { scope: None, query: None, key: Some("release-checklist".to_string()) })).await;
+        let hit = srv
+            .lookup(Parameters(LookupArgs { scope: None, query: None, key: Some("release-checklist".to_string()), kind: None }))
+            .await;
         assert!(hit.contains("RELEASE.md"), "{hit}");
 
-        let miss = srv.lookup(Parameters(LookupArgs { scope: None, query: None, key: Some("no-such-key".to_string()) })).await;
+        let miss = srv
+            .lookup(Parameters(LookupArgs { scope: None, query: None, key: Some("no-such-key".to_string()), kind: None }))
+            .await;
         assert!(miss.contains("no lookup found"), "{miss}");
     }
 
@@ -5380,7 +5443,7 @@ mod tests {
         register.expires = None;
         assert!(srv.remember(Parameters(register)).await.starts_with("stored"));
 
-        let reply = srv.lookup(Parameters(LookupArgs { scope: None, query: None, key: None })).await;
+        let reply = srv.lookup(Parameters(LookupArgs { scope: None, query: None, key: None, kind: None })).await;
         assert!(reply.contains("boeken"), "the scope must be named: {reply}");
         assert!(reply.contains("2 rows"), "the row count must be exact: {reply}");
         assert!(reply.contains("2026-08-11"), "the span must show when it starts: {reply}");
@@ -5398,7 +5461,7 @@ mod tests {
         register.expires = None;
         assert!(srv.remember(Parameters(register)).await.starts_with("stored"));
 
-        let reply = srv.lookup(Parameters(LookupArgs { scope: None, query: None, key: None })).await;
+        let reply = srv.lookup(Parameters(LookupArgs { scope: None, query: None, key: None, kind: None })).await;
         assert!(reply.contains("scope uitgaven"), "the first word of the key is the scope: {reply}");
     }
 
@@ -5423,7 +5486,7 @@ mod tests {
         }
 
         let reply = srv
-            .lookup(Parameters(LookupArgs { scope: Some("boeken".to_string()), query: None, key: None }))
+            .lookup(Parameters(LookupArgs { scope: Some("boeken".to_string()), query: None, key: None, kind: None }))
             .await;
         assert!(reply.contains("scope boeken: 3 item(s)"), "the true size comes first, seed included: {reply}");
         let listed: Vec<&str> = reply.lines().filter(|l| l.starts_with("  boek-")).collect();
@@ -5446,7 +5509,9 @@ mod tests {
             assert!(srv.remember(Parameters(it)).await.starts_with("stored"));
         }
 
-        let wide = srv.lookup(Parameters(LookupArgs { scope: None, query: Some("desem".to_string()), key: None })).await;
+        let wide = srv
+            .lookup(Parameters(LookupArgs { scope: None, query: Some("desem".to_string()), key: None, kind: None }))
+            .await;
         assert!(wide.contains("boek-desem") && wide.contains("recept-desem"), "{wide}");
 
         let narrow = srv
@@ -5454,6 +5519,7 @@ mod tests {
                 scope: Some("boeken".to_string()),
                 query: Some("desem".to_string()),
                 key: None,
+                kind: None,
             }))
             .await;
         assert!(narrow.contains("boek-desem"), "the hit filed here survives: {narrow}");
@@ -6140,7 +6206,7 @@ mod tests {
     async fn an_unknown_scope_names_itself_and_points_back_at_the_catalogue() {
         let srv = server();
         let reply = srv
-            .lookup(Parameters(LookupArgs { scope: Some("bestaatniet".to_string()), query: None, key: None }))
+            .lookup(Parameters(LookupArgs { scope: Some("bestaatniet".to_string()), query: None, key: None, kind: None }))
             .await;
         assert!(reply.contains("bestaatniet"), "{reply}");
         assert!(reply.contains("no arguments"), "the way back is named: {reply}");
@@ -6167,10 +6233,201 @@ mod tests {
         let srv = ThorMcpServer::new(EventStore::in_memory().unwrap()).with_vectors(vectors_path);
         srv.remember(Parameters(base_remember("cache-regression-1"))).await;
 
-        let first = srv.lookup(Parameters(LookupArgs { scope: None, query: Some("force-push".to_string()), key: None })).await;
-        let second = srv.lookup(Parameters(LookupArgs { scope: None, query: Some("force-push".to_string()), key: None })).await;
+        let first = srv
+            .lookup(Parameters(LookupArgs { scope: None, query: Some("force-push".to_string()), key: None, kind: None }))
+            .await;
+        let second = srv
+            .lookup(Parameters(LookupArgs { scope: None, query: Some("force-push".to_string()), key: None, kind: None }))
+            .await;
         assert_eq!(first, second, "two consecutive lookups on the same server must answer identically");
         assert!(first.contains("cache-regression-1"), "{first}");
+    }
+
+    // ------------------------------------------------------ lookup: kind
+
+    /// THE DEFECT THIS PREVENTS, measured on the real store 2026-09-19: three
+    /// natural-language questions returned 8 to 9 long Reports out of every 10
+    /// hits, with the short Rule that actually answered the question nowhere
+    /// in the top ten - a caller had no way to say "rules and orientations
+    /// only". `kind` is tolerant of an obvious plural, so this also proves
+    /// "rules" (not just "rule") is accepted.
+    #[tokio::test]
+    async fn lookup_kind_returns_only_the_requested_kind() {
+        let srv = server_knowing(&["test-project"]);
+        let mut rule = base_remember("widget-rule");
+        rule.text = "never ship a widget without a size chart".to_string();
+        assert!(srv.remember(Parameters(rule)).await.starts_with("stored"));
+        let mut report = blank_report("widget-report");
+        report.text = "a long report about the widget rollout last quarter".to_string();
+        assert!(srv.remember(Parameters(report)).await.starts_with("stored"));
+
+        let reply = srv
+            .lookup(Parameters(LookupArgs {
+                scope: None,
+                query: Some("widget".to_string()),
+                key: None,
+                kind: Some("rules".to_string()),
+            }))
+            .await;
+        assert!(reply.contains("widget-rule"), "the rule must be found: {reply}");
+        assert!(!reply.contains("widget-report"), "the report must be filtered out by the kind filter: {reply}");
+    }
+
+    /// `kind` narrows on top of `scope`, which narrows on top of the ranked
+    /// `query` hits - all three must compose rather than only the last one
+    /// given taking effect. THE FIXTURE ON PURPOSE puts the Rule in the SAME
+    /// scope as the matching Report: `scope` alone would already exclude a
+    /// same-scope Rule from a different lane, so proving composition (rather
+    /// than just proving scope narrowing works) needs a same-scope, same-query
+    /// hit of the wrong kind for `kind` to be the one thing that drops it.
+    #[tokio::test]
+    async fn lookup_kind_composes_with_scope_and_query() {
+        let srv = server_knowing(&["boeken", "eten"]);
+        let mut in_scope_report = blank_report("widget-in-boeken");
+        in_scope_report.project = Some("boeken".to_string());
+        in_scope_report.text = "widget assembly notes filed under boeken".to_string();
+        assert!(srv.remember(Parameters(in_scope_report)).await.starts_with("stored"));
+
+        let mut other_scope_report = blank_report("widget-in-eten");
+        other_scope_report.project = Some("eten".to_string());
+        other_scope_report.text = "widget shaped cookie cutter notes filed under eten".to_string();
+        assert!(srv.remember(Parameters(other_scope_report)).await.starts_with("stored"));
+
+        // Same scope as `in_scope_report` above, on purpose - see this test's
+        // own doc comment for why that is the point.
+        let mut rule = base_remember("widget-rule-in-boeken");
+        rule.project = Some("boeken".to_string());
+        rule.text = "never ship a widget without testing it first".to_string();
+        assert!(srv.remember(Parameters(rule)).await.starts_with("stored"));
+
+        let reply = srv
+            .lookup(Parameters(LookupArgs {
+                scope: Some("boeken".to_string()),
+                query: Some("widget".to_string()),
+                key: None,
+                kind: Some("report".to_string()),
+            }))
+            .await;
+        assert!(reply.contains("widget-in-boeken"), "the matching report inside the scope must survive: {reply}");
+        assert!(!reply.contains("widget-in-eten"), "a report outside the scope must be dropped by scope narrowing: {reply}");
+        assert!(
+            !reply.contains("widget-rule-in-boeken"),
+            "the same-scope rule must be dropped by the kind filter, not by scope narrowing: {reply}"
+        );
+    }
+
+    /// `Kind::Lookup` is the one kind `serve::lookup::search` always filters
+    /// out - asking for it here must be refused, loudly, and point at `key`
+    /// (the door that actually answers one), never silently answer "no
+    /// matches" as if it had searched and simply found nothing.
+    #[tokio::test]
+    async fn lookup_kind_of_lookup_itself_is_refused_and_points_at_key() {
+        let srv = server();
+        let reply = srv
+            .lookup(Parameters(LookupArgs {
+                scope: None,
+                query: Some("anything".to_string()),
+                key: None,
+                kind: Some("lookup".to_string()),
+            }))
+            .await;
+        assert!(reply.contains("kind 'lookup' is never searchable"), "{reply}");
+        assert!(reply.contains("'key' argument"), "the refusal must point at the 'key' argument: {reply}");
+    }
+
+    /// An unknown `kind` value is a caller mistake, not an empty result - it
+    /// must be refused, naming the four kinds that do work, and it must never
+    /// fall back to running the search unfiltered.
+    #[tokio::test]
+    async fn lookup_kind_unknown_value_is_refused_and_names_the_four_that_work() {
+        let srv = server_knowing(&["test-project"]);
+        let mut report = blank_report("findable-1");
+        report.text = "this findable item must never be reached because the kind argument is invalid".to_string();
+        assert!(srv.remember(Parameters(report)).await.starts_with("stored"));
+
+        let reply = srv
+            .lookup(Parameters(LookupArgs {
+                scope: None,
+                query: Some("findable".to_string()),
+                key: None,
+                kind: Some("bogus".to_string()),
+            }))
+            .await;
+        assert!(reply.contains("unknown 'kind' value 'bogus'"), "{reply}");
+        assert!(
+            reply.contains("rule") && reply.contains("orientation") && reply.contains("report") && reply.contains("chunk"),
+            "the four searchable kinds must all be named: {reply}"
+        );
+        assert!(
+            !reply.contains("findable-1"),
+            "an invalid kind must search nothing at all, not fall back to an unfiltered search: {reply}"
+        );
+    }
+
+    /// A thin answer must say "nothing of THIS kind", not read as though the
+    /// memory holds nothing at all - the same courtesy an empty scope already
+    /// gets from `an_unknown_scope_names_itself_and_points_back_at_the_catalogue`.
+    #[tokio::test]
+    async fn lookup_no_matches_names_the_kind_that_was_asked_for() {
+        let srv = server_knowing(&["test-project"]);
+        let mut report = blank_report("gizmo-1");
+        report.text = "a gizmo has nothing to do with the other word".to_string();
+        assert!(srv.remember(Parameters(report)).await.starts_with("stored"));
+
+        let reply = srv
+            .lookup(Parameters(LookupArgs {
+                scope: None,
+                query: Some("gizmo".to_string()),
+                key: None,
+                kind: Some("rule".to_string()),
+            }))
+            .await;
+        assert!(reply.contains("no matches for 'gizmo'"), "{reply}");
+        assert!(reply.contains("Rule"), "a thin answer must name the kind that was asked for: {reply}");
+    }
+
+    /// THE DEFECT THIS PREVENTS: a kind-filtered search that finds nothing
+    /// reads exactly like an empty memory unless it also says how many hits
+    /// of OTHER kinds the very same (unfiltered) ranking found - a bare "no
+    /// matches" there is a lie by omission about what the ranking actually
+    /// did.
+    #[tokio::test]
+    async fn lookup_kind_filtered_empty_reply_names_how_many_other_kind_hits_there_were() {
+        let srv = server_knowing(&["test-project"]);
+        let mut report = blank_report("gizmo-1");
+        report.text = "a gizmo has nothing to do with the other word".to_string();
+        assert!(srv.remember(Parameters(report)).await.starts_with("stored"));
+
+        let reply = srv
+            .lookup(Parameters(LookupArgs {
+                scope: None,
+                query: Some("gizmo".to_string()),
+                key: None,
+                kind: Some("rule".to_string()),
+            }))
+            .await;
+        assert!(reply.contains("1 hit(s) of other kind(s)"), "must name how many other-kind hits the ranking found: {reply}");
+    }
+
+    /// A literal text match must never carry the "this came from meaning
+    /// search" note - that note exists only to explain an ANSWER BUILT
+    /// PURELY FROM SEMANTIC EXTRAS, and attaching it to a real text match
+    /// would cast doubt on a hit that needs none.
+    #[tokio::test]
+    async fn lookup_reply_never_carries_the_meaning_only_note_when_a_literal_hit_was_found() {
+        let srv = server_knowing(&["test-project"]);
+        let mut report = blank_report("gizmo-1");
+        report.text = "a gizmo has nothing to do with the other word".to_string();
+        assert!(srv.remember(Parameters(report)).await.starts_with("stored"));
+
+        let reply = srv
+            .lookup(Parameters(LookupArgs { scope: None, query: Some("gizmo".to_string()), key: None, kind: None }))
+            .await;
+        assert!(reply.contains("gizmo-1"), "{reply}");
+        assert!(
+            !reply.contains("no wording in the store literally matched"),
+            "a literal hit must never carry the meaning-only note: {reply}"
+        );
     }
 
     fn blank_report(id: &str) -> RememberArgs {
@@ -6345,7 +6602,9 @@ mod tests {
                 "two judgements from different sessions must retire it from the injection surfaces"
             );
         }
-        let found = srv.lookup(Parameters(LookupArgs { scope: None, query: Some("noisy-1".to_string()), key: None })).await;
+        let found = srv
+            .lookup(Parameters(LookupArgs { scope: None, query: Some("noisy-1".to_string()), key: None, kind: None }))
+            .await;
         assert!(found.contains("noisy-1"), "and it must stay findable via lookup: {found}");
     }
 

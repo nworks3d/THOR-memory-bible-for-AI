@@ -17,7 +17,7 @@
 //! "silently wrong answer" this workspace exists to prevent.
 
 use crate::embed::Embedder;
-use crate::live::live_items;
+use crate::live::{live_items, LiveItem};
 use crate::semantic_paths::{DIM, MODEL_ID};
 use anyhow::{bail, Result};
 use model::item::Kind;
@@ -138,6 +138,16 @@ impl VectorStore {
         Ok(())
     }
 
+    /// Delete every stored row (every part) for each id in `ids` - how
+    /// `refresh` drops a vector whose item is no longer live. An id with no
+    /// stored row at all is simply a no-op, never an error.
+    pub fn delete_ids(&self, ids: &[String]) -> Result<()> {
+        for id in ids {
+            self.conn.execute("DELETE FROM vec WHERE id = ?", params![id])?;
+        }
+        Ok(())
+    }
+
     /// Every stored `(id, content_hash)` pair - used by `report` to compare
     /// against live content without paying to decode every vector blob.
     /// One row per ITEM, never per part: every part of an item shares the same
@@ -170,6 +180,32 @@ impl VectorStore {
     ///
     /// Returning the best PART's vector rather than a score keeps every caller
     /// downstream unchanged - the ranking core still works on one vector per
+    /// EVERY stored part of each id, in part order - the whole vector set an
+    /// item carries, not one chosen chunk.
+    ///
+    /// WHY THIS EXISTS (2026-09-19). `get_many_best` above needs the query
+    /// vector to pick a chunk, so a caller that scores MANY queries against
+    /// the same store either re-reads the sidecar once per query or scores
+    /// the wrong chunk. The recall harness took the second road by calling
+    /// `get_many` (part 0 only) once for the whole battery, which silently
+    /// measured first-chunk similarity while live measures best-chunk - a
+    /// divergence at the data layer, in a file whose own header warns about
+    /// exactly that class of divergence in the ranking layer. With this, a
+    /// batch caller reads the parts once and applies live's own max-over-
+    /// chunks rule itself, per query, with no second trip to the database.
+    pub fn get_many_parts(&self, ids: &[String]) -> Result<HashMap<String, Vec<Vec<f32>>>> {
+        let mut out = HashMap::with_capacity(ids.len());
+        let mut st = self.conn.prepare("SELECT v FROM vec WHERE id = ? ORDER BY part")?;
+        for id in ids {
+            let Ok(rows) = st.query_map(params![id], |r| r.get::<_, Vec<u8>>(0)) else { continue };
+            let parts: Vec<Vec<f32>> = rows.flatten().filter_map(|blob| blob_to_f32(&blob)).collect();
+            if !parts.is_empty() {
+                out.insert(id.clone(), parts);
+            }
+        }
+        Ok(out)
+    }
+
     /// id, and never learns that parts exist.
     pub fn get_many_best(&self, ids: &[String], query_vec: &[f32]) -> Result<HashMap<String, Vec<f32>>> {
         let mut out = HashMap::with_capacity(ids.len());
@@ -235,41 +271,36 @@ fn content_hash(text: &str) -> String {
     format!("{:x}", hasher.finalize())
 }
 
-/// Rebuild the sidecar from scratch: every live item except `Lookup` - the
-/// same population `lookup::search` itself covers (any project, archive
-/// kinds `Report`/`Chunk` fully included; CONTRACT: "opzoeken is geen
-/// injectie"). Always a clean, whole-store re-embedding, never a partial
-/// patch, so a build's result never depends on what was there before.
-pub fn build(store: &EventStore, model_dir: &Path, vectors_path: &Path) -> Result<usize> {
-    let candidates: Vec<_> = live_items(store).into_iter().filter(|li| li.item.kind != Kind::Lookup).collect();
-    let mut vs = VectorStore::open(vectors_path)?;
-    vs.clear()?;
-    vs.set_model_id(MODEL_ID)?;
-    if candidates.is_empty() {
-        return Ok(0);
-    }
-    let mut embedder = Embedder::load(model_dir)?;
-
-    // One vector per PART, not per item. Two defects close together here: the
-    // embedder truncates at 1000 characters, so everything past that in a long
-    // item never reached the model at all; and a single vector for a whole
-    // document averages every subject in it into a point near none of them.
-    // Measured 2026-08-16 - see `VectorStore::get_many_best` for the numbers.
-    //
-    // A short item yields exactly one part, so its stored vector is bit for bit
-    // what it was before this change. That is what keeps the ranking that was
-    // tuned on short, identifier-shaped items from moving underneath it.
+/// Turn a batch of live items into the flat `(id, part, hash, vector)` rows
+/// `upsert_parts` expects. THE ONE PLACE `build` and `refresh` both chunk and
+/// embed an item, so the two can never silently drift apart on how one is
+/// turned into vectors - a refreshed item that embedded even slightly
+/// differently from a rebuilt one would be exactly the kind of split-brain
+/// this file's own top-of-file doc comment warns a STALE vector already is,
+/// except self-inflicted by this crate rather than caused by a revise.
+///
+/// One vector per PART, not per item. Two defects close together here: the
+/// embedder truncates at 1000 characters, so everything past that in a long
+/// item never reached the model at all; and a single vector for a whole
+/// document averages every subject in it into a point near none of them.
+/// Measured 2026-08-16 - see `VectorStore::get_many_best` for the numbers.
+///
+/// A short item yields exactly one part, so its stored vector is bit for bit
+/// what it was before parts existed. That is what keeps the ranking that was
+/// tuned on short, identifier-shaped items from moving underneath it.
+///
+/// PART 0 IS ALWAYS THE WHOLE ITEM, and the pieces follow from 1. That is not
+/// tidiness: a binary built before parts existed reads this sidecar with a
+/// plain "give me this id's vector" and takes what comes back first. If part
+/// 0 were the first paragraph, every older binary reading a rebuilt sidecar
+/// would silently start scoring questions against opening lines only - a live
+/// behaviour change nobody asked for, from a data migration. With the whole
+/// item at 0, an older binary behaves exactly as it always did, and only a
+/// binary that knows about parts sees the improvement.
+fn embed_rows(embedder: &mut Embedder, items: &[&LiveItem]) -> Result<Vec<(String, usize, String, Vec<f32>)>> {
     let mut flat_ids: Vec<(String, usize, String)> = Vec::new();
     let mut flat_texts: Vec<String> = Vec::new();
-    // PART 0 IS ALWAYS THE WHOLE ITEM, and the pieces follow from 1. That is
-    // not tidiness: a binary built before parts existed reads this sidecar with
-    // a plain "give me this id's vector" and takes what comes back first. If
-    // part 0 were the first paragraph, every older binary reading a rebuilt
-    // sidecar would silently start scoring questions against opening lines
-    // only - a live behaviour change nobody asked for, from a data migration.
-    // With the whole item at 0, an older binary behaves exactly as it always
-    // did, and only a binary that knows about parts sees the improvement.
-    for li in &candidates {
+    for li in items {
         let hash = content_hash(&li.item.text);
         flat_ids.push((li.id.clone(), 0usize, hash.clone()));
         flat_texts.push(li.item.text.clone());
@@ -283,11 +314,127 @@ pub fn build(store: &EventStore, model_dir: &Path, vectors_path: &Path) -> Resul
         }
     }
     let vectors = embedder.embed_many(&flat_texts)?;
-    let rows: Vec<(String, usize, String, Vec<f32>)> =
-        flat_ids.into_iter().zip(vectors).map(|((id, part, hash), v)| (id, part, hash, v)).collect();
+    Ok(flat_ids.into_iter().zip(vectors).map(|((id, part, hash), v)| (id, part, hash, v)).collect())
+}
+
+/// Rebuild the sidecar from scratch: every live item except `Lookup` - the
+/// same population `lookup::search` itself covers (any project, archive
+/// kinds `Report`/`Chunk` fully included; CONTRACT: "opzoeken is geen
+/// injectie"). Always a clean, whole-store re-embedding, never a partial
+/// patch, so a build's result never depends on what was there before. See
+/// `refresh` below for the incremental complement that keeps a store fresh
+/// in between full rebuilds.
+pub fn build(store: &EventStore, model_dir: &Path, vectors_path: &Path) -> Result<usize> {
+    let candidates: Vec<_> = live_items(store).into_iter().filter(|li| li.item.kind != Kind::Lookup).collect();
+    let mut vs = VectorStore::open(vectors_path)?;
+    vs.clear()?;
+    vs.set_model_id(MODEL_ID)?;
+    if candidates.is_empty() {
+        return Ok(0);
+    }
+    let mut embedder = Embedder::load(model_dir)?;
+    let refs: Vec<&LiveItem> = candidates.iter().collect();
+    let rows = embed_rows(&mut embedder, &refs)?;
     let n = candidates.len();
     vs.upsert_parts(&rows)?;
     Ok(n)
+}
+
+/// What one `refresh` call actually did. `build` returns a plain count
+/// because it always does the same kind of work (rebuild everything);
+/// `refresh` needs to tell "embedded N" apart from "there was nothing to do"
+/// apart from "refused outright", so a struct beats a single number here.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct RefreshOutcome {
+    /// Items actually embedded this call: missing or stale, up to `budget`.
+    /// Never counts a part - the same "one row per ITEM" unit `report`'s own
+    /// `missing`/`stale` counts use.
+    pub embedded: usize,
+    /// Vectors deleted because their id is no longer a live item. Never
+    /// budgeted - see `refresh`'s own doc comment for why that is cheap
+    /// enough to always do in full.
+    pub deleted: usize,
+    /// How many more items still needed embedding when this call's budget
+    /// ran out. 0 whenever every missing/stale item got embedded this call.
+    pub remaining: usize,
+    /// Whether this call had to stamp `model_id` - true exactly when the
+    /// sidecar had none yet and this call just wrote its first real vector.
+    pub model_id_written: bool,
+    /// True when the sidecar's stored `model_id` did not match this binary's
+    /// own: refresh refused to touch the store at all, and every other field
+    /// above is 0/false. The fix is always the same regardless of how far out
+    /// of date the sidecar is: run `vectors-build`.
+    pub model_id_mismatch: bool,
+}
+
+/// Embed only what changed since the store was last built or refreshed, and
+/// drop vectors whose id is no longer live - the incremental complement to
+/// `build`'s full from-scratch rebuild, so a fact written an hour ago does
+/// not sit unfindable by meaning until a human remembers to run
+/// `vectors-build`.
+///
+/// SAME WRITE PATH AS `build`, ON PURPOSE: both call `embed_rows` (this
+/// file's one chunk-and-embed routine) and the same `upsert_parts`, so an
+/// item refreshed here and the same item rebuilt from scratch produce BIT
+/// IDENTICAL stored rows - proven by this file's own equivalence test, which
+/// compares the actual float rows, not just which ids exist.
+///
+/// REFUSES OUTRIGHT on a model_id mismatch, checked before a single live item
+/// is even read - the same "cheap, before the embedder ever loads" guard
+/// `lookup::search_best_effort_cached` applies at query time (see its own doc
+/// comment). On the WRITE side refusing is the only safe move: `build` fixes
+/// a mismatch by clearing everything first, but `refresh` only ever adds or
+/// drops individual rows, so writing even one new vector next to old foreign
+/// ones would leave the sidecar half in one embedding space and half in
+/// another, with nothing left on the row itself to tell them apart
+/// afterwards. `report`'s own `model_id_matches` is the read-side version of
+/// this same stance.
+///
+/// `budget` caps how many ITEMS (never a part) this call embeds; 0 means
+/// unlimited. Orphan deletion always runs in full, unbudgeted - deleting a
+/// row is one cheap statement, not a roughly-a-second model call, so there is
+/// nothing there worth spreading across runs.
+pub fn refresh(store: &EventStore, model_dir: &Path, vectors_path: &Path, budget: usize) -> Result<RefreshOutcome> {
+    let mut vs = VectorStore::open(vectors_path)?;
+    let stored_model_id = vs.model_id();
+    if let Some(id) = &stored_model_id {
+        if id != MODEL_ID {
+            return Ok(RefreshOutcome { model_id_mismatch: true, ..Default::default() });
+        }
+    }
+
+    let live: Vec<_> = live_items(store).into_iter().filter(|li| li.item.kind != Kind::Lookup).collect();
+    let live_ids: std::collections::HashSet<&str> = live.iter().map(|li| li.id.as_str()).collect();
+    let stored: HashMap<String, String> = vs.all_ids_and_hashes()?.into_iter().collect();
+
+    let orphan_ids: Vec<String> = stored.keys().filter(|id| !live_ids.contains(id.as_str())).cloned().collect();
+    vs.delete_ids(&orphan_ids)?;
+    let deleted = orphan_ids.len();
+
+    let needs: Vec<&LiveItem> = live
+        .iter()
+        .filter(|li| match stored.get(&li.id) {
+            None => true,
+            Some(h) => *h != content_hash(&li.item.text),
+        })
+        .collect();
+    let total_needed = needs.len();
+    let take = if budget == 0 { total_needed } else { budget.min(total_needed) };
+    let to_embed = &needs[..take];
+    let remaining = total_needed - take;
+
+    let mut model_id_written = false;
+    if !to_embed.is_empty() {
+        if stored_model_id.is_none() {
+            vs.set_model_id(MODEL_ID)?;
+            model_id_written = true;
+        }
+        let mut embedder = Embedder::load(model_dir)?;
+        let rows = embed_rows(&mut embedder, to_embed)?;
+        vs.upsert_parts(&rows)?;
+    }
+
+    Ok(RefreshOutcome { embedded: to_embed.len(), deleted, remaining, model_id_written, model_id_mismatch: false })
 }
 
 /// The most a single part may carry, comfortably under the embedder's own
@@ -479,6 +626,7 @@ mod tests {
     use super::*;
     use model::item::Item;
     use model::store;
+    use std::path::PathBuf;
 
     fn v(fill: f32) -> Vec<f32> {
         vec![fill; DIM]
@@ -544,6 +692,24 @@ mod tests {
         vs.conn.execute("INSERT INTO vec(id,content_hash,v) VALUES('a','h', ?)", params![vec![1u8, 2, 3]]).unwrap();
         let got = vs.get_many(&["a".to_string()]).unwrap();
         assert!(got.is_empty(), "a corrupt blob is skipped, never misread as a real vector");
+    }
+
+    #[test]
+    fn delete_ids_removes_only_the_named_ids() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut vs = VectorStore::open(&dir.path().join("v.db")).unwrap();
+        vs.upsert_batch(&[("a".to_string(), "ha".to_string(), v(0.1)), ("b".to_string(), "hb".to_string(), v(0.2))]).unwrap();
+        vs.delete_ids(&["a".to_string()]).unwrap();
+        assert_eq!(vs.count().unwrap(), 1);
+        assert!(vs.get_many(&["a".to_string()]).unwrap().is_empty());
+        assert!(!vs.get_many(&["b".to_string()]).unwrap().is_empty());
+    }
+
+    #[test]
+    fn delete_ids_on_an_absent_id_is_a_no_op_not_an_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let vs = VectorStore::open(&dir.path().join("v.db")).unwrap();
+        assert!(vs.delete_ids(&["nope".to_string()]).is_ok());
     }
 
     // -------------------------------------------------------------- report()
@@ -634,5 +800,215 @@ mod tests {
         let vectors_path = dir.path().join("v.db");
         let r = report(&db, &vectors_path).unwrap();
         assert_eq!(r.live_count, 0, "a Lookup item must never be counted in the semantic population");
+    }
+
+    // ------------------------------------------------------------- refresh()
+
+    /// The real per-user semantic model, when this machine actually has one.
+    /// Every `refresh` test below that needs to embed something for real
+    /// (there is no seam to fake `Embedder::load`) calls this first and skips
+    /// itself when it comes back `None` - the same "a missing model is a
+    /// normal, supported setup, never a failure" stance this whole feature
+    /// takes everywhere else (see `semantic_paths::SearchMode::ModelMissing`).
+    fn require_model() -> Option<PathBuf> {
+        let dir = crate::semantic_paths::default_model_dir()?;
+        crate::semantic_paths::model_present(&dir).then_some(dir)
+    }
+
+    /// Every stored part's vector for one id, in part order. `get_many`/
+    /// `get_many_best` each deliberately return only ONE vector per id, so a
+    /// test that must compare a multi-part item's rows bit for bit reads the
+    /// table directly, the same way `corrupt_blob_is_skipped_not_misread`
+    /// above already does.
+    fn all_parts(vs: &VectorStore, id: &str) -> Vec<Vec<f32>> {
+        let mut st = vs.conn.prepare("SELECT v FROM vec WHERE id = ? ORDER BY part").unwrap();
+        st.query_map(params![id], |r| r.get::<_, Vec<u8>>(0))
+            .unwrap()
+            .map(|b| blob_to_f32(&b.unwrap()).expect("a freshly-written blob must decode"))
+            .collect()
+    }
+
+    /// THE DEFECT THIS PREVENTS: two independent write paths (a full rebuild
+    /// and an incremental refresh) that quietly embedded the same text
+    /// differently would be a split-brain no `report` count could ever catch
+    /// - a search's ranking would silently depend on WHICH path happened to
+    /// write an item last.
+    #[test]
+    fn refresh_embeds_missing_and_stale_but_leaves_unchanged_alone() {
+        let Some(model_dir) = require_model() else {
+            eprintln!("skipping refresh_embeds_missing_and_stale_but_leaves_unchanged_alone: no per-user semantic model present");
+            return;
+        };
+        let mut db = EventStore::in_memory().unwrap();
+        store::declare(&mut db, "s", "l", "a", &report_item("missing", Kind::Report, "the espresso machine needs descaling every month"))
+            .unwrap();
+        store::declare(&mut db, "s", "l", "a", &report_item("changed", Kind::Report, "the bicycle tire needs replacing before winter"))
+            .unwrap();
+        store::declare(&mut db, "s", "l", "a", &report_item("unchanged", Kind::Report, "the garden hose has a slow leak near the nozzle"))
+            .unwrap();
+
+        let dir = tempfile::tempdir().unwrap();
+        let vectors_path = dir.path().join("v.db");
+        {
+            let mut vs = VectorStore::open(&vectors_path).unwrap();
+            vs.set_model_id(MODEL_ID).unwrap();
+            // Stamped under the OLD text - simulates "embedded before a revise".
+            vs.upsert_batch(&[("changed".to_string(), content_hash("the bicycle tire needs air before winter"), v(0.111))]).unwrap();
+            vs.upsert_batch(&[("unchanged".to_string(), content_hash("the garden hose has a slow leak near the nozzle"), v(0.222))])
+                .unwrap();
+        }
+
+        let outcome = refresh(&db, &model_dir, &vectors_path, 0).unwrap();
+        assert_eq!(outcome.embedded, 2, "missing + changed, never the unchanged one");
+        assert_eq!(outcome.deleted, 0);
+        assert_eq!(outcome.remaining, 0);
+        assert!(!outcome.model_id_mismatch);
+
+        let vs = VectorStore::open(&vectors_path).unwrap();
+        let stored: HashMap<String, String> = vs.all_ids_and_hashes().unwrap().into_iter().collect();
+        assert_eq!(stored.get("missing").cloned(), Some(content_hash("the espresso machine needs descaling every month")));
+        assert_eq!(stored.get("changed").cloned(), Some(content_hash("the bicycle tire needs replacing before winter")));
+        assert_eq!(stored.get("unchanged").cloned(), Some(content_hash("the garden hose has a slow leak near the nozzle")));
+
+        // The untouched row must be BYTE IDENTICAL, not merely hash-equal -
+        // proof refresh never rewrites something it had no reason to touch.
+        assert_eq!(all_parts(&vs, "unchanged"), vec![v(0.222)], "an unchanged item's stored vector must not move at all");
+    }
+
+    /// THE DEFECT THIS PREVENTS: an id that was retracted, diverged away, or
+    /// otherwise stopped being live must not go on answering searches forever
+    /// just because nobody has run a full rebuild since it left.
+    #[test]
+    fn refresh_deletes_the_vector_of_an_id_that_is_no_longer_live() {
+        let mut db = EventStore::in_memory().unwrap();
+        store::declare(&mut db, "s", "l", "a", &report_item("still-here", Kind::Report, "a fact that is still live")).unwrap();
+
+        let dir = tempfile::tempdir().unwrap();
+        let vectors_path = dir.path().join("v.db");
+        {
+            let mut vs = VectorStore::open(&vectors_path).unwrap();
+            vs.set_model_id(MODEL_ID).unwrap();
+            vs.upsert_batch(&[("still-here".to_string(), content_hash("a fact that is still live"), v(0.5))]).unwrap();
+            vs.upsert_batch(&[("gone".to_string(), content_hash("whatever it used to say"), v(0.25))]).unwrap();
+        }
+
+        // Deliberately bogus: the one live item is already current, so a
+        // correct refresh never has a reason to load an embedder at all -
+        // keeping this test hermetic and fast on purpose.
+        let bogus_model_dir = dir.path().join("no-such-model");
+        let outcome = refresh(&db, &bogus_model_dir, &vectors_path, 0).unwrap();
+
+        assert_eq!(outcome.deleted, 1);
+        assert_eq!(outcome.embedded, 0, "the only live item was already current - the embedder must never load");
+
+        let vs = VectorStore::open(&vectors_path).unwrap();
+        let stored: HashMap<String, String> = vs.all_ids_and_hashes().unwrap().into_iter().collect();
+        assert!(!stored.contains_key("gone"), "the orphaned vector must be gone");
+        assert!(stored.contains_key("still-here"), "the still-live item's vector must remain");
+    }
+
+    /// THE DEFECT THIS PREVENTS: a first catch-up over hundreds of missing
+    /// items must never turn one hourly run into an unbounded one - `budget`
+    /// is how `ops::sync`'s hourly job stays short, and this pins that a
+    /// budget of N really does stop at N, leaving the rest for next time.
+    #[test]
+    fn refresh_respects_the_budget() {
+        let Some(model_dir) = require_model() else {
+            eprintln!("skipping refresh_respects_the_budget: no per-user semantic model present");
+            return;
+        };
+        let mut db = EventStore::in_memory().unwrap();
+        store::declare(&mut db, "s", "l", "a", &report_item("a1", Kind::Report, "the espresso machine needs descaling every month"))
+            .unwrap();
+        store::declare(&mut db, "s", "l", "a", &report_item("a2", Kind::Report, "the bicycle tire needs replacing before winter"))
+            .unwrap();
+
+        let dir = tempfile::tempdir().unwrap();
+        let vectors_path = dir.path().join("v.db");
+
+        let outcome = refresh(&db, &model_dir, &vectors_path, 1).unwrap();
+        assert_eq!(outcome.embedded, 1, "a budget of 1 must embed exactly one item");
+        assert_eq!(outcome.remaining, 1, "the other missing item must be counted remaining");
+        assert!(outcome.model_id_written, "the first ever write to a fresh sidecar must stamp its model_id");
+
+        let vs = VectorStore::open(&vectors_path).unwrap();
+        assert_eq!(vs.all_ids_and_hashes().unwrap().len(), 1);
+    }
+
+    /// THE MIXING THIS REFUSAL PREVENTS: a sidecar stamped by a different
+    /// model must never gain even one new vector from this binary - doing so
+    /// would leave some rows in one embedding space and some in another with
+    /// nothing on the row itself to tell them apart afterwards. The write-side
+    /// twin of `report_flags_a_model_id_mismatch_plainly` above.
+    #[test]
+    fn refresh_refuses_a_mismatched_model_id_without_writing_anything() {
+        let mut db = EventStore::in_memory().unwrap();
+        store::declare(&mut db, "s", "l", "a", &report_item("r1", Kind::Report, "a fact that would need embedding")).unwrap();
+
+        let dir = tempfile::tempdir().unwrap();
+        let vectors_path = dir.path().join("v.db");
+        {
+            let vs = VectorStore::open(&vectors_path).unwrap();
+            vs.set_model_id("some-other-model@v0").unwrap();
+        }
+
+        // Bogus on purpose: a refusal must never even try to load it.
+        let bogus_model_dir = dir.path().join("no-such-model");
+        let outcome = refresh(&db, &bogus_model_dir, &vectors_path, 0).unwrap();
+
+        assert!(outcome.model_id_mismatch);
+        assert_eq!(outcome.embedded, 0);
+        assert_eq!(outcome.deleted, 0);
+        assert_eq!(outcome.remaining, 0);
+        assert!(!outcome.model_id_written);
+
+        let vs = VectorStore::open(&vectors_path).unwrap();
+        assert_eq!(vs.model_id().as_deref(), Some("some-other-model@v0"), "refresh must never overwrite a foreign model_id");
+        assert_eq!(vs.count().unwrap(), 0, "refresh must not write anything at all when it refuses");
+    }
+
+    /// THE EQUIVALENCE PROOF: `build` and `refresh` must write BIT IDENTICAL
+    /// rows for the same item, or a search's ranking would silently depend on
+    /// which of the two write paths happened to touch an id last - exactly
+    /// the split-brain `embed_rows`'s own doc comment names. Covers a short
+    /// item (one part) and a long one (several parts), so both of
+    /// `embed_rows`'s branches are compared, not just the easy case.
+    #[test]
+    fn refresh_from_empty_matches_build_from_scratch_bit_for_bit() {
+        let Some(model_dir) = require_model() else {
+            eprintln!("skipping refresh_from_empty_matches_build_from_scratch_bit_for_bit: no per-user semantic model present");
+            return;
+        };
+        let mut db = EventStore::in_memory().unwrap();
+        store::declare(&mut db, "s", "l", "a", &report_item("short", Kind::Report, "a short fact about the bbq recipe")).unwrap();
+        let long_text = format!("{}\n\n{}\n\n{}", "first paragraph ".repeat(200), "second paragraph ".repeat(200), "third paragraph ".repeat(200));
+        store::declare(&mut db, "s", "l", "a", &report_item("long", Kind::Report, &long_text)).unwrap();
+
+        let dir = tempfile::tempdir().unwrap();
+        let built_path = dir.path().join("built.db");
+        let refreshed_path = dir.path().join("refreshed.db");
+
+        let n = build(&db, &model_dir, &built_path).unwrap();
+        assert_eq!(n, 2);
+        let outcome = refresh(&db, &model_dir, &refreshed_path, 0).unwrap();
+        assert_eq!(outcome.embedded, 2);
+
+        let built = VectorStore::open(&built_path).unwrap();
+        let refreshed = VectorStore::open(&refreshed_path).unwrap();
+        let mut built_rows = built.all_ids_and_hashes().unwrap();
+        let mut refreshed_rows = refreshed.all_ids_and_hashes().unwrap();
+        built_rows.sort();
+        refreshed_rows.sort();
+        assert_eq!(built_rows, refreshed_rows, "the same ids with the same content hashes must come out of both paths");
+
+        for id in ["short", "long"] {
+            let built_vecs = all_parts(&built, id);
+            let refreshed_vecs = all_parts(&refreshed, id);
+            assert!(!built_vecs.is_empty(), "id {id}: build must have stored at least one part");
+            assert_eq!(built_vecs.len(), refreshed_vecs.len(), "id {id}: same number of parts from both paths");
+            for (part, (a, b)) in built_vecs.iter().zip(&refreshed_vecs).enumerate() {
+                assert_eq!(a, b, "id {id} part {part}: build and refresh must store bit-identical vectors");
+            }
+        }
     }
 }

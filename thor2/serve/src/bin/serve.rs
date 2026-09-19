@@ -14,7 +14,7 @@
 
 use clap::{Parser, Subcommand};
 use intent::Action;
-use model::item::TargetKind;
+use model::item::{Kind, TargetKind};
 use serde_json::Value;
 use serve::decay::DecayContext;
 use serve::input::ServeInput;
@@ -78,6 +78,33 @@ enum Command {
     /// any project, archive kinds (Report/Chunk) included.
     Search {
         query: String,
+        /// Narrow the ranking to one kind: rule, orientation, report or chunk
+        /// (case-insensitive, an obvious plural such as "rules" accepted).
+        /// Without it, Report hits tend to dominate a plain search since
+        /// their own text runs long. Asking for `lookup` is refused rather
+        /// than answered empty - a register only ever answers to its own key,
+        /// so use `lookup-key` for that. Same argument, same names and the
+        /// same two refusals as the agent's own `lookup` tool: both doors
+        /// call `serve::lookup::parse_searchable_kind`.
+        #[arg(long)]
+        kind: Option<String>,
+        /// Print the normal answer, then a block naming per hit whether it
+        /// was found by TEXT (`literal`) or only by MEANING (`meaning`, with
+        /// its similarity score) - never changes the ranking or the normal
+        /// lines above it. See `serve::lookup::explain_best_effort`'s own doc
+        /// comment for why the floor and the cap are the only two ways a hit
+        /// can be missing entirely, which `--explain-id` names for one id at
+        /// a time.
+        #[arg(long)]
+        explain: bool,
+        /// Name one id and say exactly why it did or did not make this
+        /// ranking: its similarity score, and - when it is missing - whether
+        /// that is because it never reached the similarity floor or because
+        /// too many other candidates outscored it under the cap. Composes
+        /// with `--explain`, which only adds the per-hit literal/meaning
+        /// lines above this one.
+        #[arg(long = "explain-id")]
+        explain_id: Option<String>,
     },
     /// Surface 4's other door: an explicit request for one Lookup's key.
     LookupKey {
@@ -180,6 +207,30 @@ enum Command {
     VectorsStatus {
         #[arg(long = "vectors-db")]
         vectors_db: Option<PathBuf>,
+    },
+    /// Embed only what changed since the last build/refresh (feature
+    /// `semantic`): a missing vector, or one whose stored hash no longer
+    /// matches its item's current text; also drops the vector of any id that
+    /// is no longer live. Never touches an item that is already up to date -
+    /// see `vectors-build` above for the full, from-scratch rebuild this
+    /// complements, and `serve::vectors::refresh`'s own doc comment for why a
+    /// mismatched model_id makes this refuse outright instead of build's
+    /// "clear and start over".
+    #[cfg(feature = "semantic")]
+    VectorsRefresh {
+        /// Override the model directory (default:
+        /// `serve::semantic_paths::default_model_dir`).
+        #[arg(long = "model-dir")]
+        model_dir: Option<PathBuf>,
+        /// Override the sidecar's own path (default:
+        /// `serve::semantic_paths::default_vectors_path`).
+        #[arg(long = "vectors-db")]
+        vectors_db: Option<PathBuf>,
+        /// The most items to embed in this one call, 0 (default) for
+        /// unlimited. Deleting an id that is no longer live is never
+        /// budgeted - see `serve::vectors::refresh`'s own doc comment.
+        #[arg(long, default_value_t = 0)]
+        budget: usize,
     },
 }
 
@@ -286,7 +337,9 @@ fn main() {
             cmd_session_start(&cli.db, resolved.as_deref())
         }
         Command::Prompt { text } => cmd_prompt(&cli.db, &text),
-        Command::Search { query } => cmd_search(&cli.db, &query),
+        Command::Search { query, kind, explain, explain_id } => {
+            cmd_search(&cli.db, &query, kind.as_deref(), explain, explain_id.as_deref())
+        }
         Command::LookupKey { key } => cmd_lookup_key(&cli.db, &key),
         Command::Catalog => {
             let store = open_store_or_die(&cli.db);
@@ -305,6 +358,10 @@ fn main() {
         Command::VectorsBuild { model_dir, vectors_db } => cmd_vectors_build(&cli.db, model_dir.as_deref(), vectors_db.as_deref()),
         #[cfg(feature = "semantic")]
         Command::VectorsStatus { vectors_db } => cmd_vectors_status(&cli.db, vectors_db.as_deref()),
+        #[cfg(feature = "semantic")]
+        Command::VectorsRefresh { model_dir, vectors_db, budget } => {
+            cmd_vectors_refresh(&cli.db, model_dir.as_deref(), vectors_db.as_deref(), budget)
+        }
     }
 }
 
@@ -5105,25 +5162,175 @@ fn cmd_prompt(db_path: &Path, text: &str) {
 /// silently degrades to plain text match without the `semantic` feature, or
 /// with it but no usable model/sidecar - so this one call site is correct in
 /// every build without an `#[cfg]` of its own.
-fn cmd_search(db_path: &Path, query: &str) {
-    let store = open_store_or_die(db_path);
-    let vectors_path = serve::semantic_paths::default_vectors_path(db_path);
-    let hits = lookup::search_best_effort(&store, &vectors_path, None, query);
-    // How many its own expiry rule held back, so a thin answer is never
-    // mistaken for an empty memory (see lookup::search_with_expired).
-    let withheld = lookup::search_with_expired(&store, query).1;
+/// `cmd_search`'s reply body, kept separate from the `println!` calls so a
+/// unit test can check it directly. This workspace's usual way to prove a
+/// CLI end to end is spawning the real compiled binary (`serve/tests/*.rs`,
+/// using `env!("CARGO_BIN_EXE_serve")`), but that mechanism only works from
+/// a DIFFERENT target in the same package (an integration test, an example,
+/// another bin) - never from the `serve` bin's own unit tests, which is all
+/// this file may add to (see this file's own top-of-file doc comment on the
+/// four channels this binary owns). So this returns a plain `String`, the
+/// same shape the agent's own `lookup` tool already builds for exactly this
+/// reason.
+///
+/// Never mistaken for a second reply engine: it is the ONLY place `cmd_search`
+/// builds its normal-answer text, called by `cmd_search` itself and by this
+/// file's own tests.
+fn render_search_reply(
+    hits: &[lookup::LookupHit],
+    query: &str,
+    kind: Option<Kind>,
+    unfiltered_count: usize,
+    literal_found_any: bool,
+    withheld: usize,
+) -> String {
+    let mut out = String::new();
     if hits.is_empty() {
-        println!("no matches for '{query}'");
+        match kind {
+            // Names the kind, so a thin answer reads as "nothing of that
+            // kind" rather than as an empty memory - and, when the
+            // unfiltered ranking DID find something, how many hits of other
+            // kinds there were (see `other_kind_hint`'s own doc comment: a
+            // bare "no matches" there would be a lie by omission).
+            Some(k) => out.push_str(&format!("no matches for '{query}' of kind {k:?}{}\n", lookup::other_kind_hint(unfiltered_count))),
+            None => out.push_str(&format!("no matches for '{query}'\n")),
+        }
     } else {
-        for hit in &hits {
-            println!("{:<28} {:<12} {}", hit.id, format!("{:?}", hit.item.kind), hit.item.text);
+        for hit in hits {
+            out.push_str(&format!("{:<28} {:<12} {}\n", hit.id, format!("{:?}", hit.item.kind), hit.item.text));
+        }
+        // Every hit above came from the meaning leg alone - say so, since an
+        // answer built entirely from semantic extras otherwise looks exactly
+        // like an ordinary literal result (see `meaning_only_note`'s own doc
+        // comment).
+        if let Some(note) = lookup::meaning_only_note(literal_found_any) {
+            out.push_str(note);
+            out.push('\n');
         }
     }
     if withheld > 0 {
-        println!(
-            "({withheld} match(es) held back: their own expiry date has passed. `get <id>` still shows them whole.)"
-        );
+        out.push_str(&format!(
+            "({withheld} match(es) held back: their own expiry date has passed. `get <id>` still shows them whole.)\n"
+        ));
     }
+    out
+}
+
+/// The `--explain`/`--explain-id` block: strictly ADDITIONAL text meant to be
+/// appended after `render_search_reply`'s own output, never altering it -
+/// see `explain_only_appends_never_alters_the_normal_reply_lines`, the test
+/// this guarantees. `hits` is the exact (already kind-filtered) list
+/// `render_search_reply` just rendered, so the per-hit lines below name
+/// exactly what was shown, never a wider or narrower set.
+fn render_explain_block(
+    explanation: &lookup::ExplainAnswer,
+    hits: &[lookup::LookupHit],
+    show_per_hit: bool,
+    explain_id: Option<&str>,
+) -> String {
+    let mut out = String::new();
+    out.push_str("explain:");
+    match (explanation.floor, explanation.cap) {
+        // Printed ONCE here, since a number a caller cannot see is not a
+        // diagnosis - never re-typed per line below.
+        (Some(floor), Some(cap)) => out.push_str(&format!(" floor {floor:.3}, cap {cap}\n")),
+        _ => out.push_str(" no meaning door ran this call - every hit here is literal\n"),
+    }
+    if show_per_hit {
+        let by_id: std::collections::HashMap<&str, &lookup::ExplainedHit> =
+            explanation.hits.iter().map(|h| (h.id.as_str(), h)).collect();
+        for hit in hits {
+            match by_id.get(hit.id.as_str()) {
+                Some(eh) if eh.literal => out.push_str(&format!("  {} literal\n", hit.id)),
+                Some(eh) => out.push_str(&format!("  {} meaning {:.3}\n", hit.id, eh.similarity.unwrap_or(0.0))),
+                // Cannot happen while explain_best_effort and search_best_effort
+                // agree on ids (see this file's own test module and lookup.rs's
+                // explain_path_and_plain_search_best_effort_agree_on_ids_and_order)
+                // - skipped rather than panicking if that ever stops holding.
+                None => {}
+            }
+        }
+    }
+    if let (Some(id), Some(target)) = (explain_id, &explanation.target) {
+        out.push_str(&render_explain_target(id, target));
+    }
+    out
+}
+
+/// One line naming exactly why `--explain-id`'s named `id` did or did not
+/// make the ranking - see `lookup::ExplainedTarget`'s own doc comment for
+/// what each case means. Always names `id` itself: this line often follows
+/// several per-hit lines above it (when `--explain` was also given), so a
+/// reader must never have to guess which id this one is about.
+fn render_explain_target(id: &str, target: &lookup::ExplainedTarget) -> String {
+    match target {
+        lookup::ExplainedTarget::Literal => format!("explain {id}: a literal hit - the floor and the cap never apply to it\n"),
+        lookup::ExplainedTarget::Meaning { similarity } => format!("explain {id}: a meaning hit, similarity {similarity:.3}\n"),
+        lookup::ExplainedTarget::BelowFloor { similarity, floor } => {
+            format!("explain {id}: scored {similarity:.3} - below the floor {floor:.3}, so it never became a candidate\n")
+        }
+        lookup::ExplainedTarget::CutByCap { similarity, cap, outscored_by } => format!(
+            "explain {id}: scored {similarity:.3}, above the floor - but {outscored_by} other candidate(s) outscored it, and only the top {cap} are ever shown\n"
+        ),
+        lookup::ExplainedTarget::NoVector => format!("explain {id}: no vector is on record for it, so no similarity could be computed\n"),
+        lookup::ExplainedTarget::NotACandidate => {
+            format!("explain {id}: not a live searchable candidate right now (unknown, a Lookup register, or expired)\n")
+        }
+    }
+}
+
+/// Everything `cmd_search` prints, in one string: the normal answer
+/// (`render_search_reply`), then, only when asked, the explain block
+/// strictly appended after it. Split out from `cmd_search` so a test can
+/// call it directly against an in-memory store instead of spawning the
+/// compiled binary - see `render_search_reply`'s own doc comment for why.
+fn build_search_reply(
+    store: &EventStore,
+    vectors_path: &Path,
+    query: &str,
+    kind: Option<Kind>,
+    explain: bool,
+    explain_id: Option<&str>,
+) -> String {
+    let (literal_hits, withheld) = lookup::search_with_expired(store, query);
+    let hits = lookup::search_best_effort(store, vectors_path, None, query);
+    let unfiltered_count = hits.len();
+    let hits = match kind {
+        Some(k) => lookup::only_kind(hits, k),
+        None => hits,
+    };
+    let mut out = render_search_reply(&hits, query, kind, unfiltered_count, !literal_hits.is_empty(), withheld);
+    if explain || explain_id.is_some() {
+        let explanation = lookup::explain_best_effort(store, vectors_path, None, query, explain_id);
+        out.push_str(&render_explain_block(&explanation, &hits, explain, explain_id));
+    }
+    out
+}
+
+/// Surface 4: free-text search over every live item, any project, archive
+/// kinds (Report/Chunk) included - never an injection surface, so there is
+/// no delivery to record here at all. Calls `search_best_effort`, which
+/// silently degrades to plain text match without the `semantic` feature, or
+/// with it but no usable model/sidecar - so this one call site is correct in
+/// every build without an `#[cfg]` of its own.
+fn cmd_search(db_path: &Path, query: &str, kind: Option<&str>, explain: bool, explain_id: Option<&str>) {
+    // Parsed BEFORE the store is opened and before anything is ranked: an
+    // unusable kind is a mistake in the question, and answering an unfiltered
+    // search instead would look like a result. Exit 2, not 1: a refused
+    // argument is not the same outcome as a search that ran and found nothing.
+    let kind = match kind.map(str::trim).filter(|k| !k.is_empty()) {
+        None => None,
+        Some(raw) => match lookup::parse_searchable_kind(raw) {
+            Ok(k) => Some(k),
+            Err(refusal) => {
+                eprintln!("{refusal}");
+                std::process::exit(2);
+            }
+        },
+    };
+    let store = open_store_or_die(db_path);
+    let vectors_path = serve::semantic_paths::default_vectors_path(db_path);
+    print!("{}", build_search_reply(&store, &vectors_path, query, kind, explain, explain_id));
 }
 
 /// Surface 4's other door: an explicit request for exactly one Lookup's key.
@@ -5323,6 +5530,38 @@ fn cmd_vectors_status(db_path: &Path, vectors_db: Option<&Path>) {
     print_vectors_report(&store, &vectors_db);
 }
 
+/// Embed only what changed, drop what is no longer live, and print one
+/// honest line (feature `semantic`) - see `serve::vectors::refresh`'s own
+/// doc comment for exactly what counts as changed.
+#[cfg(feature = "semantic")]
+fn cmd_vectors_refresh(db_path: &Path, model_dir: Option<&Path>, vectors_db: Option<&Path>, budget: usize) {
+    let store = open_store_or_die(db_path);
+    let model_dir = model_dir.map(PathBuf::from).or_else(serve::semantic_paths::default_model_dir);
+    let Some(model_dir) = model_dir else {
+        eprintln!("no per-user data directory could be resolved for the model - pass --model-dir");
+        std::process::exit(1);
+    };
+    let vectors_db = vectors_db.map(PathBuf::from).unwrap_or_else(|| serve::semantic_paths::default_vectors_path(db_path));
+    match serve::vectors::refresh(&store, &model_dir, &vectors_db, budget) {
+        Ok(outcome) if outcome.model_id_mismatch => {
+            println!("refused: stored model_id does not match this binary's - run vectors-build first");
+        }
+        Ok(outcome) if outcome.embedded == 0 && outcome.deleted == 0 => {
+            println!("nothing needed doing at {}", vectors_db.display());
+        }
+        Ok(outcome) => {
+            println!(
+                "embedded {}, deleted {}, {} remaining at {}",
+                outcome.embedded, outcome.deleted, outcome.remaining, vectors_db.display()
+            );
+        }
+        Err(e) => {
+            eprintln!("could not refresh vectors: {e}");
+            std::process::exit(1);
+        }
+    }
+}
+
 // -------------------------------------------------------------------- mark
 
 /// Record that `id` actually helped. A human-facing, deliberate write (R5's
@@ -5378,5 +5617,64 @@ mod subagent_detection_tests {
         assert!(!payload_is_from_a_subagent(&json!({"agent_id": ""})));
         assert!(!payload_is_from_a_subagent(&json!({"agent_id": null})));
         assert!(!payload_is_from_a_subagent(&json!({"agent_id": 42})));
+    }
+}
+
+#[cfg(test)]
+mod search_explain_tests {
+    use super::*;
+    use model::item::{Item, Kind};
+    use model::store;
+    use thor_core::event_store::EventStore;
+
+    fn report(id: &str, text: &str) -> Item {
+        Item {
+            id: id.to_string(),
+            kind: Kind::Report,
+            text: text.to_string(),
+            bindings: vec![],
+            severity: None,
+            project: Some("test-project".to_string()),
+            tags: vec![],
+            expires: Some("2027-01-01".to_string()),
+            key: None,
+            falsifier: None,
+            check: None,
+        }
+    }
+
+    /// THE DEFECT THIS PREVENTS: an `--explain`/`--explain-id` flag that
+    /// altered the normal answer (reordered a hit, dropped one, changed a
+    /// line) would make the diagnostic surface itself untrustworthy - a
+    /// caller could never be sure what they saw was the real ranking, only
+    /// what it looked like with a flag attached.
+    #[test]
+    fn explain_only_appends_never_alters_the_normal_reply_lines() {
+        let mut db = EventStore::in_memory().unwrap();
+        store::declare(&mut db, "s", "l", "a", &report("r1", "the bbq recipe lives here")).unwrap();
+        store::declare(&mut db, "s", "l", "a", &report("r2", "a totally unrelated fact about zebras")).unwrap();
+        let vectors_dir = tempfile::tempdir().unwrap();
+        let vectors_path = vectors_dir.path().join("v.db");
+
+        let plain = build_search_reply(&db, &vectors_path, "bbq", None, false, None);
+        let explained = build_search_reply(&db, &vectors_path, "bbq", None, true, None);
+        assert!(explained.starts_with(&plain), "explain must only ever append, never alter, the normal reply: {explained}");
+        assert_ne!(explained, plain, "explain must actually add something when there are hits to explain");
+    }
+
+    /// THE DEFECT THIS PREVENTS: a kind-filtered search that finds nothing
+    /// reads exactly like an empty memory unless it also says how many hits
+    /// of OTHER kinds the same ranking found - a bare "no matches" there is
+    /// a lie by omission.
+    #[test]
+    fn kind_filtered_empty_reply_names_how_many_other_kind_hits_there_were() {
+        let mut db = EventStore::in_memory().unwrap();
+        store::declare(&mut db, "s", "l", "a", &report("gizmo-1", "a gizmo has nothing to do with rules")).unwrap();
+        let vectors_dir = tempfile::tempdir().unwrap();
+        let vectors_path = vectors_dir.path().join("v.db");
+
+        let reply = build_search_reply(&db, &vectors_path, "gizmo", Some(Kind::Rule), false, None);
+        assert!(reply.contains("no matches for 'gizmo' of kind Rule"), "{reply}");
+        assert!(reply.contains("1 hit(s) of other kind(s)"), "must name how many other-kind hits there were: {reply}");
     }
 }

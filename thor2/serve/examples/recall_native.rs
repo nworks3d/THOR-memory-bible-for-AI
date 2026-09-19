@@ -96,7 +96,58 @@ fn eval_dir() -> PathBuf {
 struct Item {
     lower: String,
     tags_lower: Vec<String>,
-    vec: Option<Vec<f32>>,
+    /// EVERY stored chunk of this item, in part order - not one chosen chunk.
+    ///
+    /// THE DIVERGENCE THIS CLOSES (found 2026-09-19, and it had been silently
+    /// wrong for every number this harness ever printed). This field used to
+    /// hold ONE vector, loaded with `VectorStore::get_many`, which reads
+    /// `part = 0` only. Live loads with `get_many_best`, which picks the chunk
+    /// with the highest dot product against THIS query. So the harness scored
+    /// every item by its first chunk while live scored it by its best one -
+    /// identical for a short single-chunk rule, and a systematic understatement
+    /// for a long multi-chunk report, which is exactly the contrast this
+    /// battery exists to measure. The ranking function was shared all along
+    /// (see this file's own "THE DIVERGENCE TRAP" note); the divergence had
+    /// simply moved one layer down, into how the vectors were read.
+    parts: Option<Vec<Vec<f32>>>,
+    /// Carried only so a SIMULATION can ask what a per-kind reservation would
+    /// have rescued (2026-09-19). Live's ranking does not know an item's kind
+    /// at all today, which is exactly the question being measured before
+    /// anything is built.
+    kind: Kind,
+}
+
+/// Live's own chunk choice, mirrored: the chunk with the highest DOT product
+/// against the query, exactly as `VectorStore::get_many_best` picks it (dot,
+/// not cosine - the selection and the later scoring deliberately differ, and
+/// this mirrors the selection). `None` when the item has no vector at all.
+fn best_chunk<'a>(parts: &'a Option<Vec<Vec<f32>>>, qvec: &[f32]) -> Option<&'a [f32]> {
+    let parts = parts.as_ref()?;
+    let mut best: Option<(f32, &[f32])> = None;
+    for v in parts {
+        if v.len() != qvec.len() {
+            continue;
+        }
+        let dot: f32 = v.iter().zip(qvec).map(|(a, b)| a * b).sum();
+        if best.as_ref().is_none_or(|(b, _)| dot > *b) {
+            best = Some((dot, v.as_slice()));
+        }
+    }
+    best.map(|(_, v)| v)
+}
+
+/// The id-to-vector map live hands its ranking function, rebuilt for ONE
+/// query: every item's best chunk against that query. Cheap, because the
+/// parts are already in memory - see `Item::parts` for why this cannot be
+/// hoisted out of the query loop.
+fn best_chunk_map(ids: &[String], items: &[Item], qvec: &[f32]) -> HashMap<String, Vec<f32>> {
+    let mut out = HashMap::with_capacity(ids.len());
+    for (i, id) in ids.iter().enumerate() {
+        if let Some(v) = best_chunk(&items[i].parts, qvec) {
+            out.insert(id.clone(), v.to_vec());
+        }
+    }
+    out
 }
 
 /// One battery question, resolved against the live corpus.
@@ -127,16 +178,19 @@ fn literal_filter(items: &[Item], qlower: &str) -> Vec<usize> {
 /// id -> lowercased text+tags (already lowercased is fine: BM25 tokenizes
 /// case-insensitively regardless).
 fn literal_order(
-    vectors: &HashMap<String, Vec<f32>>,
     texts: &HashMap<String, String>,
     id2idx: &HashMap<String, usize>,
     ids: &[String],
+    items: &[Item],
     literal_idx: &[usize],
     qlower: &str,
     qvec: &[f32],
 ) -> Vec<usize> {
     let literal_ids: Vec<String> = literal_idx.iter().map(|&i| ids[i].clone()).collect();
-    let (lit_order, _extras) = rank_literal_and_extras(qlower, qvec, &literal_ids, &[], vectors, texts, f32::INFINITY, 0);
+    // Per query, exactly as `rank_live` does it - see `Item::parts`.
+    let vectors = best_chunk_map(ids, items, qvec);
+    let (lit_order, _extras) =
+        rank_literal_and_extras(qlower, qvec, &literal_ids, &[], &vectors, texts, f32::INFINITY, 0);
     lit_order.iter().map(|id| id2idx[id]).collect()
 }
 
@@ -144,7 +198,6 @@ fn literal_order(
 /// (shared code) plus the semantic-only extras, flat floor + cap - exactly
 /// `search_best_effort_cached`'s own shape, because it is the SAME function.
 fn rank_live(
-    vectors: &HashMap<String, Vec<f32>>,
     texts: &HashMap<String, String>,
     id2idx: &HashMap<String, usize>,
     ids: &[String],
@@ -156,8 +209,10 @@ fn rank_live(
 ) -> Vec<usize> {
     let literal_idx = literal_filter(items, qlower);
     let literal_ids: Vec<String> = literal_idx.iter().map(|&i| ids[i].clone()).collect();
+    // Built per query, never hoisted: see `Item::parts`.
+    let vectors = best_chunk_map(ids, items, qvec);
     let (lit_order, extra_order) =
-        rank_literal_and_extras(qlower, qvec, &literal_ids, ids, vectors, texts, min_similarity, max_extra);
+        rank_literal_and_extras(qlower, qvec, &literal_ids, ids, &vectors, texts, min_similarity, max_extra);
     lit_order.into_iter().chain(extra_order).map(|id| id2idx[&id]).collect()
 }
 
@@ -168,7 +223,7 @@ fn rank_live(
 fn semantic_scored(items: &[Item], qvec: &[f32], lit_set: &HashSet<usize>) -> Vec<(f32, usize)> {
     let mut sem: Vec<(f32, usize)> = (0..items.len())
         .filter(|i| !lit_set.contains(i))
-        .filter_map(|i| items[i].vec.as_deref().map(|v| (cos(qvec, v), i)))
+        .filter_map(|i| best_chunk(&items[i].parts, qvec).map(|v| (cos(qvec, v), i)))
         .collect();
     sem.sort_by(|a, b| b.0.total_cmp(&a.0).then(a.1.cmp(&b.1)));
     sem
@@ -234,25 +289,26 @@ fn main() -> anyhow::Result<()> {
     println!("MIN_SIMILARITY (floor) = {live_floor}  (RECALL2_FLOOR to override)");
 
     // The live fact corpus surface-4 can serve: non-Lookup, non-expired.
-    let raw: Vec<(String, String, Vec<String>)> = live_items(&store)
+    let raw: Vec<(String, String, Vec<String>, Kind)> = live_items(&store)
         .into_iter()
         .filter(|li| li.item.kind != Kind::Lookup && !is_expired(li.item.expires.as_deref()))
-        .map(|li| (li.id, li.item.text, li.item.tags))
+        .map(|li| (li.id, li.item.text, li.item.tags, li.item.kind))
         .collect();
-    let ids: Vec<String> = raw.iter().map(|(id, _, _)| id.clone()).collect();
+    let ids: Vec<String> = raw.iter().map(|(id, _, _, _)| id.clone()).collect();
     let id2idx: HashMap<String, usize> = ids.iter().enumerate().map(|(i, id)| (id.clone(), i)).collect();
 
     let vs = VectorStore::open(&vpath)?;
-    let vectors = vs.get_many(&ids)?;
+    let parts_by_id = vs.get_many_parts(&ids)?;
     let items: Vec<Item> = raw
         .iter()
-        .map(|(id, text, tags)| Item {
+        .map(|(id, text, tags, kind)| Item {
             lower: text.to_lowercase(),
             tags_lower: tags.iter().map(|t| t.to_lowercase()).collect(),
-            vec: vectors.get(id).cloned(),
+            kind: *kind,
+            parts: parts_by_id.get(id).cloned(),
         })
         .collect();
-    let n_vec = items.iter().filter(|i| i.vec.is_some()).count();
+    let n_vec = items.iter().filter(|i| i.parts.is_some()).count();
     eprintln!(
         "live fact items: {}   with a current vector: {} ({:.0}% coverage)   sidecar model_id: {:?}",
         items.len(),
@@ -290,10 +346,13 @@ fn main() -> anyhow::Result<()> {
         };
         let mut gold = HashSet::new();
         gold.insert(gi);
-        if let Some(gv) = items[gi].vec.as_deref() {
+        // FACT TO FACT, so there is no query to pick a chunk with: both sides
+        // use the opening chunk (part 0), which is what this comparison always
+        // used. Stated rather than left to look like live's best-chunk rule.
+        if let Some(gv) = items[gi].parts.as_ref().and_then(|p| p.first()).map(Vec::as_slice) {
             for (j, it) in items.iter().enumerate() {
                 if j != gi {
-                    if let Some(v) = it.vec.as_deref() {
+                    if let Some(v) = it.parts.as_ref().and_then(|p| p.first()).map(Vec::as_slice) {
                         if cos(gv, v) >= DUP {
                             gold.insert(j);
                         }
@@ -336,7 +395,7 @@ fn main() -> anyhow::Result<()> {
         .iter()
         .map(|q| {
             let idx = literal_filter(&items, &q.qlower);
-            literal_order(&vectors, &texts, &id2idx, &ids, &idx, &q.qlower, &q.qvec)
+            literal_order(&texts, &id2idx, &ids, &items, &idx, &q.qlower, &q.qvec)
         })
         .collect();
 
@@ -360,12 +419,15 @@ fn main() -> anyhow::Result<()> {
         s.insert(q.gold_seed);
         s
     };
-    let mut strict = [0usize; 3];
-    let mut expanded = [0usize; 3];
+    let mut strict = [0usize; 4];
+    let mut expanded = [0usize; 4];
     for q in &battery {
-        let ranked = rank_live(&vectors, &texts, &id2idx, &ids, &items, &q.qlower, &q.qvec, live_floor, CAP);
+        let ranked = rank_live(&texts, &id2idx, &ids, &items, &q.qlower, &q.qvec, live_floor, CAP);
         let ss = seed_set(q);
-        for (slot, k) in [(0usize, 1usize), (1, 3), (2, 5)] {
+        // The fourth column is CAP, which is what a caller actually SEES: the
+        // block shows up to that many, so a change that moves the gold from
+        // rank 14 to rank 8 is invisible at @5 and decisive in practice.
+        for (slot, k) in [(0usize, 1usize), (1, 3), (2, 5), (3, CAP)] {
             if hit_at(&ranked, k, &ss) {
                 strict[slot] += 1;
             }
@@ -374,15 +436,18 @@ fn main() -> anyhow::Result<()> {
             }
         }
     }
-    println!("\n=== recall at the LIVE gate (floor {live_floor}), n={} ===", n);
-    println!("             recall@1        recall@3        recall@5");
+    println!();
+    println!("=== recall at the LIVE gate (floor {live_floor}), n={} ===", n);
+    println!("             recall@1        recall@3        recall@5       recall@{CAP} (what the block shows)");
     println!(
-        "strict    | {:3}/{:<3} {:4.0}% | {:3}/{:<3} {:4.0}% | {:3}/{:<3} {:4.0}%",
-        strict[0], n, pct(strict[0], n), strict[1], n, pct(strict[1], n), strict[2], n, pct(strict[2], n)
+        "strict    | {:3}/{:<3} {:4.0}% | {:3}/{:<3} {:4.0}% | {:3}/{:<3} {:4.0}% | {:3}/{:<3} {:4.0}%",
+        strict[0], n, pct(strict[0], n), strict[1], n, pct(strict[1], n), strict[2], n, pct(strict[2], n),
+        strict[3], n, pct(strict[3], n)
     );
     println!(
-        "expanded  | {:3}/{:<3} {:4.0}% | {:3}/{:<3} {:4.0}% | {:3}/{:<3} {:4.0}%",
-        expanded[0], n, pct(expanded[0], n), expanded[1], n, pct(expanded[1], n), expanded[2], n, pct(expanded[2], n)
+        "expanded  | {:3}/{:<3} {:4.0}% | {:3}/{:<3} {:4.0}% | {:3}/{:<3} {:4.0}% | {:3}/{:<3} {:4.0}%",
+        expanded[0], n, pct(expanded[0], n), expanded[1], n, pct(expanded[1], n), expanded[2], n, pct(expanded[2], n),
+        expanded[3], n, pct(expanded[3], n)
     );
 
     // Per-category recall@5 (expanded gold) - the number the gate cares about
@@ -390,7 +455,7 @@ fn main() -> anyhow::Result<()> {
     let mut cat_n: HashMap<&str, usize> = HashMap::new();
     let mut cat_hit5: HashMap<&str, usize> = HashMap::new();
     for q in &battery {
-        let ranked = rank_live(&vectors, &texts, &id2idx, &ids, &items, &q.qlower, &q.qvec, live_floor, CAP);
+        let ranked = rank_live(&texts, &id2idx, &ids, &items, &q.qlower, &q.qvec, live_floor, CAP);
         *cat_n.entry(q.category.as_str()).or_default() += 1;
         if hit_at(&ranked, 5, &q.gold_expanded) {
             *cat_hit5.entry(q.category.as_str()).or_default() += 1;
@@ -412,13 +477,13 @@ fn main() -> anyhow::Result<()> {
     if let Ok(dump_path) = std::env::var("RECALL2_BATTERY_DUMP") {
         let mut dump: Vec<Value> = Vec::new();
         for q in &battery {
-            let ranked = rank_live(&vectors, &texts, &id2idx, &ids, &items, &q.qlower, &q.qvec, live_floor, CAP);
+            let ranked = rank_live(&texts, &id2idx, &ids, &items, &q.qlower, &q.qvec, live_floor, CAP);
             let top: Vec<Value> = ranked
                 .iter()
                 .take(5)
                 .enumerate()
                 .map(|(r, &i)| {
-                    let score = items[i].vec.as_deref().map(|v| cos(&q.qvec, v)).unwrap_or(0.0);
+                    let score = best_chunk(&items[i].parts, &q.qvec).map(|v| cos(&q.qvec, v)).unwrap_or(0.0);
                     serde_json::json!({
                         "rank": r + 1,
                         "id": ids[i],
@@ -464,7 +529,7 @@ fn main() -> anyhow::Result<()> {
         .iter()
         .map(|(_, ql, qv)| {
             let idx = literal_filter(&items, ql);
-            literal_order(&vectors, &texts, &id2idx, &ids, &idx, ql, qv)
+            literal_order(&texts, &id2idx, &ids, &items, &idx, ql, qv)
         })
         .collect();
 
@@ -481,7 +546,7 @@ fn main() -> anyhow::Result<()> {
                 .iter()
                 .take(5)
                 .map(|&i| {
-                    let score = items[i].vec.as_deref().map(|v| cos(qv, v)).unwrap_or(0.0);
+                    let score = best_chunk(&items[i].parts, qv).map(|v| cos(qv, v)).unwrap_or(0.0);
                     serde_json::json!({ "id": ids[i], "score": score, "text": raw[i].1 })
                 })
                 .collect();
@@ -524,7 +589,7 @@ fn main() -> anyhow::Result<()> {
     if !noise_vecs.is_empty() {
         let mut noise_res_live = 0usize;
         for (_, ql, qv) in &noise_vecs {
-            let ranked = rank_live(&vectors, &texts, &id2idx, &ids, &items, ql, qv, live_floor, CAP);
+            let ranked = rank_live(&texts, &id2idx, &ids, &items, ql, qv, live_floor, CAP);
             noise_res_live += ranked.len();
         }
         println!(
@@ -626,25 +691,97 @@ fn main() -> anyhow::Result<()> {
     // ---- Diagnostic: recall@5 misses at the live gate (are they real, or a
     // gold-cluster gap?). Prints the seed gold text and the top-3 retrieved.
     if std::env::var("RECALL2_DIAG").is_ok() {
-        println!("\n=== recall@5 MISSES at the live gate (expanded gold) ===");
+        println!("
+=== recall@5 MISSES at the live gate (expanded gold) ===");
+        // WHY EACH MISS MISSED, counted. There are exactly three ways the gold
+        // can be absent from the top five, and they need opposite fixes, so a
+        // dump that only shows the winners cannot settle anything:
+        //   BELOW-FLOOR  its own similarity never reached `live_floor`, so it
+        //                was never a candidate at all - a floor question;
+        //   CUT-BY-CAP   it cleared the floor but more than CAP items scored
+        //                higher, so the cap dropped it - a crowding question;
+        //   IN-BUT-LOW   it survived floor and cap and still landed below rank
+        //                five - an ordering question, and the only one of the
+        //                three a reranker alone could fix.
+        let (mut below_floor, mut cut_by_cap, mut in_but_low, mut no_vector) = (0usize, 0usize, 0usize, 0usize);
+        let mut below_floor_but_near_top = 0usize;
+        let mut rescuable_by_reservation = 0usize;
         let mut shown = 0;
         for q in &battery {
-            let ranked = rank_live(&vectors, &texts, &id2idx, &ids, &items, &q.qlower, &q.qvec, live_floor, CAP);
+            let ranked = rank_live(&texts, &id2idx, &ids, &items, &q.qlower, &q.qvec, live_floor, CAP);
             if hit_at(&ranked, 5, &q.gold_expanded) {
                 continue;
             }
-            shown += 1;
-            if shown > 25 {
-                break;
+            let gi = q.gold_seed;
+            let gold_score = best_chunk(&items[gi].parts, &q.qvec).map(|v| cos(&q.qvec, v));
+            // Where the gold sits among every scored candidate, before the floor
+            // and before the cap: 1 means it was the best match in the store.
+            let lit_set: HashSet<usize> = literal_filter(&items, &q.qlower).into_iter().collect();
+            let sem = semantic_scored(&items, &q.qvec, &lit_set);
+            let gold_rank = sem.iter().position(|(_, i)| *i == gi).map(|r| r + 1);
+            let outscoring = sem.iter().filter(|(sc, _)| Some(*sc) > gold_score).count();
+            let verdict = match (gold_score, gold_rank) {
+                (None, _) => {
+                    no_vector += 1;
+                    "NO-VECTOR (nothing stored for this item)".to_string()
+                }
+                (Some(sc), rank) if sc < live_floor => {
+                    below_floor += 1;
+                    // The RANK matters as much as the score here: a gold that
+                    // sits at rank 1 or 2 and merely fails an absolute
+                    // threshold is rescuable by showing the best few as weak
+                    // hits, while a gold at rank 300 is not rescuable by any
+                    // gate at all and says the question cannot be answered
+                    // this way.
+                    if rank.is_some_and(|r| r <= 5) {
+                        below_floor_but_near_top += 1;
+                    }
+                    format!("BELOW-FLOOR (score {sc:.3} under floor {live_floor}, rank {rank:?} of {})", sem.len())
+                }
+                (Some(sc), Some(rank)) if rank > CAP => {
+                    cut_by_cap += 1;
+                    format!("CUT-BY-CAP (score {sc:.3}, rank {rank} of {}, cap {CAP}, {outscoring} outscored it)", sem.len())
+                }
+                (Some(sc), rank) => {
+                    in_but_low += 1;
+                    format!("IN-BUT-LOW (score {sc:.3}, rank {rank:?}, survived floor and cap)")
+                }
+            };
+            // SIMULATION, nothing is changed by it: where does the gold sit
+            // among candidates OF ITS OWN KIND that cleared the floor? If it
+            // sits in the first few, then reserving a few of the block's slots
+            // for rules and orientations would have shown it, without touching
+            // a single score. If it sits deep here too, reservation buys
+            // nothing and must not be built.
+            let same_kind_rank = sem
+                .iter()
+                .filter(|(sc, i)| *sc >= live_floor && items[*i].kind == items[gi].kind)
+                .position(|(_, i)| *i == gi)
+                .map(|r| r + 1);
+            if let Some(r) = same_kind_rank {
+                if r <= 4 {
+                    rescuable_by_reservation += 1;
+                }
             }
-            println!("\n[{}] Q: {}", q.category, q.qlower);
-            let g: String = raw[q.gold_seed].1.chars().take(120).collect();
-            println!("    GOLD[{}]: {}", ids[q.gold_seed], g);
-            for (r, &i) in ranked.iter().take(3).enumerate() {
-                let t: String = raw[i].1.chars().take(100).collect();
-                println!("    top{}: {}", r + 1, t);
+            shown += 1;
+            if shown <= 25 {
+                println!("
+[{}] Q: {}", q.category, q.qlower);
+                let g: String = raw[q.gold_seed].1.chars().take(120).collect();
+                println!("    GOLD[{}]: {}", ids[q.gold_seed], g);
+                println!("    WHY: {verdict}");
+                println!("    rank among live candidates of its own kind: {same_kind_rank:?}");
+                for (r, &i) in ranked.iter().take(3).enumerate() {
+                    let t: String = raw[i].1.chars().take(100).collect();
+                    println!("    top{}: {}", r + 1, t);
+                }
             }
         }
+        println!(
+            "
+misses by cause: below-floor {below_floor} (of those, {below_floor_but_near_top} were still in the best five by score)  cut-by-cap {cut_by_cap}  in-but-low {in_but_low}  no-vector {no_vector}
+  of all misses, {rescuable_by_reservation} sit in the best four of their OWN kind above the floor, so reserving four slots would show them"
+        );
     }
 
     Ok(())

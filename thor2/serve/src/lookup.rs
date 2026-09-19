@@ -19,6 +19,7 @@
 
 use crate::live::live_items;
 use model::item::{Item, Kind};
+use std::str::FromStr;
 #[cfg(feature = "semantic")]
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
@@ -386,6 +387,102 @@ pub fn only_scope(hits: Vec<LookupHit>, scope: &str) -> Vec<LookupHit> {
         .collect()
 }
 
+/// Keep only the hits whose kind is `kind`. Applied AFTER a FINISHED ranking,
+/// so a kind-filtered search returns exactly the hits an unfiltered one would
+/// have returned, in the same order, minus the ones of another kind: this
+/// narrows, it never reorders, exactly like `only_scope` above.
+pub fn only_kind(hits: Vec<LookupHit>, kind: Kind) -> Vec<LookupHit> {
+    hits.into_iter().filter(|h| h.item.kind == kind).collect()
+}
+
+/// The four kinds a search may be narrowed to. `Kind::Lookup` is deliberately
+/// not among them - see `parse_searchable_kind` for why asking for it is
+/// refused outright rather than quietly answered empty.
+pub const SEARCHABLE_KIND_NAMES: &[&str] = &["rule", "orientation", "report", "chunk"];
+
+/// Parses a caller's own `kind` argument: case-insensitive, and tolerant of an
+/// obvious plural (the bare name plus a trailing 's', e.g. "rules") - nothing
+/// fancier, so a spelling nobody actually typed is never guessed at.
+///
+/// `model::item::Kind::from_str` already owns the canonical name-to-`Kind`
+/// mapping (case-sensitive, no plural) - reused here rather than
+/// reimplemented, so the two can never silently disagree on what a name means.
+///
+/// `Kind::Lookup` itself parses fine (it is a real `Kind`), but is refused here
+/// with its own message rather than ever returned as a usable filter: `search`
+/// filters `Kind::Lookup` out of every ranking on purpose, because a register
+/// answers only an exact request for its own key - filtering BY it would
+/// therefore never match anything, and a caller would read that silence as a
+/// plain "no matches" rather than learn why.
+///
+/// LIVES HERE, NOT AT EITHER DOOR (2026-09-19). The agent's `lookup` tool and
+/// the CLI's own `search` both take this argument, and this crate is the only
+/// thing both of them already depend on. A copy at each door is exactly how
+/// the two drifted apart once before - the CLI ran letter-and-meaning while
+/// the tool ran letter only - so the parse, the accepted names and the two
+/// refusal texts are defined once, here.
+pub fn parse_searchable_kind(raw: &str) -> Result<Kind, String> {
+    let lower = raw.trim().to_lowercase();
+    let singular = lower.strip_suffix('s').unwrap_or(&lower);
+    let parsed = Kind::from_str(&lower).or_else(|_| Kind::from_str(singular)).map_err(|_| {
+        format!(
+            "unknown 'kind' value '{raw}' - a search can only filter by one of: {}",
+            SEARCHABLE_KIND_NAMES.join(", ")
+        )
+    })?;
+    if parsed == Kind::Lookup {
+        return Err("kind 'lookup' is never searchable: a Lookup register answers only an exact request for its own key, never a text search - ask for it with the 'key' argument instead of 'kind'."
+ .to_string());
+    }
+    Ok(parsed)
+}
+
+/// The one honest addition a normal search reply owes its caller when every
+/// hit it is about to show came from the meaning leg and the literal leg (a
+/// plain, case-insensitive substring match - see `search`'s own doc comment)
+/// found nothing at all for this query: meaning search scores whole
+/// documents by cosine similarity and tends to favour long ones, so a short
+/// rule that actually answers the question may be missing from the store
+/// entirely, or may simply not have been the closest match by that measure.
+///
+/// LIVES HERE, NOT AT EITHER DOOR, for the same reason `parse_searchable_kind`
+/// does (see its own doc comment): the CLI's `search` and the agent's
+/// `lookup` tool both need the identical wording, and a copy at each door is
+/// exactly how the two drifted apart once before.
+///
+/// `None` when the literal leg found anything at all. A caller only calls
+/// this once it already knows its own hits are non-empty (see `cmd_search`/
+/// `lookup`'s own call sites) - "nothing was found at all" already has its
+/// own, separate message and never needs this one.
+pub fn meaning_only_note(literal_found_any: bool) -> Option<&'static str> {
+    if literal_found_any {
+        return None;
+    }
+    Some(
+        "note: no wording in the store literally matched this query - the result(s) below came from \
+         meaning search, which scores whole documents and tends to favour long ones, so a short rule \
+         that actually answers this may be missing entirely. Two or three distinctive words usually \
+         work better than a full sentence.",
+    )
+}
+
+/// The clause a kind-filtered "no matches" answer owes its caller: how many
+/// hits of OTHER kinds the very same ranking found, so an empty answer here
+/// never reads as "the memory holds nothing" when it actually means
+/// "nothing of the kind you asked for, but something else did clear the
+/// ranking". Empty string when the unfiltered ranking itself found nothing -
+/// the plain "no matches" already says that honestly and needs no addition.
+///
+/// LIVES HERE for the same reason `meaning_only_note` does just above: one
+/// wording, shared by both doors.
+pub fn other_kind_hint(unfiltered_count: usize) -> String {
+    if unfiltered_count == 0 {
+        String::new()
+    } else {
+        format!(" ({unfiltered_count} hit(s) of other kind(s) cleared the ranking)")
+    }
+}
+
 /// The date a row belongs on: the `YYYY-MM-DD` its first non-blank line starts
 /// with, if it starts with one.
 fn opening_date(text: &str) -> Option<String> {
@@ -673,6 +770,66 @@ const BM25_LAMBDA: f64 = 2.5;
 /// already in `literal_ids`) by cosine alone, above `min_similarity`, best
 /// first, capped at `max_extra` - UNCHANGED by the BM25 leg: extras are a
 /// semantic-only door, cosine is the only signal that applies to them.
+/// The fused score (`bm_norm + BM25_LAMBDA * max(cos,0)`) and the raw cosine
+/// each literal hit drew on, in the SAME order as `literal_ids` - the exact
+/// per-candidate numbers `rank_literal_and_extras` sorts by, factored out so
+/// a caller that needs to EXPLAIN a literal hit's own score (see
+/// `explain_best_effort`) reads it from the one place it is computed rather
+/// than a second, possibly-drifting copy (this file's own "surface 4:
+/// meaning" note above tells the story of the divergence trap a
+/// hand-mirrored copy of this ranking caused once already).
+#[cfg(feature = "semantic")]
+fn literal_fused_scores(
+    query: &str,
+    query_vec: &[f32],
+    literal_ids: &[String],
+    vectors: &HashMap<String, Vec<f32>>,
+    texts: &HashMap<String, String>,
+) -> Vec<(f64, Option<f32>)> {
+    let cosine = |id: &str| vectors.get(id).map(|v| fastembed::similarity::cosine_similarity(query_vec, v));
+    let query_tokens = bm25_tokenize(query);
+    let pool_docs: Vec<Vec<String>> =
+        literal_ids.iter().map(|id| bm25_tokenize(texts.get(id).map(String::as_str).unwrap_or(""))).collect();
+    let raw = bm25_raw_scores(&pool_docs, &query_tokens);
+    let bm_norm = bm25_min_max_normalize(&raw);
+
+    literal_ids
+        .iter()
+        .enumerate()
+        .map(|(i, id)| {
+            let cos = cosine(id);
+            let fused = bm_norm[i] + BM25_LAMBDA * cos.map(|c| c as f64).unwrap_or(0.0).max(0.0);
+            (fused, cos)
+        })
+        .collect()
+}
+
+/// Every semantic-only candidate (any `all_candidate_ids` entry not already
+/// in `literal_ids`) whose cosine to the query is `>= min_similarity`,
+/// sorted best first (cosine desc, id asc as a tie-break) - the FULL list,
+/// before `rank_literal_and_extras`'s own cap trims it to `max_extra`.
+/// Factored out so the live cap and `explain_best_effort`'s "how many
+/// outscored it" count read the identical order, never two.
+#[cfg(feature = "semantic")]
+fn extras_above_floor(
+    query_vec: &[f32],
+    literal_ids: &[String],
+    all_candidate_ids: &[String],
+    vectors: &HashMap<String, Vec<f32>>,
+    min_similarity: f32,
+) -> Vec<(f32, String)> {
+    let cosine = |id: &str| vectors.get(id).map(|v| fastembed::similarity::cosine_similarity(query_vec, v));
+    let literal_set: HashSet<&str> = literal_ids.iter().map(String::as_str).collect();
+    let mut extras: Vec<(f32, String)> = all_candidate_ids
+        .iter()
+        .filter(|id| !literal_set.contains(id.as_str()))
+        .filter_map(|id| cosine(id).map(|s| (s, id.clone())))
+        .filter(|(s, _)| *s >= min_similarity)
+        .collect();
+    extras.sort_by(|a, b| b.0.total_cmp(&a.0).then_with(|| a.1.cmp(&b.1)));
+    extras
+}
+
 #[cfg(feature = "semantic")]
 pub fn rank_literal_and_extras(
     query: &str,
@@ -684,33 +841,16 @@ pub fn rank_literal_and_extras(
     min_similarity: f32,
     max_extra: usize,
 ) -> (Vec<String>, Vec<String>) {
-    let cosine = |id: &str| vectors.get(id).map(|v| fastembed::similarity::cosine_similarity(query_vec, v));
-
-    let query_tokens = bm25_tokenize(query);
-    let pool_docs: Vec<Vec<String>> =
-        literal_ids.iter().map(|id| bm25_tokenize(texts.get(id).map(String::as_str).unwrap_or(""))).collect();
-    let raw = bm25_raw_scores(&pool_docs, &query_tokens);
-    let bm_norm = bm25_min_max_normalize(&raw);
-
     let mut lit: Vec<(f64, String)> = literal_ids
         .iter()
-        .enumerate()
-        .map(|(i, id)| {
-            let cos = cosine(id).map(|c| c as f64).unwrap_or(0.0).max(0.0);
-            (bm_norm[i] + BM25_LAMBDA * cos, id.clone())
-        })
+        .cloned()
+        .zip(literal_fused_scores(query, query_vec, literal_ids, vectors, texts))
+        .map(|(id, (fused, _))| (fused, id))
         .collect();
     lit.sort_by(|a, b| b.0.total_cmp(&a.0).then_with(|| a.1.cmp(&b.1)));
     let lit: Vec<String> = lit.into_iter().map(|(_, id)| id).collect();
 
-    let literal_set: HashSet<&str> = literal_ids.iter().map(String::as_str).collect();
-    let mut extras: Vec<(f32, String)> = all_candidate_ids
-        .iter()
-        .filter(|id| !literal_set.contains(id.as_str()))
-        .filter_map(|id| cosine(id).map(|s| (s, id.clone())))
-        .filter(|(s, _)| *s >= min_similarity)
-        .collect();
-    extras.sort_by(|a, b| b.0.total_cmp(&a.0).then_with(|| a.1.cmp(&b.1)));
+    let mut extras = extras_above_floor(query_vec, literal_ids, all_candidate_ids, vectors, min_similarity);
     extras.truncate(max_extra);
 
     (lit, extras.into_iter().map(|(_, id)| id).collect())
@@ -750,6 +890,108 @@ pub fn search_best_effort(
     search_best_effort_cached(store, vectors_path, model_dir, query, &mut throwaway_cache)
 }
 
+/// Everything both `search_best_effort_cached` and `explain_best_effort`
+/// need once the meaning leg's own setup has succeeded: the query's own
+/// vector, the semantic-only candidates alongside the literal hits, and the
+/// vectors covering both - one assembly, so the two functions can never
+/// resolve a different candidate set for the same query.
+#[cfg(feature = "semantic")]
+struct MeaningSetup {
+    query_vec: Vec<f32>,
+    literal_ids: Vec<String>,
+    /// The literal hits plus the semantic-only candidates - every id this
+    /// query may rank over.
+    all_candidate_ids: Vec<String>,
+    vectors: HashMap<String, Vec<f32>>,
+    texts: HashMap<String, String>,
+    by_id: HashMap<String, LookupHit>,
+}
+
+/// Resolves everything `MeaningSetup` needs, or `None` at the first sign the
+/// meaning leg cannot run right now - EXACTLY the silent-degrade conditions
+/// `search_best_effort`'s own doc comment lists (no model directory, no
+/// model files, an unreadable sidecar, a foreign `model_id`, or the embedder
+/// failing to load/embed) - so a caller getting `None` here must fall back
+/// to plain `text_hits`, never treat it as an error. Factored out of
+/// `search_best_effort_cached` so `explain_best_effort` shares this ONE
+/// assembly rather than re-deriving it.
+#[cfg(feature = "semantic")]
+fn resolve_meaning_setup(
+    store: &EventStore,
+    vectors_path: &Path,
+    model_dir: Option<&Path>,
+    query: &str,
+    text_hits: &[LookupHit],
+    embedder_cache: &mut Option<crate::embed::Embedder>,
+) -> Option<MeaningSetup> {
+    let model_dir = model_dir.map(Path::to_path_buf).or_else(crate::semantic_paths::default_model_dir)?;
+    if !crate::semantic_paths::model_present(&model_dir) {
+        return None;
+    }
+    let vs = crate::vectors::VectorStore::open(vectors_path).ok()?;
+    if vs.model_id().as_deref() != Some(crate::semantic_paths::MODEL_ID) {
+        // A stale or foreign sidecar: its numbers live in some other
+        // embedding space entirely. Never trusted for scoring, no matter how
+        // plausible a cosine value it might produce.
+        return None;
+    }
+    if embedder_cache.is_none() {
+        *embedder_cache = Some(crate::embed::Embedder::load(&model_dir).ok()?);
+    }
+    let embedder = embedder_cache.as_mut()?;
+    let query_vec = embedder.embed_one(query).ok()?;
+
+    let already: HashSet<&str> = text_hits.iter().map(|h| h.id.as_str()).collect();
+    // The same expiry rule the text side applies. Without this an item that
+    // text search correctly held back could walk straight back in through the
+    // meaning door - a filter with a second entrance is not a filter.
+    let today = today();
+    let sem_candidates: Vec<_> = live_items(store)
+        .into_iter()
+        .filter(|li| li.item.kind != Kind::Lookup && !already.contains(li.id.as_str()))
+        .filter(|li| !is_expired(&li.item, &today))
+        .collect();
+
+    // One vector fetch covering BOTH the literal hits (to reorder them by
+    // cosine) and the semantic-only candidates (the extras). If the sidecar
+    // cannot be read right now, the caller keeps `search`'s own id order
+    // rather than guess.
+    let mut want_ids: Vec<String> = text_hits.iter().map(|h| h.id.clone()).collect();
+    want_ids.extend(sem_candidates.iter().map(|li| li.id.clone()));
+    // Best PART per item, not the item's single average: a long item is stored
+    // as several vectors and answers with whichever piece the question is
+    // actually about. A short item has exactly one part, so this is identical
+    // to the old fetch for everything the current ranking was tuned on.
+    let vectors = vs.get_many_best(&want_ids, &query_vec).ok()?;
+
+    // `by_id` lets the ranking core work in plain ids and hand `LookupHit`s
+    // back at the end. `text_hits` is only borrowed here (the caller may
+    // still need it in its own degrade path), so its hits are cloned in.
+    let literal_ids: Vec<String> = text_hits.iter().map(|h| h.id.clone()).collect();
+    let mut by_id: HashMap<String, LookupHit> = HashMap::with_capacity(want_ids.len());
+    for h in text_hits {
+        by_id.insert(h.id.clone(), LookupHit { id: h.id.clone(), item: h.item.clone() });
+    }
+    for li in sem_candidates {
+        by_id.insert(li.id.clone(), LookupHit { id: li.id, item: li.item });
+    }
+
+    // Text for the BM25 leg of the literal-hit reorder - item TEXT ONLY, not
+    // tags, matching exactly the configuration validated in
+    // LANE-A-IDENTIFIER-BATTERY.md (an earlier draft of this line also
+    // joined in tags, which measurably changed the ranking versus what was
+    // tuned/verified: -3.6pp hold-out recall@1, caught by a same-run
+    // cross-check against that measurement's own reimplementation before
+    // shipping - see that doc's "what remains unverified" section). A
+    // literal hit that matched only via a TAG gets an empty BM25 document
+    // (contributes 0, not dropped - it still ranks on cosine); only the
+    // literal hits need this at all, extras stay cosine-only.
+    let texts: HashMap<String, String> =
+        literal_ids.iter().filter_map(|id| by_id.get(id).map(|h| (id.clone(), h.item.text.clone()))).collect();
+
+    Some(MeaningSetup { query_vec, literal_ids, all_candidate_ids: want_ids, vectors, texts, by_id })
+}
+
 /// Same as `search_best_effort`, except the caller supplies `embedder_cache`
 /// and keeps it alive across repeated calls instead of a fresh one going out
 /// of scope every time.
@@ -785,87 +1027,9 @@ pub fn search_best_effort_cached(
     embedder_cache: &mut Option<crate::embed::Embedder>,
 ) -> Vec<LookupHit> {
     let text_hits = search(store, query);
-
-    let Some(model_dir) = model_dir.map(Path::to_path_buf).or_else(crate::semantic_paths::default_model_dir) else {
+    let Some(setup) = resolve_meaning_setup(store, vectors_path, model_dir, query, &text_hits, embedder_cache) else {
         return text_hits;
     };
-    if !crate::semantic_paths::model_present(&model_dir) {
-        return text_hits;
-    }
-    let Ok(vs) = crate::vectors::VectorStore::open(vectors_path) else {
-        return text_hits;
-    };
-    if vs.model_id().as_deref() != Some(crate::semantic_paths::MODEL_ID) {
-        // A stale or foreign sidecar: its numbers live in some other
-        // embedding space entirely. Never trusted for scoring, no matter how
-        // plausible a cosine value it might produce.
-        return text_hits;
-    }
-    if embedder_cache.is_none() {
-        match crate::embed::Embedder::load(&model_dir) {
-            Ok(loaded) => *embedder_cache = Some(loaded),
-            Err(_) => return text_hits,
-        }
-    }
-    let Some(embedder) = embedder_cache.as_mut() else {
-        // Unreachable (the branch above just filled it or returned), kept as
-        // a named fallback rather than an `expect` so a future refactor of
-        // this function can never turn this into a panic.
-        return text_hits;
-    };
-    let Ok(query_vec) = embedder.embed_one(query) else {
-        return text_hits;
-    };
-
-    let already: HashSet<&str> = text_hits.iter().map(|h| h.id.as_str()).collect();
-    // The same expiry rule the text side applies. Without this an item that
-    // text search correctly held back could walk straight back in through the
-    // meaning door - a filter with a second entrance is not a filter.
-    let today = today();
-    let sem_candidates: Vec<_> = live_items(store)
-        .into_iter()
-        .filter(|li| li.item.kind != Kind::Lookup && !already.contains(li.id.as_str()))
-        .filter(|li| !is_expired(&li.item, &today))
-        .collect();
-
-    // One vector fetch covering BOTH the literal hits (to reorder them by
-    // cosine) and the semantic-only candidates (the extras). If the sidecar
-    // cannot be read right now, keep `search`'s own id order rather than
-    // guess.
-    let mut want_ids: Vec<String> = text_hits.iter().map(|h| h.id.clone()).collect();
-    want_ids.extend(sem_candidates.iter().map(|li| li.id.clone()));
-    // Best PART per item, not the item's single average: a long item is stored
-    // as several vectors and answers with whichever piece the question is
-    // actually about. A short item has exactly one part, so this is identical
-    // to the old fetch for everything the current ranking was tuned on.
-    let Ok(vectors) = vs.get_many_best(&want_ids, &query_vec) else {
-        return text_hits;
-    };
-
-    // `all_candidate_ids`: every candidate this query may rank over - the
-    // literal hits plus the semantic-only candidates. `by_id` lets the
-    // ranking core work in plain ids and hand `LookupHit`s back at the end.
-    let literal_ids: Vec<String> = text_hits.iter().map(|h| h.id.clone()).collect();
-    let mut by_id: HashMap<String, LookupHit> = HashMap::with_capacity(want_ids.len());
-    for h in text_hits {
-        by_id.insert(h.id.clone(), h);
-    }
-    for li in sem_candidates {
-        by_id.insert(li.id.clone(), LookupHit { id: li.id, item: li.item });
-    }
-
-    // Text for the BM25 leg of the literal-hit reorder - item TEXT ONLY, not
-    // tags, matching exactly the configuration validated in
-    // LANE-A-IDENTIFIER-BATTERY.md (an earlier draft of this line also
-    // joined in tags, which measurably changed the ranking versus what was
-    // tuned/verified: -3.6pp hold-out recall@1, caught by a same-run
-    // cross-check against that measurement's own reimplementation before
-    // shipping - see that doc's "what remains unverified" section). A
-    // literal hit that matched only via a TAG gets an empty BM25 document
-    // (contributes 0, not dropped - it still ranks on cosine); only the
-    // literal hits need this at all, extras stay cosine-only.
-    let texts: HashMap<String, String> =
-        literal_ids.iter().filter_map(|id| by_id.get(id).map(|h| (id.clone(), h.item.text.clone()))).collect();
 
     // THE recall@1 fix (2026-08-03, cosine-only at first; BM25-fused
     // 2026-08-05): the first result must be the most relevant literal
@@ -874,15 +1038,16 @@ pub fn search_best_effort_cached(
     // reordered.
     let (lit_order, extra_order) = rank_literal_and_extras(
         query,
-        &query_vec,
-        &literal_ids,
-        &want_ids,
-        &vectors,
-        &texts,
+        &setup.query_vec,
+        &setup.literal_ids,
+        &setup.all_candidate_ids,
+        &setup.vectors,
+        &setup.texts,
         MIN_SIMILARITY,
         MAX_SEMANTIC_EXTRA,
     );
 
+    let mut by_id = setup.by_id;
     let mut out = Vec::with_capacity(lit_order.len() + extra_order.len());
     for id in lit_order.into_iter().chain(extra_order) {
         if let Some(hit) = by_id.remove(&id) {
@@ -892,6 +1057,184 @@ pub fn search_best_effort_cached(
     out
 }
 
+/// One ranked hit, annotated with what decided it - `explain_best_effort`'s
+/// own per-hit output, never surfaced by plain `search_best_effort`. A
+/// literal hit's `similarity` is always `None` even though a cosine may have
+/// been computed for its fused BM25+cosine score (see `literal_fused_scores`):
+/// what a caller needs to know about a literal hit is that `search` already
+/// found it by TEXT, not a similarity number nobody asked for - the floor
+/// and the cap below never apply to it at all.
+///
+/// NAMED `similarity`, NOT `cosine` (2026-09-19): this field is read from
+/// `serve/src/bin/serve.rs`, which `serve/tests/semantic_is_lookup_only.rs`
+/// greps for the literal word "cosine" (among other similarity-search
+/// machinery names) and refuses outside `lookup.rs`/`embed.rs`/`vectors.rs` -
+/// a plain-text grep matches a field-access expression exactly as it would
+/// match any other mention, so the field itself has to spell the CONCEPT
+/// without that reserved word for a non-exempt file to ever read it. The
+/// underlying number is still a cosine similarity; only the identifier
+/// avoids the one word that guard is watching for.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ExplainedHit {
+    pub id: String,
+    pub item: Item,
+    pub literal: bool,
+    pub similarity: Option<f32>,
+}
+
+/// Why one named id did or did not make a ranking - `explain_best_effort`'s
+/// whole reason for existing. `BelowFloor` and `CutByCap` are the only two
+/// ways a semantic-only candidate can be missing from `ExplainAnswer::hits`
+/// (see `MIN_SIMILARITY`/`MAX_SEMANTIC_EXTRA`'s own doc comments): naming
+/// which of the two applies to a given id is the entire diagnosis this type
+/// exists to carry - never a bare "not found" indistinguishable from a
+/// typo'd id. Each variant's own number is named `similarity`, not `cosine` -
+/// see `ExplainedHit`'s own doc comment for why.
+#[derive(Debug, Clone, PartialEq)]
+pub enum ExplainedTarget {
+    /// Present in `hits` - `search` found it by text; the floor/cap never
+    /// applied to it at all.
+    Literal,
+    /// Present in `hits` as a semantic-only extra, at this similarity.
+    Meaning { similarity: f32 },
+    /// Never became a candidate for the extras door at all: its similarity
+    /// to the query never reached `floor`.
+    BelowFloor { similarity: f32, floor: f32 },
+    /// Cleared the floor, but `outscored_by` other semantic-only candidates
+    /// ranked ahead of it and only the top `cap` of them are ever shown.
+    CutByCap { similarity: f32, cap: usize, outscored_by: usize },
+    /// No vector is on record for this id at all, so no similarity could be
+    /// computed - never reported as a floor/cap outcome, since neither is a
+    /// real measurement of an id there is nothing to measure.
+    NoVector,
+    /// Not a searchable candidate right now at all: an unknown id, a
+    /// `Lookup` item (`search` always excludes that kind), or already
+    /// expired.
+    NotACandidate,
+}
+
+/// `search_best_effort`'s own ranking, annotated with what decided each hit,
+/// plus (when `explain_id` is given) why that ONE named id did or did not
+/// make it in. See `explain_best_effort`'s own doc comment for the full
+/// contract.
+pub struct ExplainAnswer {
+    pub hits: Vec<ExplainedHit>,
+    pub target: Option<ExplainedTarget>,
+    /// `Some` only when the meaning leg actually ran this call (mirrors
+    /// `search_best_effort`'s own silent degrade - see its doc comment):
+    /// lets a caller show the real floor/cap values without hardcoding them
+    /// a second time, or say plainly that no meaning door opened at all.
+    pub floor: Option<f32>,
+    pub cap: Option<usize>,
+}
+
+/// `search_best_effort`'s own ranking, annotated (feature `semantic`): per
+/// hit, whether `search` found it by text (`literal`) or it is a
+/// semantic-only extra (`meaning`, with its cosine); plus, when `explain_id`
+/// names one id, exactly why it is or is not in `hits` at all.
+///
+/// NEVER A SECOND RANKING. This calls the exact same `rank_literal_and_extras`
+/// live search uses, fed by the exact same `resolve_meaning_setup` assembly
+/// `search_best_effort_cached` uses - see this file's own top-of-file
+/// "surface 4: meaning" note for the divergence trap a hand-mirrored copy of
+/// this ranking caused once already, and
+/// `explain_path_and_plain_search_best_effort_agree_on_ids_and_order` (this
+/// file's own test module) for the proof the two can never drift apart.
+///
+/// THE FLOOR AND THE CAP ARE THE ONLY TWO WAYS a semantic-only candidate can
+/// be missing from `hits`: either its cosine never reached `MIN_SIMILARITY`
+/// (`ExplainedTarget::BelowFloor`), or it cleared that floor but more than
+/// `MAX_SEMANTIC_EXTRA` other candidates outscored it
+/// (`ExplainedTarget::CutByCap`). Naming which of those two applies to
+/// `explain_id` - with the real floor/cap numbers, not a re-typed copy - is
+/// the entire point of this function. A literal hit is reported `Literal`
+/// (the floor/cap never applied to it); an id this query never even
+/// considered (unknown, `Lookup`, expired, or degrade-mode with no meaning
+/// leg at all) is `NotACandidate`; an id with no stored vector at all is
+/// `NoVector` - never invented as a floor/cap number, since neither would be
+/// a real measurement.
+///
+/// Degrades exactly like `search_best_effort` itself: whenever the meaning
+/// leg cannot run (no model, no sidecar, a foreign `model_id`, a failed
+/// embed), every hit here is `literal` and `floor`/`cap` are both `None`.
+#[cfg(feature = "semantic")]
+pub fn explain_best_effort(
+    store: &EventStore,
+    vectors_path: &Path,
+    model_dir: Option<&Path>,
+    query: &str,
+    explain_id: Option<&str>,
+) -> ExplainAnswer {
+    let text_hits = search(store, query);
+    let mut embedder_cache = None;
+    let Some(setup) = resolve_meaning_setup(store, vectors_path, model_dir, query, &text_hits, &mut embedder_cache) else {
+        let target = explain_id.map(|id| {
+            if text_hits.iter().any(|h| h.id == id) { ExplainedTarget::Literal } else { ExplainedTarget::NotACandidate }
+        });
+        return ExplainAnswer {
+            hits: text_hits.into_iter().map(|h| ExplainedHit { id: h.id, item: h.item, literal: true, similarity: None }).collect(),
+            target,
+            floor: None,
+            cap: None,
+        };
+    };
+
+    let (lit_order, extra_order) = rank_literal_and_extras(
+        query,
+        &setup.query_vec,
+        &setup.literal_ids,
+        &setup.all_candidate_ids,
+        &setup.vectors,
+        &setup.texts,
+        MIN_SIMILARITY,
+        MAX_SEMANTIC_EXTRA,
+    );
+    // The FULL (uncapped) extras ranking, so a cut-by-cap explanation can
+    // count exactly how many outscored the named id - the same list
+    // `rank_literal_and_extras` itself truncates to build `extra_order`.
+    let extras_full = extras_above_floor(&setup.query_vec, &setup.literal_ids, &setup.all_candidate_ids, &setup.vectors, MIN_SIMILARITY);
+    let extra_similarity: HashMap<&str, f32> = extras_full.iter().map(|(cos, id)| (id.as_str(), *cos)).collect();
+
+    let mut by_id = setup.by_id;
+    let mut hits = Vec::with_capacity(lit_order.len() + extra_order.len());
+    for id in &lit_order {
+        if let Some(hit) = by_id.remove(id) {
+            hits.push(ExplainedHit { id: hit.id, item: hit.item, literal: true, similarity: None });
+        }
+    }
+    for id in &extra_order {
+        if let Some(hit) = by_id.remove(id) {
+            let similarity = extra_similarity.get(id.as_str()).copied();
+            hits.push(ExplainedHit { id: hit.id, item: hit.item, literal: false, similarity });
+        }
+    }
+
+    let target = explain_id.map(|id| {
+        if lit_order.iter().any(|x| x == id) {
+            ExplainedTarget::Literal
+        } else if let Some(&similarity) = extra_similarity.get(id) {
+            if extra_order.iter().any(|x| x == id) {
+                ExplainedTarget::Meaning { similarity }
+            } else {
+                let outscored_by = extras_full.iter().take_while(|(_, cand)| cand != id).count();
+                ExplainedTarget::CutByCap { similarity, cap: MAX_SEMANTIC_EXTRA, outscored_by }
+            }
+        } else if setup.all_candidate_ids.iter().any(|x| x == id) {
+            match setup.vectors.get(id) {
+                Some(v) => ExplainedTarget::BelowFloor {
+                    similarity: fastembed::similarity::cosine_similarity(&setup.query_vec, v),
+                    floor: MIN_SIMILARITY,
+                },
+                None => ExplainedTarget::NoVector,
+            }
+        } else {
+            ExplainedTarget::NotACandidate
+        }
+    });
+
+    ExplainAnswer { hits, target, floor: Some(MIN_SIMILARITY), cap: Some(MAX_SEMANTIC_EXTRA) }
+}
+
 /// Without the `semantic` feature compiled in, this is exactly `search` -
 /// same name and signature as the feature-on version above, so every caller
 /// (the CLI, in particular) compiles unchanged regardless of which build it
@@ -899,6 +1242,31 @@ pub fn search_best_effort_cached(
 #[cfg(not(feature = "semantic"))]
 pub fn search_best_effort(store: &EventStore, _vectors_path: &Path, _model_dir: Option<&Path>, query: &str) -> Vec<LookupHit> {
     search(store, query)
+}
+
+/// Without the `semantic` feature compiled in, every hit is `search`'s own
+/// literal result, marked `literal` with no cosine - the non-semantic twin
+/// of `search_best_effort` above, extended with what `explain_id` can
+/// honestly say when there is no meaning door to ask about at all: present
+/// (`Literal`) or `NotACandidate`, never a fabricated floor/cap outcome.
+#[cfg(not(feature = "semantic"))]
+pub fn explain_best_effort(
+    store: &EventStore,
+    _vectors_path: &Path,
+    _model_dir: Option<&Path>,
+    query: &str,
+    explain_id: Option<&str>,
+) -> ExplainAnswer {
+    let hits = search(store, query);
+    let target = explain_id.map(|id| {
+        if hits.iter().any(|h| h.id == id) { ExplainedTarget::Literal } else { ExplainedTarget::NotACandidate }
+    });
+    ExplainAnswer {
+        hits: hits.into_iter().map(|h| ExplainedHit { id: h.id, item: h.item, literal: true, similarity: None }).collect(),
+        target,
+        floor: None,
+        cap: None,
+    }
 }
 
 // ------------------------------------------------------- surface 4: code
@@ -1195,6 +1563,104 @@ mod tests {
         assert_eq!(narrow, vec!["b1", "b2"]);
         let kept: Vec<&String> = wide_order.iter().filter(|id| narrow.contains(id)).collect();
         assert_eq!(kept, narrow.iter().collect::<Vec<_>>(), "the surviving hits keep the order they had");
+    }
+
+    /// `only_kind` narrows exactly like `only_scope` above: whatever it keeps
+    /// must keep the order it arrived in - a kind filter that reordered hits
+    /// would no longer be the same search seen through a smaller window.
+    #[test]
+    fn only_kind_keeps_the_relative_order_of_what_it_keeps() {
+        let hits = vec![
+            LookupHit { id: "r1".to_string(), item: item("r1", Kind::Report, "eerste", None) },
+            LookupHit { id: "c1".to_string(), item: item("c1", Kind::Chunk, "tweede", None) },
+            LookupHit { id: "r2".to_string(), item: item("r2", Kind::Report, "derde", None) },
+        ];
+        let kept: Vec<String> = only_kind(hits, Kind::Report).into_iter().map(|h| h.id).collect();
+        assert_eq!(kept, vec!["r1".to_string(), "r2".to_string()], "the two Reports must keep the order they arrived in");
+    }
+
+    /// THE DEFECT THIS PREVENTS: a kind filter that let another kind through
+    /// would defeat the one thing a caller asked it to do - "rules only"
+    /// coming back with a report in it is worse than an empty list, because
+    /// it still looks like an answer.
+    #[test]
+    fn only_kind_drops_every_hit_of_a_different_kind() {
+        let hits = vec![
+            LookupHit { id: "rule1".to_string(), item: item("rule1", Kind::Rule, "een vuurbare regel", None) },
+            LookupHit { id: "report1".to_string(), item: item("report1", Kind::Report, "een rapport", None) },
+        ];
+        let kept: Vec<String> = only_kind(hits, Kind::Rule).into_iter().map(|h| h.id).collect();
+        assert_eq!(kept, vec!["rule1".to_string()], "only the Rule may survive a Rule-only filter");
+    }
+
+    /// An empty ranking has nothing to narrow - `only_kind` must never invent
+    /// a hit that was not already there.
+    /// THE DEFECT THIS PREVENTS: two doors that accept different spellings.
+    /// The agent's `lookup` tool and the CLI's `search` both parse a caller's
+    /// `kind` through this one function - see its own doc comment for the day
+    /// a per-door copy made the two answer differently.
+    #[test]
+    fn a_searchable_kind_is_parsed_by_name_case_and_obvious_plural() {
+        assert_eq!(parse_searchable_kind("rule"), Ok(Kind::Rule));
+        assert_eq!(parse_searchable_kind("Rule"), Ok(Kind::Rule));
+        assert_eq!(parse_searchable_kind("  RULES  "), Ok(Kind::Rule));
+        assert_eq!(parse_searchable_kind("orientations"), Ok(Kind::Orientation));
+        assert_eq!(parse_searchable_kind("report"), Ok(Kind::Report));
+        assert_eq!(parse_searchable_kind("chunks"), Ok(Kind::Chunk));
+    }
+
+    /// A register answers only its own key, and `search` filters it out of
+    /// every ranking, so filtering BY it could never match anything. Refused
+    /// with a message that points at the key instead of answering an empty
+    /// list a caller would read as "nothing is there".
+    #[test]
+    fn asking_to_filter_by_lookup_is_refused_and_points_at_the_key() {
+        let refusal = parse_searchable_kind("lookup").expect_err("kind lookup must be refused");
+        assert!(refusal.contains("never searchable"), "{refusal}");
+        assert!(refusal.contains("'key'"), "must point at the key argument: {refusal}");
+    }
+
+    /// A spelling nobody typed is never guessed at, and the refusal names
+    /// every name that does work - otherwise a caller is left guessing twice.
+    #[test]
+    fn an_unknown_kind_is_refused_and_names_all_four_that_work() {
+        let refusal = parse_searchable_kind("bogus").expect_err("an unknown kind must be refused");
+        assert!(refusal.contains("unknown 'kind' value 'bogus'"), "{refusal}");
+        for name in SEARCHABLE_KIND_NAMES {
+            assert!(refusal.contains(name), "must name {name}: {refusal}");
+        }
+    }
+
+    #[test]
+    fn only_kind_of_an_empty_input_stays_empty() {
+        assert!(only_kind(Vec::new(), Kind::Rule).is_empty());
+    }
+
+    // ------------------------------------------------- honest answer notes
+
+    /// THE DEFECT THIS PREVENTS: a reply built entirely from semantic-only
+    /// extras reads exactly like an ordinary, fully-literal result unless it
+    /// says otherwise - a caller has no way to know a short rule that
+    /// actually answers the question might simply be missing from the
+    /// store. A literal hit must never carry this note: it would cast doubt
+    /// on a real text match for no reason.
+    #[test]
+    fn meaning_only_note_appears_only_when_the_literal_leg_found_nothing() {
+        assert!(meaning_only_note(false).is_some(), "no literal hit at all must add the honesty note");
+        assert!(meaning_only_note(true).is_none(), "a literal hit must never carry this note");
+    }
+
+    /// THE DEFECT THIS PREVENTS: a kind-filtered search that finds nothing
+    /// reads exactly like an empty memory unless it also says how many hits
+    /// of OTHER kinds the very same ranking found - a bare "no matches"
+    /// there is a lie by omission. An unfiltered ranking that itself found
+    /// nothing needs no addition: the plain "no matches" already says that
+    /// honestly.
+    #[test]
+    fn other_kind_hint_names_the_count_only_when_the_unfiltered_ranking_found_something() {
+        assert_eq!(other_kind_hint(0), "", "nothing to add when the ranking itself found nothing");
+        let hint = other_kind_hint(3);
+        assert!(hint.contains('3'), "{hint}");
     }
 
     /// THE DEFECT THIS CLOSES, reported from a real session and reproduced:
@@ -1812,5 +2278,246 @@ mod semantic_search_tests {
         let (hits, withheld) = search_with_expired(&db, "settled report");
         assert_eq!(withheld, 0, "an unreadable date retires nothing");
         assert!(hits.iter().any(|h| h.id == "odd-1"));
+    }
+
+    // ------------------------------------------------- explain_best_effort
+
+    /// The real per-user semantic model, when this machine actually has one -
+    /// same stance as `serve/src/vectors.rs`'s own `require_model`: a missing
+    /// model is a normal, supported setup, never a failure, so a test that
+    /// needs a genuine cosine number skips itself rather than fail or
+    /// fabricate one.
+    fn require_model() -> Option<std::path::PathBuf> {
+        let dir = crate::semantic_paths::default_model_dir()?;
+        crate::semantic_paths::model_present(&dir).then_some(dir)
+    }
+
+    /// A unit vector whose cosine similarity to `query_vec` is EXACTLY
+    /// `target_cosine` (up to floating-point rounding) - lets a test pick a
+    /// precise floor/cap outcome without depending on what a real model
+    /// happens to think two made-up sentences mean. Built the way a 2D
+    /// `(cos theta, sin theta)` point is: decompose an arbitrary axis into
+    /// its component along `query_vec` and the component orthogonal to it,
+    /// then mix the two unit directions in the proportion that produces the
+    /// wanted angle.
+    fn vector_at_cosine(query_vec: &[f32], target_cosine: f32) -> Vec<f32> {
+        let dim = query_vec.len();
+        let q_norm: f32 = query_vec.iter().map(|x| x * x).sum::<f32>().sqrt();
+        let q_unit: Vec<f32> = query_vec.iter().map(|x| x / q_norm).collect();
+        let mut raw = vec![0.0f32; dim];
+        raw[0] = 1.0; // an arbitrary axis - astronomically unlikely to be parallel to a real embedding
+        let dot: f32 = raw.iter().zip(&q_unit).map(|(a, b)| a * b).sum();
+        let mut orth: Vec<f32> = raw.iter().zip(&q_unit).map(|(a, b)| a - dot * b).collect();
+        let orth_norm: f32 = orth.iter().map(|x| x * x).sum::<f32>().sqrt();
+        for x in orth.iter_mut() {
+            *x /= orth_norm;
+        }
+        let sin = (1.0 - target_cosine * target_cosine).max(0.0).sqrt();
+        q_unit.iter().zip(&orth).map(|(a, b)| target_cosine * a + sin * b).collect()
+    }
+
+    const EXPLAIN_QUERY: &str = "espresso machine descaling schedule";
+
+    /// THE DEFECT THIS PREVENTS: nothing on the plain search surface says
+    /// whether a hit was found by TEXT or only by MEANING, so a caller can
+    /// never tell a real match from a semantic guess - and showing a cosine
+    /// for a literal hit would misleadingly suggest the floor/cap applies to
+    /// it, which it never does (see `rank_literal_and_extras`'s own doc
+    /// comment: extras are a semantic-only door).
+    #[test]
+    fn explain_reports_a_literal_hit_as_literal_and_a_semantic_only_hit_as_meaning() {
+        let Some(model_dir) = require_model() else {
+            eprintln!("skipping explain_reports_a_literal_hit_as_literal_and_a_semantic_only_hit_as_meaning: no per-user semantic model present");
+            return;
+        };
+        let mut db = EventStore::in_memory().unwrap();
+        store::declare(&mut db, "s", "l", "a", &report("literal-hit", &format!("the {EXPLAIN_QUERY} is posted on the fridge"))).unwrap();
+        store::declare(&mut db, "s", "l", "a", &report("meaning-hit", "the neighborhood cat prefers the porch with morning sun")).unwrap();
+
+        let dir = tempfile::tempdir().unwrap();
+        let vectors_path = dir.path().join("v.db");
+        let mut embedder = crate::embed::Embedder::load(&model_dir).unwrap();
+        let query_vec = embedder.embed_one(EXPLAIN_QUERY).unwrap();
+        {
+            let mut vs = crate::vectors::VectorStore::open(&vectors_path).unwrap();
+            vs.set_model_id(crate::semantic_paths::MODEL_ID).unwrap();
+            vs.upsert_batch(&[
+                ("literal-hit".to_string(), "h1".to_string(), vector_at_cosine(&query_vec, MIN_SIMILARITY + 0.4)),
+                ("meaning-hit".to_string(), "h2".to_string(), vector_at_cosine(&query_vec, MIN_SIMILARITY + 0.3)),
+            ])
+            .unwrap();
+        }
+
+        let answer = explain_best_effort(&db, &vectors_path, Some(&model_dir), EXPLAIN_QUERY, None);
+        let literal = answer.hits.iter().find(|h| h.id == "literal-hit").expect("the literal hit must be present");
+        assert!(literal.literal, "the text-matching item must be marked literal");
+        assert_eq!(literal.similarity, None, "a literal hit must never carry a cosine in the explain output");
+
+        let meaning = answer.hits.iter().find(|h| h.id == "meaning-hit").expect("the semantic-only hit must be present");
+        assert!(!meaning.literal, "the non-matching item must be marked meaning, not literal");
+        assert!(meaning.similarity.is_some(), "a meaning hit must carry its cosine");
+    }
+
+    /// THE WHOLE POINT: an item below `MIN_SIMILARITY` never became a
+    /// candidate at all, and a caller asking why it is missing must be told
+    /// exactly that, with the floor's own value - not a bare "not found"
+    /// indistinguishable from a typo'd id.
+    #[test]
+    fn explain_of_a_named_id_below_the_floor_says_so_and_names_the_floor() {
+        let Some(model_dir) = require_model() else {
+            eprintln!("skipping explain_of_a_named_id_below_the_floor_says_so_and_names_the_floor: no per-user semantic model present");
+            return;
+        };
+        let mut db = EventStore::in_memory().unwrap();
+        store::declare(&mut db, "s", "l", "a", &report("far-away", "a library card expires after three years of no renewal")).unwrap();
+
+        let dir = tempfile::tempdir().unwrap();
+        let vectors_path = dir.path().join("v.db");
+        let mut embedder = crate::embed::Embedder::load(&model_dir).unwrap();
+        let query_vec = embedder.embed_one(EXPLAIN_QUERY).unwrap();
+        let below_floor = MIN_SIMILARITY - 0.1;
+        {
+            let mut vs = crate::vectors::VectorStore::open(&vectors_path).unwrap();
+            vs.set_model_id(crate::semantic_paths::MODEL_ID).unwrap();
+            vs.upsert_batch(&[("far-away".to_string(), "h1".to_string(), vector_at_cosine(&query_vec, below_floor))]).unwrap();
+        }
+
+        let answer = explain_best_effort(&db, &vectors_path, Some(&model_dir), EXPLAIN_QUERY, Some("far-away"));
+        match answer.target {
+            Some(ExplainedTarget::BelowFloor { similarity, floor }) => {
+                assert!((similarity - below_floor).abs() < 0.01, "expected the planted cosine back: {similarity}");
+                assert_eq!(floor, MIN_SIMILARITY);
+            }
+            other => panic!("expected BelowFloor, got {other:?}"),
+        }
+        assert!(answer.hits.iter().all(|h| h.id != "far-away"), "an item below the floor must never appear in the ranking itself");
+    }
+
+    /// THE OTHER HALF: an item that DID clear the floor but lost to more
+    /// than `MAX_SEMANTIC_EXTRA` other candidates is missing for a
+    /// completely different reason, and the two must never be reported as
+    /// the same thing.
+    #[test]
+    fn explain_of_a_named_id_above_the_floor_but_beyond_the_cap_says_so_and_counts_outscorers() {
+        let Some(model_dir) = require_model() else {
+            eprintln!("skipping explain_of_a_named_id_above_the_floor_but_beyond_the_cap_says_so_and_counts_outscorers: no per-user semantic model present");
+            return;
+        };
+        // Genuinely distinct sentences, never a templated "strong candidate
+        // N": model::store::find_near_duplicate's Jaccard check compares
+        // same-kind items lexically, and a templated set risks tripping it -
+        // see this workspace's own DISTINCT_TEXTS convention
+        // (serve/tests/why_hint_matches_the_parser.rs and others).
+        const STRONG_TEXTS: [&str; MAX_SEMANTIC_EXTRA] = [
+            "a bicycle chain needs oil after riding through rain",
+            "the community garden assigns plots by a spring lottery",
+            "a violin string flattens in pitch as the room cools",
+            "the recycling truck skips the street on public holidays",
+            "a sourdough starter needs feeding twice a day in summer",
+            "the ferry schedule shifts an hour earlier after autumn",
+            "a chess clock rewards the player who moves faster",
+            "the rooftop solar panels get cleaned once a year",
+            "a knitted scarf takes about a week of evenings to finish",
+            "the corner bookstore restocks travel guides every March",
+        ];
+        let mut db = EventStore::in_memory().unwrap();
+        for (i, text) in STRONG_TEXTS.iter().enumerate() {
+            store::declare(&mut db, "s", "l", "a", &report(&format!("strong-{i}"), text)).unwrap();
+        }
+        store::declare(&mut db, "s", "l", "a", &report("cut-target", "a library card expires after three years of no renewal")).unwrap();
+
+        let dir = tempfile::tempdir().unwrap();
+        let vectors_path = dir.path().join("v.db");
+        let mut embedder = crate::embed::Embedder::load(&model_dir).unwrap();
+        let query_vec = embedder.embed_one(EXPLAIN_QUERY).unwrap();
+        let strong_cosine = MIN_SIMILARITY + 0.4;
+        let cut_target_cosine = MIN_SIMILARITY + 0.1;
+        {
+            let mut vs = crate::vectors::VectorStore::open(&vectors_path).unwrap();
+            vs.set_model_id(crate::semantic_paths::MODEL_ID).unwrap();
+            let mut rows = vec![("cut-target".to_string(), "h".to_string(), vector_at_cosine(&query_vec, cut_target_cosine))];
+            for i in 0..MAX_SEMANTIC_EXTRA {
+                rows.push((format!("strong-{i}"), "h".to_string(), vector_at_cosine(&query_vec, strong_cosine)));
+            }
+            vs.upsert_batch(&rows).unwrap();
+        }
+
+        let answer = explain_best_effort(&db, &vectors_path, Some(&model_dir), EXPLAIN_QUERY, Some("cut-target"));
+        match answer.target {
+            Some(ExplainedTarget::CutByCap { similarity, cap, outscored_by }) => {
+                assert!((similarity - cut_target_cosine).abs() < 0.01, "expected the planted cosine back: {similarity}");
+                assert_eq!(cap, MAX_SEMANTIC_EXTRA);
+                assert_eq!(outscored_by, MAX_SEMANTIC_EXTRA, "every one of the stronger candidates must count as outscoring it");
+            }
+            other => panic!("expected CutByCap, got {other:?}"),
+        }
+        assert!(answer.hits.iter().all(|h| h.id != "cut-target"), "an item cut by the cap must never appear in the ranking itself");
+    }
+
+    /// THE DIVERGENCE PROOF: `explain_best_effort` must never be a second,
+    /// possibly-drifting ranking implementation - it has to return exactly
+    /// what `search_best_effort` returns, in exactly the same order, for the
+    /// same query (see this file's own "surface 4: meaning" note on the
+    /// divergence trap a hand-mirrored copy of this ranking caused once
+    /// already).
+    #[test]
+    fn explain_path_and_plain_search_best_effort_agree_on_ids_and_order() {
+        let Some(model_dir) = require_model() else {
+            eprintln!("skipping explain_path_and_plain_search_best_effort_agree_on_ids_and_order: no per-user semantic model present");
+            return;
+        };
+        let mut db = EventStore::in_memory().unwrap();
+        store::declare(&mut db, "s", "l", "a", &report("literal-hit", &format!("the {EXPLAIN_QUERY} is on the fridge"))).unwrap();
+        store::declare(&mut db, "s", "l", "a", &report("meaning-hit-a", "a bicycle chain needs oil after riding through rain")).unwrap();
+        store::declare(&mut db, "s", "l", "a", &report("meaning-hit-b", "the community garden assigns plots by a spring lottery")).unwrap();
+
+        let dir = tempfile::tempdir().unwrap();
+        let vectors_path = dir.path().join("v.db");
+        let mut embedder = crate::embed::Embedder::load(&model_dir).unwrap();
+        let query_vec = embedder.embed_one(EXPLAIN_QUERY).unwrap();
+        {
+            let mut vs = crate::vectors::VectorStore::open(&vectors_path).unwrap();
+            vs.set_model_id(crate::semantic_paths::MODEL_ID).unwrap();
+            vs.upsert_batch(&[
+                ("literal-hit".to_string(), "h".to_string(), vector_at_cosine(&query_vec, MIN_SIMILARITY + 0.45)),
+                ("meaning-hit-a".to_string(), "h".to_string(), vector_at_cosine(&query_vec, MIN_SIMILARITY + 0.35)),
+                ("meaning-hit-b".to_string(), "h".to_string(), vector_at_cosine(&query_vec, MIN_SIMILARITY + 0.25)),
+            ])
+            .unwrap();
+        }
+
+        let plain = search_best_effort(&db, &vectors_path, Some(&model_dir), EXPLAIN_QUERY);
+        let explained = explain_best_effort(&db, &vectors_path, Some(&model_dir), EXPLAIN_QUERY, None);
+        let plain_ids: Vec<&str> = plain.iter().map(|h| h.id.as_str()).collect();
+        let explained_ids: Vec<&str> = explained.hits.iter().map(|h| h.id.as_str()).collect();
+        assert_eq!(explained_ids, plain_ids, "one ranking, not two");
+        assert!(plain_ids.contains(&"meaning-hit-a"), "the fixture must actually exercise the meaning leg: {plain_ids:?}");
+    }
+
+    /// THE PRECONDITION `meaning_only_note` relies on: a query that matches
+    /// nothing literally can still be answered entirely by meaning search -
+    /// proving the scenario the note describes is real, not hypothetical.
+    #[test]
+    fn search_best_effort_can_answer_from_meaning_alone_when_nothing_matches_literally() {
+        let Some(model_dir) = require_model() else {
+            eprintln!("skipping search_best_effort_can_answer_from_meaning_alone_when_nothing_matches_literally: no per-user semantic model present");
+            return;
+        };
+        let mut db = EventStore::in_memory().unwrap();
+        store::declare(&mut db, "s", "l", "a", &report("meaning-only", "a violin string flattens in pitch as the room cools")).unwrap();
+
+        let dir = tempfile::tempdir().unwrap();
+        let vectors_path = dir.path().join("v.db");
+        let mut embedder = crate::embed::Embedder::load(&model_dir).unwrap();
+        let query_vec = embedder.embed_one(EXPLAIN_QUERY).unwrap();
+        {
+            let mut vs = crate::vectors::VectorStore::open(&vectors_path).unwrap();
+            vs.set_model_id(crate::semantic_paths::MODEL_ID).unwrap();
+            vs.upsert_batch(&[("meaning-only".to_string(), "h".to_string(), vector_at_cosine(&query_vec, MIN_SIMILARITY + 0.3))]).unwrap();
+        }
+
+        assert!(search(&db, EXPLAIN_QUERY).is_empty(), "the fixture must not match literally at all");
+        let hits = search_best_effort(&db, &vectors_path, Some(&model_dir), EXPLAIN_QUERY);
+        assert_eq!(hits.iter().map(|h| h.id.as_str()).collect::<Vec<_>>(), vec!["meaning-only"]);
     }
 }

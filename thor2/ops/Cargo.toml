@@ -30,6 +30,12 @@ tokio = { version = "1", features = ["macros", "rt-multi-thread", "net"] }
 axum = "0.8"
 reqwest = { version = "0.12", default-features = false, features = ["blocking", "json"] }
 
+[features]
+# Forwards to serve's own semantic build so the hourly `sync ship` can call
+# `serve::vectors::refresh` - the same reason `mcp`'s own `semantic` feature
+# exists. OFF by default: a plain build of `ops` stays free of ort/onnxruntime.
+semantic = ["serve/semantic"]
+
 [[bin]]
 name = "sync"
 path = "src/bin/sync.rs"

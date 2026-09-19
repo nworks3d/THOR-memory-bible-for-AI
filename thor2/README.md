@@ -382,6 +382,65 @@ there is no other protection on that transport either. Run both transports -
 this one and the tool-server connector above - on a LAN or behind a private
 tunnel, never on the open internet.
 
+## Asking it what applies, from your own program
+
+Something that is not an assistant can use this memory too - a local model
+behind a program of your own, a deploy script, a job that runs unattended.
+There are two doors, and picking the wrong one is the most common mistake
+this project sees.
+
+**The moment door is for steering an action.** You are about to run a
+command, or touch a file, and you want the facts that apply to it. You do not
+search for those: you hand over the command or the path, and the memory
+answers with what is bound there. No keywords to guess, nothing to phrase.
+
+```bash
+serve --db /path/thor.db check --command "ssh user@host 'cp printer.cfg /tmp/x'"
+serve --db /path/thor.db check --file server/db.js
+serve --db /path/thor.db why --command "git push --force origin main"
+```
+
+`check` prints what a real block would show. `why` prints everything that
+applies, including what the block would withhold, which is what you want when
+something you expected did not appear. Both are previews: they do not count
+as a delivery. The production boundary is `hook` - JSON on stdin, JSON on
+stdout, exit 0 always, silent on any failure - and it branches on the
+payload's own `hook_event_name`: `SessionStart`, `UserPromptSubmit`, and
+anything else is treated as a tool call about to happen. Only `hook` records
+that an item actually fired, so the counts you later read in `doctor` come
+from that door alone.
+
+One trap costs an evening if you meet it blind: a payload carrying a Windows
+path in single backslashes is not valid JSON, and this program then prints
+nothing and exits 0, which reads exactly like "no rule applies". Use forward
+slashes in the payload, and when a hook is silent, check the payload before
+you conclude the memory is empty.
+
+**The search door is for looking something up on purpose**, by a person or an
+assistant that then reads the answer. It is not a way to fetch the one fact
+that answers a question, and it is worth knowing why before you build on it.
+A search first tries your words literally - the whole phrase, and failing
+that, every single word has to appear somewhere in the item. A ten-word
+question therefore matches nothing literally, and everything you get back
+comes from meaning search instead. That leg scores an item by its best
+chunk, so a long report, split into many chunks, gets many attempts while a
+short rule gets one. Measured on a real store in September 2026: three
+natural-language questions returned eight or nine long reports out of every
+ten hits, and the short rule that actually answered the question was not in
+the results at all.
+
+When a search surprises you, `search --explain` prints, per hit, whether it
+matched literally or by meaning and with what score, plus the floor and the cap
+that decide what survives; `search --explain-id <id>` answers the harder
+question, which is why one particular item is NOT there - under the floor, or
+over it and cut by the cap. That is the difference between "the memory does not
+know this" and "the memory knows it and did not show it".
+
+So, from a program: two or three distinctive words, not a sentence, and
+`--kind rule` when it is a rule you want. And when what you really need is
+"tell me what applies to what I am about to do", use the moment door above
+instead - that is the one built for it.
+
 ## Run the tests
 
 ```bash

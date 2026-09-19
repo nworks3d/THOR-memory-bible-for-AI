@@ -392,7 +392,25 @@ pub fn only_scope(hits: Vec<LookupHit>, scope: &str) -> Vec<LookupHit> {
 /// have returned, in the same order, minus the ones of another kind: this
 /// narrows, it never reorders, exactly like `only_scope` above.
 pub fn only_kind(hits: Vec<LookupHit>, kind: Kind) -> Vec<LookupHit> {
-    hits.into_iter().filter(|h| h.item.kind == kind).collect()
+    only_kinds(hits, &[kind])
+}
+
+/// `only_kind` for a SET of kinds, which is what a caller usually needs.
+///
+/// WHY A SET, LEARNED IN USE (2026-09-19). The first version took exactly one
+/// kind, and the first real consumer - a program steering a local model -
+/// broke two of its own checks on it: the fact that mattered there was an
+/// Orientation, not a Rule, so asking for rules hid it. They worked around it
+/// with two searches. That workaround is this filter's fault, not theirs: the
+/// distinction that matters is "everything that can fire at a moment" (Rule
+/// and Orientation) against the archive (Report and Chunk), and asking for
+/// that took two calls. An empty set keeps everything, so a caller can pass
+/// what it has without a branch.
+pub fn only_kinds(hits: Vec<LookupHit>, kinds: &[Kind]) -> Vec<LookupHit> {
+    if kinds.is_empty() {
+        return hits;
+    }
+    hits.into_iter().filter(|h| kinds.contains(&h.item.kind)).collect()
 }
 
 /// The four kinds a search may be narrowed to. `Kind::Lookup` is deliberately
@@ -422,19 +440,89 @@ pub const SEARCHABLE_KIND_NAMES: &[&str] = &["rule", "orientation", "report", "c
 /// the tool ran letter only - so the parse, the accepted names and the two
 /// refusal texts are defined once, here.
 pub fn parse_searchable_kind(raw: &str) -> Result<Kind, String> {
-    let lower = raw.trim().to_lowercase();
-    let singular = lower.strip_suffix('s').unwrap_or(&lower);
-    let parsed = Kind::from_str(&lower).or_else(|_| Kind::from_str(singular)).map_err(|_| {
-        format!(
-            "unknown 'kind' value '{raw}' - a search can only filter by one of: {}",
-            SEARCHABLE_KIND_NAMES.join(", ")
-        )
-    })?;
-    if parsed == Kind::Lookup {
-        return Err("kind 'lookup' is never searchable: a Lookup register answers only an exact request for its own key, never a text search - ask for it with the 'key' argument instead of 'kind'."
- .to_string());
+    let kinds = parse_searchable_kinds(raw)?;
+    match kinds.as_slice() {
+        [one] => Ok(*one),
+        many => Err(format!(
+            "'{raw}' names {} kinds and this caller can only use one - ask for them one at a time",
+            many.len()
+        )),
     }
-    Ok(parsed)
+}
+
+/// The shorthand for every kind that can actually fire at a moment, so a
+/// caller steering an action does not need to know which of the two a
+/// particular fact happens to be - see `only_kinds` for the day that
+/// distinction cost a real consumer two broken checks.
+pub const FIREABLE_KIND_ALIAS: &str = "fires";
+
+/// Parses a caller's own `kind` argument into one or more kinds: a
+/// comma-separated list, case-insensitive, each entry tolerant of an obvious
+/// plural (the bare name plus a trailing 's'), plus the alias `fires` for
+/// every kind that can fire (Rule and Orientation). Duplicates collapse.
+/// Nothing fancier, so a spelling nobody typed is never guessed at.
+///
+/// `model::item::Kind::from_str` already owns the canonical name-to-`Kind`
+/// mapping (case-sensitive, no plural) - reused rather than reimplemented, so
+/// the two can never silently disagree about what a name means.
+///
+/// `Kind::Lookup` parses fine as a `Kind` but is refused here with its own
+/// message: `search` filters it out of every ranking on purpose, because a
+/// register answers only an exact request for its own key, so filtering BY it
+/// could never match anything and a caller would read that silence as a plain
+/// "no matches" rather than learn why.
+///
+/// LIVES HERE, NOT AT EITHER DOOR (2026-09-19). The agent's `lookup` tool and
+/// the CLI's own `search` both take this argument, and this crate is the only
+/// thing both already depend on. A copy at each door is how the two drifted
+/// apart once before - the CLI ran letter-and-meaning while the tool ran
+/// letter only - so the parse, the accepted names and the refusals live here.
+pub fn parse_searchable_kinds(raw: &str) -> Result<Vec<Kind>, String> {
+    let mut out: Vec<Kind> = Vec::new();
+    let mut named_anything = false;
+    for part in raw.split(',') {
+        let lower = part.trim().to_lowercase();
+        if lower.is_empty() {
+            continue;
+        }
+        named_anything = true;
+        if lower == FIREABLE_KIND_ALIAS || lower == "fireable" {
+            for k in [Kind::Rule, Kind::Orientation] {
+                if !out.contains(&k) {
+                    out.push(k);
+                }
+            }
+            continue;
+        }
+        let singular = lower.strip_suffix('s').unwrap_or(&lower);
+        let parsed = Kind::from_str(&lower).or_else(|_| Kind::from_str(singular)).map_err(|_| {
+            format!(
+                "unknown 'kind' value '{}' - a search can filter by any of: {}, or '{}' for everything that can fire; separate several with a comma",
+                part.trim(),
+                SEARCHABLE_KIND_NAMES.join(", "),
+                FIREABLE_KIND_ALIAS
+            )
+        })?;
+        if parsed == Kind::Lookup {
+            return Err("kind 'lookup' is never searchable: a Lookup register answers only an exact request for its own key, never a text search - ask for it with the 'key' argument instead of 'kind'.".to_string());
+        }
+        if !out.contains(&parsed) {
+            out.push(parsed);
+        }
+    }
+    if !named_anything {
+        return Err(format!(
+            "'kind' was given but names nothing - use any of: {}, or '{}' for everything that can fire",
+            SEARCHABLE_KIND_NAMES.join(", "),
+            FIREABLE_KIND_ALIAS
+        ));
+    }
+    Ok(out)
+}
+
+/// The kinds, named the way a refusal or an empty answer should name them.
+pub fn kind_names(kinds: &[Kind]) -> String {
+    kinds.iter().map(|k| format!("{k:?}")).collect::<Vec<_>>().join(", ")
 }
 
 /// The one honest addition a normal search reply owes its caller when every
@@ -1613,6 +1701,63 @@ mod tests {
     /// every ranking, so filtering BY it could never match anything. Refused
     /// with a message that points at the key instead of answering an empty
     /// list a caller would read as "nothing is there".
+    /// THE DEFECT THIS PREVENTS, and it is not hypothetical: the first real
+    /// consumer of this filter asked for rules, and the fact that had to steer
+    /// its action was an Orientation, so the filter hid it and two of that
+    /// project's own checks broke. One call has to be able to name both kinds
+    /// that can fire.
+    #[test]
+    fn several_kinds_can_be_asked_for_at_once() {
+        assert_eq!(parse_searchable_kinds("rule,orientation"), Ok(vec![Kind::Rule, Kind::Orientation]));
+        assert_eq!(parse_searchable_kinds(" Rules , REPORT "), Ok(vec![Kind::Rule, Kind::Report]));
+        assert_eq!(parse_searchable_kinds("rule,rules,rule"), Ok(vec![Kind::Rule]), "duplicates collapse");
+    }
+
+    /// The shorthand exists so a caller steering an action does not have to
+    /// know which of the two fireable kinds a particular fact happens to be -
+    /// the exact distinction that cost that consumer its two checks.
+    #[test]
+    fn the_fires_shorthand_means_every_kind_that_can_fire() {
+        assert_eq!(parse_searchable_kinds("fires"), Ok(vec![Kind::Rule, Kind::Orientation]));
+        assert_eq!(parse_searchable_kinds("fireable"), Ok(vec![Kind::Rule, Kind::Orientation]));
+        assert_eq!(parse_searchable_kinds("fires,report"), Ok(vec![Kind::Rule, Kind::Orientation, Kind::Report]));
+        for k in parse_searchable_kinds("fires").unwrap() {
+            assert!(k.can_fire(), "{k:?} cannot fire, so the shorthand is lying");
+        }
+    }
+
+    /// A list with one bad member is refused whole, naming the shorthand too -
+    /// answering the good half would quietly search for something the caller
+    /// did not ask for.
+    #[test]
+    fn one_bad_member_refuses_the_whole_list() {
+        let refusal = parse_searchable_kinds("rule,bogus").expect_err("must be refused");
+        assert!(refusal.contains("unknown 'kind' value 'bogus'"), "{refusal}");
+        assert!(refusal.contains(FIREABLE_KIND_ALIAS), "must name the shorthand: {refusal}");
+        let refusal = parse_searchable_kinds("rule,lookup").expect_err("must be refused");
+        assert!(refusal.contains("never searchable") && refusal.contains("'key'"), "{refusal}");
+    }
+
+    /// An empty set keeps everything, so a caller can pass what it has without
+    /// a branch - and a set of two keeps exactly those two.
+    #[test]
+    fn filtering_on_a_set_keeps_exactly_that_set() {
+        // LookupHit carries an Item and is deliberately not Clone, so each
+        // assertion builds its own copy of the same three hits.
+        let build = || {
+            vec![
+                LookupHit { id: "r1".to_string(), item: item("r1", Kind::Rule, "een regel", None) },
+                LookupHit { id: "o1".to_string(), item: item("o1", Kind::Orientation, "een orientatie", None) },
+                LookupHit { id: "p1".to_string(), item: item("p1", Kind::Report, "een verslag", None) },
+            ]
+        };
+        assert_eq!(only_kinds(build(), &[]).len(), 3, "an empty set filters nothing");
+        let fireable = only_kinds(build(), &[Kind::Rule, Kind::Orientation]);
+        assert_eq!(fireable.iter().map(|h| h.id.as_str()).collect::<Vec<_>>(), vec!["r1", "o1"]);
+        let reports = only_kinds(build(), &[Kind::Report]);
+        assert_eq!(reports.iter().map(|h| h.id.as_str()).collect::<Vec<_>>(), vec!["p1"]);
+    }
+
     #[test]
     fn asking_to_filter_by_lookup_is_refused_and_points_at_the_key() {
         let refusal = parse_searchable_kind("lookup").expect_err("kind lookup must be refused");

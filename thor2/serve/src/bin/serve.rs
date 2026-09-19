@@ -45,7 +45,16 @@ enum Command {
     /// stdout, exit 0 always, silent on any failure. Branches on the JSON
     /// payload's `hook_event_name` ("SessionStart" / "UserPromptSubmit" /
     /// anything else, treated as a PreToolUse-shaped tool call).
-    Hook,
+    Hook {
+        /// Say on stderr whether this run could look at all, and exit 2 when it
+        /// could not. For a caller that is NOT an assistant harness: the
+        /// default silence cannot tell "I looked and nothing applies" apart
+        /// from "I could not look", and a program steering a local model has
+        /// to know the difference. stdout and the always-zero exit of a normal
+        /// run are untouched by this flag.
+        #[arg(long)]
+        diagnose: bool,
+    },
     /// What would fire for a given command, file, target or moment (surface
     /// 2 preview - does not count as a delivery).
     Check(TargetArgs),
@@ -78,7 +87,10 @@ enum Command {
     /// any project, archive kinds (Report/Chunk) included.
     Search {
         query: String,
-        /// Narrow the ranking to one kind: rule, orientation, report or chunk
+        /// Narrow the ranking to one or more kinds: rule, orientation, report
+        /// or chunk, several at once separated by a comma, and `fires` as
+        /// shorthand for every kind that can fire at a moment - which is the
+        /// one to use when the fact has to steer an action
         /// (case-insensitive, an obvious plural such as "rules" accepted).
         /// Without it, Report hits tend to dominate a plain search since
         /// their own text runs long. Asking for `lookup` is refused rather
@@ -328,7 +340,7 @@ fn main() {
     }
     let cli = Cli::parse();
     match cli.command {
-        Command::Hook => cmd_hook(&cli.db),
+        Command::Hook { diagnose } => cmd_hook(&cli.db, diagnose),
         Command::Check(args) => cmd_check(&cli.db, &build_input(&args)),
         Command::Why(args) => cmd_why(&cli.db, &build_input(&args)),
         Command::Audit => cmd_audit(&cli.db),
@@ -778,9 +790,19 @@ mod resolve_session_id_tests {
     }
 }
 
-fn hook_once(db_path: &Path) -> Option<HookOutput> {
-    let mut raw = String::new();
-    std::io::stdin().read_to_string(&mut raw).ok()?;
+fn hook_once(db_path: &Path, payload_text: Option<String>) -> Option<HookOutput> {
+    // `payload_text` is `Some` only when the caller already read stdin (see
+    // `cmd_hook`'s `--diagnose` path, which has to read it to say anything
+    // about it). stdin can only be consumed once, so it is read HERE for a
+    // normal run and handed over for that one.
+    let raw = match payload_text {
+        Some(text) => text,
+        None => {
+            let mut raw = String::new();
+            std::io::stdin().read_to_string(&mut raw).ok()?;
+            raw
+        }
+    };
     let payload: Value = serde_json::from_str(&raw).ok()?;
 
     let event_name = payload
@@ -4988,87 +5010,147 @@ mod remember_moment_tests {
 /// error path and must never look like one; a marked invocation is the
 /// EXPECTED shape for a hook firing inside the judge's own child session,
 /// not a failure.
-fn cmd_hook(db_path: &Path) {
-    if serve::reentry::is_reentrant() {
-        std::process::exit(0);
-    }
-    std::panic::set_hook(Box::new(|_| {}));
-    let db_path = db_path.to_path_buf();
-    let result = std::panic::catch_unwind(move || hook_once(&db_path));
-    match result {
-        Ok(Some(HookOutput::Context { event_name, block })) => {
-            let out = serde_json::json!({
-                "hookSpecificOutput": {
-                    "hookEventName": event_name,
-                    "additionalContext": block,
-                }
-            });
-            let _ = serde_json::to_writer(std::io::stdout(), &out);
-        }
-        Ok(Some(HookOutput::ContextWithNotice { event_name, block, notice })) => {
-            let out = serde_json::json!({
-                "systemMessage": notice,
-                "hookSpecificOutput": {
-                    "hookEventName": event_name,
-                    "additionalContext": block,
-                }
-            });
-            let _ = serde_json::to_writer(std::io::stdout(), &out);
-        }
-        // The Response Guard's verdict is its own top-level shape, printed
-        // verbatim - never wrapped in additionalContext.
-        Ok(Some(HookOutput::Decision(v))) => {
-            let _ = serde_json::to_writer(std::io::stdout(), &v);
-        }
-        // A WARN-tier verdict at Stop - kept as its own match arm rather
-        // than folded into `Context`'s (not merely to save a few lines)
-        // because the two mean different things, and no longer render the
-        // same way either: `Context` is an injection surface handing the
-        // model ONE field, `hookSpecificOutput.additionalContext`. `Warn` is
-        // the Response Guard's own softer verdict, and has a second audience
-        // `Context` never needs to reach - the owner, not just the model -
-        // so it also sets a top-level `systemMessage` carrying the same
-        // text, confirmed by Claude Code's own hooks documentation as the
-        // field "shown to the user". See `HookOutput::Warn`'s own doc
-        // comment for what that documentation settles and the one question
-        // it still leaves open - if that remaining assumption is ever found
-        // wrong, only this arm needs to change.
-        Ok(Some(HookOutput::Warn { event_name, text })) => {
-            let out = serde_json::json!({
-                "systemMessage": text,
-                "hookSpecificOutput": {
-                    "hookEventName": event_name,
-                    "additionalContext": text,
-                }
-            });
-            let _ = serde_json::to_writer(std::io::stdout(), &out);
-        }
-        _ => {}
-    }
-    std::process::exit(0);
+/// Everything a caller can check BEFORE the hook runs, as a pure answer
+/// instead of silence: `Ok(())` means this run can look, `Err(line)` says why
+/// it cannot in one sentence.
+///
+/// WHY THIS EXISTS (asked for 2026-09-19 by the first program that drives this
+/// boundary itself). `hook` prints nothing and exits 0 on every failure,
+/// deliberately: an assistant must never be broken by its own memory. But from
+/// outside, that silence is identical to "no rule applies here", and a program
+/// whose whole purpose is to stop a wrong action cannot tell those two apart.
+/// Both cases this closes were found in real use: a payload that is not valid
+/// JSON, and a store path that does not exist.
+fn hook_preflight(raw: &str, db_path: &Path) -> Result<(), String> {
+    if let Err(e) = serde_json::from_str::<Value>(raw) {
+        return Err(format!(
+            "could not look: the payload on stdin is not valid JSON ({e}). A Windows path written with single backslashes is the usual cause - use forward slashes in the payload."
+ ));
+ }
+ if !db_path.exists() {
+ return Err(format!("could not look: there is no memory at {}", db_path.display()));
+ }
+ if let Err(e) = EventStore::open_existing(db_path) {
+ return Err(format!("could not look: the memory at {} would not open ({e})", db_path.display()));
+ }
+ Ok(())
+}
+
+fn cmd_hook(db_path: &Path, diagnose: bool) {
+ if serve::reentry::is_reentrant() {
+ if diagnose {
+ eprintln!("did not look: this process is a hook inside a hook, which never runs the surfaces again");
+ }
+ std::process::exit(0);
+ }
+ // Read stdin HERE only for the diagnosing path, which has to inspect the
+ // payload before the surfaces run; a normal run lets `hook_once` read it,
+ // exactly as before.
+ let payload_text = if diagnose {
+ let mut raw = String::new();
+ if std::io::stdin().read_to_string(&mut raw).is_err() {
+ eprintln!("could not look: the payload on stdin could not be read");
+ std::process::exit(2);
+ }
+ if let Err(line) = hook_preflight(&raw, db_path) {
+ eprintln!("{line}");
+ std::process::exit(2);
+ }
+ Some(raw)
+ } else {
+ None
+ };
+ std::panic::set_hook(Box::new(|_| {}));
+ let db_path = db_path.to_path_buf();
+ let result = std::panic::catch_unwind(move || hook_once(&db_path, payload_text));
+ // Taken before the match below consumes `result`.
+ let diagnosis: Option<(&str, i32)> = if diagnose {
+ Some(match &result {
+ Ok(Some(_)) => ("looked, and produced a block", 0),
+ Ok(None) => ("looked, and nothing applies here", 0),
+ Err(_) => ("could not look: the hook failed internally after starting, and wrote nothing", 2),
+ })
+ } else {
+ None
+ };
+ match result {
+ Ok(Some(HookOutput::Context { event_name, block })) => {
+ let out = serde_json::json!({
+ "hookSpecificOutput": {
+ "hookEventName": event_name,
+ "additionalContext": block,
+ }
+ });
+ let _ = serde_json::to_writer(std::io::stdout(), &out);
+ }
+ Ok(Some(HookOutput::ContextWithNotice { event_name, block, notice })) => {
+ let out = serde_json::json!({
+ "systemMessage": notice,
+ "hookSpecificOutput": {
+ "hookEventName": event_name,
+ "additionalContext": block,
+ }
+ });
+ let _ = serde_json::to_writer(std::io::stdout(), &out);
+ }
+ // The Response Guard's verdict is its own top-level shape, printed
+ // verbatim - never wrapped in additionalContext.
+ Ok(Some(HookOutput::Decision(v))) => {
+ let _ = serde_json::to_writer(std::io::stdout(), &v);
+ }
+ // A WARN-tier verdict at Stop - kept as its own match arm rather
+ // than folded into `Context`'s (not merely to save a few lines)
+ // because the two mean different things, and no longer render the
+ // same way either: `Context` is an injection surface handing the
+ // model ONE field, `hookSpecificOutput.additionalContext`. `Warn` is
+ // the Response Guard's own softer verdict, and has a second audience
+ // `Context` never needs to reach - the owner, not just the model -
+ // so it also sets a top-level `systemMessage` carrying the same
+ // text, confirmed by Claude Code's own hooks documentation as the
+ // field "shown to the user". See `HookOutput::Warn`'s own doc
+ // comment for what that documentation settles and the one question
+ // it still leaves open - if that remaining assumption is ever found
+ // wrong, only this arm needs to change.
+ Ok(Some(HookOutput::Warn { event_name, text })) => {
+ let out = serde_json::json!({
+ "systemMessage": text,
+ "hookSpecificOutput": {
+ "hookEventName": event_name,
+ "additionalContext": text,
+ }
+ });
+ let _ = serde_json::to_writer(std::io::stdout(), &out);
+ }
+ _ => {}
+ }
+ if let Some((line, code)) = diagnosis {
+ eprintln!("{line}");
+ std::process::exit(code);
+ }
+ std::process::exit(0);
 }
 
 // -------------------------------------------------------- human-facing CLI
 
 fn open_store_or_die(db_path: &Path) -> EventStore {
-    match EventStore::new(db_path) {
-        Ok(store) => store,
-        Err(e) => {
-            eprintln!("could not open store at {}: {e}", db_path.display());
-            std::process::exit(1);
-        }
-    }
+ match EventStore::new(db_path) {
+ Ok(store) => store,
+ Err(e) => {
+ eprintln!("could not open store at {}: {e}", db_path.display());
+ std::process::exit(1);
+ }
+ }
 }
 
 fn cmd_check(db_path: &Path, input: &ServeInput) {
-    if input.is_empty() {
-        println!("no intent detected - nothing would fire");
-        return;
-    }
-    if input.moments.is_empty() {
-        println!("detected: (no action; matching on target only)");
-    } else {
-        println!("detected: {}", input.moments.iter().map(Action::as_str).collect::<Vec<_>>().join(", "));
+ if input.is_empty() {
+ println!("no intent detected - nothing would fire");
+ return;
+ }
+ if input.moments.is_empty() {
+ println!("detected: (no action; matching on target only)");
+ } else {
+ println!("detected: {}", input.moments.iter().map(Action::as_str).collect::<Vec<_>>().join(", "));
     }
     let store = open_store_or_die(db_path);
     let served = serve::serve(&store, input);
@@ -5179,21 +5261,28 @@ fn cmd_prompt(db_path: &Path, text: &str) {
 fn render_search_reply(
     hits: &[lookup::LookupHit],
     query: &str,
-    kind: Option<Kind>,
+    kinds: &[Kind],
     unfiltered_count: usize,
     literal_found_any: bool,
     withheld: usize,
 ) -> String {
     let mut out = String::new();
     if hits.is_empty() {
-        match kind {
-            // Names the kind, so a thin answer reads as "nothing of that
-            // kind" rather than as an empty memory - and, when the
-            // unfiltered ranking DID find something, how many hits of other
-            // kinds there were (see `other_kind_hint`'s own doc comment: a
-            // bare "no matches" there would be a lie by omission).
-            Some(k) => out.push_str(&format!("no matches for '{query}' of kind {k:?}{}\n", lookup::other_kind_hint(unfiltered_count))),
-            None => out.push_str(&format!("no matches for '{query}'\n")),
+        // Names the kinds asked for, so a thin answer reads as "nothing of
+        // that kind" rather than as an empty memory - and, when the
+        // unfiltered ranking DID find something, how many hits of other
+        // kinds there were (see `other_kind_hint`'s own doc comment: a bare
+        // "no matches" there would be a lie by omission).
+        if kinds.is_empty() {
+            out.push_str(&format!("no matches for '{query}'
+"));
+        } else {
+            out.push_str(&format!(
+                "no matches for '{query}' of kind {}{}
+",
+                lookup::kind_names(kinds),
+                lookup::other_kind_hint(unfiltered_count)
+            ));
         }
     } else {
         for hit in hits {
@@ -5288,18 +5377,15 @@ fn build_search_reply(
     store: &EventStore,
     vectors_path: &Path,
     query: &str,
-    kind: Option<Kind>,
+    kinds: &[Kind],
     explain: bool,
     explain_id: Option<&str>,
 ) -> String {
     let (literal_hits, withheld) = lookup::search_with_expired(store, query);
     let hits = lookup::search_best_effort(store, vectors_path, None, query);
     let unfiltered_count = hits.len();
-    let hits = match kind {
-        Some(k) => lookup::only_kind(hits, k),
-        None => hits,
-    };
-    let mut out = render_search_reply(&hits, query, kind, unfiltered_count, !literal_hits.is_empty(), withheld);
+    let hits = lookup::only_kinds(hits, kinds);
+    let mut out = render_search_reply(&hits, query, kinds, unfiltered_count, !literal_hits.is_empty(), withheld);
     if explain || explain_id.is_some() {
         let explanation = lookup::explain_best_effort(store, vectors_path, None, query, explain_id);
         out.push_str(&render_explain_block(&explanation, &hits, explain, explain_id));
@@ -5318,10 +5404,10 @@ fn cmd_search(db_path: &Path, query: &str, kind: Option<&str>, explain: bool, ex
     // unusable kind is a mistake in the question, and answering an unfiltered
     // search instead would look like a result. Exit 2, not 1: a refused
     // argument is not the same outcome as a search that ran and found nothing.
-    let kind = match kind.map(str::trim).filter(|k| !k.is_empty()) {
-        None => None,
-        Some(raw) => match lookup::parse_searchable_kind(raw) {
-            Ok(k) => Some(k),
+    let kinds: Vec<Kind> = match kind.map(str::trim).filter(|k| !k.is_empty()) {
+        None => Vec::new(),
+        Some(raw) => match lookup::parse_searchable_kinds(raw) {
+            Ok(k) => k,
             Err(refusal) => {
                 eprintln!("{refusal}");
                 std::process::exit(2);
@@ -5330,7 +5416,7 @@ fn cmd_search(db_path: &Path, query: &str, kind: Option<&str>, explain: bool, ex
     };
     let store = open_store_or_die(db_path);
     let vectors_path = serve::semantic_paths::default_vectors_path(db_path);
-    print!("{}", build_search_reply(&store, &vectors_path, query, kind, explain, explain_id));
+    print!("{}", build_search_reply(&store, &vectors_path, query, &kinds, explain, explain_id));
 }
 
 /// Surface 4's other door: an explicit request for exactly one Lookup's key.
@@ -5622,6 +5708,45 @@ mod subagent_detection_tests {
 
 #[cfg(test)]
 mod search_explain_tests {
+    /// THE DEFECT THIS CLOSES, reported 2026-09-19 by the first program that
+    /// drives this boundary itself: `hook` prints nothing and exits 0 whether
+    /// it looked and found nothing or could not look at all, and a program whose
+    /// job is to stop a wrong action cannot tell those apart. Both real cases
+    /// are pinned here.
+    #[test]
+    fn preflight_names_a_payload_that_is_not_json_and_blames_the_usual_cause() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("t.db");
+        EventStore::new(&db).unwrap();
+        let refusal = hook_preflight(r#"{"cwd": "C:\Users\dev\repo"}"#, &db)
+            .expect_err("single backslashes are not valid JSON");
+        assert!(refusal.starts_with("could not look:"), "{refusal}");
+        assert!(refusal.contains("not valid JSON"), "{refusal}");
+        assert!(refusal.contains("forward slashes"), "must name the fix: {refusal}");
+    }
+
+    /// A store path that does not exist reads, from outside, exactly like a
+    /// memory with nothing to say. It has to be named instead.
+    #[test]
+    fn preflight_names_a_memory_that_is_not_there() {
+        let dir = tempfile::tempdir().unwrap();
+        let missing = dir.path().join("nowhere").join("thor.db");
+        let refusal = hook_preflight(r#"{"hook_event_name":"SessionStart"}"#, &missing)
+            .expect_err("a missing store must be named");
+        assert!(refusal.starts_with("could not look:"), "{refusal}");
+        assert!(refusal.contains(&missing.display().to_string()), "must name the path: {refusal}");
+    }
+
+    /// And the honest pass: a real payload against a real store says nothing at
+    /// all, so the diagnosing path only ever speaks about real trouble.
+    #[test]
+    fn preflight_passes_a_real_payload_against_a_real_store() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("t.db");
+        EventStore::new(&db).unwrap();
+        assert_eq!(hook_preflight(r#"{"hook_event_name":"SessionStart"}"#, &db), Ok(()));
+    }
+
     use super::*;
     use model::item::{Item, Kind};
     use model::store;
@@ -5656,8 +5781,8 @@ mod search_explain_tests {
         let vectors_dir = tempfile::tempdir().unwrap();
         let vectors_path = vectors_dir.path().join("v.db");
 
-        let plain = build_search_reply(&db, &vectors_path, "bbq", None, false, None);
-        let explained = build_search_reply(&db, &vectors_path, "bbq", None, true, None);
+        let plain = build_search_reply(&db, &vectors_path, "bbq", &[], false, None);
+        let explained = build_search_reply(&db, &vectors_path, "bbq", &[], true, None);
         assert!(explained.starts_with(&plain), "explain must only ever append, never alter, the normal reply: {explained}");
         assert_ne!(explained, plain, "explain must actually add something when there are hits to explain");
     }
@@ -5673,7 +5798,7 @@ mod search_explain_tests {
         let vectors_dir = tempfile::tempdir().unwrap();
         let vectors_path = vectors_dir.path().join("v.db");
 
-        let reply = build_search_reply(&db, &vectors_path, "gizmo", Some(Kind::Rule), false, None);
+        let reply = build_search_reply(&db, &vectors_path, "gizmo", &[Kind::Rule], false, None);
         assert!(reply.contains("no matches for 'gizmo' of kind Rule"), "{reply}");
         assert!(reply.contains("1 hit(s) of other kind(s)"), "must name how many other-kind hits there were: {reply}");
     }

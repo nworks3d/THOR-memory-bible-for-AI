@@ -1926,7 +1926,7 @@ impl ThorMcpServer {
         .await
     }
 
-    #[tool(description = "Code lane: searches THOR's memory - every project, archive kinds (Report, Chunk) included - never scoped to only the current project. Call this before remember, so an existing near-duplicate becomes a revise instead. No arguments returns the catalogue of scopes; scope alone lists everything filed there; scope with query narrows a search to it; query alone searches everywhere; key answers only a Lookup item's own exact key (query, scope and kind are then ignored); kind narrows a search to rule, orientation, report or chunk (case-insensitive, an obvious plural such as 'rules' accepted) - without it, Report hits tend to dominate a plain search since their own text runs long, and asking for kind lookup is refused rather than silently answered empty, since a Lookup register only ever answers to its own key. Read-only, and never an injection surface - nothing here reaches you unprompted. Replies with up to 25 matching lines (id, kind, text) and how many more exist, the catalogue, or a plain 'no matches'.", annotations(title = "Search the memory", read_only_hint = true, destructive_hint = false, idempotent_hint = true, open_world_hint = false))]
+    #[tool(description = "Code lane: searches THOR's memory - every project, archive kinds (Report, Chunk) included - never scoped to only the current project. Call this before remember, so an existing near-duplicate becomes a revise instead. No arguments returns the catalogue of scopes; scope alone lists everything filed there; scope with query narrows a search to it; query alone searches everywhere; key answers only a Lookup item's own exact key (query, scope and kind are then ignored); kind narrows a search to rule, orientation, report or chunk - several at once with a comma, and 'fires' as shorthand for every kind that can fire at a moment, which is what you want when the fact has to steer an action (case-insensitive, an obvious plural such as 'rules' accepted) - without it, Report hits tend to dominate a plain search since their own text runs long, and asking for kind lookup is refused rather than silently answered empty, since a Lookup register only ever answers to its own key. Read-only, and never an injection surface - nothing here reaches you unprompted. Replies with up to 25 matching lines (id, kind, text) and how many more exist, the catalogue, or a plain 'no matches'.", annotations(title = "Search the memory", read_only_hint = true, destructive_hint = false, idempotent_hint = true, open_world_hint = false))]
     async fn lookup(&self, Parameters(args): Parameters<LookupArgs>) -> String {
         let vectors = self.vectors.clone();
         #[cfg(feature = "semantic")]
@@ -1942,9 +1942,9 @@ impl ThorMcpServer {
             // refused before anything is searched - see `serve::lookup::parse_searchable_kind`'s
             // own doc comment for why `Kind::Lookup` gets a different refusal
             // than a plain typo.
-            let kind = match args.kind.as_deref().map(str::trim).filter(|k| !k.is_empty()) {
-                None => None,
-                Some(raw) => Some(serve::lookup::parse_searchable_kind(raw)?),
+            let kinds = match args.kind.as_deref().map(str::trim).filter(|k| !k.is_empty()) {
+                None => Vec::new(),
+                Some(raw) => serve::lookup::parse_searchable_kinds(raw)?,
             };
             // NEITHER given is not a mistake any more: it asks what addresses
             // exist. THE DEFECT THIS CLOSES, measured 2026-08-16: the store
@@ -2002,10 +2002,7 @@ impl ThorMcpServer {
             // Kind narrows LAST, on top of the scope-narrowed ranking, so the
             // three arguments compose: a query+scope+kind search returns
             // exactly what query+scope would have, minus the other kinds.
-            let hits = match kind {
-                Some(k) => serve::lookup::only_kind(hits, k),
-                None => hits,
-            };
+            let hits = serve::lookup::only_kinds(hits, &kinds);
             // How many the expiry rule held back, so a thin answer is never
             // mistaken for an empty memory (see lookup::search_with_expired),
             // and whether the LITERAL leg (search's own text match) found
@@ -2022,9 +2019,14 @@ impl ThorMcpServer {
                 // kinds this ranking found - a bare "no matches" there would
                 // be a lie by omission (see `other_kind_hint`'s own doc
                 // comment).
-                let kind_note = match kind {
-                    Some(k) => format!(" of kind {k:?}{}", serve::lookup::other_kind_hint(unfiltered_count)),
-                    None => String::new(),
+                let kind_note = if kinds.is_empty() {
+                    String::new()
+                } else {
+                    format!(
+                        " of kind {}{}",
+                        serve::lookup::kind_names(&kinds),
+                        serve::lookup::other_kind_hint(unfiltered_count)
+                    )
                 };
                 match scope {
                     Some(sc) => out.push_str(&format!(

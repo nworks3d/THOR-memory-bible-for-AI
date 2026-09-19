@@ -1803,6 +1803,95 @@ pub fn default_command_marker_path(db: &Path) -> PathBuf {
     db.parent().unwrap_or_else(|| Path::new(".")).join("absent-guard-command-blocked.json")
 }
 
+// -------------------------------------------- classification (2026-09-19)
+//
+// A THIRD reader of the exact matching the command guard above already runs,
+// never a second definition of it. Where `find_command_violation` DECIDES
+// ("do not run this"), this reader only ANSWERS a question a caller already
+// knows how to ask elsewhere: of the items already selected for a moment
+// (`rank::select`'s own output - the ranked pool `check`/`why`/`hook` already
+// serve), which of them is a machine-checkable PROHIBITION for the thing
+// about to happen, and which is merely ADVICE. The owner does not want this
+// memory to refuse an action itself - the program driving a local model
+// already knows the machine state and owns that decision. What this gives it
+// is the ANSWER to say which served facts are prohibitions, so the program
+// can refuse on them and log the reason, and so a new rail can be written as
+// a fact instead of as a code change.
+//
+// THE DEFINITION IS DELIBERATELY NARROW (the owner's own words, 2026-09-19):
+// a served fact is a prohibition for this moment when, and only when, its
+// own machine check would catch the very thing being proposed - it carries
+// `Check::Forbidden` and at least one of that check's literals actually
+// occurs in the proposed command, or (where the surface has one) the
+// proposed content. Everything else is ADVICE. In particular a heavy fact
+// (`irreversible`/`costly`) with NO check is advice, never a prohibition:
+// severity says being wrong is EXPENSIVE, it does not say anything is
+// machine-verifiable. This is what keeps a rail honest - getting it wrong
+// means a program refuses a job on a hunch, never on a proof. Every OTHER
+// check form (`PathExists`/`Contains`/`Absent`/`AbsentAll`/`Requires`) is
+// advice here too, however heavy its own severity reads: an anchored check's
+// currency is a file-system question, proven against a path, never a
+// question the text of a command or a proposed write can answer on its own.
+//
+// REUSES `command_literals`/`first_present_literal` - the exact matching
+// `first_command_violation` already runs - rather than a second copy of
+// either. `command_literals` returns `Some((None, literals))` for ONE check
+// form only (`Forbidden`; every anchored form comes back `Some((Some(path),
+// ..))`, every unrelated form `None`), so testing its path half for `None`
+// IS "is this check a Forbidden check", with nothing here re-deciding that
+// question a second way. A prohibition found here can therefore never
+// disagree with a refusal `find_command_violation` finds for the very same
+// item and command: both ask the identical question of the identical check
+// (see `the_classifier_and_the_command_guard_never_disagree` below).
+
+/// One served fact's classification for a proposed action - see this
+/// section's own doc comment for the full doctrine. `Prohibition` names the
+/// literal that matched, so a caller never has to re-search for it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Verdict {
+    Prohibition { literal: String },
+    Advice,
+}
+
+/// Whether `check` is a prohibition for `command` (and, where the surface
+/// carries one, `content`) - the per-check half of `classify_moment` below,
+/// kept separate so a test can drive one check at a time with no
+/// `RankedItem` to build. `content` is tried only when `command` itself did
+/// not already match: a Bash-style call has no content at all (see
+/// `proposed_content`'s own doc comment on the two tool shapes that do), and
+/// checking it unconditionally would cost nothing wrong today but would
+/// invite exactly that "just search everything" drift this module's own
+/// doctrine warns against elsewhere.
+pub fn classify_check(check: Option<&Check>, command: &str, content: Option<&str>) -> Verdict {
+    let Some(check) = check else { return Verdict::Advice };
+    // See this section's own doc comment: `Some((None, literals))` is
+    // `command_literals`'s own way of saying "this is a Forbidden check" -
+    // an anchored form comes back `Some((Some(path), ..))`, an unrelated one
+    // `None`. Both fall through to Advice below, never a second match arm
+    // re-deciding what `command_literals` already decided.
+    let Some((None, literals)) = command_literals(check) else { return Verdict::Advice };
+    if let Some(literal) = first_present_literal(literals, command) {
+        return Verdict::Prohibition { literal: literal.to_string() };
+    }
+    if let Some(content) = content {
+        if let Some(literal) = first_present_literal(literals, content) {
+            return Verdict::Prohibition { literal: literal.to_string() };
+        }
+    }
+    Verdict::Advice
+}
+
+/// The classifier itself: `classify_check` above, run over every one of
+/// `ranked` - the items a moment already selected (`rank::select`'s own
+/// output, exactly as `check`/`why`/`hook` already serve it) - paired with
+/// each item's own id so a caller never has to zip two lists back together
+/// by hand. No rendering, no I/O: a caller turns this into JSON or prose,
+/// never this function (see `serve/src/bin/serve.rs`'s own `check_rows`,
+/// `mark_prohibitions` and `why_lines`, the only places that do).
+pub fn classify_moment(ranked: &[RankedItem], command: &str, content: Option<&str>) -> Vec<(String, Verdict)> {
+    ranked.iter().map(|r| (r.id.clone(), classify_check(r.item.check.as_ref(), command, content))).collect()
+}
+
 // ----------------------------------------------------- staleness sidecar
 //
 // The second half of this module's own opening doctrine (see the top of
@@ -4734,5 +4823,107 @@ sonnet").is_none(),
         let items = vec![dir_item_with_check("d8", "thor2", "forbidden")];
 
         assert!(stale_in_dir_content(&items, "elsewhere/probe-scratch.md", Some(dir.path())).is_empty());
+    }
+
+    // ------------------------------------------------------ classification
+    //
+    // `classify_check`/`classify_moment` (see this file's own "classification"
+    // section above) never blocks anything - it only ANSWERS, for an item
+    // already selected for a moment, whether ITS OWN check would have caught
+    // the very thing being proposed. Each test below is named after the exact
+    // defect it prevents, per the owner's own instruction.
+
+    /// A fact with a forbidden check whose literal occurs in the proposed
+    /// command is a prohibition, and the literal is named - never a bare
+    /// boolean, so a caller never has to re-search the command for what
+    /// matched.
+    #[test]
+    fn a_forbidden_literal_present_in_the_command_is_a_prohibition_naming_the_literal() {
+        let check = Check::Forbidden { literals: vec!["--force".to_string()] };
+        let verdict = classify_check(Some(&check), "git push --force origin main", None);
+        assert_eq!(verdict, Verdict::Prohibition { literal: "--force".to_string() });
+    }
+
+    /// THE DEFECT THIS PREVENTS: a program that treats every `Forbidden`
+    /// check as a standing prohibition, regardless of whether it actually
+    /// matches THIS command, would refuse things its own rule never named.
+    #[test]
+    fn the_same_forbidden_check_is_advice_when_its_literal_does_not_occur_in_the_command() {
+        let check = Check::Forbidden { literals: vec!["--force".to_string()] };
+        let verdict = classify_check(Some(&check), "git push origin main", None);
+        assert_eq!(verdict, Verdict::Advice);
+    }
+
+    /// THE DEFECT THIS PREVENTS, and the one the owner named first: a program
+    /// refusing an action on `severity: irreversible` ALONE, with no check to
+    /// back it, would be refusing on a hunch - severity says being wrong is
+    /// EXPENSIVE, never that it is machine-verifiable. A heavy fact with no
+    /// check at all must classify as advice, never a prohibition, however
+    /// loudly its own text reads like a command.
+    #[test]
+    fn a_heavy_fact_with_no_check_is_advice_never_a_prohibition_on_severity_alone() {
+        let item = Item {
+            id: "irreversible-no-check".to_string(),
+            kind: Kind::Rule,
+            text: "never run the irreversible thing".to_string(),
+            bindings: vec![Binding::Target { kind: TargetKind::Command, value: "rm".to_string() }],
+            severity: Some(Severity::Irreversible),
+            project: None,
+            tags: vec![],
+            expires: None,
+            key: None,
+            falsifier: Some("the irreversible thing turns out fine".to_string()),
+            check: None,
+        };
+        let ranked = vec![RankedItem { id: item.id.clone(), item }];
+        let verdicts = classify_moment(&ranked, "rm -rf /", None);
+        assert_eq!(verdicts, vec![("irreversible-no-check".to_string(), Verdict::Advice)]);
+    }
+
+    /// A fact with a non-forbidden check - contains, absent, absent_all,
+    /// path_exists or requires - is advice at a command moment, even when the
+    /// command text carries exactly what the check's own literal names: only
+    /// `Forbidden` is ever machine-verifiable at THIS surface (an anchored
+    /// check's own currency is a file-system question, never a command-text
+    /// one), so every other form stays advice regardless of what the command
+    /// says.
+    #[test]
+    fn a_non_forbidden_check_is_advice_at_a_command_moment() {
+        for check in [
+            Check::Contains { path: "README.md".to_string(), literal: "GPLv3".to_string() },
+            Check::Absent { path: "README.md".to_string(), literal: "TODO".to_string() },
+            Check::AbsentAll { path: "README.md".to_string(), literals: vec!["TODO".to_string()] },
+            Check::PathExists { path: "README.md".to_string() },
+            Check::Requires { when: "git commit".to_string(), required: vec!["issue:".to_string()] },
+        ] {
+            let verdict = classify_check(Some(&check), "git commit -m TODO", None);
+            assert_eq!(verdict, Verdict::Advice, "{check:?} must never be a prohibition here");
+        }
+    }
+
+    /// THE DEFECT THIS PREVENTS: a second, independent copy of "does this
+    /// item's forbidden literal occur in what is about to happen" drifting
+    /// from the one `find_command_violation` already runs, so a program
+    /// reading the classifier's verdict and the real guard's refusal could
+    /// disagree about the very same call. Drives both over the identical
+    /// item and command and asserts they agree - so a future change to
+    /// either one shows up here, not in production.
+    #[test]
+    fn the_classifier_and_the_command_guard_never_disagree() {
+        let dir = tempfile::tempdir().unwrap();
+        let live = command_item_with_forbidden_check("no-public", "gh repo edit", &["--visibility public"]);
+        let command = "gh repo edit --visibility public";
+
+        let (reason, _anchor) = find_command_violation(std::slice::from_ref(&live), command, Some(dir.path()))
+            .expect("sanity: the guard must actually refuse this command");
+        assert!(reason.contains("no-public"), "{reason}");
+
+        let ranked = vec![RankedItem { id: live.id.clone(), item: live.item.clone() }];
+        let verdicts = classify_moment(&ranked, command, None);
+        assert_eq!(
+            verdicts,
+            vec![(live.id.clone(), Verdict::Prohibition { literal: "--visibility public".to_string() })],
+            "a command the guard refuses must be the classifier's own prohibition for the same item"
+        );
     }
 }

@@ -18,6 +18,7 @@ use model::item::{Kind, TargetKind};
 use serde_json::Value;
 use serve::decay::DecayContext;
 use serve::input::ServeInput;
+use serve::rank::RankedItem;
 use serve::{
     absent_guard, capture, deliver, judge, lookup, mark, project, prompt, render, respond, session_start, stale_guard,
     status, time, usefulness,
@@ -300,6 +301,19 @@ struct TargetArgs {
     /// An explicit moment, named directly (repeatable).
     #[arg(long = "moment", value_parser = parse_moment_arg)]
     moments: Vec<Action>,
+    /// Machine-readable output in place of the prose form: a JSON array on
+    /// stdout and nothing else (no "detected: ..." line, no prose), one
+    /// object per item, each with exactly these keys - "id" (string),
+    /// "kind" (string), "severity" (string, or null when the item carries
+    /// none), "verdict" ("prohibition" or "advice" - see this binary's own
+    /// classifier, `absent_guard::classify_moment`, for the doctrine), only
+    /// ever "matched_literal" (a string) when the verdict is a prohibition,
+    /// never for advice, and "text" (string). `check` emits one row per item
+    /// the block would actually show; `why` emits one row per item that
+    /// applies at all, shown or withheld - the same distinction their own
+    /// prose forms already keep.
+    #[arg(long)]
+    json: bool,
 }
 
 fn parse_target_arg(s: &str) -> Result<(TargetKind, String), String> {
@@ -362,8 +376,8 @@ fn main() {
     let cli = Cli::parse();
     match cli.command {
         Command::Hook { diagnose, actor, no_record } => cmd_hook(&cli.db, diagnose, actor, no_record),
-        Command::Check(args) => cmd_check(&cli.db, &build_input(&args)),
-        Command::Why(args) => cmd_why(&cli.db, &build_input(&args)),
+        Command::Check(args) => cmd_check(&cli.db, &build_input(&args), args.json),
+        Command::Why(args) => cmd_why(&cli.db, &build_input(&args), args.json),
         Command::Audit => cmd_audit(&cli.db),
         Command::SessionStart { project } => {
             let resolved = project.or_else(current_project_from_cwd);
@@ -549,6 +563,163 @@ fn decay_notice(store: &EventStore, db: &Path, cwd: Option<&Path>) -> Option<Str
     ))
 }
 
+// --------------------------------------------- prohibition/advice JSON rows
+//
+// The one place `absent_guard::Verdict` (data only - "no rendering, no I/O",
+// per that module's own doctrine) turns into the documented wire shape:
+// `Command::Check`'s own doc comment (read by `--help`) names the exact six
+// keys below. `check --json`, `why --json` and `hook`'s own `verdicts`
+// sibling field all build their rows through this ONE function, so the
+// three can never quietly disagree about what a prohibition looks like on
+// the wire.
+
+/// One item's row in the `--json` shape `check`/`why` document in their own
+/// `--help` text, and the exact shape `hook`'s own `verdicts` field carries
+/// too. `kind`/`severity` are the real `model::item` enums, not hand-rolled
+/// strings - both already serialise snake_case (`Kind`/`Severity`'s own
+/// `#[serde(rename_all = "snake_case")]`), so "house_style" comes out right
+/// without this file re-deciding how to spell it. `matched_literal` is
+/// `None` for advice and skipped entirely by serde rather than written as
+/// `null` - "present only for a prohibition" means the KEY is absent, not
+/// merely empty (see `json_rows_carry_exactly_the_documented_keys` below).
+#[derive(Debug, serde::Serialize)]
+struct CheckRow {
+    id: String,
+    kind: model::item::Kind,
+    severity: Option<model::item::Severity>,
+    verdict: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    matched_literal: Option<String>,
+    text: String,
+}
+
+/// `absent_guard::classify_moment` run over `ranked` against `command`/
+/// `content`, translated into the documented `CheckRow` shape - the one
+/// function `check --json`, `why --json`, `mark_prohibitions` and `why_lines`
+/// (the prose markers) and `hook`'s own `verdicts` field all build on, so
+/// none of them can drift from what the classifier itself decided.
+fn check_rows(ranked: &[RankedItem], command: &str, content: Option<&str>) -> Vec<CheckRow> {
+    let verdicts = absent_guard::classify_moment(ranked, command, content);
+    ranked
+        .iter()
+        .zip(verdicts)
+        .map(|(r, (id, verdict))| {
+            debug_assert_eq!(r.id, id, "classify_moment must return one verdict per item, in ranked's own order");
+            let (verdict, matched_literal) = match verdict {
+                absent_guard::Verdict::Prohibition { literal } => ("prohibition", Some(literal)),
+                absent_guard::Verdict::Advice => ("advice", None),
+            };
+            CheckRow { id, kind: r.item.kind, severity: r.item.severity, verdict, matched_literal, text: r.item.text.clone() }
+        })
+        .collect()
+}
+
+/// `check --json`/`why --json`'s only I/O: a JSON array on stdout and
+/// nothing else - no prose, no trailing prompt, never mixed with anything
+/// else this process might otherwise have printed on that path (see
+/// `cmd_check`/`cmd_why`, which return immediately after calling this).
+/// Serialisation over `rows` (plain owned strings/enums, nothing that can
+/// fail to serialise in practice) is not expected to ever error, but this
+/// still degrades to printing `[]` rather than nothing at all or a partial
+/// line, so the one promise this function makes - stdout is always a single
+/// valid JSON array - holds even in that should-not-happen case.
+fn print_json_rows(rows: &[CheckRow]) {
+    match serde_json::to_string(rows) {
+        Ok(json) => println!("{json}"),
+        Err(_) => println!("[]"),
+    }
+}
+
+#[cfg(test)]
+mod check_rows_json_tests {
+    use super::*;
+    use model::item::{Binding, Check, Item, Kind, Severity, TargetKind};
+
+    fn ranked(id: &str, check: Option<Check>, severity: Option<Severity>) -> RankedItem {
+        RankedItem {
+            id: id.to_string(),
+            item: Item {
+                id: id.to_string(),
+                kind: Kind::Rule,
+                text: format!("{id}: some fact"),
+                bindings: vec![Binding::Target { kind: TargetKind::Command, value: "git push".to_string() }],
+                severity,
+                project: None,
+                tags: vec![],
+                expires: None,
+                key: None,
+                falsifier: Some(format!("{id} turns out not to matter")),
+                check,
+            },
+        }
+    }
+
+    /// THE DEFECT THIS PREVENTS: a program reading `--json` is the "door" the
+    /// task's own instructions name - its shape has to be boring and stable.
+    /// Proves the exact key SET the task documents, both ways: a prohibition
+    /// row carries `matched_literal`, an advice row does not carry the key AT
+    /// ALL (not `null` - an absent key), and `severity` is always present,
+    /// `null` only when the item carries none.
+    #[test]
+    fn json_rows_carry_exactly_the_documented_keys() {
+        let prohibited = ranked(
+            "p1",
+            Some(Check::Forbidden { literals: vec!["--force".to_string()] }),
+            Some(Severity::Irreversible),
+        );
+        let advice = ranked("a1", None, None);
+        let rows = check_rows(&[prohibited, advice], "git push --force", None);
+        let json = serde_json::to_value(&rows).unwrap();
+        let arr = json.as_array().expect("must be a JSON array");
+        assert_eq!(arr.len(), 2);
+
+        let p = arr[0].as_object().expect("row must be a JSON object");
+        let mut p_keys: Vec<&str> = p.keys().map(String::as_str).collect();
+        p_keys.sort_unstable();
+        assert_eq!(p_keys, vec!["id", "kind", "matched_literal", "severity", "text", "verdict"]);
+        assert_eq!(p["id"], "p1");
+        assert_eq!(p["kind"], "rule");
+        assert_eq!(p["severity"], "irreversible");
+        assert_eq!(p["verdict"], "prohibition");
+        assert_eq!(p["matched_literal"], "--force");
+
+        let a = arr[1].as_object().expect("row must be a JSON object");
+        let mut a_keys: Vec<&str> = a.keys().map(String::as_str).collect();
+        a_keys.sort_unstable();
+        assert_eq!(
+            a_keys,
+            vec!["id", "kind", "severity", "text", "verdict"],
+            "matched_literal must be ABSENT for advice, not merely null"
+        );
+        assert_eq!(a["severity"], serde_json::Value::Null, "a missing severity serialises as null, never omitted");
+        assert_eq!(a["verdict"], "advice");
+    }
+
+    /// `check --json` and `why --json` must build rows through the identical
+    /// function - proven here by exercising `check_rows` directly against a
+    /// SET (`served.selection.shown` vs `served.all` in production), never
+    /// against a single hand-picked item, so an ordering bug in the
+    /// zip-based construction (`check_rows`'s own `.zip(verdicts)`) would
+    /// show up as a wrong id/verdict pairing rather than passing by luck.
+    #[test]
+    fn rows_stay_paired_with_the_right_item_across_several_at_once() {
+        let items = vec![
+            ranked("i0", None, None),
+            ranked("i1", Some(Check::Forbidden { literals: vec!["bad".to_string()] }), None),
+            ranked("i2", None, Some(Severity::HouseStyle)),
+        ];
+        let rows = check_rows(&items, "this command is bad", None);
+        assert_eq!(rows.len(), 3);
+        assert_eq!(rows[0].id, "i0");
+        assert_eq!(rows[0].verdict, "advice");
+        assert_eq!(rows[1].id, "i1");
+        assert_eq!(rows[1].verdict, "prohibition");
+        assert_eq!(rows[1].matched_literal.as_deref(), Some("bad"));
+        assert_eq!(rows[2].id, "i2");
+        assert_eq!(rows[2].verdict, "advice");
+    }
+}
+
 /// `Debug` only - for a test failure message (`{other:?}`); nothing in
 /// production ever formats a `HookOutput`, each variant is rendered by hand
 /// in `cmd_hook`.
@@ -556,7 +727,18 @@ fn decay_notice(store: &EventStore, db: &Path, cwd: Option<&Path>) -> Option<Str
 enum HookOutput {
     /// An injection surface's block, wrapped by the caller as
     /// `hookSpecificOutput.additionalContext`.
-    Context { event_name: String, block: String },
+    ///
+    /// `verdicts` (added 2026-09-19) is a SEPARATE, top-level sibling of that
+    /// same JSON, never mixed into `block`/`additionalContext` itself - see
+    /// `hook_output_json`'s own doc comment for why the two must never touch:
+    /// `additionalContext` is what Claude Code hands the model verbatim, and
+    /// this field exists for a DIFFERENT reader, a program driving a local
+    /// model that already calls this channel per action and wants the same
+    /// prohibition/advice verdicts `check --json`/`why --json` document,
+    /// without spawning a second process. One row per item in `block` -
+    /// `absent_guard::classify_moment` run over the exact items selected for
+    /// this call, translated by `check_rows`.
+    Context { event_name: String, block: String, verdicts: Vec<CheckRow> },
     /// An injection block PLUS a one-line notice for the OWNER.
     ///
     /// WHY A SECOND AUDIENCE AT SESSION START. A memory decays while nobody
@@ -566,7 +748,10 @@ enum HookOutput {
     /// refusing to rely on - the owner never once saw it, because he never
     /// ran it. This carries the same block to the model and, only when
     /// something is actually wrong, one line to him.
-    ContextWithNotice { event_name: String, block: String, notice: String },
+    ///
+    /// `verdicts` - see `Context`'s own doc comment just above; the same
+    /// field, for the same reason, on this variant's own `block`.
+    ContextWithNotice { event_name: String, block: String, notice: String, verdicts: Vec<CheckRow> },
     /// A verdict, printed verbatim - `{"decision":"block","reason":...}`.
     /// Asks the model to reconsider (Stop) or refuses a tool call
     /// (PreToolUse) rather than adding to its context. Three surfaces share
@@ -1363,9 +1548,15 @@ fn hook_once(db_path: &Path, payload_text: Option<String>, actor: &str, no_recor
                     Some("session start"),
                 );
             }
+            // No `verdicts` here - see `HookOutput::Context`'s own doc
+            // comment: the classifier answers "is this a prohibition for the
+            // thing about to happen", and session start proposes nothing at
+            // all (it is the pinned `Always` block, not a reaction to a real
+            // command or write) - empty is the honest answer, never a guess
+            // dressed up as advice for every item shown.
             match decay_notice(&store, db_path, session_cwd.as_deref()) {
-                Some(notice) => Some(HookOutput::ContextWithNotice { event_name, block, notice }),
-                None => Some(HookOutput::Context { event_name, block }),
+                Some(notice) => Some(HookOutput::ContextWithNotice { event_name, block, notice, verdicts: Vec::new() }),
+                None => Some(HookOutput::Context { event_name, block, verdicts: Vec::new() }),
             }
         }
         "UserPromptSubmit" => {
@@ -1406,7 +1597,13 @@ fn hook_once(db_path: &Path, payload_text: Option<String>, actor: &str, no_recor
             if !no_record {
                 deliver::record_delivery(&mut store, &session_id, &session_id, actor, &time::now_iso8601(), &ids);
             }
-            Some(HookOutput::Context { event_name, block })
+            // No `verdicts` here either, for the identical reason session
+            // start carries none: a raw prompt is neither a proposed command
+            // nor proposed content (`prompt::resolve` never calls
+            // `add_command`/`add_file` - see `render::why_invocation`'s own
+            // doc comment), so there is nothing for the classifier to catch
+            // anything IN.
+            Some(HookOutput::Context { event_name, block, verdicts: Vec::new() })
         }
         _ => {
             // Surface 2 (PreToolUse, and the safe default for any event name
@@ -1548,8 +1745,10 @@ fn hook_once(db_path: &Path, payload_text: Option<String>, actor: &str, no_recor
             }
             if input.is_empty() {
                 // Nothing else would render, but a provisional sink warning
-                // may still stand entirely on its own.
-                return sink_warning.map(|block| HookOutput::Context { event_name, block });
+                // may still stand entirely on its own. Nothing was ever
+                // selected, so `verdicts` is empty here too - never a guess
+                // at what would have applied.
+                return sink_warning.map(|block| HookOutput::Context { event_name, block, verdicts: Vec::new() });
             }
             let served = serve::serve(&store, &input);
             let rendered = render::render_text(&served.selection, &input, db_path);
@@ -1561,6 +1760,17 @@ fn hook_once(db_path: &Path, payload_text: Option<String>, actor: &str, no_recor
             };
             let block = block?;
             let ids: Vec<String> = served.selection.shown.iter().map(|r| r.id.clone()).collect();
+            // THE ONE SURFACE WHERE `verdicts` IS EVER REAL: the moment of
+            // action, the only one of the three hook events that proposes an
+            // actual command or write. `input.command` is whatever was
+            // already resolved above (the real command when there was one,
+            // the tool-name fallback otherwise - the SAME text this call's
+            // own selection already ran on, never a second derivation), and
+            // `proposed_content` is the Write/Edit fragment when this tool
+            // call carries one. See `check_rows`/`CheckRow` for the shape and
+            // `Context`'s own doc comment for why this can never leak into
+            // `block` itself.
+            let verdicts = check_rows(&served.selection.shown, input.command.as_deref().unwrap_or(""), absent_guard::proposed_content(tool_name, tool_input));
             // The command as typed wins over the file, never the tool-name
             // fallback `input.add_command` used above when there was no real
             // command (`absent_guard::proposed_command` returns `None` for
@@ -1581,7 +1791,7 @@ fn hook_once(db_path: &Path, payload_text: Option<String>, actor: &str, no_recor
                     trigger,
                 );
             }
-            Some(HookOutput::Context { event_name, block })
+            Some(HookOutput::Context { event_name, block, verdicts })
         }
     }
 }
@@ -5181,7 +5391,7 @@ mod hook_actor_and_no_record_tests {
 
     fn context_block(out: Option<HookOutput>) -> (String, String) {
         match out {
-            Some(HookOutput::Context { event_name, block }) => (event_name, block),
+            Some(HookOutput::Context { event_name, block, .. }) => (event_name, block),
             other => panic!("expected a plain Context block, got {other:?}"),
         }
     }
@@ -5242,6 +5452,201 @@ mod hook_actor_and_no_record_tests {
     }
 }
 
+/// The JSON `cmd_hook` writes to stdout for one `HookOutput` - split out of
+/// `cmd_hook` itself so a test can inspect the exact value a payload
+/// produces without going through the real process, which calls
+/// `std::process::exit` unconditionally and so can never be driven from a
+/// unit test directly. The match is exhaustive over every variant
+/// `HookOutput` has today, so a future variant fails to compile here rather
+/// than silently printing nothing.
+///
+/// `verdicts` (`Context`/`ContextWithNotice` only) is written as a TOP-LEVEL
+/// sibling of `hookSpecificOutput`, never folded inside it and never mixed
+/// into `additionalContext`/`block` itself - seeing both keys is how a
+/// program that already calls this channel per action gets the same
+/// prohibition/advice rows `check --json`/`why --json` document without a
+/// second process, while `additionalContext` keeps carrying exactly the text
+/// it always did for Claude Code, byte for byte (see `hook_verdicts_never_
+/// change_the_additional_context_text` and `a_path_bound_forbidden_item_
+/// reaches_the_hook_as_a_prohibition_without_touching_additional_context`
+/// below for the proof). Every variant produces a value - unlike
+/// `HookOutput` itself, which `hook_once` may not even return at all
+/// (`Option<HookOutput>`), this function only ever runs once a caller
+/// already has one in hand, so there is nothing left for it to say "nothing"
+/// about; it returns `Value`, never `Option<Value>`.
+fn hook_output_json(output: HookOutput) -> Value {
+    match output {
+        HookOutput::Context { event_name, block, verdicts } => serde_json::json!({
+            "hookSpecificOutput": {
+                "hookEventName": event_name,
+                "additionalContext": block,
+            },
+            "verdicts": verdicts,
+        }),
+        HookOutput::ContextWithNotice { event_name, block, notice, verdicts } => serde_json::json!({
+            "systemMessage": notice,
+            "hookSpecificOutput": {
+                "hookEventName": event_name,
+                "additionalContext": block,
+            },
+            "verdicts": verdicts,
+        }),
+        // The Response Guard's verdict is its own top-level shape, printed
+        // verbatim - never wrapped in additionalContext, and no `verdicts`
+        // sibling either: a BLOCK already IS the refusal, so there is
+        // nothing left for an advisory classifier to add.
+        HookOutput::Decision(v) => v,
+        // A WARN-tier verdict at Stop - kept as its own arm rather than
+        // folded into `Context`'s (not merely to save a few lines) because
+        // the two mean different things and no longer render the same way
+        // either: `Context` is an injection surface handing the model ONE
+        // field, `hookSpecificOutput.additionalContext`. `Warn` is the
+        // Response Guard's own softer verdict, and has a second audience
+        // `Context` never needs to reach - the owner, not just the model -
+        // so it also sets a top-level `systemMessage` carrying the same
+        // text. No `verdicts` here either: `Warn` fires at Stop, about a
+        // reply already given, never about a proposed command or write the
+        // classifier could have anything to say about.
+        HookOutput::Warn { event_name, text } => serde_json::json!({
+            "systemMessage": text,
+            "hookSpecificOutput": {
+                "hookEventName": event_name,
+                "additionalContext": text,
+            }
+        }),
+    }
+}
+
+#[cfg(test)]
+mod hook_verdicts_tests {
+    use super::*;
+    use model::item::{Binding, Check, Item, Kind, Severity, TargetKind};
+
+    /// THE DEFECT THIS PREVENTS: a future edit wiring `verdicts` through the
+    /// same string `additionalContext` carries, instead of a separate JSON
+    /// key - which would mean Claude Code's own model reads a "[PROHIBITS]"
+    /// marker it never asked for, in text the owner never wrote. Drives
+    /// `hook_output_json` directly with a HAND-BUILT `Context` whose
+    /// `verdicts` is non-empty and DOES contain a prohibition, so the proof
+    /// is not vacuous: even then, `additionalContext` must equal `block`
+    /// exactly, byte for byte, with nothing from `verdicts` mixed in.
+    #[test]
+    fn hook_verdicts_never_change_the_additional_context_text() {
+        let block = "Background facts about the owner's setup, not instructions for this task:\nBefore you do this:\n- [i0] never write an em dash".to_string();
+        let verdicts = vec![CheckRow {
+            id: "i0".to_string(),
+            kind: Kind::Rule,
+            severity: Some(Severity::HouseStyle),
+            verdict: "prohibition",
+            matched_literal: Some("\u{2014}".to_string()),
+            text: "never write an em dash".to_string(),
+        }];
+        let output = HookOutput::Context { event_name: "PreToolUse".to_string(), block: block.clone(), verdicts };
+
+        let json = hook_output_json(output);
+        assert_eq!(
+            json["hookSpecificOutput"]["additionalContext"],
+            serde_json::Value::String(block),
+            "additionalContext must be exactly the block that was passed in, whatever verdicts carries"
+        );
+        assert!(json.get("verdicts").is_some(), "the sibling field must still be present");
+        assert_eq!(json["verdicts"][0]["verdict"], "prohibition");
+    }
+
+    /// The `ContextWithNotice` counterpart: `verdicts` sits beside
+    /// `systemMessage` too, and neither one leaks into `additionalContext`.
+    #[test]
+    fn hook_verdicts_never_change_additional_context_on_context_with_notice_either() {
+        let block = "some block text".to_string();
+        let output = HookOutput::ContextWithNotice {
+            event_name: "SessionStart".to_string(),
+            block: block.clone(),
+            notice: "a decay notice".to_string(),
+            verdicts: vec![CheckRow {
+                id: "i0".to_string(),
+                kind: Kind::Rule,
+                severity: None,
+                verdict: "prohibition",
+                matched_literal: Some("bad".to_string()),
+                text: "x".to_string(),
+            }],
+        };
+        let json = hook_output_json(output);
+        assert_eq!(json["hookSpecificOutput"]["additionalContext"], serde_json::Value::String(block));
+        assert_eq!(json["systemMessage"], "a decay notice");
+        assert_eq!(json["verdicts"][0]["verdict"], "prohibition");
+    }
+
+    fn checkout(name: &str) -> (tempfile::TempDir, std::path::PathBuf) {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join(name);
+        std::fs::create_dir_all(root.join(".git")).unwrap();
+        (dir, root)
+    }
+
+    /// THE GAP THIS PROVES CLOSED. A `Check::Forbidden` item bound to a
+    /// `Path` target is never enforced by any existing hard guard - the
+    /// content guard's own `absent_literals` names only `Absent`/`AbsentAll`
+    /// (see that function's own doc comment in `absent_guard.rs`), and the
+    /// self-contained/command arms require an `Always`/`Command` binding
+    /// respectively, neither of which this item carries. So this exact call
+    /// reaches the informational Context branch untouched by any block -
+    /// yet the new classifier must still call it a prohibition for a Write
+    /// whose own content carries the literal, and the hook's own `verdicts`
+    /// field must say so, all while `additionalContext` - the actual text
+    /// the model reads - stays exactly what `render::render_text` alone
+    /// already produces (proven directly above at the JSON-assembly level;
+    /// this proves the same thing end to end, through the real store and
+    /// the real `hook_once`, including the verdict computation that reads
+    /// the SAME `served.selection.shown`/`input` the block was built from).
+    #[test]
+    fn a_path_bound_forbidden_item_reaches_the_hook_as_a_prohibition_without_touching_additional_context() {
+        let (dir, root) = checkout("Some-Project");
+        let db = dir.path().join("t.db");
+        let mut store = EventStore::new(&db).unwrap();
+        let item = Item {
+            id: "no-todo-marker".to_string(),
+            kind: Kind::Rule,
+            text: "guarded.rs never carries a TODO-MARKER-XYZ".to_string(),
+            bindings: vec![Binding::Target { kind: TargetKind::Path, value: "guarded.rs".to_string() }],
+            severity: Some(Severity::HouseStyle),
+            project: Some("Some-Project".to_string()),
+            tags: vec![],
+            expires: None,
+            key: None,
+            falsifier: Some("a TODO-MARKER-XYZ lands in guarded.rs and stays a week".to_string()),
+            check: Some(Check::Forbidden { literals: vec!["TODO-MARKER-XYZ".to_string()] }),
+        };
+        model::store::declare(&mut store, "t", "t", "t", &item).expect("fixture must store");
+        drop(store);
+
+        let payload = serde_json::json!({
+            "hook_event_name": "PreToolUse",
+            "session_id": "s1",
+            "cwd": root.display().to_string(),
+            "tool_name": "Write",
+            "tool_input": {"file_path": "guarded.rs", "content": "fn x() { /* TODO-MARKER-XYZ */ }"},
+        })
+        .to_string();
+
+        let out = hook_once(&db, Some(payload), "hook", true);
+        let (event_name, block, verdicts) = match out {
+            Some(HookOutput::Context { event_name, block, verdicts }) => (event_name, block, verdicts),
+            other => panic!("expected a plain Context block carrying the item above, got {other:?}"),
+        };
+        assert_eq!(event_name, "PreToolUse");
+
+        // additionalContext must be exactly what render_text alone produces -
+        // never anything the new verdicts computation added to it.
+        assert!(block.contains("no-todo-marker"), "sanity: the item must actually be shown: {block}");
+        assert!(!block.contains("PROHIBITS"), "additionalContext must carry no marker of its own: {block}");
+
+        let row = verdicts.iter().find(|r| r.id == "no-todo-marker").expect("the item must appear in verdicts");
+        assert_eq!(row.verdict, "prohibition");
+        assert_eq!(row.matched_literal.as_deref(), Some("TODO-MARKER-XYZ"));
+    }
+}
+
 fn cmd_hook(db_path: &Path, diagnose: bool, actor: Option<String>, no_record: bool) {
  // Validated HERE, before the reentry check below: a malformed `--actor`
  // is the caller's own mistake (a typo in whatever is invoking this),
@@ -5294,55 +5699,13 @@ fn cmd_hook(db_path: &Path, diagnose: bool, actor: Option<String>, no_record: bo
  } else {
  None
  };
- match result {
- Ok(Some(HookOutput::Context { event_name, block })) => {
- let out = serde_json::json!({
- "hookSpecificOutput": {
- "hookEventName": event_name,
- "additionalContext": block,
- }
- });
+ // The per-variant shape (including the new `verdicts` sibling on
+ // `Context`/`ContextWithNotice` - see that function's own doc comment)
+ // now lives in `hook_output_json` alone, so a test can drive it
+ // directly without going through this process-exiting function.
+ if let Ok(Some(output)) = result {
+ let out = hook_output_json(output);
  let _ = serde_json::to_writer(std::io::stdout(), &out);
- }
- Ok(Some(HookOutput::ContextWithNotice { event_name, block, notice })) => {
- let out = serde_json::json!({
- "systemMessage": notice,
- "hookSpecificOutput": {
- "hookEventName": event_name,
- "additionalContext": block,
- }
- });
- let _ = serde_json::to_writer(std::io::stdout(), &out);
- }
- // The Response Guard's verdict is its own top-level shape, printed
- // verbatim - never wrapped in additionalContext.
- Ok(Some(HookOutput::Decision(v))) => {
- let _ = serde_json::to_writer(std::io::stdout(), &v);
- }
- // A WARN-tier verdict at Stop - kept as its own match arm rather
- // than folded into `Context`'s (not merely to save a few lines)
- // because the two mean different things, and no longer render the
- // same way either: `Context` is an injection surface handing the
- // model ONE field, `hookSpecificOutput.additionalContext`. `Warn` is
- // the Response Guard's own softer verdict, and has a second audience
- // `Context` never needs to reach - the owner, not just the model -
- // so it also sets a top-level `systemMessage` carrying the same
- // text, confirmed by Claude Code's own hooks documentation as the
- // field "shown to the user". See `HookOutput::Warn`'s own doc
- // comment for what that documentation settles and the one question
- // it still leaves open - if that remaining assumption is ever found
- // wrong, only this arm needs to change.
- Ok(Some(HookOutput::Warn { event_name, text })) => {
- let out = serde_json::json!({
- "systemMessage": text,
- "hookSpecificOutput": {
- "hookEventName": event_name,
- "additionalContext": text,
- }
- });
- let _ = serde_json::to_writer(std::io::stdout(), &out);
- }
- _ => {}
  }
  if let Some((line, code)) = diagnosis {
  eprintln!("{line}");
@@ -5363,35 +5726,203 @@ fn open_store_or_die(db_path: &Path) -> EventStore {
  }
 }
 
-fn cmd_check(db_path: &Path, input: &ServeInput) {
- if input.is_empty() {
- println!("no intent detected - nothing would fire");
- return;
- }
- if input.moments.is_empty() {
- println!("detected: (no action; matching on target only)");
- } else {
- println!("detected: {}", input.moments.iter().map(Action::as_str).collect::<Vec<_>>().join(", "));
+/// `render::render_text`'s own block, with one extra marker line spliced in
+/// right after each shown item's bullet whose check classifies as a
+/// prohibition for `command`/`content` - never touching `render_text`
+/// itself, whose output the hook channel hands the model BYTE FOR BYTE (see
+/// `hook_output_json`'s own doc comment and tests). `render_text` is the one
+/// shared renderer for `check`, `hook` and `prompt` alike; marking inside it
+/// would leak this work's own marker into the hook's `additionalContext`,
+/// which must never change. So this walks the ALREADY-RENDERED block's own
+/// lines instead and inserts a short, separate line - never rewriting or
+/// removing one that was already there - for every id `classify_moment`
+/// calls a prohibition. `check` and `hook` therefore agree on which items
+/// are prohibitions only because both ultimately call the SAME classifier;
+/// only `check`'s own prose is ever marked with it.
+fn mark_prohibitions(block: &str, shown: &[RankedItem], command: &str, content: Option<&str>) -> String {
+    let verdicts = absent_guard::classify_moment(shown, command, content);
+    let mut lines: Vec<String> = Vec::new();
+    for line in block.lines() {
+        // `render_text`'s own bullet shape is `"- [{id}] {text}"` - the id
+        // sits between the first `[` and the first `]` after it, whatever it
+        // contains (a project-prefixed id carries its own `:`).
+        let bullet_id = line.strip_prefix("- [").and_then(|rest| rest.split(']').next());
+        lines.push(line.to_string());
+        let Some(id) = bullet_id else { continue };
+        let verdict = verdicts.iter().find(|(vid, _)| vid == id).map(|(_, v)| v);
+        if let Some(absent_guard::Verdict::Prohibition { literal }) = verdict {
+            lines.push(format!("  [PROHIBITS] matched \"{literal}\""));
+        }
+    }
+    lines.join("\n")
+}
+
+fn cmd_check(db_path: &Path, input: &ServeInput, json: bool) {
+    if input.is_empty() {
+        if json {
+            println!("[]");
+        } else {
+            println!("no intent detected - nothing would fire");
+        }
+        return;
     }
     let store = open_store_or_die(db_path);
     let served = serve::serve(&store, input);
+    let command = input.command.as_deref().unwrap_or("");
+    if json {
+        print_json_rows(&check_rows(&served.selection.shown, command, None));
+        return;
+    }
+    if input.moments.is_empty() {
+        println!("detected: (no action; matching on target only)");
+    } else {
+        println!("detected: {}", input.moments.iter().map(Action::as_str).collect::<Vec<_>>().join(", "));
+    }
     match render::render_text(&served.selection, input, db_path) {
-        Some(block) => println!("\n{block}"),
+        Some(block) => println!("\n{}", mark_prohibitions(&block, &served.selection.shown, command, None)),
         None => println!("\n(no item governs this)"),
     }
 }
 
-fn cmd_why(db_path: &Path, input: &ServeInput) {
+/// One item's two-line description in `why`'s own prose form, plus - only
+/// when `classify_check` calls it a prohibition for `command` - a short
+/// third line marking it. Split out of `cmd_why` so a test can inspect the
+/// exact lines it produces without capturing real stdout; every original
+/// line stays exactly as it always read (see this file's own `mark_
+/// prohibitions` for the identical guarantee on `check`'s side).
+fn why_lines(all: &[RankedItem], shown_ids: &std::collections::HashSet<&str>, command: &str) -> Vec<String> {
+    let mut lines = Vec::new();
+    for ranked in all {
+        let mark = if shown_ids.contains(ranked.id.as_str()) { " " } else { "-" };
+        let severity = ranked.item.severity.map(|s| format!("{s:?}")).unwrap_or_else(|| "none".to_string());
+        lines.push(format!("{mark} [{severity}] {}", ranked.item.text));
+        lines.push(format!("    id {}   kind {:?}", ranked.id, ranked.item.kind));
+        if let absent_guard::Verdict::Prohibition { literal } =
+            absent_guard::classify_check(ranked.item.check.as_ref(), command, None)
+        {
+            lines.push(format!("    [PROHIBITS] matched \"{literal}\""));
+        }
+    }
+    lines
+}
+
+fn cmd_why(db_path: &Path, input: &ServeInput, json: bool) {
     let store = open_store_or_die(db_path);
     let served = serve::serve(&store, input);
+    let command = input.command.as_deref().unwrap_or("");
+    if json {
+        print_json_rows(&check_rows(&served.all, command, None));
+        return;
+    }
     let shown_ids: std::collections::HashSet<&str> =
         served.selection.shown.iter().map(|r| r.id.as_str()).collect();
     println!("{} item(s) apply; the block would show {}.\n", served.all.len(), served.selection.shown.len());
-    for ranked in &served.all {
-        let mark = if shown_ids.contains(ranked.id.as_str()) { " " } else { "-" };
-        let severity = ranked.item.severity.map(|s| format!("{s:?}")).unwrap_or_else(|| "none".to_string());
-        println!("{mark} [{severity}] {}", ranked.item.text);
-        println!("    id {}   kind {:?}", ranked.id, ranked.item.kind);
+    for line in why_lines(&served.all, &shown_ids, command) {
+        println!("{line}");
+    }
+}
+
+#[cfg(test)]
+mod prose_marking_tests {
+    use super::*;
+    use model::item::{Binding, Check, Item, Kind, Severity, TargetKind};
+
+    fn ranked_command_item(id: &str, check: Option<Check>) -> RankedItem {
+        RankedItem {
+            id: id.to_string(),
+            item: Item {
+                id: id.to_string(),
+                kind: Kind::Rule,
+                text: format!("{id}: never carry the forbidden text"),
+                bindings: vec![Binding::Target { kind: TargetKind::Command, value: "git push".to_string() }],
+                severity: Some(Severity::HouseStyle),
+                project: None,
+                tags: vec![],
+                expires: None,
+                key: None,
+                falsifier: Some(format!("{id} turns out fine anyway")),
+                check,
+            },
+        }
+    }
+
+    // ------------------------------------------------- check's own marking
+
+    /// THE DEFECT THIS PREVENTS: `render_text` is the one shared renderer
+    /// for `check`, `hook` and `prompt` alike (see `mark_prohibitions`'s own
+    /// doc comment) - marking INSIDE it would leak straight into the hook's
+    /// own `additionalContext`, which must never change. `mark_prohibitions`
+    /// must therefore only ever ADD a line, never touch one that was already
+    /// there: every line `render_text` produced must still be found, whole,
+    /// in the marked output, plus the new marker.
+    #[test]
+    fn marking_a_prohibited_item_keeps_every_original_line_and_adds_the_marker() {
+        let shown = vec![
+            ranked_command_item("p1", Some(Check::Forbidden { literals: vec!["--force".to_string()] })),
+            ranked_command_item("a1", None),
+        ];
+        let selection = render::Selection { shown: shown.clone(), withheld: 0 };
+        let input = ServeInput { command: Some("git push --force origin main".to_string()), ..Default::default() };
+        let before = render::render_text(&selection, &input, Path::new("does-not-need-to-exist.db"))
+            .expect("fixture must render a block");
+
+        let after = mark_prohibitions(&before, &shown, "git push --force origin main", None);
+
+        for line in before.lines() {
+            assert!(after.contains(line), "an original line went missing: {line:?}\nafter:\n{after}");
+        }
+        assert!(after.contains("[PROHIBITS]"), "the prohibited item must be marked: {after}");
+        assert!(after.contains("--force"), "the marker must name the matched literal: {after}");
+        assert!(
+            !after.lines().any(|l| l.contains("a1") && l.contains("PROHIBITS")),
+            "the advice item must never be marked: {after}"
+        );
+    }
+
+    /// An item whose check never matches this command stays unmarked -
+    /// `mark_prohibitions` must add nothing at all when nothing classifies
+    /// as a prohibition.
+    #[test]
+    fn a_block_with_no_prohibition_is_returned_unchanged() {
+        let shown = vec![ranked_command_item("a1", None)];
+        let selection = render::Selection { shown: shown.clone(), withheld: 0 };
+        let input = ServeInput { command: Some("git status".to_string()), ..Default::default() };
+        let before = render::render_text(&selection, &input, Path::new("does-not-need-to-exist.db")).unwrap();
+
+        let after = mark_prohibitions(&before, &shown, "git status", None);
+        assert_eq!(before, after, "nothing to mark means nothing added");
+    }
+
+    // --------------------------------------------------- why's own marking
+
+    /// The identical guarantee as `check`'s own marker, proven at the
+    /// `why_lines` level instead: every original two-line description stays
+    /// exactly as it read, and the marker is a THIRD, separate line, never a
+    /// rewrite of either.
+    #[test]
+    fn why_lines_keep_the_original_two_lines_and_add_a_third_for_a_prohibition() {
+        let items = vec![ranked_command_item("p1", Some(Check::Forbidden { literals: vec!["--force".to_string()] }))];
+        let shown_ids: std::collections::HashSet<&str> = ["p1"].into_iter().collect();
+
+        let lines = why_lines(&items, &shown_ids, "git push --force origin main");
+        assert_eq!(lines.len(), 3, "two original lines plus one marker: {lines:?}");
+        // "shown" (the fixture's own `shown_ids`) prints as a one-char mark
+        // (a plain space) THEN the format string's own literal space before
+        // "[" - two spaces total before the bracket, not one.
+        assert_eq!(lines[0], "  [HouseStyle] p1: never carry the forbidden text");
+        assert_eq!(lines[1], "    id p1   kind Rule");
+        assert!(lines[2].contains("[PROHIBITS]") && lines[2].contains("--force"), "{}", lines[2]);
+    }
+
+    /// An item that is not a prohibition for this command produces exactly
+    /// its two original lines, no third one.
+    #[test]
+    fn why_lines_add_nothing_for_advice() {
+        let items = vec![ranked_command_item("a1", None)];
+        let shown_ids: std::collections::HashSet<&str> = ["a1"].into_iter().collect();
+
+        let lines = why_lines(&items, &shown_ids, "git push --force origin main");
+        assert_eq!(lines.len(), 2, "{lines:?}");
     }
 }
 
